@@ -45,7 +45,7 @@ class Renderer:
         path: str, device: torch.device, use_2dgs, *args, **kwargs
     ) -> "Renderer":
         guru.info(f"Loading checkpoint from {path}")
-        ckpt = torch.load(path)
+        ckpt = torch.load(path, weights_only=False)
         state_dict = ckpt["model"]
         model = SceneModel.init_from_state_dict(state_dict)
         model.use_2dgs = use_2dgs

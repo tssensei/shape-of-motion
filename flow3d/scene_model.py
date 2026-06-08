@@ -197,7 +197,7 @@ class SceneModel(nn.Module):
     ) -> dict:
 
         curr_w2cs = w2cs
-
+        target_w2cs_clone = None
         if target_w2cs is not None:
             target_w2cs_clone = target_w2cs
         device = w2cs.device
@@ -333,7 +333,12 @@ class SceneModel(nn.Module):
         # Populate the current data for adaptive gaussian control.
         if self.training and info["means2d"].requires_grad:
             self._current_xys = info["means2d"]
-            self._current_radii = info["radii"]
+            radii = info["radii"]
+            # Newer gsplat returns per-axis radii with shape (..., G, 2).
+            # SOM's density-control code expects one scalar radius per Gaussian.
+            if radii.ndim == self._current_xys.ndim and radii.shape[-1] == 2:
+                radii = radii.amax(dim=-1)
+            self._current_radii = radii
             self._current_img_wh = img_wh
             # We want to be able to access to xys' gradients later in a
             # torch.no_grad context.
