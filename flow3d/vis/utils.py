@@ -4,11 +4,15 @@ from typing import cast
 import cv2
 import numpy as np
 
-# import nvdiffrast.torch as dr
 import torch
 import torch.nn.functional as F
 from matplotlib import colormaps
 from viser import ViserServer
+
+try:
+    import nvdiffrast.torch as dr
+except ImportError:
+    dr = None
 
 
 class Singleton(type):
@@ -239,6 +243,15 @@ def draw_tracks_2d_th(
     track_line_width: int = 2,
     cmap_name: str = "gist_rainbow",
 ):
+    if dr is None:
+        return draw_tracks_2d(
+            img,
+            tracks_2d,
+            track_point_size=track_point_size,
+            track_line_width=track_line_width,
+            cmap_name=cmap_name,
+        )
+
     cmap = colormaps.get_cmap(cmap_name)
     CTX = dr.RasterizeCudaContext()
 
