@@ -71,14 +71,15 @@ class Renderer:
         w2c = torch.linalg.inv(
             torch.from_numpy(camera_state.c2w.astype(np.float32)).to(self.device)
         )
-        t = (
-            int(self.viewer._playback_guis[0].value)
-            if not self.viewer._canonical_checkbox.value
-            else None
-        )
+        playback_guis = getattr(self.viewer, "_playback_guis", None)
+        canonical_checkbox = getattr(self.viewer, "_canonical_checkbox", None)
+        canonical = bool(canonical_checkbox.value) if canonical_checkbox is not None else False
+        t = int(playback_guis[0].value) if playback_guis is not None and not canonical else None
         self.model.training = False
         img = self.model.render(t, w2c[None], K[None], img_wh)["img"][0]
-        if not self.viewer._render_track_checkbox.value:
+        render_track_checkbox = getattr(self.viewer, "_render_track_checkbox", None)
+        render_tracks = bool(render_track_checkbox.value) if render_track_checkbox is not None else False
+        if not render_tracks:
             img = (img.cpu().numpy() * 255.0).astype(np.uint8)
         else:
             assert t is not None
