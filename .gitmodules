@@ -7,3 +7,6 @@
 [submodule "preproc/UniDepth"]
 	path = preproc/UniDepth
 	url = https://github.com/lpiccinelli-eth/UniDepth.git
+[submodule "preproc/MegaSaM"]
+	path = preproc/MegaSaM
+	url = https://github.com/mega-sam/mega-sam.git

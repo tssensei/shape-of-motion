@@ -1,6 +1,9 @@
 import argparse
 import json
 import os
+import shlex
+import subprocess
+import sys
 
 import cv2
 import imageio.v2 as iio
@@ -38,7 +41,9 @@ def load_calib_intrinsics(calib_path: str, frame_names: list[str]) -> np.ndarray
 def to_4x4_poses(poses: np.ndarray, key: str) -> np.ndarray:
     poses = np.asarray(poses, dtype=np.float32)
     if poses.ndim != 3:
-        raise ValueError(f"{key} must have shape (N, 4, 4) or (N, 3, 4), got {poses.shape}")
+        raise ValueError(
+            f"{key} must have shape (N, 4, 4) or (N, 3, 4), got {poses.shape}"
+        )
     if poses.shape[-2:] == (4, 4):
         return poses
     if poses.shape[-2:] == (3, 4):
@@ -46,7 +51,9 @@ def to_4x4_poses(poses: np.ndarray, key: str) -> np.ndarray:
             np.array([0, 0, 0, 1], dtype=np.float32), (poses.shape[0], 1, 4)
         )
         return np.concatenate([poses, bottom], axis=1)
-    raise ValueError(f"{key} must have shape (N, 4, 4) or (N, 3, 4), got {poses.shape}")
+    raise ValueError(
+        f"{key} must have shape (N, 4, 4) or (N, 3, 4), got {poses.shape}"
+    )
 
 
 def load_megasam_c2w(npz: np.lib.npyio.NpzFile) -> np.ndarray:
@@ -64,6 +71,15 @@ def load_megasam_c2w(npz: np.lib.npyio.NpzFile) -> np.ndarray:
         "Could not find MegaSaM camera poses. "
         f"Expected one of {c2w_keys + w2c_keys}; found {list(npz.keys())}"
     )
+
+
+def infer_megasam_hw(npz: np.lib.npyio.NpzFile) -> tuple[int, int] | None:
+    if "images" not in npz:
+        return None
+    images = npz["images"]
+    if images.ndim >= 4:
+        return int(images.shape[1]), int(images.shape[2])
+    return None
 
 
 def intrinsic_to_vec(arr: np.ndarray, image_hw: tuple[int, int], key: str) -> np.ndarray:
@@ -145,7 +161,9 @@ def estimate_pose_scale(
     image_hw: tuple[int, int],
 ) -> float:
     ratios = []
-    for idx, target_depth in enumerate(aligned_depths):
+    count = min(len(aligned_depths), len(megasam_depths))
+    for idx in range(count):
+        target_depth = aligned_depths[idx]
         source_depth = resize_megasam_depth(megasam_depths, idx, is_disparity, image_hw)
         valid = (
             np.isfinite(source_depth)
@@ -188,29 +206,90 @@ def unproject_depth(
     x = (xs - cx) / fx * depth
     y = (ys - cy) / fy * depth
     cam_points = np.stack([x, y, depth], axis=-1)
-    world_points = (
-        cam_points @ c2w[:3, :3].T + c2w[:3, 3][None, None, :]
-    ).astype(np.float32)
-    return world_points
+    world_points = cam_points @ c2w[:3, :3].T + c2w[:3, 3][None, None, :]
+    return world_points.astype(np.float32)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--img_dir", required=True)
-    parser.add_argument("--depth_dir", required=True)
-    parser.add_argument("--calib", required=True)
-    parser.add_argument("--megasam", required=True)
-    parser.add_argument("--out_path", required=True)
-    parser.add_argument(
-        "--intrinsics-source",
-        choices=("auto", "megasam", "calib"),
-        default="auto",
+def default_megasam_root() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "MegaSaM")
+
+
+def require_path(path: str, description: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing {description}: {path}")
+
+
+def run_megasam(args, scene_name: str) -> str:
+    megasam_root = os.path.abspath(args.megasam_root)
+    require_path(megasam_root, "MegaSaM root")
+
+    script_path = os.path.join(megasam_root, "camera_tracking_scripts", "test_demo.py")
+    require_path(script_path, "MegaSaM camera tracking script")
+
+    weights = args.weights or os.path.join(
+        megasam_root, "checkpoints", "megasam_final.pth"
     )
-    parser.add_argument("--point-long-edge", type=int, default=320)
-    parser.add_argument("--pose-scale", type=float, default=1.0)
-    parser.add_argument("--no-scale-align", action="store_true")
-    args = parser.parse_args()
+    mono_depth_path = args.mono_depth_path or os.path.join(
+        megasam_root, "Depth-Anything", "video_visualization"
+    )
+    metric_depth_path = args.metric_depth_path or os.path.join(
+        megasam_root, "UniDepth", "outputs"
+    )
 
+    require_path(weights, "MegaSaM checkpoint")
+    require_path(
+        os.path.join(mono_depth_path, scene_name),
+        "MegaSaM mono-depth directory for this scene",
+    )
+    require_path(
+        os.path.join(metric_depth_path, scene_name),
+        "MegaSaM metric-depth directory for this scene",
+    )
+
+    cmd = [
+        args.python,
+        script_path,
+        "--datapath",
+        os.path.abspath(args.img_dir),
+        "--weights",
+        os.path.abspath(weights),
+        "--scene_name",
+        scene_name,
+        "--mono_depth_path",
+        os.path.abspath(mono_depth_path),
+        "--metric_depth_path",
+        os.path.abspath(metric_depth_path),
+        "--disable_vis",
+    ]
+    if args.megasam_args:
+        cmd.extend(shlex.split(args.megasam_args))
+
+    print("Running MegaSaM:")
+    print(" ".join(shlex.quote(x) for x in cmd))
+    subprocess.run(cmd, cwd=megasam_root, check=True)
+
+    expected = os.path.join(megasam_root, "outputs", f"{scene_name}_droid.npz")
+    require_path(expected, "MegaSaM output npz")
+    return expected
+
+
+def resolve_megasam_npz(args, scene_name: str) -> str:
+    if args.megasam_npz is not None:
+        megasam_npz = os.path.abspath(args.megasam_npz)
+        if os.path.exists(megasam_npz) and not args.force_run:
+            return megasam_npz
+        if args.no_run:
+            require_path(megasam_npz, "MegaSaM output npz")
+        print(f"MegaSaM npz not found or force-run requested: {megasam_npz}")
+
+    if args.no_run:
+        raise FileNotFoundError(
+            "No MegaSaM npz was available. Provide --megasam_npz or remove --no_run."
+        )
+    return run_megasam(args, scene_name)
+
+
+def convert_megasam_to_som(args, megasam_npz: str, scene_name: str):
     img_files = list_images(args.img_dir)
     if not img_files:
         raise ValueError(f"No images found in {args.img_dir}")
@@ -219,57 +298,65 @@ def main():
     full_h, full_w = first_img.shape[:2]
     full_hw = (full_h, full_w)
 
-    megasam = np.load(args.megasam)
+    megasam = np.load(megasam_npz)
+    print(f"MegaSaM npz: {megasam_npz}")
     print(f"MegaSaM keys: {list(megasam.keys())}")
 
     traj_c2w = load_megasam_c2w(megasam)
-    if len(traj_c2w) != len(img_files):
+    if len(traj_c2w) < len(img_files):
         raise ValueError(
             f"Frame count mismatch: {len(img_files)} images but {len(traj_c2w)} poses"
         )
+    if len(traj_c2w) > len(img_files):
+        print(f"Trimming {len(traj_c2w)} poses to {len(img_files)} image frames")
+        traj_c2w = traj_c2w[: len(img_files)]
 
+    megasam_hw = infer_megasam_hw(megasam)
     calib_intrinsics = load_calib_intrinsics(args.calib, img_files)
-    megasam_intrinsics = load_megasam_intrinsics(megasam, full_hw)
-    if args.intrinsics_source == "megasam":
-        if megasam_intrinsics is None:
-            raise KeyError("Requested MegaSaM intrinsics, but none were found in npz")
-        full_intrinsics = megasam_intrinsics
-    elif args.intrinsics_source == "calib":
-        full_intrinsics = calib_intrinsics
+
+    if args.intrinsics_source == "calib":
+        base_hw = full_hw
+        base_intrinsics = calib_intrinsics
     else:
-        full_intrinsics = (
-            megasam_intrinsics if megasam_intrinsics is not None else calib_intrinsics
-        )
+        intrinsic_hw = megasam_hw or full_hw
+        megasam_intrinsics = load_megasam_intrinsics(megasam, intrinsic_hw)
+        if args.intrinsics_source == "megasam":
+            if megasam_intrinsics is None:
+                raise KeyError("Requested MegaSaM intrinsics, but none were found")
+            base_hw = intrinsic_hw
+            base_intrinsics = megasam_intrinsics
+        elif megasam_intrinsics is not None:
+            base_hw = intrinsic_hw
+            base_intrinsics = megasam_intrinsics
+        else:
+            base_hw = full_hw
+            base_intrinsics = calib_intrinsics
 
     if args.point_long_edge > 0:
-        point_scale = min(1.0, args.point_long_edge / max(full_h, full_w))
+        point_scale = min(1.0, args.point_long_edge / max(base_hw))
     else:
         point_scale = 1.0
-    out_h = max(1, int(round(full_h * point_scale)))
-    out_w = max(1, int(round(full_w * point_scale)))
+    out_h = max(1, int(round(base_hw[0] * point_scale)))
+    out_w = max(1, int(round(base_hw[1] * point_scale)))
     out_hw = (out_h, out_w)
     out_intrinsics = scaled_intrinsics(
-        full_intrinsics, out_w / full_w, out_h / full_h
+        base_intrinsics, out_w / base_hw[1], out_h / base_hw[0]
     )
 
-    full_depths = [
-        load_depth_from_disp(args.depth_dir, frame_name, full_hw)
-        for frame_name in tqdm(img_files, desc="loading aligned depths")
-    ]
+    base_depths = []
+    for frame_name in tqdm(img_files, desc="loading aligned depths"):
+        full_depth = load_depth_from_disp(args.depth_dir, frame_name, full_hw)
+        if full_hw != base_hw:
+            full_depth = resize_hw(full_depth, base_hw, cv2.INTER_LINEAR)
+        base_depths.append(full_depth)
 
     pose_scale = args.pose_scale
     megasam_depth_info = load_megasam_depths(megasam)
     if not args.no_scale_align and megasam_depth_info is not None:
         depth_arr, is_disparity = megasam_depth_info
-        if len(depth_arr) == len(img_files):
-            pose_scale *= estimate_pose_scale(
-                full_depths, depth_arr, is_disparity, full_hw
-            )
-        else:
-            print(
-                "Skipping MegaSaM depth scale alignment because depth count "
-                f"{len(depth_arr)} != image count {len(img_files)}"
-            )
+        pose_scale *= estimate_pose_scale(
+            base_depths, depth_arr, is_disparity, base_hw
+        )
     traj_c2w = traj_c2w.copy()
     traj_c2w[:, :3, 3] *= pose_scale
 
@@ -279,7 +366,7 @@ def main():
     for idx, frame_name in enumerate(tqdm(img_files, desc="building recon")):
         img = read_image(os.path.join(args.img_dir, frame_name))
         img_small = resize_hw(img, out_hw, cv2.INTER_AREA)
-        depth_small = resize_hw(full_depths[idx], out_hw, cv2.INTER_LINEAR)
+        depth_small = resize_hw(base_depths[idx], out_hw, cv2.INTER_LINEAR)
         valid = np.isfinite(depth_small) & (depth_small > 1e-6)
 
         images.append(img_small.astype(np.float32) / 255.0)
@@ -302,9 +389,41 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
     np.save(args.out_path, np.array(save_dict))
 
+    print(f"scene_name={scene_name}")
     print(f"pose_scale={pose_scale}")
     for key, value in save_dict.items():
         print(f"{key} {value.shape if isinstance(value, np.ndarray) else value}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--img_dir", required=True)
+    parser.add_argument("--depth_dir", required=True)
+    parser.add_argument("--calib", required=True)
+    parser.add_argument("--out_path", required=True)
+    parser.add_argument("--scene_name", default=None)
+    parser.add_argument("--megasam_root", default=default_megasam_root())
+    parser.add_argument("--megasam_npz", "--megasam", dest="megasam_npz", default=None)
+    parser.add_argument("--weights", default=None)
+    parser.add_argument("--mono_depth_path", default=None)
+    parser.add_argument("--metric_depth_path", default=None)
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--megasam_args", default="")
+    parser.add_argument("--no_run", action="store_true")
+    parser.add_argument("--force_run", action="store_true")
+    parser.add_argument(
+        "--intrinsics-source",
+        choices=("auto", "megasam", "calib"),
+        default="auto",
+    )
+    parser.add_argument("--point-long-edge", type=int, default=320)
+    parser.add_argument("--pose-scale", type=float, default=1.0)
+    parser.add_argument("--no-scale-align", action="store_true")
+    args = parser.parse_args()
+
+    scene_name = args.scene_name or os.path.basename(os.path.normpath(args.img_dir))
+    megasam_npz = resolve_megasam_npz(args, scene_name)
+    convert_megasam_to_som(args, megasam_npz, scene_name)
 
 
 if __name__ == "__main__":
