@@ -298,7 +298,7 @@ def make_demo(
                 frame_index = gr.Slider(
                     label="Frame index",
                     minimum=0,
-                    maximum=len(prompts.img_paths) - 1,
+                    maximum=max(len(prompts.img_paths) - 1, 1),
                     value=0,
                     step=1,
                 )
