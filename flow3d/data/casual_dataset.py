@@ -133,6 +133,7 @@ class CasualDataset(BaseDataset):
         self.masks: list[torch.Tensor | None] = [None for _ in self.frame_names]
 
         # load cameras
+        self.megasam_path: Path | None = None
         if camera_type == "droid_recon":
             img = self.get_image(0)
             H, W = img.shape[:2]
@@ -141,15 +142,10 @@ class CasualDataset(BaseDataset):
             )
             
         elif camera_type == "megasam":
-            data_name = data_dir.split("/")[-1]
-            cam_path = Path(data_dir) / f"{data_name}.npz"
-            cams = np.load(cam_path)
-            c2ws = cams["cam_c2w"][:self.end]
-            K = cams["intrinsic"]
-                
-            c2ws = torch.from_numpy(c2ws)
-            w2cs = torch.linalg.inv(c2ws)
-            Ks = torch.from_numpy(K).unsqueeze(0).repeat((c2ws.shape[0], 1, 1))
+            img = self.get_image(0)
+            H, W = img.shape[:2]
+            self.megasam_path = resolve_megasam_path(data_dir)
+            w2cs, Ks, tstamps = load_megasam_cameras(self.megasam_path, H, W)
                 
         else:
             raise ValueError(f"Unknown camera type: {camera_type}")
@@ -226,12 +222,14 @@ class CasualDataset(BaseDataset):
             if self.camera_type == "droid_recon":
                 self.depths[index] = self.load_depth(index)
             elif self.camera_type == "megasam":
-                data_name = self.data_dir.split("/")[-1]
-                depth_path = Path(self.data_dir) / f"{data_name}.npz"
-                depths = np.load(depth_path)
-                self.depths[index] = torch.tensor(depths["depths"][index]).float()
-               
-                
+                assert self.megasam_path is not None
+                with np.load(self.megasam_path) as data:
+                    depth = np.squeeze(data["depths"][index]).astype(np.float32)
+                H, W = self.get_image(index).shape[:2]
+                if depth.shape != (H, W):
+                    depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_LINEAR)
+                self.depths[index] = torch.from_numpy(depth).float()
+
         return self.depths[index] / self.scale
 
     def load_image(self, index) -> torch.Tensor:
@@ -510,6 +508,99 @@ def load_cameras(
         torch.from_numpy(Ks).float(),
         torch.from_numpy(kf_tstamps),
     )
+
+
+def resolve_megasam_path(data_dir: str) -> Path:
+    data_path = Path(data_dir)
+    data_name = data_path.name
+    candidates = [
+        data_path / "megasam.npz",
+        data_path / f"{data_name}.npz",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        "Could not find MegaSaM camera file. Expected one of: "
+        + ", ".join(str(path) for path in candidates)
+    )
+
+
+def load_megasam_cameras(
+    path: Path, H: int, W: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with np.load(path) as data:
+        c2ws = load_megasam_c2ws(data)
+        K = load_megasam_K(data, H, W)
+
+    w2cs = np.linalg.inv(c2ws)
+    Ks = np.tile(K[None, ...], (len(c2ws), 1, 1))
+    tstamps = np.arange(len(c2ws), dtype=int)
+    return (
+        torch.from_numpy(w2cs).float(),
+        torch.from_numpy(Ks).float(),
+        torch.from_numpy(tstamps),
+    )
+
+
+def load_megasam_c2ws(data: np.lib.npyio.NpzFile) -> np.ndarray:
+    for key in ("cam_c2w", "c2ws", "camera_c2w", "traj_c2w"):
+        if key in data:
+            return to_4x4_poses(data[key], key)
+    for key in ("cam_w2c", "w2cs", "camera_w2c", "traj_w2c"):
+        if key in data:
+            return np.linalg.inv(to_4x4_poses(data[key], key)).astype(np.float32)
+    raise KeyError(f"Could not find MegaSaM camera poses in {list(data.keys())}")
+
+
+def to_4x4_poses(poses: np.ndarray, key: str) -> np.ndarray:
+    poses = np.asarray(poses, dtype=np.float32)
+    if poses.ndim != 3:
+        raise ValueError(f"{key} must have shape (N, 4, 4) or (N, 3, 4), got {poses.shape}")
+    if poses.shape[-2:] == (4, 4):
+        return poses
+    if poses.shape[-2:] == (3, 4):
+        bottom = np.broadcast_to(
+            np.array([0, 0, 0, 1], dtype=np.float32), (poses.shape[0], 1, 4)
+        )
+        return np.concatenate([poses, bottom], axis=1)
+    raise ValueError(f"{key} must have shape (N, 4, 4) or (N, 3, 4), got {poses.shape}")
+
+
+def load_megasam_K(data: np.lib.npyio.NpzFile, H: int, W: int) -> np.ndarray:
+    for key in ("intrinsic", "intrinsics", "K", "Ks", "cam_K", "cam_intrinsic"):
+        if key in data:
+            K = intrinsic_to_matrix(data[key], key)
+            h0, w0 = infer_megasam_hw(data, H, W)
+            sy, sx = H / h0, W / w0
+            K = K.copy()
+            K[0] *= sx
+            K[1] *= sy
+            return K.astype(np.float32)
+    raise KeyError(f"Could not find MegaSaM intrinsics in {list(data.keys())}")
+
+
+def intrinsic_to_matrix(intrinsic: np.ndarray, key: str) -> np.ndarray:
+    intrinsic = np.asarray(intrinsic, dtype=np.float32)
+    if intrinsic.ndim == 3 and intrinsic.shape[-2:] == (3, 3):
+        return np.median(intrinsic, axis=0).astype(np.float32)
+    if intrinsic.ndim == 2 and intrinsic.shape == (3, 3):
+        return intrinsic.astype(np.float32)
+    if intrinsic.ndim == 2 and intrinsic.shape[-1] >= 4:
+        fx, fy, cx, cy = np.median(intrinsic[..., :4], axis=0)
+    elif intrinsic.ndim == 1 and intrinsic.shape[0] >= 4:
+        fx, fy, cx, cy = intrinsic[:4]
+    else:
+        raise ValueError(f"Unsupported MegaSaM intrinsic shape for {key}: {intrinsic.shape}")
+    return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+
+
+def infer_megasam_hw(data: np.lib.npyio.NpzFile, H: int, W: int) -> tuple[int, int]:
+    if "images" in data and data["images"].ndim >= 4:
+        return int(data["images"].shape[1]), int(data["images"].shape[2])
+    if "depths" in data and data["depths"].ndim >= 3:
+        return int(data["depths"].shape[-2]), int(data["depths"].shape[-1])
+    return H, W
 
 
 def compute_scene_norm(
