@@ -1,0 +1,197 @@
+diff --git a/base/droid_slam/factor_graph.py b/base/droid_slam/factor_graph.py
+index de3ce05..1b87643 100644
+--- a/base/droid_slam/factor_graph.py
++++ b/base/droid_slam/factor_graph.py
+@@ -265,7 +265,12 @@ class FactorGraph:
+       )
+       # weight = weight_ * torch.index_select(self.video.motion_masks, dim=0, index=self.ii)[None, ..., None]
+     elif MASK_TYPE == 2:
+-      weight = mot_prob
++      weight = (
++          mot_prob
++          * torch.index_select(self.video.motion_masks, dim=0, index=self.ii)[
++              None, ..., None
++          ]
++      )
+       # self.video.motion_w[torch.unique(self.ii)] = mot_prob.float()
+       # weight = weight * torch.index_select(self.video.motion_w, dim=0, index=self.ii)[None, ..., None]
+ 
+@@ -461,7 +466,12 @@ class FactorGraph:
+           )
+           # weight = weight_ * torch.index_select(self.video.motion_masks, dim=0, index=iis)[None, ..., None]
+         elif MASK_TYPE == 2:
+-          weight = mot_prob
++          weight = (
++              mot_prob
++              * torch.index_select(self.video.motion_masks, dim=0, index=iis)[
++                  None, ..., None
++              ]
++          )
+ 
+         refined_w_scatter = scatter_mean(
+             refined_w, iis - torch.min(iis), dim=0
+diff --git a/camera_tracking_scripts/test_demo.py b/camera_tracking_scripts/test_demo.py
+index a07f61d..0a464f9 100644
+--- a/camera_tracking_scripts/test_demo.py
++++ b/camera_tracking_scripts/test_demo.py
+@@ -34,12 +34,64 @@ import cv2
+ import os
+ import glob
+ import argparse
++import json
+ from lietorch import SE3
+ 
+ import torch.nn.functional as F
+ from droid import Droid
+ 
+ 
++def load_calib_K(calib_path, image_list):
++  """Load full-resolution intrinsics from a SOM calibration JSON."""
++  with open(calib_path, "r") as f:
++    calib = json.load(f)
++
++  values = []
++  for image_file in image_list:
++    stem = os.path.splitext(os.path.basename(image_file))[0]
++    if stem not in calib:
++      raise KeyError(f"Missing intrinsics for frame {stem} in {calib_path}")
++    values.append(calib[stem][:4])
++
++  fx, fy, cx, cy = np.median(np.asarray(values, dtype=np.float32), axis=0)
++  K = np.eye(3)
++  K[0, 0] = fx
++  K[1, 1] = fy
++  K[0, 2] = cx
++  K[1, 2] = cy
++  return K
++
++
++def load_tracking_mask(mask_path, image_file, mask_fg_weight):
++  """Load a SOM foreground mask and convert it to tracking weights."""
++  stem = os.path.splitext(os.path.basename(image_file))[0]
++  candidates = [
++      os.path.join(mask_path, stem + ext)
++      for ext in [".png", ".jpg", ".jpeg", ".npy"]
++  ]
++  mask_file = next((path for path in candidates if os.path.exists(path)), None)
++  if mask_file is None:
++    raise FileNotFoundError(
++        "Missing mask for frame {} in {}".format(stem, mask_path)
++    )
++
++  if mask_file.endswith(".npy"):
++    raw_mask = np.load(mask_file)
++  else:
++    raw_mask = cv2.imread(mask_file, cv2.IMREAD_UNCHANGED)
++    if raw_mask is None:
++      raise FileNotFoundError(mask_file)
++
++  if raw_mask.ndim == 3:
++    fg_mask = raw_mask.reshape((*raw_mask.shape[:2], -1)).max(axis=-1) > 0
++  else:
++    fg_mask = raw_mask > 0
++
++  tracking_mask = np.ones_like(fg_mask, dtype=np.float32)
++  tracking_mask[fg_mask] = mask_fg_weight
++  return tracking_mask
++
++
+ def image_stream(
+     image_list,
+     mono_disp_list,
+@@ -48,6 +100,8 @@ def image_stream(
+     aligns=None,
+     K=None,
+     stride=1,
++    mask_path=None,
++    mask_fg_weight=0.2,
+ ):
+   """image generator."""
+   del scene_name, stride
+@@ -95,7 +149,13 @@ def image_stream(
+     ).squeeze()
+     depth = depth[: h1 - h1 % 8, : w1 - w1 % 8]
+ 
+-    mask = torch.ones_like(depth)
++    if mask_path is None:
++      mask = torch.ones_like(depth)
++    else:
++      mask = load_tracking_mask(mask_path, image_file, mask_fg_weight)
++      mask = cv2.resize(mask, (w1, h1), interpolation=cv2.INTER_NEAREST)
++      mask = mask[: h1 - h1 % 8, : w1 - w1 % 8]
++      mask = torch.as_tensor(mask)
+ 
+     intrinsics = torch.as_tensor([fx, fy, cx, cy])
+     intrinsics[0::2] *= w1 / w0
+@@ -188,8 +248,14 @@ if __name__ == "__main__":
+       "--mono_depth_path", default="Depth-Anything/video_visualization"
+   )
+   parser.add_argument("--metric_depth_path", default="UniDepth/outputs ")
++  parser.add_argument("--calib_path", default=None)
++  parser.add_argument("--mask_path", default=None)
++  parser.add_argument("--mask_fg_weight", type=float, default=0.2)
+   args = parser.parse_args()
+ 
++  if not 0.0 <= args.mask_fg_weight <= 1.0:
++    raise ValueError("--mask_fg_weight must be in [0, 1]")
++
+   print("Running evaluation on {}".format(args.datapath))
+   print(args)
+ 
+@@ -268,20 +334,24 @@ if __name__ == "__main__":
+     shifts.append(shift)
+ 
+   print("************** UNIDEPTH FOV ", np.median(fovs))
+-  ff = img_0.shape[1] / (2 * np.tan(np.radians(np.median(fovs) / 2.0)))
+-  K = np.eye(3)
+-  K[0, 0] = (
+-      ff * 1.0
+-  )  # pp_intrinsic[0]  * (img_0.shape[1] / (pp_intrinsic[1] * 2))
+-  K[1, 1] = (
+-      ff * 1.0
+-  )  # pp_intrinsic[0]  * (img_0.shape[0] / (pp_intrinsic[2] * 2))
+-  K[0, 2] = (
+-      img_0.shape[1] / 2.0
+-  )  # pp_intrinsic[1]) * (img_0.shape[1] / (pp_intrinsic[1] * 2))
+-  K[1, 2] = (
+-      img_0.shape[0] / 2.0
+-  )  # (pp_intrinsic[2]) * (img_0.shape[0] / (pp_intrinsic[2] * 2))
++  if args.calib_path is not None:
++    K = load_calib_K(args.calib_path, image_list)
++    print("************** CALIB K ", K)
++  else:
++    ff = img_0.shape[1] / (2 * np.tan(np.radians(np.median(fovs) / 2.0)))
++    K = np.eye(3)
++    K[0, 0] = (
++        ff * 1.0
++    )  # pp_intrinsic[0]  * (img_0.shape[1] / (pp_intrinsic[1] * 2))
++    K[1, 1] = (
++        ff * 1.0
++    )  # pp_intrinsic[0]  * (img_0.shape[0] / (pp_intrinsic[2] * 2))
++    K[0, 2] = (
++        img_0.shape[1] / 2.0
++    )  # pp_intrinsic[1]) * (img_0.shape[1] / (pp_intrinsic[1] * 2))
++    K[1, 2] = (
++        img_0.shape[0] / 2.0
++    )  # (pp_intrinsic[2]) * (img_0.shape[0] / (pp_intrinsic[2] * 2))
+ 
+   ss_product = np.array(scales) * np.array(shifts)
+   med_idx = np.argmin(np.abs(ss_product - np.median(ss_product)))
+@@ -303,6 +373,8 @@ if __name__ == "__main__":
+           use_depth=True,
+           aligns=aligns,
+           K=K,
++          mask_path=args.mask_path,
++          mask_fg_weight=args.mask_fg_weight,
+       )
+   ):
+     if not args.disable_vis:
+@@ -328,6 +400,8 @@ if __name__ == "__main__":
+           use_depth=True,
+           aligns=aligns,
+           K=K,
++          mask_path=args.mask_path,
++          mask_fg_weight=args.mask_fg_weight,
+       ),
+       _opt_intr=True,
+       full_ba=True,
