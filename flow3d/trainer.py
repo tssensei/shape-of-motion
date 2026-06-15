@@ -435,21 +435,22 @@ class Trainer:
         loss += depth_gradient_loss * self.losses_cfg.w_depth_grad
 
         # bases should be smooth.
-        small_accel_loss = compute_se3_smoothness_loss(
-            self.model.motion_bases.params["rots"],
-            self.model.motion_bases.params["transls"],
-        )
-        loss += small_accel_loss * self.losses_cfg.w_smooth_bases
+        if self.model.trajectory_type == "som_basis":
+            small_accel_loss = compute_se3_smoothness_loss(
+                self.model.motion_bases.params["rots"],
+                self.model.motion_bases.params["transls"],
+            )
+            loss += small_accel_loss * self.losses_cfg.w_smooth_bases
+            dct_coef_loss = torch.zeros((), device=self.device)
+        else:
+            small_accel_loss = torch.zeros((), device=self.device)
+            dct_coef_loss = self.model.fg.params["traj_coefs"].pow(2).mean()
+            loss += dct_coef_loss * self.losses_cfg.w_dct_coef
 
         # tracks should be smooth
         ts = torch.clamp(ts, min=1, max=num_frames - 2)
         ts_neighbors = torch.cat((ts - 1, ts, ts + 1))
-        transfms_nbs = self.model.compute_transforms(ts_neighbors)  # (G, 3n, 3, 4)
-        means_fg_nbs = torch.einsum(
-            "pnij,pj->pni",
-            transfms_nbs,
-            F.pad(self.model.fg.params["means"], (0, 1), value=1.0),
-        )
+        means_fg_nbs, _ = self.model.compute_poses_fg(ts_neighbors)
         means_fg_nbs = means_fg_nbs.reshape(
             means_fg_nbs.shape[0], 3, -1, 3
         )  # [G, 3, n, 3]
@@ -496,6 +497,7 @@ class Trainer:
             "train/mapped_depth_loss": mapped_depth_loss.item(),
             "train/track_2d_loss": track_2d_loss.item(),
             "train/small_accel_loss": small_accel_loss.item(),
+            "train/dct_coef_loss": dct_coef_loss.item(),
             "train/z_acc_loss": z_accel_loss.item(),
             "train/num_gaussians": self.model.num_gaussians,
             "train/num_fg_gaussians": self.model.num_fg_gaussians,
@@ -741,6 +743,10 @@ class Trainer:
         # e.g. fg.params.means
         # lr config is a nested dict for each fg/bg part
         for name, params in self.model.named_parameters():
+            if self.model.trajectory_type == "dct_center" and name.startswith(
+                "motion_bases."
+            ):
+                continue
             part, _, field = name.split(".")
             lr = lr_dict[part][field]
             optim = torch.optim.Adam([{"params": params, "lr": lr, "name": name}])

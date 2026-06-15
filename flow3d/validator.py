@@ -419,17 +419,24 @@ class Validator:
             fps=fps,
         )
         # Render motion coefficient video.
+        if self.model.trajectory_type == "som_basis":
+            coef_values = self.model.fg.get_coefs()
+        else:
+            coef_values = self.model.fg.params["traj_coefs"].flatten(1)
         with torch.random.fork_rng():
             torch.random.manual_seed(0)
             motion_coef_colors = torch.pca_lowrank(
-                self.model.fg.get_coefs()[None],
+                coef_values[None],
                 q=3,
             )[0][0]
-        motion_coef_colors = (motion_coef_colors - motion_coef_colors.min(0)[0]) / (
-            motion_coef_colors.max(0)[0] - motion_coef_colors.min(0)[0]
+        motion_coef_min = motion_coef_colors.min(0)[0]
+        motion_coef_range = (motion_coef_colors.max(0)[0] - motion_coef_min).clamp_min(
+            1e-6
         )
+        motion_coef_colors = (motion_coef_colors - motion_coef_min) / motion_coef_range
+        num_bg = self.model.bg.num_gaussians if self.model.bg is not None else 0
         motion_coef_colors = F.pad(
-            motion_coef_colors, (0, 0, 0, self.model.bg.num_gaussians), value=0.5
+            motion_coef_colors, (0, 0, 0, num_bg), value=0.5
         )
         video = []
         for batch in tqdm(

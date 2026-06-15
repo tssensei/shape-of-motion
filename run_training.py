@@ -3,7 +3,7 @@ import os.path as osp
 import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 import numpy as np
 import torch
@@ -26,6 +26,7 @@ from flow3d.data.utils import to_device
 from flow3d.init_utils import (
     init_bg,
     init_fg_from_tracks_3d,
+    init_motion_params_with_dct,
     init_motion_params_with_procrustes,
     run_initial_optim,
     vis_init_params,
@@ -69,6 +70,9 @@ class TrainConfig:
     num_fg: int = 40_000
     num_bg: int = 100_000
     num_motion_bases: int = 10
+    trajectory_type: Literal["som_basis", "dct_center"] = "som_basis"
+    num_dct_bases: int | None = None
+    dct_init: Literal["tracks", "zero"] = "tracks"
     num_epochs: int = 500
     port: int | None = None
     vis_debug: bool = False 
@@ -182,21 +186,26 @@ def initialize_and_checkpoint_model(
         guru.info(f"model checkpoint exists at {ckpt_path}")
         return
 
-    fg_params, motion_bases, bg_params, tracks_3d = init_model_from_tracks(
+    fg_params, motion_bases, bg_params, tracks_3d, cano_t = init_model_from_tracks(
         train_dataset,
         cfg.num_fg,
         cfg.num_bg,
         cfg.num_motion_bases,
+        cfg.trajectory_type,
+        cfg.num_dct_bases,
+        cfg.dct_init,
         vis=vis,
         port=port,
     )
     # run initial optimization
     Ks = train_dataset.get_Ks().to(device)
     w2cs = train_dataset.get_w2cs().to(device)
-    run_initial_optim(fg_params, motion_bases, tracks_3d, Ks, w2cs)
+    if cfg.trajectory_type == "som_basis":
+        run_initial_optim(fg_params, motion_bases, tracks_3d, Ks, w2cs)
     if vis and cfg.port is not None:
         server = get_server(port=cfg.port)
-        vis_init_params(server, fg_params, motion_bases)
+        if cfg.trajectory_type == "som_basis":
+            vis_init_params(server, fg_params, motion_bases)
 
 
     camera_poses = init_trainable_poses(w2cs)
@@ -209,6 +218,9 @@ def initialize_and_checkpoint_model(
         camera_poses,
         bg_params,
         cfg.use_2dgs,
+        trajectory_type=cfg.trajectory_type,
+        cano_t=cano_t,
+        num_dct_bases=cfg.num_dct_bases,
     )
 
     guru.info(f"Saving initialization to {ckpt_path}")
@@ -221,6 +233,9 @@ def init_model_from_tracks(
     num_fg: int,
     num_bg: int,
     num_motion_bases: int,
+    trajectory_type: Literal["som_basis", "dct_center"],
+    num_dct_bases: int | None,
+    dct_init: Literal["tracks", "zero"],
     vis: bool = False,
     port: int | None = None,
 ):
@@ -241,12 +256,21 @@ def init_model_from_tracks(
     guru.info(f"{cano_t=} {num_fg=} {num_bg=} {num_motion_bases=}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    motion_bases, motion_coefs, tracks_3d = init_motion_params_with_procrustes(
-        tracks_3d, num_motion_bases, rot_type, cano_t, vis=vis, port=port
-    )
+    if trajectory_type == "som_basis":
+        motion_bases, motion_coefs, tracks_3d = init_motion_params_with_procrustes(
+            tracks_3d, num_motion_bases, rot_type, cano_t, vis=vis, port=port
+        )
+        traj_coefs = None
+    else:
+        motion_bases, traj_coefs, tracks_3d = init_motion_params_with_dct(
+            tracks_3d, num_dct_bases, cano_t, dct_init=dct_init
+        )
+        motion_coefs = None
     motion_bases = motion_bases.to(device)
 
-    fg_params = init_fg_from_tracks_3d(cano_t, tracks_3d, motion_coefs)
+    fg_params = init_fg_from_tracks_3d(
+        cano_t, tracks_3d, motion_coefs, traj_coefs=traj_coefs
+    )
     fg_params = fg_params.to(device)
 
     bg_params = None
@@ -257,7 +281,7 @@ def init_model_from_tracks(
         bg_params = bg_params.to(device)
 
     tracks_3d = tracks_3d.to(device)
-    return fg_params, motion_bases, bg_params, tracks_3d
+    return fg_params, motion_bases, bg_params, tracks_3d, cano_t
 
 
 def backup_code(work_dir):

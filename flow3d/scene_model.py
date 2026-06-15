@@ -6,7 +6,13 @@ from gsplat.rendering import rasterization
 from gsplat.rendering import rasterization_2dgs
 from torch import Tensor
 
-from flow3d.params import GaussianParams, MotionBases, CameraScales, CameraPoses
+from flow3d.params import (
+    GaussianParams,
+    MotionBases,
+    CameraScales,
+    CameraPoses,
+    build_dct_basis,
+)
 
 
 class SceneModel(nn.Module):
@@ -19,9 +25,15 @@ class SceneModel(nn.Module):
         camera_poses: CameraPoses | None = None, # currently unused?
         bg_params: GaussianParams | None = None,
         use_2dgs: bool = False,
+        trajectory_type: str = "som_basis",
+        cano_t: int | None = None,
+        num_dct_bases: int | None = None,
     ):
         super().__init__()
+        if trajectory_type not in ("som_basis", "dct_center"):
+            raise ValueError(f"Unknown trajectory type: {trajectory_type}")
         self.num_frames = motion_bases.num_frames
+        self.trajectory_type = trajectory_type
         self.fg = fg_params
         self.motion_bases = motion_bases
         self.bg = bg_params
@@ -36,6 +48,27 @@ class SceneModel(nn.Module):
         self._current_img_wh = None
 
         self.use_2dgs = use_2dgs
+        cano_t_value = -1 if cano_t is None else cano_t
+        self.register_buffer("cano_t", torch.tensor(cano_t_value, dtype=torch.long))
+        if trajectory_type == "dct_center":
+            if cano_t is None:
+                raise ValueError("cano_t is required for dct_center trajectory")
+            if "traj_coefs" not in self.fg.params:
+                raise ValueError("fg.params['traj_coefs'] is required for dct_center")
+            if num_dct_bases is None:
+                num_dct_bases = self.fg.params["traj_coefs"].shape[1]
+            dct_basis = build_dct_basis(
+                self.num_frames,
+                num_dct_bases,
+                cano_t,
+                device=self.fg.params["means"].device,
+                dtype=self.fg.params["means"].dtype,
+            )
+        else:
+            dct_basis = torch.empty(
+                self.num_frames, 0, device=self.fg.params["means"].device
+            )
+        self.register_buffer("dct_basis", dct_basis)
 
     @property
     def num_gaussians(self) -> int:
@@ -69,11 +102,22 @@ class SceneModel(nn.Module):
     def compute_transforms(
         self, ts: torch.Tensor, inds: torch.Tensor | None = None
     ) -> torch.Tensor: # (G, B(len(ts)), 3, 4)
+        if self.trajectory_type != "som_basis":
+            raise RuntimeError("compute_transforms is only valid for som_basis")
         coefs = self.fg.get_coefs()  # (G, K), get_coef() softmax
         if inds is not None:
             coefs = coefs[inds]
         transfms = self.motion_bases.compute_transforms(ts, coefs)  # (G, B, 3, 4)
         return transfms
+
+    def compute_dct_offsets(
+        self, ts: torch.Tensor, inds: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        traj_coefs = self.fg.params["traj_coefs"]
+        if inds is not None:
+            traj_coefs = traj_coefs[inds]
+        basis = self.dct_basis[ts].to(dtype=traj_coefs.dtype, device=traj_coefs.device)
+        return torch.einsum("bk,gkc->gbc", basis, traj_coefs)
 
     def compute_poses_fg(
         self, ts: torch.Tensor | None, inds: torch.Tensor | None = None
@@ -87,21 +131,25 @@ class SceneModel(nn.Module):
             means = means[inds]
             quats = quats[inds]
         if ts is not None:
-            transfms = self.compute_transforms(ts, inds)  # (G, B, 3, 4)
-            means = torch.einsum(
-                "pnij,pj->pni",
-                transfms,
-                F.pad(means, (0, 1), value=1.0),
-            )
-            quats = roma.quat_xyzw_to_wxyz(
-                (
-                    roma.quat_product(
-                        roma.rotmat_to_unitquat(transfms[..., :3, :3]),
-                        roma.quat_wxyz_to_xyzw(quats[:, None]),
+            if self.trajectory_type == "dct_center":
+                means = means[:, None] + self.compute_dct_offsets(ts, inds)
+                quats = quats[:, None].expand(-1, ts.shape[0], -1)
+            else:
+                transfms = self.compute_transforms(ts, inds)  # (G, B, 3, 4)
+                means = torch.einsum(
+                    "pnij,pj->pni",
+                    transfms,
+                    F.pad(means, (0, 1), value=1.0),
+                )
+                quats = roma.quat_xyzw_to_wxyz(
+                    (
+                        roma.quat_product(
+                            roma.rotmat_to_unitquat(transfms[..., :3, :3]),
+                            roma.quat_wxyz_to_xyzw(quats[:, None]),
+                        )
                     )
                 )
-            )
-            quats = F.normalize(quats, p=2, dim=-1)
+                quats = F.normalize(quats, p=2, dim=-1)
         else:
             means = means[:, None]
             quats = quats[:, None]
@@ -165,13 +213,27 @@ class SceneModel(nn.Module):
                 state_dict, prefix=f"{prefix}camera_poses.params."
             )
 
+        trajectory_type = (
+            "dct_center" if f"{prefix}fg.params.traj_coefs" in state_dict else "som_basis"
+        )
+        cano_t = None
+        if f"{prefix}cano_t" in state_dict:
+            cano_t_tensor = state_dict[f"{prefix}cano_t"]
+            cano_t = int(cano_t_tensor.item()) if cano_t_tensor.item() >= 0 else None
+        num_dct_bases = None
+        if f"{prefix}fg.params.traj_coefs" in state_dict:
+            num_dct_bases = state_dict[f"{prefix}fg.params.traj_coefs"].shape[1]
+
         return SceneModel(
             Ks, 
             w2cs, 
             fg, 
             motion_bases, 
             camera_poses,
-            bg
+            bg,
+            trajectory_type=trajectory_type,
+            cano_t=cano_t,
+            num_dct_bases=num_dct_bases,
         )
 
     def render(

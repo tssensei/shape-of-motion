@@ -9,6 +9,7 @@ class FGLRConfig:
     quats: float = 1e-3
     colors: float = 1e-2
     motion_coefs: float = 1e-2
+    traj_coefs: float = 1.6e-4
 
 
 @dataclass
@@ -55,6 +56,7 @@ class LossesConfig:
     w_smooth_tracks: float = 2.0
     w_scale_var: float = 0.01
     w_z_accel: float = 1.0
+    w_dct_coef: float = 1e-4
 
     # w_smooth_bases: float = 0.0
     # w_smooth_tracks: float = 0.0

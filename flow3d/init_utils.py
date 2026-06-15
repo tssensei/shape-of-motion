@@ -1,3 +1,4 @@
+import math
 import time
 from typing import Literal
 
@@ -24,7 +25,7 @@ from flow3d.loss_utils import (
     knn,
     masked_l1_loss,
 )
-from flow3d.params import GaussianParams, MotionBases, CameraPoses
+from flow3d.params import GaussianParams, MotionBases, CameraPoses, build_dct_basis
 from flow3d.tensor_dataclass import StaticObservations, TrackObservations
 from flow3d.transforms import cont_6d_to_rmat, rt_to_mat4, solve_procrustes
 from flow3d.vis.utils import draw_keypoints_video, get_server, project_2d_tracks
@@ -38,7 +39,10 @@ def init_trainable_poses(w2cs: Tensor) -> CameraPoses:
     return CameraPoses(Rs, ts)
 
 def init_fg_from_tracks_3d(
-    cano_t: int, tracks_3d: TrackObservations, motion_coefs: torch.Tensor
+    cano_t: int,
+    tracks_3d: TrackObservations,
+    motion_coefs: torch.Tensor | None = None,
+    traj_coefs: torch.Tensor | None = None,
 ) -> GaussianParams:
     """
     using dataclasses individual tensors so we know they're consistent
@@ -62,7 +66,15 @@ def init_fg_from_tracks_3d(
     quats = torch.rand(num_fg, 4)
     # Initialize gaussian opacities.
     opacities = torch.logit(torch.full((num_fg,), 0.7))
-    gaussians = GaussianParams(means, quats, scales, colors, opacities, motion_coefs)
+    gaussians = GaussianParams(
+        means,
+        quats,
+        scales,
+        colors,
+        opacities,
+        motion_coefs,
+        traj_coefs=traj_coefs,
+    )
     return gaussians
 
 
@@ -266,6 +278,81 @@ def init_motion_params_with_procrustes(
 
     bases = MotionBases(init_rots, init_ts)
     return bases, motion_coefs, tracks_3d
+
+
+def init_identity_motion_bases(
+    num_frames: int, device: torch.device, dtype: torch.dtype
+) -> MotionBases:
+    id_rot = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], device=device, dtype=dtype)
+    rots = id_rot.reshape(1, 1, 6).repeat(1, num_frames, 1)
+    transls = torch.zeros(1, num_frames, 3, device=device, dtype=dtype)
+    return MotionBases(rots, transls)
+
+
+def init_motion_params_with_dct(
+    tracks_3d: TrackObservations,
+    num_dct_bases: int | None,
+    cano_t: int,
+    dct_init: Literal["tracks", "zero"] = "tracks",
+    ridge: float = 1e-4,
+    min_visible: int = 4,
+    batch_size: int = 4096,
+) -> tuple[MotionBases, torch.Tensor, TrackObservations]:
+    device = tracks_3d.xyz.device
+    dtype = tracks_3d.xyz.dtype
+    num_frames = tracks_3d.xyz.shape[1]
+    if num_dct_bases is None:
+        num_dct_bases = math.ceil(num_frames / 4)
+
+    means_cano = tracks_3d.xyz[:, cano_t].clone()
+    scene_center = means_cano.median(dim=0).values
+    print(f"{scene_center=}")
+    dists = torch.norm(means_cano - scene_center, dim=-1)
+    dists_th = torch.quantile(dists, 0.95)
+    valid_mask = dists < dists_th
+    valid_mask = valid_mask & tracks_3d.visibles.any(dim=1)
+    print(f"{valid_mask.sum()=}")
+
+    tracks_3d = tracks_3d.filter_valid(valid_mask)
+    num_tracks = tracks_3d.xyz.shape[0]
+    traj_coefs = torch.zeros(
+        num_tracks, num_dct_bases, 3, device=device, dtype=dtype
+    )
+    basis = build_dct_basis(num_frames, num_dct_bases, cano_t, device, dtype)
+
+    if dct_init == "tracks":
+        displacements = tracks_3d.xyz - tracks_3d.xyz[:, cano_t : cano_t + 1]
+        weights = tracks_3d.visibles.float() * tracks_3d.confidences
+        valid_fit = tracks_3d.visibles.sum(dim=-1) >= min_visible
+        valid_idcs = valid_fit.nonzero(as_tuple=True)[0]
+        eye = torch.eye(num_dct_bases, device=device, dtype=dtype)
+        for start in tqdm(range(0, len(valid_idcs), batch_size), desc="DCT init"):
+            idcs = valid_idcs[start : start + batch_size]
+            w = weights[idcs]
+            y = displacements[idcs]
+            lhs = torch.einsum("tk,bt,tl->bkl", basis, w, basis)
+            lhs = lhs + ridge * eye[None]
+            rhs = torch.einsum("tk,bt,btc->bkc", basis, w, y)
+            traj_coefs[idcs] = torch.linalg.solve(lhs, rhs)
+
+        with torch.no_grad():
+            pred = torch.einsum("tk,gkc->gtc", basis, traj_coefs)
+            weight_sum = weights.sum().clamp_min(1e-6)
+            err_before = (displacements.norm(dim=-1) * weights).sum() / weight_sum
+            err_after = ((pred - displacements).norm(dim=-1) * weights).sum() / weight_sum
+            guru.info(
+                "DCT init weighted mean error: {:.5f} => {:.5f}".format(
+                    err_before.item(), err_after.item()
+                )
+            )
+    elif dct_init != "zero":
+        raise ValueError(f"Unknown DCT init mode: {dct_init}")
+
+    bases = init_identity_motion_bases(num_frames, device, dtype)
+    guru.info(
+        f"DCT init {num_dct_bases=} {traj_coefs.shape=} {dct_init=}"
+    )
+    return bases, traj_coefs, tracks_3d
 
 
 def run_initial_optim(

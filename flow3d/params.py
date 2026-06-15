@@ -7,6 +7,26 @@ from torch import Tensor
 
 from flow3d.transforms import cont_6d_to_rmat
 
+
+def build_dct_basis(
+    num_frames: int,
+    num_bases: int,
+    cano_t: int,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    if num_bases <= 0:
+        raise ValueError(f"{num_bases=} must be positive")
+    if not 0 <= cano_t < num_frames:
+        raise ValueError(f"{cano_t=} must be in [0, {num_frames})")
+    t = torch.arange(num_frames, device=device, dtype=dtype)[:, None]
+    k = torch.arange(1, num_bases + 1, device=device, dtype=dtype)[None]
+    basis = math.sqrt(2.0 / num_frames) * torch.cos(
+        math.pi / (2.0 * num_frames) * (2.0 * t + 1.0) * k
+    )
+    return basis - basis[cano_t : cano_t + 1]
+
+
 ###### Deprecated ######
 class CameraScales(nn.Module):
     """Align the monst3r camera pose scale with the scene"""
@@ -109,12 +129,13 @@ class GaussianParams(nn.Module):
         colors: torch.Tensor,
         opacities: torch.Tensor,
         motion_coefs: torch.Tensor | None = None,
+        traj_coefs: torch.Tensor | None = None,
         scene_center: torch.Tensor | None = None,
         scene_scale: torch.Tensor | float = 1.0,
     ):
         super().__init__()
         if not check_gaussian_sizes(
-            means, quats, scales, colors, opacities, motion_coefs
+            means, quats, scales, colors, opacities, motion_coefs, traj_coefs
         ):
             import ipdb
 
@@ -128,6 +149,8 @@ class GaussianParams(nn.Module):
         }
         if motion_coefs is not None:
             params_dict["motion_coefs"] = nn.Parameter(motion_coefs)
+        if traj_coefs is not None:
+            params_dict["traj_coefs"] = nn.Parameter(traj_coefs)
         self.params = nn.ParameterDict(params_dict)
         self.quat_activation = lambda x: F.normalize(x, dim=-1, p=2)
         self.color_activation = torch.sigmoid
@@ -146,6 +169,7 @@ class GaussianParams(nn.Module):
         assert all(f"{prefix}{k}" in state_dict for k in req_keys)
         args = {
             "motion_coefs": None,
+            "traj_coefs": None,
             "scene_center": torch.zeros(3),
             "scene_scale": torch.tensor(1.0),
         }
@@ -251,6 +275,7 @@ def check_gaussian_sizes(
     colors: torch.Tensor,
     opacities: torch.Tensor,
     motion_coefs: torch.Tensor | None = None,
+    traj_coefs: torch.Tensor | None = None,
 ) -> bool:
     dims = means.shape[:-1]
     leading_dims_match = (
@@ -261,11 +286,14 @@ def check_gaussian_sizes(
     )
     if motion_coefs is not None and motion_coefs.numel() > 0:
         leading_dims_match &= motion_coefs.shape[:-1] == dims
+    if traj_coefs is not None and traj_coefs.numel() > 0:
+        leading_dims_match &= traj_coefs.shape[:-2] == dims
     dims_correct = (
         means.shape[-1] == 3
         and (quats.shape[-1] == 4)
         and (scales.shape[-1] == 3)
         and (colors.shape[-1] == 3)
+        and (traj_coefs is None or traj_coefs.shape[-1] == 3)
     )
     return leading_dims_match and dims_correct
 
