@@ -514,4 +514,5 @@ if __name__ == "__main__":
         args.vid_name,
         args.img_name,
     )
-    demo.launch(server_port=args.port)
+    allowed_video_dir = os.path.abspath(f"{args.root_dir}/{args.vid_name}")
+    demo.launch(server_port=args.port, allowed_paths=[allowed_video_dir])
