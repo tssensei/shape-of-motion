@@ -27,8 +27,35 @@ def project_tracks(
     )
     tracks_proj = torch.einsum("tij,ntj->nti", Ks, tracks_cam)
     depths = tracks_proj[..., 2]
-    tracks_2d = tracks_proj[..., :2] / depths[..., None].clamp(min=1e-6)
+    valid_depths = depths > 1e-6
+    safe_depths = torch.where(valid_depths, depths, torch.ones_like(depths))
+    tracks_2d = tracks_proj[..., :2] / safe_depths[..., None]
+    tracks_2d = torch.where(
+        valid_depths[..., None],
+        tracks_2d,
+        torch.full_like(tracks_2d, float("nan")),
+    )
     return tracks_2d, depths
+
+
+def projected_track_mask(
+    tracks_2d: torch.Tensor,
+    depths: torch.Tensor,
+    img_wh: tuple[int, int],
+    screen_margin: float = 4.0,
+) -> torch.Tensor:
+    W, H = img_wh
+    margin_x = W * screen_margin
+    margin_y = H * screen_margin
+    finite = torch.isfinite(tracks_2d).all(dim=-1) & torch.isfinite(depths)
+    in_front = depths > 1e-6
+    not_extreme = (
+        (tracks_2d[..., 0] >= -margin_x)
+        & (tracks_2d[..., 0] <= W - 1 + margin_x)
+        & (tracks_2d[..., 1] >= -margin_y)
+        & (tracks_2d[..., 1] <= H - 1 + margin_y)
+    )
+    return finite & in_front & not_extreme
 
 
 def select_gaussian_tracks(
@@ -50,9 +77,9 @@ def select_gaussian_tracks(
     W, H = img_wh
     query_xy = tracks_2d[:, query_frame]
     query_depth = depths[:, query_frame]
+    projection_valid = projected_track_mask(tracks_2d, depths, img_wh)
     finite = torch.isfinite(tracks_3d).all(dim=(1, 2))
-    finite &= torch.isfinite(tracks_2d).all(dim=(1, 2))
-    finite &= torch.isfinite(depths).all(dim=1)
+    stable = projection_valid.float().mean(dim=1) >= 0.8
     in_front = query_depth > 1e-6
     in_frame = (
         (query_xy[:, 0] >= 0)
@@ -61,11 +88,12 @@ def select_gaussian_tracks(
         & (query_xy[:, 1] <= H - 1)
     )
 
-    px = query_xy[:, 0].round().long().clamp(0, W - 1)
-    py = query_xy[:, 1].round().long().clamp(0, H - 1)
+    query_xy_safe = torch.nan_to_num(query_xy, nan=0.0, posinf=0.0, neginf=0.0)
+    px = query_xy_safe[:, 0].round().long().clamp(0, W - 1)
+    py = query_xy_safe[:, 1].round().long().clamp(0, H - 1)
     in_mask = query_mask[py, px] > 0
     opaque = opacities >= opacity_thresh
-    valid = finite & in_front & in_frame & in_mask & opaque
+    valid = finite & stable & in_front & in_frame & in_mask & opaque
     valid_ids = torch.where(valid)[0]
     if len(valid_ids) == 0:
         raise ValueError(
@@ -261,6 +289,7 @@ def main():
         seed=args.seed,
     )
     tracks_2d = tracks_2d[track_ids]
+    track_valid_mask = projected_track_mask(tracks_2d, depths[track_ids], img_wh)
     print(
         "selected gaussian centers:",
         tracks_2d.shape,
@@ -279,7 +308,11 @@ def main():
             )["img"][0]
 
         start = max(0, i - args.window)
-        render_tracks = draw_tracks_2d(render_img, tracks_2d[:, start : i + 1])
+        window_valid = track_valid_mask[:, start : i + 1].all(dim=1)
+        render_tracks = draw_tracks_2d(
+            render_img,
+            tracks_2d[window_valid, start : i + 1],
+        )
 
         input_img = dataset.get_image(i)
         input_img = (input_img.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
