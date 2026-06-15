@@ -361,21 +361,37 @@ def make_demo(
             os.makedirs(out_dir, exist_ok=True)
 
             def make_time(seconds):
-                return datetime.time(
-                    seconds // 3600, (seconds % 3600) // 60, seconds % 60
-                )
+                seconds = max(float(seconds or 0), 0.0)
+                return str(datetime.timedelta(seconds=seconds))
 
-            start_time = make_time(start).strftime("%H:%M:%S")
-            end_time = make_time(end).strftime("%H:%M:%S")
-            cmd = (
-                f"ffmpeg -ss {start_time} -to {end_time} -i {vid_path} "
-                f"-vf 'scale=-1:{height},fps={fps}' {out_dir}/%05d.{ext}"
+            start = max(float(start or 0), 0.0)
+            end = max(float(end or 0), 0.0)
+            fps = float(fps or 30)
+            height = int(height or 540)
+            start_time = make_time(start)
+            out_pattern = f"{out_dir}/%05d.{ext}"
+            cmd = ["ffmpeg", "-y", "-ss", start_time]
+            if end > start:
+                cmd.extend(["-to", make_time(end)])
+            cmd.extend(
+                [
+                    "-i",
+                    vid_path,
+                    "-vf",
+                    f"scale=-1:{height},fps={fps},format=rgb24",
+                    out_pattern,
+                ]
             )
-            print(cmd)
-            subprocess.call(cmd, shell=True)
+            print(" ".join(cmd))
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                raise gr.Error(f"ffmpeg failed to extract frames from {vid_path}.")
+            img_paths = [p for p in listdir(out_dir) if isimage(p)]
+            if len(img_paths) == 0:
+                raise gr.Error(f"No frames were extracted to {out_dir}.")
             img_root = f"{root_dir}/{img_name}"
             img_dirs = listdir(img_root)
-            return out_dir, img_dirs
+            return out_dir, gr.Dropdown(choices=img_dirs, value=seq_name)
 
         def select_image_dir(root_dir, img_name, seq_name):
             img_dir = f"{root_dir}/{img_name}/{seq_name}"
@@ -385,7 +401,15 @@ def make_demo(
         def update_image_dir(root_dir, img_name, seq_name):
             img_dir = f"{root_dir}/{img_name}/{seq_name}"
             num_imgs = prompts.set_img_dir(img_dir)
-            slider = gr.Slider(minimum=0, maximum=num_imgs - 1, value=0, step=1)
+            if num_imgs == 0:
+                raise gr.Error(f"No images found in {img_dir}.")
+            slider = gr.Slider(
+                minimum=0,
+                maximum=max(num_imgs - 1, 1),
+                value=0,
+                step=1,
+                interactive=num_imgs > 1,
+            )
             message = (
                 f"Loaded {num_imgs} images from {img_dir}. Choose a frame to run SAM!"
             )
