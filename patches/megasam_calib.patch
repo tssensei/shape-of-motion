@@ -1,0 +1,86 @@
+diff --git a/camera_tracking_scripts/test_demo.py b/camera_tracking_scripts/test_demo.py
+index a07f61d..8bee9f5 100644
+--- a/camera_tracking_scripts/test_demo.py
++++ b/camera_tracking_scripts/test_demo.py
+@@ -34,12 +34,34 @@ import cv2
+ import os
+ import glob
+ import argparse
++import json
+ from lietorch import SE3
+ 
+ import torch.nn.functional as F
+ from droid import Droid
+ 
+ 
++def load_calib_K(calib_path, image_list):
++  """Load full-resolution intrinsics from a SOM calibration JSON."""
++  with open(calib_path, "r") as f:
++    calib = json.load(f)
++
++  values = []
++  for image_file in image_list:
++    stem = os.path.splitext(os.path.basename(image_file))[0]
++    if stem not in calib:
++      raise KeyError(f"Missing intrinsics for frame {stem} in {calib_path}")
++    values.append(calib[stem][:4])
++
++  fx, fy, cx, cy = np.median(np.asarray(values, dtype=np.float32), axis=0)
++  K = np.eye(3)
++  K[0, 0] = fx
++  K[1, 1] = fy
++  K[0, 2] = cx
++  K[1, 2] = cy
++  return K
++
++
+ def image_stream(
+     image_list,
+     mono_disp_list,
+@@ -188,6 +210,7 @@ if __name__ == "__main__":
+       "--mono_depth_path", default="Depth-Anything/video_visualization"
+   )
+   parser.add_argument("--metric_depth_path", default="UniDepth/outputs ")
++  parser.add_argument("--calib_path", default=None)
+   args = parser.parse_args()
+ 
+   print("Running evaluation on {}".format(args.datapath))
+@@ -268,20 +291,24 @@ if __name__ == "__main__":
+     shifts.append(shift)
+ 
+   print("************** UNIDEPTH FOV ", np.median(fovs))
+-  ff = img_0.shape[1] / (2 * np.tan(np.radians(np.median(fovs) / 2.0)))
+-  K = np.eye(3)
+-  K[0, 0] = (
+-      ff * 1.0
+-  )  # pp_intrinsic[0]  * (img_0.shape[1] / (pp_intrinsic[1] * 2))
+-  K[1, 1] = (
+-      ff * 1.0
+-  )  # pp_intrinsic[0]  * (img_0.shape[0] / (pp_intrinsic[2] * 2))
+-  K[0, 2] = (
+-      img_0.shape[1] / 2.0
+-  )  # pp_intrinsic[1]) * (img_0.shape[1] / (pp_intrinsic[1] * 2))
+-  K[1, 2] = (
+-      img_0.shape[0] / 2.0
+-  )  # (pp_intrinsic[2]) * (img_0.shape[0] / (pp_intrinsic[2] * 2))
++  if args.calib_path is not None:
++    K = load_calib_K(args.calib_path, image_list)
++    print("************** CALIB K ", K)
++  else:
++    ff = img_0.shape[1] / (2 * np.tan(np.radians(np.median(fovs) / 2.0)))
++    K = np.eye(3)
++    K[0, 0] = (
++        ff * 1.0
++    )  # pp_intrinsic[0]  * (img_0.shape[1] / (pp_intrinsic[1] * 2))
++    K[1, 1] = (
++        ff * 1.0
++    )  # pp_intrinsic[0]  * (img_0.shape[0] / (pp_intrinsic[2] * 2))
++    K[0, 2] = (
++        img_0.shape[1] / 2.0
++    )  # pp_intrinsic[1]) * (img_0.shape[1] / (pp_intrinsic[1] * 2))
++    K[1, 2] = (
++        img_0.shape[0] / 2.0
++    )  # (pp_intrinsic[2]) * (img_0.shape[0] / (pp_intrinsic[2] * 2))
+ 
+   ss_product = np.array(scales) * np.array(shifts)
+   med_idx = np.argmin(np.abs(ss_product - np.median(ss_product)))

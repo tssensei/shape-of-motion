@@ -69,7 +69,7 @@ def parse_tapir_track_info(occlusions, expected_dist):
 def get_tracks_3d_for_query_frame(
     query_index: int,
     query_img: torch.Tensor,
-    tracks_2d: torch.Tensor,
+    tracks_2d: torch.Tensor, 
     depths: torch.Tensor,
     masks: torch.Tensor,
     inv_Ks: torch.Tensor,

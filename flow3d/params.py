@@ -30,7 +30,7 @@ class CameraScales(nn.Module):
     def get_camera_scales(self) -> torch.Tensor:
         return self.params["camera_scales"]
 
-
+# inert
 class CameraPoses(nn.Module):
     def __init__(
         self,
@@ -237,6 +237,7 @@ class MotionBases(nn.Module):
         """
         transls = self.params["transls"][:, ts]  # (K, B, 3)
         rots = self.params["rots"][:, ts]  # (K, B, 6)
+        # weighted sum
         transls = torch.einsum("pk,kni->pni", coefs, transls)
         rots = torch.einsum("pk,kni->pni", coefs, rots)  # (G, B, 6)
         rotmats = cont_6d_to_rmat(rots)  # (K, B, 3, 3)

@@ -12,11 +12,11 @@ from flow3d.params import GaussianParams, MotionBases, CameraScales, CameraPoses
 class SceneModel(nn.Module):
     def __init__(
         self,
-        Ks: Tensor,
-        w2cs: Tensor,
+        Ks: Tensor, # camera intrinsics, [num_frames, 3, 3]
+        w2cs: Tensor, # camera extrinsics, [num_frames, 4, 4]
         fg_params: GaussianParams,
         motion_bases: MotionBases,
-        camera_poses: CameraPoses | None = None,
+        camera_poses: CameraPoses | None = None, # currently unused?
         bg_params: GaussianParams | None = None,
         use_2dgs: bool = False,
     ):
@@ -68,8 +68,8 @@ class SceneModel(nn.Module):
 
     def compute_transforms(
         self, ts: torch.Tensor, inds: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        coefs = self.fg.get_coefs()  # (G, K)
+    ) -> torch.Tensor: # (G, B(len(ts)), 3, 4)
+        coefs = self.fg.get_coefs()  # (G, K), get_coef() softmax
         if inds is not None:
             coefs = coefs[inds]
         transfms = self.motion_bases.compute_transforms(ts, coefs)  # (G, B, 3, 4)
