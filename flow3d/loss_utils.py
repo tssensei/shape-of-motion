@@ -93,16 +93,24 @@ def masked_huber_loss(pred, gt, delta, mask=None, normalize=True):
 
 def trimmed_mse_loss(pred, gt, quantile=0.9):
     loss = F.mse_loss(pred, gt, reduction="none").mean(dim=-1)
+    if loss.numel() == 0 or quantile >= 1:
+        return loss.mean()
     loss_at_quantile = torch.quantile(loss, quantile)
-    trimmed_loss = loss[loss < loss_at_quantile].mean()
-    return trimmed_loss
+    trimmed_loss = loss[loss <= loss_at_quantile]
+    if trimmed_loss.numel() == 0:
+        return loss.mean()
+    return trimmed_loss.mean()
 
 
 def trimmed_l1_loss(pred, gt, quantile=0.9):
     loss = F.l1_loss(pred, gt, reduction="none").mean(dim=-1)
+    if loss.numel() == 0 or quantile >= 1:
+        return loss.mean()
     loss_at_quantile = torch.quantile(loss, quantile)
-    trimmed_loss = loss[loss < loss_at_quantile].mean()
-    return trimmed_loss
+    trimmed_loss = loss[loss <= loss_at_quantile]
+    if trimmed_loss.numel() == 0:
+        return loss.mean()
+    return trimmed_loss.mean()
 
 
 def compute_gradient_loss(pred, gt, mask, quantile=0.98):
