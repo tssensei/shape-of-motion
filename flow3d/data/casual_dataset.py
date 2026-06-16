@@ -133,9 +133,9 @@ class CasualDataset(BaseDataset):
         self.masks: list[torch.Tensor | None] = [None for _ in self.frame_names]
 
         # load cameras
+        img = self.get_image(0)
+        H, W = img.shape[:2]
         if camera_type == "droid_recon":
-            img = self.get_image(0)
-            H, W = img.shape[:2]
             w2cs, Ks, tstamps = load_cameras(
                 f"{data_dir}/{camera_type}.npy", H, W
             )
@@ -145,7 +145,10 @@ class CasualDataset(BaseDataset):
             cam_path = Path(data_dir) / f"{data_name}.npz"
             cams = np.load(cam_path)
             c2ws = cams["cam_c2w"][:self.end]
-            K = cams["intrinsic"]
+            K = cams["intrinsic"].astype(np.float32).copy()
+            depth_h, depth_w = np.squeeze(cams["depths"][0]).shape[:2]
+            K[0, :] *= float(W) / float(depth_w)
+            K[1, :] *= float(H) / float(depth_h)
                 
             c2ws = torch.from_numpy(c2ws).float()
             w2cs = torch.linalg.inv(c2ws)
@@ -229,7 +232,11 @@ class CasualDataset(BaseDataset):
                 data_name = self.data_dir.split("/")[-1]
                 depth_path = Path(self.data_dir) / f"{data_name}.npz"
                 depths = np.load(depth_path)
-                self.depths[index] = torch.tensor(depths["depths"][index]).float()
+                depth = np.squeeze(depths["depths"][index]).astype(np.float32)
+                H, W = self.get_image(index).shape[:2]
+                if depth.shape != (H, W):
+                    depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_LINEAR)
+                self.depths[index] = torch.from_numpy(depth).float()
                
                 
         return self.depths[index] / self.scale
