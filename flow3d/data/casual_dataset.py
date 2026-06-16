@@ -147,9 +147,9 @@ class CasualDataset(BaseDataset):
             c2ws = cams["cam_c2w"][:self.end]
             K = cams["intrinsic"]
                 
-            c2ws = torch.from_numpy(c2ws)
+            c2ws = torch.from_numpy(c2ws).float()
             w2cs = torch.linalg.inv(c2ws)
-            Ks = torch.from_numpy(K).unsqueeze(0).repeat((c2ws.shape[0], 1, 1))
+            Ks = torch.from_numpy(K).float().unsqueeze(0).repeat((c2ws.shape[0], 1, 1))
                 
         else:
             raise ValueError(f"Unknown camera type: {camera_type}")
