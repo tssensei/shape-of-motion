@@ -112,6 +112,16 @@ def draw_tracks_2d(
 
     num_tracks, num_frames = tracks_2d_np.shape[:2]
 
+    H, W = img_np.shape[:2]
+    coord_margin = 4 * max(H, W)
+
+    def valid_point(pt):
+        return (
+            np.isfinite(pt).all()
+            and -coord_margin <= pt[0] <= W + coord_margin
+            and -coord_margin <= pt[1] <= H + coord_margin
+        )
+
     canvas = img_np.copy()
     for i in range(num_frames - 1):
         alpha = max(1 - 0.9 * ((num_frames - 1 - i) / (num_frames * 0.99)), 0.1)
@@ -123,6 +133,8 @@ def draw_tracks_2d(
             color = colorsys.hsv_to_rgb(hsv[0], hsv[1] * color_alpha, hsv[2])
             pt1 = tracks_2d_np[j, i]
             pt2 = tracks_2d_np[j, i + 1]
+            if not (valid_point(pt1) and valid_point(pt2)):
+                continue
             p1 = (int(round(pt1[0])), int(round(pt1[1])))
             p2 = (int(round(pt2[0])), int(round(pt2[1])))
             img_curr = cv2.line(
@@ -138,6 +150,8 @@ def draw_tracks_2d(
     for j in range(num_tracks):
         color = tuple(np.array(cmap(j / max(1, float(num_tracks - 1)))[:3]) * 255)
         pt = tracks_2d_np[j, -1]
+        if not valid_point(pt):
+            continue
         pt = (int(round(pt[0])), int(round(pt[1])))
         canvas = cv2.circle(
             canvas,
