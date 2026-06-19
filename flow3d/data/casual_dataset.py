@@ -27,7 +27,7 @@ from flow3d.data.utils import (
     normalize_coords,
     parse_tapir_track_info,
 )
-from flow3d.data.colmap import get_colmap_camera_params_txt
+from flow3d.data.colmap import get_colmap_camera_params_binary_strict
 from flow3d.transforms import rt_to_mat4
 
 
@@ -45,8 +45,9 @@ class DavisDataConfig:
         "depth_anything",
         "depth_anything_v2",
         "unidepth_disp",
+        "aligned_depth_colmap",
     ] = "aligned_depth_anything"
-    camera_type: Literal["droid_recon", "megasam"] = "megasam"
+    camera_type: Literal["droid_recon", "megasam", "colmap"] = "megasam"
     track_2d_type: Literal["bootstapir", "tapir"] = "bootstapir"
     mask_erosion_radius: int = 3
     scene_norm_dict: tyro.conf.Suppress[SceneNormDict | None] = None
@@ -68,8 +69,9 @@ class CustomDataConfig:
         "depth_anything",
         "depth_anything_v2",
         "unidepth_disp",
+        "aligned_depth_colmap",
     ] = "aligned_depth_anything"
-    camera_type: Literal["droid_recon", "megasam"] = "megasam"
+    camera_type: Literal["droid_recon", "megasam", "colmap"] = "megasam"
     track_2d_type: Literal["bootstapir", "tapir"] = "bootstapir"
     mask_erosion_radius: int = 7
     scene_norm_dict: tyro.conf.Suppress[SceneNormDict | None] = None
@@ -92,8 +94,9 @@ class CasualDataset(BaseDataset):
             "depth_anything",
             "depth_anything_v2",
             "unidepth_disp",
+            "aligned_depth_colmap",
         ] = "aligned_depth_anything",
-        camera_type: Literal["droid_recon", "megasam"] = "megasam",
+        camera_type: Literal["droid_recon", "megasam", "colmap"] = "megasam",
         track_2d_type: Literal["bootstapir", "tapir"] = "bootstapir",
         mask_erosion_radius: int = 3,
         scene_norm_dict: SceneNormDict | None = None,
@@ -105,6 +108,8 @@ class CasualDataset(BaseDataset):
 
         self.data_dir = data_dir
         self.res = res
+        if camera_type == "colmap":
+            depth_type = "aligned_depth_colmap"
         self.depth_type = depth_type
         self.num_targets_per_frame = num_targets_per_frame
         self.load_from_cache = load_from_cache
@@ -153,6 +158,19 @@ class CasualDataset(BaseDataset):
             c2ws = torch.from_numpy(c2ws).float()
             w2cs = torch.linalg.inv(c2ws)
             Ks = torch.from_numpy(K).float().unsqueeze(0).repeat((c2ws.shape[0], 1, 1))
+
+        elif camera_type == "colmap":
+            img_files = [
+                f"{self.img_dir}/{frame_name}{self.img_ext}"
+                for frame_name in self.frame_names
+            ]
+            Ks_np, w2cs_np = get_colmap_camera_params_binary_strict(
+                Path(data_dir) / "colmap" / "sparse" / "0",
+                img_files,
+                (W, H),
+            )
+            Ks = torch.from_numpy(Ks_np).float()
+            w2cs = torch.from_numpy(w2cs_np).float()
                 
         else:
             raise ValueError(f"Unknown camera type: {camera_type}")
@@ -226,7 +244,7 @@ class CasualDataset(BaseDataset):
 
     def get_depth(self, index) -> torch.Tensor:
         if self.depths[index] is None:
-            if self.camera_type == "droid_recon":
+            if self.camera_type in ("droid_recon", "colmap"):
                 self.depths[index] = self.load_depth(index)
             elif self.camera_type == "megasam":
                 data_name = self.data_dir.split("/")[-1]

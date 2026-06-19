@@ -25,6 +25,53 @@ def get_colmap_camera_params(colmap_dir, img_files):
 
     return K_all, extrinsics_all
 
+
+def get_colmap_camera_params_binary_strict(
+    colmap_dir: str | Path,
+    img_files: list[str],
+    image_size: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    colmap_dir = Path(colmap_dir)
+    cameras_path = colmap_dir / "cameras.bin"
+    images_path = colmap_dir / "images.bin"
+    if not cameras_path.exists():
+        raise FileNotFoundError(cameras_path)
+    if not images_path.exists():
+        raise FileNotFoundError(images_path)
+
+    cameras = read_cameras_binary(cameras_path)
+    images = read_images_binary(images_path)
+    colmap_image_idcs: dict[str, int] = {}
+    for image_id, image in images.items():
+        name = os.path.basename(image.name)
+        if name in colmap_image_idcs:
+            raise ValueError(f"Duplicate COLMAP image basename: {name}")
+        colmap_image_idcs[name] = image_id
+
+    img_names = [os.path.basename(img_file) for img_file in img_files]
+    if len(set(img_names)) != len(img_names):
+        raise ValueError("Training images have duplicate basenames")
+
+    width, height = image_size
+    Ks = np.zeros((len(img_names), 3, 3), dtype=np.float32)
+    w2cs = np.zeros((len(img_names), 4, 4), dtype=np.float32)
+    for idx, name in enumerate(img_names):
+        if name not in colmap_image_idcs:
+            raise KeyError(f"Image {name} is not registered in {images_path}")
+        image = images[colmap_image_idcs[name]]
+        camera = cameras[image.camera_id]
+        if camera.width != width or camera.height != height:
+            raise ValueError(
+                f"COLMAP camera size for {name} is {camera.width}x{camera.height}, "
+                f"but training images are {width}x{height}"
+            )
+        K, w2c = get_intrinsics_extrinsics(image, cameras)
+        Ks[idx] = K[:3, :3].astype(np.float32)
+        w2cs[idx] = w2c.astype(np.float32)
+
+    return Ks, w2cs
+
+
 def get_colmap_camera_params_txt(colmap_dir, img_files):
     cameras_pth = os.path.join(colmap_dir + "/cameras.txt")
     images_pth = os.path.join(colmap_dir + "/images.txt")
