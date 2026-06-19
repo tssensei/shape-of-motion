@@ -14,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter  # type: ignore
 from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig
 from flow3d.loss_utils import (
     compute_gradient_loss,
+    compute_ray_local_isometry_loss,
     compute_se3_smoothness_loss,
     compute_z_acc_loss,
     masked_l1_loss,
@@ -462,6 +463,37 @@ class Trainer:
             )
             loss += small_accel_loss_tracks * self.losses_cfg.w_smooth_tracks
 
+        local_iso_ray_loss = torch.zeros((), device=self.device)
+        local_iso_perp_loss = torch.zeros((), device=self.device)
+        local_iso_dist_loss = torch.zeros((), device=self.device)
+        local_iso_num_edges = torch.zeros((), device=self.device)
+        local_iso_is_active = (
+            self.global_step >= self.losses_cfg.local_iso_start_step
+            and (
+                self.losses_cfg.w_local_iso_ray > 0
+                or self.losses_cfg.w_local_iso_perp > 0
+                or self.losses_cfg.w_local_iso_dist > 0
+            )
+        )
+        if local_iso_is_active:
+            (
+                local_iso_ray_loss,
+                local_iso_perp_loss,
+                local_iso_dist_loss,
+                local_iso_num_edges,
+            ) = compute_ray_local_isometry_loss(
+                means_fg_nbs[:, 1],
+                self.model.fg.params["means"],
+                w2cs,
+                self.losses_cfg.local_iso_knn,
+                self.losses_cfg.local_iso_radius_mult,
+                self.losses_cfg.local_iso_huber_beta,
+                self.losses_cfg.local_iso_edge_weight_temp,
+            )
+            loss += self.losses_cfg.w_local_iso_ray * local_iso_ray_loss
+            loss += self.losses_cfg.w_local_iso_perp * local_iso_perp_loss
+            loss += self.losses_cfg.w_local_iso_dist * local_iso_dist_loss
+
 
         # Constrain the std of scales.
         # TODO: do we want to penalize before or after exp?
@@ -499,6 +531,10 @@ class Trainer:
             "train/small_accel_loss": small_accel_loss.item(),
             "train/dct_coef_loss": dct_coef_loss.item(),
             "train/z_acc_loss": z_accel_loss.item(),
+            "train/local_iso_ray_loss": local_iso_ray_loss.item(),
+            "train/local_iso_perp_loss": local_iso_perp_loss.item(),
+            "train/local_iso_dist_loss": local_iso_dist_loss.item(),
+            "train/local_iso_num_edges": local_iso_num_edges.item(),
             "train/num_gaussians": self.model.num_gaussians,
             "train/num_fg_gaussians": self.model.num_fg_gaussians,
             "train/num_bg_gaussians": self.model.num_bg_gaussians,

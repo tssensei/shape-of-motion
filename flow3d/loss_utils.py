@@ -180,6 +180,102 @@ def compute_z_acc_loss(means_ts_nb: torch.Tensor, w2cs: torch.Tensor):
     return acc_loss
 
 
+def compute_ray_local_isometry_loss(
+    means_t: torch.Tensor,
+    means0: torch.Tensor,
+    w2cs: torch.Tensor,
+    knn_k: int,
+    radius_mult: float,
+    huber_beta: float,
+    edge_weight_temp: float,
+):
+    """
+    Preserve local foreground structure with separate ray/perpendicular components.
+    :param means_t: (G, B, 3)
+    :param means0: (G, 3)
+    :param w2cs: (B, 4, 4)
+    return ray_loss, perp_loss, dist_loss, num_edges
+    """
+    zero = means_t.new_zeros(())
+    num_gaussians = means0.shape[0]
+    if num_gaussians <= 1 or knn_k <= 0:
+        return zero, zero, zero, zero
+
+    k = min(knn_k, num_gaussians - 1)
+    eps = 1e-6
+
+    with torch.no_grad():
+        means0_np = means0.detach().float().cpu().numpy()
+        knn_model = NearestNeighbors(
+            n_neighbors=k + 1, algorithm="auto", metric="euclidean"
+        ).fit(means0_np)
+        dists_np, inds_np = knn_model.kneighbors(means0_np)
+        nbr_inds = torch.from_numpy(inds_np[:, 1:]).to(
+            device=means_t.device, dtype=torch.long
+        )
+        cand_dists = torch.from_numpy(dists_np[:, 1:]).to(
+            device=means_t.device, dtype=means_t.dtype
+        )
+        valid = cand_dists > eps
+        if radius_mult > 0 and valid.any():
+            radius = cand_dists[valid].median() * radius_mult
+            valid = valid & (cand_dists <= radius)
+        if not valid.any():
+            return zero, zero, zero, zero
+
+        src_inds = (
+            torch.arange(num_gaussians, device=means_t.device)[:, None]
+            .expand(-1, k)
+        )
+        src_inds = src_inds[valid]
+        nbr_inds = nbr_inds[valid]
+        rest_len = cand_dists[valid].clamp_min(eps)
+
+        if edge_weight_temp > 0:
+            weight_scale = rest_len.median().clamp_min(eps)
+            edge_weights = torch.exp(
+                -((rest_len / weight_scale) ** 2) / edge_weight_temp
+            )
+        else:
+            edge_weights = torch.ones_like(rest_len)
+
+    e_t = means_t[src_inds] - means_t[nbr_inds]  # (E, B, 3)
+    e0 = means0.detach()[src_inds] - means0.detach()[nbr_inds]  # (E, 3)
+    rest_len = rest_len[:, None]
+    edge_weights = edge_weights[:, None]
+
+    camera_centers = torch.linalg.inv(w2cs.to(dtype=means_t.dtype))[:, :3, 3]  # (B, 3)
+    edge_midpoints = 0.5 * (means_t[src_inds] + means_t[nbr_inds])
+    ray_dirs = F.normalize(
+        edge_midpoints.detach() - camera_centers[None], p=2.0, dim=-1
+    )  # (E, B, 3)
+
+    dot_t = (e_t * ray_dirs).sum(dim=-1)
+    dot0 = (e0[:, None] * ray_dirs).sum(dim=-1)
+    ray_err = (dot_t.abs() - dot0.abs()) / rest_len
+
+    perp_t = e_t - dot_t[..., None] * ray_dirs
+    perp0 = e0[:, None] - dot0[..., None] * ray_dirs
+    perp_err = (perp_t.norm(dim=-1) - perp0.norm(dim=-1)) / rest_len
+
+    dist_err = (e_t.norm(dim=-1) - rest_len) / rest_len
+
+    def robust_mean(err):
+        if huber_beta > 0:
+            vals = F.huber_loss(
+                err, torch.zeros_like(err), delta=huber_beta, reduction="none"
+            )
+        else:
+            vals = err.pow(2)
+        return (vals * edge_weights).sum() / (edge_weights.sum() * err.shape[1] + eps)
+
+    ray_loss = robust_mean(ray_err)
+    perp_loss = robust_mean(perp_err)
+    dist_loss = robust_mean(dist_err)
+    num_edges = means_t.new_tensor(float(src_inds.shape[0]))
+    return ray_loss, perp_loss, dist_loss, num_edges
+
+
 def compute_se3_smoothness_loss(
     rots: torch.Tensor,
     transls: torch.Tensor,

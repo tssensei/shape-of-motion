@@ -57,6 +57,14 @@ class LossesConfig:
     w_scale_var: float = 0.01
     w_z_accel: float = 1.0
     w_dct_coef: float = 1e-4
+    w_local_iso_ray: float = 0.00
+    w_local_iso_perp: float = 0.00
+    w_local_iso_dist: float = 0.00
+    local_iso_knn: int = 6
+    local_iso_radius_mult: float = 2.0
+    local_iso_huber_beta: float = 0.05
+    local_iso_start_step: int = 500
+    local_iso_edge_weight_temp: float = 1.0
 
     # w_smooth_bases: float = 0.0
     # w_smooth_tracks: float = 0.0
