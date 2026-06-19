@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:nvidia_rtx_6000_ada_generation:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=12:00:00
+#SBATCH --time=8:00:00
 #SBATCH --output=/home/zs292/slurm_outputs/som/som-train-bush1-%j.out
 #SBATCH --error=/home/zs292/slurm_outputs/som/som-train-bush1-%j.err
 
@@ -16,7 +16,8 @@ conda activate som
 cd /home/zs292/shape-of-motion
 
 python -u run_training.py \
-  --work-dir /home/zs292/outputs/bush1_radii_fix_v1 \
+  --work-dir /home/zs292/outputs/dct619/no_w_depth_grad \
+  --trajectory-type dct_center \
   data:custom \
-  --data.data-dir /home/zs292/datasets/bush1 \
-  --data.camera-type droid_recon
+  --data.data-dir /home/zs292/datasets/custom_train/bush1 \
+  --data.camera-type megasam

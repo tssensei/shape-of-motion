@@ -73,7 +73,7 @@ class TrainConfig:
     trajectory_type: Literal["som_basis", "dct_center"] = "som_basis"
     num_dct_bases: int | None = None
     dct_init: Literal["tracks", "zero"] = "tracks"
-    num_epochs: int = 500
+    num_epochs: int = 100
     port: int | None = None
     vis_debug: bool = False 
     batch_size: int = 8
