@@ -479,7 +479,7 @@ def main():
             "-i",
             str(bg_dir / "%08d.png"),
             "-vf",
-            detect_filter,
+            f"format=gray,{detect_filter}",
             "-f",
             "null",
             "-",
