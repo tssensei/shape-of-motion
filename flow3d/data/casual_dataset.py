@@ -381,6 +381,7 @@ class CasualDataset(BaseDataset):
 
 
         bg_geometry = []
+        selected_counts = []
         print(f"{query_idcs=}")
         for query_idx in tqdm(query_idcs, desc="Loading bkgd points", leave=False):
             img = self.get_image(query_idx)
@@ -390,37 +391,15 @@ class CasualDataset(BaseDataset):
             w2c = self.w2cs[query_idx]
             K = self.Ks[query_idx]
 
-
-            # get the bounding box of previous points that reproject into frame
-            # inefficient but works for now
-            bmax_x, bmax_y, bmin_x, bmin_y = 0, 0, W, H
-            for p3d, _, _ in bg_geometry:
-                if len(p3d) < 1:
-                    continue
-                # reproject into current frame
-                p2d = torch.einsum(
-                    "ij,jk,pk->pi", K, w2c[:3], F.pad(p3d, (0, 1), value=1.0)
-                )
-                p2d = p2d[:, :2] / p2d[:, 2:].clamp(min=1e-6)
-                xmin, xmax = p2d[:, 0].min().item(), p2d[:, 0].max().item()
-                ymin, ymax = p2d[:, 1].min().item(), p2d[:, 1].max().item()
-
-                bmin_x = min(bmin_x, int(xmin))
-                bmin_y = min(bmin_y, int(ymin))
-                bmax_x = max(bmax_x, int(xmax))
-                bmax_y = max(bmax_y, int(ymax))
-
-            # don't include points that are covered by previous points
-            bmin_x = max(0, bmin_x)
-            bmin_y = max(0, bmin_y)
-            bmax_x = min(W, bmax_x)
-            bmax_y = min(H, bmax_y)
-            overlap_mask = torch.ones_like(bool_mask)
-            overlap_mask[bmin_y:bmax_y, bmin_x:bmax_x] = 0
-
-            bool_mask &= overlap_mask
+            # The original overlap-exclusion path got the bounding box of previous
+            # points that reproject into the frame and did not include points that
+            # are covered by previous points. It is disabled for wide-baseline
+            # videos because the reprojected bounding box can cover nearly the
+            # whole image and prevent later views from adding newly visible static
+            # background.
             if bool_mask.sum() < min_per_frame:
                 guru.debug(f"skipping {query_idx=}")
+                selected_counts.append(0)
                 continue
 
             points = (
@@ -446,11 +425,20 @@ class CasualDataset(BaseDataset):
             point_normals = point_normals[sel_idcs]
             point_colors = point_colors[sel_idcs]
             guru.debug(f"{query_idx=} {points.shape=}")
+            selected_counts.append(len(points))
             bg_geometry.append((points, point_normals, point_colors))
 
         bg_points, bg_normals, bg_colors = map(
             partial(torch.cat, dim=0), zip(*bg_geometry)
         )
+        if selected_counts:
+            counts = np.asarray(selected_counts, dtype=np.int64)
+            thirds = np.array_split(counts, 3)
+            guru.info(
+                "background point samples before global downsample: "
+                f"total={int(counts.sum())}, "
+                f"thirds={[int(x.sum()) for x in thirds]}"
+            )
 
         if len(bg_points) > num_samples:
             sel_idcs = np.random.choice(len(bg_points), num_samples, replace=False)
