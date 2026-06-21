@@ -503,7 +503,7 @@ def main():
             "-i",
             str(original_dir / "%08d.png"),
             "-vf",
-            f"{transform_filter},format=rgb24",
+            f"format=yuv420p,{transform_filter},format=rgb24",
             str(stable_img_tmp / "%08d.png"),
         ]
     )
@@ -519,7 +519,7 @@ def main():
             "-i",
             str(input_mask_dir / "%08d.png"),
             "-vf",
-            f"{transform_filter},format=gray",
+            f"format=gray,{transform_filter},format=gray",
             str(stable_mask_tmp / "%08d.png"),
         ]
     )
