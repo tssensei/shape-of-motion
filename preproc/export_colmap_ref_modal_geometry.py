@@ -7,6 +7,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# COLMAP sweep model + view1/view2 reference images
+# + UniDepth disparity
+# + modal_analysis npz
+# -> view1_config.json / view2_config.json / depth / mask
 
 def qvec_to_rotmat(qvec: np.ndarray) -> np.ndarray:
     qvec = np.asarray(qvec, dtype=np.float64)

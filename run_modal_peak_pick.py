@@ -25,11 +25,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_pick.add_argument("--sigma-b", type=float, default=3.0, help="Spatial smoothing sigma.")
     p_pick.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
     p_pick.add_argument("--snap-window-hz", type=float, default=1.0, help="Peak snapping window.")
-    p_pick.add_argument("--out-json", default="outputs/selected_peaks.json", help="Selected peaks JSON path.")
+    p_pick.add_argument("--out-json", default="outputs_modal/selected_peaks.json", help="Selected peaks JSON path.")
 
     p_export = sub.add_parser("export", help="Export selected complex 2D mode slices.")
     p_export.add_argument("--video", required=True, help="Input video path.")
-    p_export.add_argument("--out", default="outputs/modal_analysis.npz", help="Output .npz path.")
+    p_export.add_argument("--out", default="outputs_modal/modal_analysis.npz", help="Output .npz path.")
     p_export.add_argument("--freqs", default=None, help="Comma-separated selected frequencies in Hz.")
     p_export.add_argument("--peaks-json", default=None, help="JSON file with selected_peaks_hz.")
     p_export.add_argument("--peak-window-hz", type=float, default=0.6, help="Snap selected frequencies to local peaks.")

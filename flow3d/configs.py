@@ -48,22 +48,22 @@ class SceneLRConfig:
 class LossesConfig:
     w_rgb: float = 1.0
     w_depth_reg: float = 0.5
-    w_depth_const: float = 0.1
-    w_depth_grad: float = 0.0
-    w_track: float = 2.0
+    w_depth_const: float = 0.0
+    w_depth_grad: float = 1.0
+    w_track: float = 0.0
     w_mask: float = 1.0
     w_smooth_bases: float = 0.1
     w_smooth_tracks: float = 2.0
     w_scale_var: float = 0.01
     w_z_accel: float = 1.0
     w_dct_coef: float = 1e-4
-    w_local_iso_ray: float = 0.00
+    w_local_iso_ray: float = 0.0
     w_local_iso_perp: float = 0.00
-    w_local_iso_dist: float = 0.00
+    w_local_iso_dist: float = 0.0
     local_iso_knn: int = 6
     local_iso_radius_mult: float = 2.0
     local_iso_huber_beta: float = 0.05
-    local_iso_start_step: int = 500
+    local_iso_start_step: int = 100
     local_iso_edge_weight_temp: float = 1.0
 
     # w_smooth_bases: float = 0.0
