@@ -1,3 +1,89 @@
+"""Export modal_surface geometry inputs from registered COLMAP reference views.
+
+This script is the bridge between the calibration-sweep geometry stage and the
+surface-based modal optimization stage.
+
+The intended workflow is:
+
+1. Record stabilized modal videos for two static-ish viewpoints.
+2. Export one reference image for each modal view, usually:
+
+       geometry/images/view1.png
+       geometry/images/view2.png
+
+3. Record an additional calibration sweep video around the same scene.
+4. Build a multi-view COLMAP sparse reconstruction from sweep frames plus the
+   two reference images. The two reference images must be registered in the
+   same COLMAP model, for example as:
+
+       refs/view1.png
+       refs/view2.png
+
+5. Run UniDepth on the reference images to get per-view disparity maps.
+6. Run this script to produce the view configs and aligned depth maps consumed
+   by run_modal_surface.py.
+
+Example:
+
+    python shape-of-motion/preproc/export_colmap_ref_modal_geometry.py \
+      --model-dir outputs_modal/bush4/geometry/sweep_colmap/sparse_txt \
+      --image-dir outputs_modal/bush4/geometry/sweep_colmap/images \
+      --mask-dir outputs_modal/bush4/geometry/masks \
+      --unidepth-disp-dir outputs_modal/bush4/geometry/unidepth_disp \
+      --view1-name refs/view1.png \
+      --view2-name refs/view2.png \
+      --view1-modal-npz outputs_modal/bush4/view1/modal_analysis_0p357hz.npz \
+      --view2-modal-npz outputs_modal/bush4/view2/modal_analysis_0p357hz.npz \
+      --out-dir outputs_modal/bush4/geometry/modal_surface_colmap
+
+Outputs:
+
+    view1_config.json
+    view2_config.json
+    view1_depth.npy
+    view2_depth.npy
+    view1_mask.npy
+    view2_mask.npy
+    colmap_ref_pose_stats.json
+
+Why this exists:
+
+Two-view relative pose estimation from only view1/view2 is fragile for this
+experiment: background structure can be close to planar, the vibrating bush is
+masked out, and monocular depth scale is uncertain. A calibration sweep gives
+COLMAP many rigid-background views, producing a more stable sparse model. This
+script then reads the already-registered reference view poses from that model
+instead of estimating pose from the two references alone.
+
+Depth scale alignment:
+
+UniDepth disparity is converted to a depth-like map by depth = 1 / disparity.
+That depth is not guaranteed to share the same scale as the COLMAP model. For
+each reference image, COLMAP provides sparse 2D observations with POINT3D_IDs.
+For every valid observation, this script compares:
+
+    z_colmap   = camera-space z of the observed sparse 3D point
+    z_unidepth = UniDepth depth sampled at the same pixel
+
+and estimates a robust per-view scale:
+
+    scale = median(z_colmap / z_unidepth)
+    depth_aligned = depth_unidepth * scale
+
+The resulting aligned depth maps and COLMAP world_to_camera matrices are in the
+same coordinate scale, which is required before unprojecting surface points and
+projecting them across views in modal_surface.
+
+Assumptions:
+
+- COLMAP TXT model uses PINHOLE cameras.
+- Reference image names passed via --view1-name/--view2-name are present in
+  images.txt and have corresponding masks/depths keyed by their stem.
+- UniDepth outputs disparity .npy files, not metric z-depth directly.
+- The modal npz files define the target image size used by modal_surface.
+- This script exports only two reference views.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -71,6 +157,15 @@ def load_modal_mask_or_resize(modal_npz: Path, fallback_mask: np.ndarray, target
 
 
 def load_depth_from_unidepth_disp(path: Path, source_hw: tuple[int, int]) -> np.ndarray:
+    """Load UniDepth disparity and convert it to a depth-like z map.
+
+    UniDepth outputs used in this project are stored as disparity-like arrays.
+    The modal_surface code expects positive depth, so this helper uses
+    depth = 1 / disparity and resizes the result to the reference image size.
+
+    The returned depth is not yet guaranteed to be in COLMAP scale. Scale
+    alignment is handled later by align_depth_to_colmap().
+    """
     disp = np.load(str(path)).astype(np.float32)
     disp = np.squeeze(disp)
     if disp.ndim != 2:
@@ -98,6 +193,12 @@ def scale_K(K: np.ndarray, source_hw: tuple[int, int], target_hw: tuple[int, int
 
 
 def parse_cameras(path: Path) -> dict[int, dict[str, object]]:
+    """Parse COLMAP cameras.txt into camera intrinsics records.
+
+    Only the PINHOLE camera model is supported because modal_surface expects a
+    3x3 pinhole intrinsic matrix K. The returned dictionary maps camera_id to
+    a record containing image width/height, K, and the raw COLMAP params.
+    """
     cameras: dict[int, dict[str, object]] = {}
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -141,6 +242,20 @@ def parse_points2d(line: str) -> np.ndarray:
 
 
 def parse_images(path: Path) -> dict[str, dict[str, object]]:
+    """Parse COLMAP images.txt into per-image pose and observation records.
+
+    COLMAP stores each image as two non-comment lines:
+
+        IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+        POINTS2D[] as triples of X Y POINT3D_ID
+
+    The qvec/tvec pair is converted to a 4x4 world_to_camera matrix using
+    COLMAP's convention:
+
+        X_cam = R * X_world + t
+
+    The dictionary is keyed by image name, such as "refs/view1.png".
+    """
     images: dict[str, dict[str, object]] = {}
     with path.open("r", encoding="utf-8") as f:
         lines = [line.rstrip("\n") for line in f if line.strip() and not line.startswith("#")]
@@ -176,6 +291,7 @@ def parse_images(path: Path) -> dict[str, dict[str, object]]:
 
 
 def parse_points3d(path: Path) -> dict[int, np.ndarray]:
+    """Parse COLMAP points3D.txt into POINT3D_ID -> XYZ_world."""
     points: dict[int, np.ndarray] = {}
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -225,6 +341,18 @@ def align_depth_to_colmap(
     depth: np.ndarray,
     min_points: int,
 ) -> tuple[np.ndarray, dict[str, object]]:
+    """Scale a UniDepth depth map into the COLMAP coordinate scale.
+
+    For one registered reference image, COLMAP gives a sparse set of 2D feature
+    observations and their corresponding 3D points. This function computes the
+    camera-space z value of each observed sparse 3D point, samples UniDepth at
+    the same pixel, and estimates a robust multiplicative scale between them.
+
+    The 10th-90th percentile trimmed median is used to reduce the influence of
+    bad sparse points, wrong local depth, and foreground/background boundary
+    errors. The function returns the scaled dense depth map and diagnostic
+    statistics written later to colmap_ref_pose_stats.json.
+    """
     points2d = np.asarray(image_record["points2d"], dtype=np.float64)
     if points2d.size == 0:
         raise ValueError(f"{image_record['name']} has no COLMAP 2D point observations.")
@@ -250,6 +378,9 @@ def align_depth_to_colmap(
     sampled_depth = bilinear_sample(depth, np.asarray(pixels, dtype=np.float64))
     z_colmap_arr = np.asarray(z_colmap, dtype=np.float64)
     valid = np.isfinite(sampled_depth) & (sampled_depth > 0) & np.isfinite(z_colmap_arr) & (z_colmap_arr > 0)
+    # Ratio at each sparse observation: COLMAP camera z divided by UniDepth z.
+    # Multiplying UniDepth by the robust median ratio puts dense depth in the
+    # same scale as the COLMAP poses.
     ratios = z_colmap_arr[valid] / sampled_depth[valid]
     ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
     if ratios.size < min_points:
@@ -287,6 +418,7 @@ def save_view_config(
     depth_name: str,
     mask_name: str,
 ) -> None:
+    """Write the JSON view_config contract consumed by modal_surface."""
     payload = {
         "view_id": view_id,
         "image_width": int(image_width),
@@ -316,6 +448,20 @@ def export_view(
     disable_depth_alignment: bool,
     out_dir: Path,
 ) -> dict[str, object]:
+    """Export one registered reference view to modal_surface inputs.
+
+    This performs all per-view conversion:
+
+    - verify the COLMAP camera image size matches the reference image;
+    - load foreground mask and UniDepth disparity by image stem;
+    - optionally align dense depth to COLMAP scale;
+    - scale K from reference-image coordinates to modal-image coordinates;
+    - resize depth and mask to the modal image shape;
+    - write depth/mask arrays and view_config JSON.
+
+    The returned dictionary is diagnostic metadata for
+    colmap_ref_pose_stats.json, not part of the modal_surface runtime contract.
+    """
     source_image = read_image(image_dir / colmap_name)
     source_hw = source_image.shape[:2]
     camera_hw = (int(camera_record["height"]), int(camera_record["width"]))
