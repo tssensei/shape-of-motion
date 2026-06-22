@@ -74,19 +74,26 @@ def _scatter_mode_image(
     height: int,
     title: str,
     cmap: str = "magma",
+    normalize: bool = True,
 ) -> None:
     amp = np.sqrt(np.sum(np.abs(values) ** 2, axis=1)).astype(np.float32)
-    hi = float(np.percentile(amp, 99)) if amp.size else 1.0
-    hi = max(hi, 1e-6)
+    if normalize:
+        hi = float(np.percentile(amp, 99)) if amp.size else 1.0
+        hi = max(hi, 1e-6)
+        color_values = np.clip(amp / hi, 0.0, 1.0)
+        vmax = 1.0
+    else:
+        color_values = amp
+        vmax = None
     fig, ax = plt.subplots(figsize=(10, 6))
     sc = ax.scatter(
         pixels_xy[:, 0],
         pixels_xy[:, 1],
-        c=np.clip(amp / hi, 0.0, 1.0),
+        c=color_values,
         s=2,
         cmap=cmap,
         vmin=0.0,
-        vmax=1.0,
+        vmax=vmax,
     )
     ax.set_xlim(0, width)
     ax.set_ylim(height, 0)
@@ -262,6 +269,7 @@ def optimize_two_view(
             image1_height,
             "View 1 residual",
             cmap="viridis",
+            normalize=False,
         )
         _scatter_mode_image(vis / "view2_observed.png", p2_xy[idx], y2[idx], image2_width, image2_height, "View 2 observed")
         _scatter_mode_image(vis / "view2_predicted.png", p2_xy[idx], pred_y2, image2_width, image2_height, "View 2 predicted")
@@ -273,9 +281,9 @@ def optimize_two_view(
             image2_height,
             "View 2 residual",
             cmap="viridis",
+            normalize=False,
         )
         _write_ply(vis / "pointcloud_amplitude.ply", points[idx], _amplitude_colors(phi))
         _write_ply(vis / "pointcloud_phase_u.ply", points[idx], _phase_colors(phi))
 
     return out
-
