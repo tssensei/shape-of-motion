@@ -1,3 +1,22 @@
+"""Geometry utilities for surface-based modal optimization.
+
+The modal_surface pipeline represents a vibrating object as dense surface
+samples. Geometry enters the pipeline in two places:
+
+1. make-packet unprojects masked depth pixels into world-space points.
+2. match/optimize project those world-space points into another view and use
+   projection Jacobians to relate 3D displacement to 2D image-plane motion.
+
+For a world-space point X and camera projection pi(.), a small 3D modal
+displacement phi produces an approximate 2D complex motion:
+
+    y ~= J(X) phi
+    J(X) = d pi(X) / d X
+
+This local linearization is the bridge between Davis-style 2D complex mode
+images and the latent 3D complex displacement field.
+"""
+
 from __future__ import annotations
 
 import cv2
@@ -5,6 +24,7 @@ import numpy as np
 
 
 def erode_mask(mask: np.ndarray, iterations: int) -> np.ndarray:
+    """Erode a binary mask to avoid fragile foreground and depth boundaries."""
     if iterations <= 0:
         return mask.astype(bool, copy=False)
     kernel = np.ones((3, 3), dtype=np.uint8)
@@ -18,6 +38,12 @@ def depth_edge_keep_mask(
     edge_tau: float,
     kernel_size: int = 5,
 ) -> np.ndarray:
+    """Reject pixels near local depth discontinuities.
+
+    A small local depth range relative to the center depth suggests a stable
+    surface patch. Large relative ranges usually occur at occlusion boundaries
+    where unprojection and cross-view visibility tests are unreliable.
+    """
     if edge_tau <= 0:
         return valid_mask.astype(bool, copy=False)
     if kernel_size % 2 == 0:
@@ -45,6 +71,11 @@ def unproject_pixels(
     K: np.ndarray,
     world_to_camera: np.ndarray,
 ) -> np.ndarray:
+    """Unproject image pixels with camera z-depth into world coordinates.
+
+    pixels_xy are image-plane coordinates in the same resolution as K and
+    depth. depth is assumed to be camera z-depth, not ray distance.
+    """
     pixels_xy = np.asarray(pixels_xy, dtype=np.float64)
     depth = np.asarray(depth, dtype=np.float64)
     fx, fy = float(K[0, 0]), float(K[1, 1])
@@ -52,12 +83,15 @@ def unproject_pixels(
     x = (pixels_xy[:, 0] - cx) * depth / fx
     y = (pixels_xy[:, 1] - cy) * depth / fy
     points_cam = np.stack([x, y, depth, np.ones_like(depth)], axis=1)
+    # View configs store world_to_camera. Invert it to move camera-frame depth
+    # samples into the shared COLMAP/world coordinate system.
     camera_to_world = np.linalg.inv(world_to_camera)
     points_world_h = points_cam @ camera_to_world.T
     return points_world_h[:, :3].astype(np.float32)
 
 
 def world_to_camera_points(points_world: np.ndarray, world_to_camera: np.ndarray) -> np.ndarray:
+    """Transform world-space points into one camera coordinate system."""
     points_world = np.asarray(points_world, dtype=np.float64)
     ones = np.ones((points_world.shape[0], 1), dtype=np.float64)
     points_h = np.concatenate([points_world, ones], axis=1)
@@ -69,6 +103,7 @@ def project_points(
     K: np.ndarray,
     world_to_camera: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Project world-space points into an image and return pixels plus z-depth."""
     points_cam = world_to_camera_points(points_world, world_to_camera)
     z = points_cam[:, 2]
     x = points_cam[:, 0]
@@ -83,6 +118,14 @@ def projection_jacobian(
     K: np.ndarray,
     world_to_camera: np.ndarray,
 ) -> np.ndarray:
+    """Compute d(project(X)) / dX_world for each point.
+
+    The returned array has shape (N,2,3). Multiplying J[i] by a small 3D
+    displacement vector gives the induced 2D image-plane displacement at the
+    projected point. This is the linear operator used in:
+
+        y_i ~= J_i phi_i
+    """
     points_cam = world_to_camera_points(points_world, world_to_camera)
     x = points_cam[:, 0]
     y = points_cam[:, 1]
@@ -96,10 +139,12 @@ def projection_jacobian(
     J_cam[:, 0, 2] = -fx * x / (z * z)
     J_cam[:, 1, 1] = fy / z
     J_cam[:, 1, 2] = -fy * y / (z * z)
+    # Chain rule: d projection / d X_world = d projection / d X_cam * R_w2c.
     return np.einsum("nij,jk->nik", J_cam, R).astype(np.float32)
 
 
 def bilinear_sample(image: np.ndarray, pixels_xy: np.ndarray) -> np.ndarray:
+    """Sample a 2D array or image at floating-point pixel coordinates."""
     image = np.asarray(image)
     pixels_xy = np.asarray(pixels_xy, dtype=np.float64)
     h, w = image.shape[:2]
@@ -126,7 +171,7 @@ def bilinear_sample(image: np.ndarray, pixels_xy: np.ndarray) -> np.ndarray:
 
 
 def in_image_with_margin(pixels_xy: np.ndarray, width: int, height: int, margin: int = 1) -> np.ndarray:
+    """Return a mask for pixels that are safely inside an image boundary."""
     x = pixels_xy[:, 0]
     y = pixels_xy[:, 1]
     return (x >= margin) & (x < width - 1 - margin) & (y >= margin) & (y < height - 1 - margin)
-

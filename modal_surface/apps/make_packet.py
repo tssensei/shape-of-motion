@@ -1,3 +1,5 @@
+"""CLI adapter for the make-packet stage."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,6 +8,7 @@ from modal_surface.packets import make_surface_packet
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register make-packet command-line arguments."""
     parser.add_argument("--view-config", required=True, help="View JSON config path.")
     parser.add_argument("--modal-npz", required=True, help="modal_analysis.npz from modal peak-pick export.")
     parser.add_argument("--out", required=True, help="Output surface packet .npz path.")
@@ -16,6 +19,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    """Run make-packet from an argparse namespace."""
     out = make_surface_packet(
         view_config_path=args.view_config,
         modal_npz_path=args.modal_npz,
@@ -26,4 +30,3 @@ def run(args: argparse.Namespace) -> None:
         min_amplitude_percentile=args.min_amplitude_percentile,
     )
     print(f"Saved surface packet -> {out}")
-

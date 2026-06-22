@@ -1,3 +1,30 @@
+"""Optimize a two-view latent 3D complex modal displacement field.
+
+optimize-two-view is the final stage of the current modal_surface prototype:
+
+    matches_12.npz -> latent_field_12.npz + optional visualizations
+
+For each co-visible surface point X_i, the goal is to estimate a complex 3D
+modal displacement:
+
+    phi_i in C^3
+
+The two 2D complex modal observations are modeled as:
+
+    y1_i ~= J1_i phi_i
+    y2_i ~= alpha2 * J2_i phi_i
+
+where J1/J2 are projection Jacobians and alpha2 is a single complex
+clip-level scale/phase offset. alpha2 is needed because the two monocular
+videos are not synchronized; the same structural mode can appear with a
+different global phase and excitation amplitude in each clip.
+
+The first prototype solves this with alternating least squares and no graph
+smoothness. Each phi_i is solved independently given alpha2, then alpha2 is
+updated in closed form given all phi_i. The largest residual outliers can be
+pruned between iterations.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,6 +46,16 @@ def _solve_phi_points(
     alpha2: complex,
     ridge_mu: float,
 ) -> np.ndarray:
+    """Solve per-point complex ridge least squares for phi_i.
+
+    For each point, solve:
+
+        min_phi c1 ||J1 phi - y1||^2
+              + c2 ||alpha2 J2 phi - y2||^2
+              + ridge_mu ||phi||^2
+
+    The result is a complex 3-vector for every active surface point.
+    """
     if ridge_mu < 0:
         raise ValueError("ridge_mu must be non-negative.")
     n = y1.shape[0]
@@ -48,6 +85,7 @@ def _solve_phi_points(
 
 
 def _solve_alpha2(y2: np.ndarray, J2: np.ndarray, phi: np.ndarray, c2: np.ndarray) -> complex:
+    """Solve the global complex phase/amplitude offset for view2."""
     projected = np.einsum("nij,nj->ni", J2.astype(np.float32), phi.astype(np.complex64))
     weights = np.maximum(c2.astype(np.float64), 0.0)
     numerator = np.sum(weights[:, None] * np.conj(projected) * y2)
@@ -59,10 +97,12 @@ def _solve_alpha2(y2: np.ndarray, J2: np.ndarray, phi: np.ndarray, c2: np.ndarra
 
 
 def _predict(J: np.ndarray, phi: np.ndarray, alpha: complex) -> np.ndarray:
+    """Project complex 3D displacement into one view's 2D complex motion."""
     return (alpha * np.einsum("nij,nj->ni", J.astype(np.float32), phi.astype(np.complex64))).astype(np.complex64)
 
 
 def _point_residual(y: np.ndarray, pred: np.ndarray) -> np.ndarray:
+    """Compute per-point 2D complex residual amplitude."""
     return np.sqrt(np.sum(np.abs(y - pred) ** 2, axis=1)).astype(np.float32)
 
 
@@ -76,6 +116,7 @@ def _scatter_mode_image(
     cmap: str = "magma",
     normalize: bool = True,
 ) -> None:
+    """Write a 2D scatter visualization of complex vector amplitudes."""
     amp = np.sqrt(np.sum(np.abs(values) ** 2, axis=1)).astype(np.float32)
     if normalize:
         hi = float(np.percentile(amp, 99)) if amp.size else 1.0
@@ -106,6 +147,7 @@ def _scatter_mode_image(
 
 
 def _write_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
+    """Write a colored point cloud for basic 3D inspection."""
     colors = np.clip(colors, 0, 255).astype(np.uint8)
     with path.open("w", encoding="ascii") as f:
         f.write("ply\n")
@@ -123,6 +165,7 @@ def _write_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
 
 
 def _amplitude_colors(phi: np.ndarray) -> np.ndarray:
+    """Map latent 3D displacement amplitude to RGB colors."""
     amp = np.linalg.norm(phi, axis=1)
     hi = float(np.percentile(amp, 99)) if amp.size else 1.0
     val = np.clip(amp / max(hi, 1e-12), 0.0, 1.0)
@@ -131,6 +174,7 @@ def _amplitude_colors(phi: np.ndarray) -> np.ndarray:
 
 
 def _phase_colors(phi: np.ndarray) -> np.ndarray:
+    """Map the phase of the first phi component to HSV colors."""
     phase = np.angle(phi[:, 0])
     hue = (phase + np.pi) / (2.0 * np.pi)
     rgb = plt.get_cmap("hsv")(hue)[:, :3]
@@ -145,6 +189,13 @@ def optimize_two_view(
     ridge_mu: float = 1e-4,
     outlier_frac: float = 0.05,
 ) -> Path:
+    """Optimize the latent 3D field from two-view matched modal observations.
+
+    The output npz contains the active co-visible points, optimized phi,
+    alpha1/alpha2, original observations, predictions, residuals, and
+    optimization history. Optional visualizations include observed/predicted
+    2D amplitude maps and 3D colored PLY point clouds.
+    """
     if iterations <= 0:
         raise ValueError("iterations must be positive.")
     if not (0.0 <= outlier_frac < 0.5):
@@ -176,6 +227,8 @@ def optimize_two_view(
         idx = np.where(active)[0]
         if idx.size < 3:
             raise ValueError("Too few active matches remain during optimization.")
+        # Alternate between solving per-point 3D complex displacement and the
+        # single complex view2 clip offset.
         phi_active = _solve_phi_points(
             y1[idx],
             y2[idx],
@@ -205,6 +258,7 @@ def optimize_two_view(
         if outlier_frac > 0 and it < iterations - 1:
             drop_count = int(np.floor(outlier_frac * idx.size))
             if drop_count > 0 and idx.size - drop_count >= 3:
+                # Remove the worst current residuals before the next ALS step.
                 drop_local = np.argsort(total)[-drop_count:]
                 active[idx[drop_local]] = False
 

@@ -1,3 +1,5 @@
+"""CLI adapter for the optimize-two-view stage."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,6 +8,7 @@ from modal_surface.optimization import optimize_two_view
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register optimize-two-view command-line arguments."""
     parser.add_argument("--matches", required=True, help="matches_12.npz path.")
     parser.add_argument("--out", required=True, help="Output latent_field_12.npz path.")
     parser.add_argument("--vis-dir", default=None, help="Optional visualization directory.")
@@ -15,6 +18,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    """Run optimize-two-view from an argparse namespace."""
     out = optimize_two_view(
         matches_path=args.matches,
         out_path=args.out,
@@ -24,4 +28,3 @@ def run(args: argparse.Namespace) -> None:
         outlier_frac=args.outlier_frac,
     )
     print(f"Saved latent field -> {out}")
-

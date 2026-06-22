@@ -1,3 +1,24 @@
+"""Cross-view matching for surface modal points.
+
+match-two-views is the second stage of the modal_surface pipeline:
+
+    view1_surface_packet + view2_config + view2_modal_analysis
+        -> matches_12.npz
+
+The input packet provides canonical 3D points from view1. This module projects
+those points into view2, rejects points that are outside the image or fail
+mask/depth visibility checks, and samples the view2 2D complex modal response
+at the surviving projections.
+
+The output contains paired observations:
+
+    y1_i in C^2, y2_i in C^2
+    J1_i in R^(2x3), J2_i in R^(2x3)
+
+These are the sufficient inputs for optimize-two-view, which solves for a
+shared latent 3D modal displacement phi_i in C^3.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -16,10 +37,12 @@ from modal_surface.io import ensure_modal_shape, load_depth, load_mask, load_mod
 
 
 def _mode_amplitude(mode_u: np.ndarray, mode_v: np.ndarray) -> np.ndarray:
+    """Compute scalar 2D mode amplitude from complex u/v components."""
     return np.sqrt((np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32))
 
 
 def _window_depth_stats(depth: np.ndarray, x: int, y: int, radius: int) -> tuple[float, float, float, float] | None:
+    """Return robust local depth statistics around one projected pixel."""
     h, w = depth.shape
     x0 = max(0, x - radius)
     x1 = min(w, x + radius + 1)
@@ -34,6 +57,7 @@ def _window_depth_stats(depth: np.ndarray, x: int, y: int, radius: int) -> tuple
 
 
 def _view2_confidence_map(mode_u: np.ndarray, mode_v: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Build a simple amplitude-based confidence map for sampled view2 modes."""
     amp = _mode_amplitude(mode_u, mode_v)
     vals = amp[mask] if np.any(mask) else amp.ravel()
     scale = float(np.percentile(vals, 95)) if vals.size else 1.0
@@ -53,6 +77,16 @@ def match_two_views(
     depth_window_radius: int = 2,
     freq_tolerance_hz: float = 0.1,
 ) -> Path:
+    """Match canonical view1 surface points into view2.
+
+    For each view1 surface point X_i, this function projects X_i into view2,
+    checks whether it is visible according to view2 mask and depth, and samples
+    view2's complex 2D modal observation at the projected location.
+
+    The depth test is intentionally conservative: it compares the projected
+    camera z-depth against the front-side depth percentile in a small local
+    window, which helps reject points from view1 that are occluded in view2.
+    """
     if mode_index < 0:
         raise ValueError("mode_index must be non-negative.")
     if depth_tau <= 0:
@@ -105,6 +139,9 @@ def match_two_views(
         d_front, d_med, d_back, _ = stats
         if d_med <= 0:
             continue
+        # Visibility test: use the local front depth as the conservative
+        # visible surface estimate, then reject points that project behind or
+        # in front of that surface by too much.
         if abs(float(z2[i]) - d_front) / d_med >= depth_tau:
             continue
         if (d_back - d_front) / d_med > edge_tau:
@@ -124,6 +161,8 @@ def match_two_views(
     matched_points = points_world[idx]
     K1 = p1["K"].astype(np.float64)
     w2c1 = p1["world_to_camera"].astype(np.float64)
+    # J maps a 3D displacement at this surface point to the induced 2D optical
+    # flow in each view. optimize_two_view uses y ~= J phi.
     J1 = projection_jacobian(matched_points, K1, w2c1)
     J2 = projection_jacobian(matched_points, cfg2.K, cfg2.world_to_camera)
     y1 = np.stack([p1["mode_u"][mode_index, idx], p1["mode_v"][mode_index, idx]], axis=1).astype(np.complex64)
@@ -157,4 +196,3 @@ def match_two_views(
         source_view2_modal_npz=np.array(str(view2_modal_npz_path)),
     )
     return out
-

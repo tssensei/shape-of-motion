@@ -1,3 +1,24 @@
+"""I/O helpers and data contracts for the modal_surface pipeline.
+
+The modal_surface package uses a small JSON + NumPy contract between geometry
+preparation and modal optimization:
+
+    view_config.json
+        Camera intrinsics, world_to_camera pose, image size, depth path, and
+        optional mask path.
+
+    modal_analysis.npz
+        2D complex modal response from run_modal_peak_pick.py. The required
+        arrays are mode_u, mode_v, and selected_freqs_hz.
+
+    depth.npy / mask.npy
+        Dense reference-view depth and foreground mask aligned to the modal
+        image resolution.
+
+This module centralizes loading and validation so make-packet, match-two-views,
+and optimize-two-view share the same assumptions about shapes and paths.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +32,14 @@ import numpy as np
 
 @dataclass(frozen=True)
 class ViewConfig:
+    """Validated view geometry consumed by modal_surface.
+
+    K and world_to_camera are used to unproject view-local depth pixels into
+    world-space surface points and to project those points into another view.
+    depth_path and mask_path are resolved relative to the JSON config location
+    when the JSON contains relative paths.
+    """
+
     view_id: str
     image_width: int
     image_height: int
@@ -23,6 +52,7 @@ class ViewConfig:
 
 
 def _resolve_path(root: Path, value: str | None) -> Path | None:
+    """Resolve optional paths relative to the config file directory."""
     if value is None or value == "":
         return None
     path = Path(value)
@@ -32,6 +62,7 @@ def _resolve_path(root: Path, value: str | None) -> Path | None:
 
 
 def load_view_config(path: str | Path) -> ViewConfig:
+    """Load and validate a modal_surface view_config JSON file."""
     cfg_path = Path(path)
     with cfg_path.open("r", encoding="utf-8") as f:
         raw: dict[str, Any] = json.load(f)
@@ -67,6 +98,7 @@ def load_view_config(path: str | Path) -> ViewConfig:
 
 
 def load_depth(path: str | Path, expected_shape: tuple[int, int], depth_scale: float = 1.0) -> np.ndarray:
+    """Load a dense depth map and verify it matches the modal image shape."""
     path = Path(path)
     if path.suffix.lower() == ".npy":
         depth = np.load(str(path))
@@ -83,6 +115,7 @@ def load_depth(path: str | Path, expected_shape: tuple[int, int], depth_scale: f
 
 
 def load_mask(path: str | Path | None, expected_shape: tuple[int, int]) -> np.ndarray:
+    """Load a binary foreground mask, or return an all-true mask if omitted."""
     if path is None:
         return np.ones(expected_shape, dtype=bool)
     path = Path(path)
@@ -102,6 +135,7 @@ def load_mask(path: str | Path | None, expected_shape: tuple[int, int]) -> np.nd
 
 
 def load_modal_npz(path: str | Path) -> dict[str, np.ndarray]:
+    """Load a modal peak-pick export and validate required complex mode arrays."""
     z = np.load(str(path), allow_pickle=False)
     required = ["mode_u", "mode_v", "selected_freqs_hz"]
     missing = [k for k in required if k not in z.files]
@@ -115,7 +149,7 @@ def load_modal_npz(path: str | Path) -> dict[str, np.ndarray]:
 
 
 def ensure_modal_shape(modal: dict[str, np.ndarray], expected_shape: tuple[int, int]) -> None:
+    """Ensure modal image arrays are aligned to a view_config image size."""
     mode_shape = tuple(int(v) for v in modal["mode_u"].shape[1:])
     if mode_shape != expected_shape:
         raise ValueError(f"Modal mode image shape {mode_shape} does not match expected {expected_shape}.")
-

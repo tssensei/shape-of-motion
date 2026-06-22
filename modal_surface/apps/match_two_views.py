@@ -1,3 +1,5 @@
+"""CLI adapter for the match-two-views stage."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,6 +8,7 @@ from modal_surface.matching import match_two_views
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register match-two-views command-line arguments."""
     parser.add_argument("--view1-packet", required=True, help="View 1 surface packet .npz path.")
     parser.add_argument("--view2-config", required=True, help="View 2 JSON config path.")
     parser.add_argument("--view2-modal-npz", required=True, help="View 2 modal_analysis.npz path.")
@@ -19,6 +22,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    """Run match-two-views from an argparse namespace."""
     out = match_two_views(
         view1_packet_path=args.view1_packet,
         view2_config_path=args.view2_config,
@@ -32,4 +36,3 @@ def run(args: argparse.Namespace) -> None:
         freq_tolerance_hz=args.freq_tolerance_hz,
     )
     print(f"Saved matches -> {out}")
-

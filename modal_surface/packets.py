@@ -1,3 +1,16 @@
+"""Build single-view surface modal packets.
+
+make-packet is the first stage of the modal_surface pipeline:
+
+    view_config + depth + mask + modal_analysis
+        -> surface_packet.npz
+
+The packet stores a sampled set of 3D surface points from one reference view
+and attaches that view's 2D complex modal response to each point. In the current
+two-view prototype, view1 is used as the canonical surface carrier: its
+points_world are later projected into view2 by match-two-views.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,10 +22,12 @@ from modal_surface.io import ViewConfig, ensure_modal_shape, load_depth, load_ma
 
 
 def _mode_amplitude(mode_u: np.ndarray, mode_v: np.ndarray) -> np.ndarray:
+    """Compute scalar 2D mode amplitude from complex image-plane components."""
     return np.sqrt((np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32))
 
 
 def _confidence_from_amplitude(amplitude: np.ndarray) -> np.ndarray:
+    """Convert modal amplitude into a simple [0,1] confidence weight."""
     if amplitude.size == 0:
         return amplitude.astype(np.float32)
     hi = np.percentile(amplitude, 95, axis=1)
@@ -29,6 +44,19 @@ def make_surface_packet(
     depth_edge_tau: float = 0.12,
     min_amplitude_percentile: float = 5.0,
 ) -> Path:
+    """Create a sampled 3D surface packet from one view.
+
+    The function:
+
+    - loads view geometry, depth, mask, and modal npz;
+    - keeps only valid masked depth pixels away from mask/depth boundaries;
+    - samples pixels on a regular stride;
+    - drops very low modal-amplitude points;
+    - unprojects the remaining pixels into world-space 3D points;
+    - stores the attached complex mode_u/mode_v values.
+
+    Output arrays are consumed by match_two_views().
+    """
     if stride <= 0:
         raise ValueError("stride must be positive.")
     if not (0.0 <= min_amplitude_percentile < 100.0):
@@ -49,6 +77,8 @@ def make_surface_packet(
     valid = erode_mask(valid, mask_erode_iters)
     valid = depth_edge_keep_mask(depth, valid, edge_tau=depth_edge_tau, kernel_size=5)
 
+    # Sample a regular pixel grid instead of every foreground pixel to keep the
+    # first prototype small and predictable.
     yy, xx = np.mgrid[: cfg.image_height : stride, : cfg.image_width : stride]
     candidate_y = yy.ravel()
     candidate_x = xx.ravel()
@@ -70,6 +100,8 @@ def make_surface_packet(
 
     pixels_xy = np.stack([px.astype(np.float32), py.astype(np.float32)], axis=1)
     point_depth = depth[py, px].astype(np.float32)
+    # This is where view-local 2D modal pixels become world-space surface
+    # carrier points.
     points_world = unproject_pixels(pixels_xy, point_depth, cfg.K, cfg.world_to_camera)
     mode_u_points = mode_u[:, py, px].astype(np.complex64)
     mode_v_points = mode_v[:, py, px].astype(np.complex64)
@@ -96,4 +128,3 @@ def make_surface_packet(
         source_view_config=np.array(str(view_config_path)),
     )
     return out
-
