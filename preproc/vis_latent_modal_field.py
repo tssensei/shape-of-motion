@@ -181,7 +181,24 @@ def make_arrow_point_cloud(
     return np.concatenate(arrow_points, axis=0), np.concatenate(arrow_colors, axis=0)
 
 
-def add_camera_frustum(server, name: str, cfg: ViewConfig, color: tuple[int, int, int]) -> None:
+def compute_display_center(points: np.ndarray, mode: str) -> np.ndarray:
+    """Return the world-space point that should become the viewer origin."""
+    if mode == "none":
+        return np.zeros((3,), dtype=np.float32)
+    if mode == "centroid":
+        return np.mean(points, axis=0).astype(np.float32)
+    if mode == "bbox":
+        return (0.5 * (np.min(points, axis=0) + np.max(points, axis=0))).astype(np.float32)
+    raise ValueError(f"Unknown center mode {mode!r}.")
+
+
+def add_camera_frustum(
+    server,
+    name: str,
+    cfg: ViewConfig,
+    color: tuple[int, int, int],
+    display_center: np.ndarray,
+) -> None:
     """Add a camera frustum from a modal_surface world_to_camera matrix."""
     import viser.transforms as vtf
 
@@ -195,7 +212,7 @@ def add_camera_frustum(server, name: str, cfg: ViewConfig, color: tuple[int, int
         scale=0.25,
         color=color,
         wxyz=vtf.SO3.from_matrix(c2w[:3, :3]).wxyz,
-        position=c2w[:3, 3],
+        position=c2w[:3, 3] - display_center,
     )
 
 
@@ -214,6 +231,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=float, default=12.0, help="Playback FPS for the phase animation.")
     parser.add_argument("--shaft-samples", type=int, default=8, help="Number of points sampled along each arrow shaft.")
     parser.add_argument("--head-samples", type=int, default=4, help="Number of points sampled along each arrow head segment.")
+    parser.add_argument(
+        "--center-mode",
+        choices=("bbox", "centroid", "none"),
+        default="bbox",
+        help="Viewer-only recentering mode. Does not modify latent/config files.",
+    )
     return parser
 
 
@@ -240,11 +263,13 @@ def main() -> None:
     directions, amplitudes, phases = principal_modal_axes(phi)
     arrow_idx = select_arrow_indices(amplitudes, args.max_arrows)
     phase_colors = hsv_colors(phases)
+    display_center = compute_display_center(points, args.center_mode)
+    points_display = points - display_center[None, :]
 
     base_color = np.full((points.shape[0], 3), 0.58, dtype=np.float32)
     server = viser.ViserServer(port=args.port, verbose=False)
-    add_camera_frustum(server, "/cameras/view1", cfg1, (80, 150, 255))
-    add_camera_frustum(server, "/cameras/view2", cfg2, (255, 130, 70))
+    add_camera_frustum(server, "/cameras/view1", cfg1, (80, 150, 255), display_center)
+    add_camera_frustum(server, "/cameras/view2", cfg2, (255, 130, 70), display_center)
 
     handles = {"base": None, "animated": None, "arrows": None}
 
@@ -255,7 +280,7 @@ def main() -> None:
     arrow_point_size_slider = server.gui.add_slider("Arrow point size", min=0.001, max=0.06, step=0.001, initial_value=float(args.arrow_point_size))
     show_base = server.gui.add_checkbox("Show base points", True)
     show_animated = server.gui.add_checkbox("Show animated points", True)
-    show_arrows = server.gui.add_checkbox("Show principal arrows", True)
+    show_arrows = server.gui.add_checkbox("Show principal arrows", False)
     playing = server.gui.add_checkbox("Play", False)
     fps_slider = server.gui.add_slider("FPS", min=1.0, max=60.0, step=1.0, initial_value=float(args.fps))
 
@@ -266,7 +291,7 @@ def main() -> None:
         if show_base.value:
             handles["base"] = server.scene.add_point_cloud(
                 "/modal/base_points",
-                points=points,
+                points=points_display,
                 colors=base_color,
                 point_size=float(point_size_slider.value),
             )
@@ -276,7 +301,7 @@ def main() -> None:
             handles["animated"].remove()
             handles["animated"] = None
         if show_animated.value:
-            moved = animated_points(points, phi, float(phase_slider.value), float(disp_scale_slider.value))
+            moved = animated_points(points_display, phi, float(phase_slider.value), float(disp_scale_slider.value))
             handles["animated"] = server.scene.add_point_cloud(
                 "/modal/animated_points",
                 points=moved,
@@ -290,7 +315,7 @@ def main() -> None:
             handles["arrows"] = None
         if show_arrows.value:
             arrow_points, arrow_colors = make_arrow_point_cloud(
-                points[arrow_idx],
+                points_display[arrow_idx],
                 directions[arrow_idx],
                 amplitudes[arrow_idx],
                 phase_colors[arrow_idx],
@@ -321,6 +346,8 @@ def main() -> None:
 
     redraw_all()
     print(f"Loaded {points.shape[0]} latent modal points.")
+    print(f"Viewer center mode: {args.center_mode}")
+    print(f"Viewer display center in original world coordinates: {display_center.tolist()}")
     print(f"Showing {arrow_idx.shape[0]} principal-direction arrows.")
     print(f"Viser server running on http://localhost:{args.port}")
 
