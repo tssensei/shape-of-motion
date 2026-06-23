@@ -61,6 +61,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_inspect.add_argument("--peak-window-hz", type=float, default=0.6, help="Minimum spacing between candidate peaks.")
     p_inspect.add_argument("--preview-percentile", type=float, default=99.0, help="Display percentile for mode previews.")
 
+    p_synthesize = sub.add_parser("synthesize", help="Synthesize fixed-frequency modal videos from exported .npz.")
+    p_synthesize.add_argument("--modal-npz", required=True, help="modal_analysis.npz exported by the export command.")
+    p_synthesize.add_argument("--out-dir", required=True, help="Output directory for synthesized videos and previews.")
+    p_synthesize.add_argument("--mode-index", type=int, default=None, help="One-based mode index to synthesize. Omit to synthesize all modes.")
+    p_synthesize.add_argument("--duration-s", type=float, default=4.0, help="Output video duration in seconds.")
+    p_synthesize.add_argument("--fps-out", type=float, default=None, help="Output FPS. Default uses the modal-analysis FPS.")
+    p_synthesize.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier for the modal oscillation.")
+    p_synthesize.add_argument("--gain", type=float, default=1.0, help="Extra displacement gain after optional FFT normalization.")
+    p_synthesize.add_argument("--no-fft-normalize", action="store_true", help="Use raw rFFT mode coefficients without amplitude normalization.")
+    p_synthesize.add_argument("--reference-video", default=None, help="Optional video path used to load a color reference frame.")
+    p_synthesize.add_argument("--reference-time-s", type=float, default=None, help="Optional reference time for --reference-video.")
+    p_synthesize.add_argument("--preview-percentile", type=float, default=99.0, help="Magnitude percentile used for HSV preview images.")
+
     return parser
 
 
@@ -86,6 +99,11 @@ def main(argv: list[str] | None = None) -> None:
         from modal_peak_pick.apps import inspect_modes
 
         inspect_modes.run(args)
+        return
+    if args.command == "synthesize":
+        from modal_peak_pick.apps import synthesize_mode_video
+
+        synthesize_mode_video.run(args)
         return
     raise SystemExit(f"Unknown command: {args.command}")
 
