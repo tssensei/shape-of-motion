@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
 from pathlib import Path
 
 import cv2
@@ -18,8 +20,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--duration-s", type=float, default=4.0, help="Output video duration in seconds.")
     parser.add_argument("--fps-out", type=float, default=None, help="Output FPS. Default uses the input modal-analysis FPS.")
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier for the modal oscillation.")
-    parser.add_argument("--gain", type=float, default=1.0, help="Extra displacement gain after optional FFT normalization.")
-    parser.add_argument("--no-fft-normalize", action="store_true", help="Use raw rFFT mode coefficients without amplitude normalization.")
+    parser.add_argument("--scale", type=float, default=1.0, help="Manual multiplier applied directly to raw complex mode_u/mode_v.")
     parser.add_argument("--reference-video", default=None, help="Optional video path used to load a color reference frame.")
     parser.add_argument("--reference-time-s", type=float, default=None, help="Optional reference time for --reference-video.")
     parser.add_argument("--preview-percentile", type=float, default=99.0, help="Magnitude percentile used for HSV preview images.")
@@ -128,38 +129,6 @@ def _mask_from_npz(z: np.lib.npyio.NpzFile, expected_hw: tuple[int, int]) -> np.
     return mask.astype(bool)
 
 
-def _infer_fft_num_samples(freqs_hz: np.ndarray, fps: float) -> int:
-    freqs = np.asarray(freqs_hz, dtype=np.float64).reshape(-1)
-    if freqs.shape[0] < 2:
-        raise ValueError("Need at least two frequency bins to infer FFT normalization.")
-    df = float(freqs[1] - freqs[0])
-    if df <= 0:
-        raise ValueError(f"Frequency bins must be increasing; got df={df}.")
-    n = int(round(float(fps) / df))
-    if n <= 0:
-        raise ValueError(f"Could not infer positive FFT sample count from fps={fps}, df={df}.")
-    if abs((float(fps) / float(n)) - df) > max(1e-6, 1e-4 * df):
-        raise ValueError(f"Frequency spacing df={df} is inconsistent with fps={fps} and inferred N={n}.")
-    return n
-
-
-def _temporal_fft_reconstruction_gain(num_samples: int, window: str = "hann") -> float:
-    n = int(num_samples)
-    if n <= 0:
-        raise ValueError("num_samples must be positive.")
-    if window.lower() == "hann":
-        if n == 1:
-            coherent_gain = 1.0
-        else:
-            w = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n, dtype=np.float32) / float(n - 1))
-            coherent_gain = float(np.mean(w))
-    else:
-        coherent_gain = 1.0
-    if coherent_gain <= 0:
-        raise ValueError("Window coherent gain must be positive.")
-    return float(2.0 / (float(n) * coherent_gain))
-
-
 def _phase_hsv(z: np.ndarray, lo: float, hi: float) -> np.ndarray:
     phase = np.angle(z)
     mag = np.abs(z).astype(np.float32)
@@ -223,7 +192,6 @@ def _write_mode_video(
     fps_out: float,
     duration_s: float,
     speed: float,
-    gain: float,
 ) -> None:
     h, w = frame_ref_bgr.shape[:2]
     if mode_u.shape != (h, w) or mode_v.shape != (h, w):
@@ -240,8 +208,8 @@ def _write_mode_video(
             t = float(frame_idx) / float(fps_out)
             phase = np.exp(1j * 2.0 * np.pi * float(freq_hz) * t * float(speed)).astype(np.complex64)
             phase_rel = (phase - np.complex64(1.0)).astype(np.complex64)
-            dx = (float(gain) * np.real(mode_u * phase_rel)).astype(np.float32)
-            dy = (float(gain) * np.real(mode_v * phase_rel)).astype(np.float32)
+            dx = np.real(mode_u * phase_rel).astype(np.float32)
+            dy = np.real(mode_v * phase_rel).astype(np.float32)
             if mask_f is not None:
                 dx *= mask_f
                 dy *= mask_f
@@ -259,12 +227,41 @@ def _mode_indices(num_modes: int, mode_index: int | None) -> list[int]:
     return [idx]
 
 
+def _convert_to_h264(opencv_path: Path, out_path: Path) -> bool:
+    """Convert OpenCV's mp4v output to a browser/VSCode-friendly H.264 MP4."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        opencv_path.replace(out_path)
+        print("Warning: ffmpeg not found; kept OpenCV mp4v output, which may not preview in VSCode/browser.")
+        return False
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(opencv_path),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(out_path),
+    ]
+    subprocess.run(cmd, check=True)
+    opencv_path.unlink()
+    return True
+
+
 def run(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     z = np.load(str(args.modal_npz), allow_pickle=False)
-    required = ["mode_u", "mode_v", "selected_freqs_hz", "reference_frame", "fps", "freqs_hz"]
+    required = ["mode_u", "mode_v", "selected_freqs_hz", "reference_frame", "fps"]
     missing = [key for key in required if key not in z.files]
     if missing:
         raise ValueError(f"{args.modal_npz} missing required arrays: {missing}")
@@ -287,45 +284,42 @@ def run(args: argparse.Namespace) -> None:
     if args.duration_s <= 0:
         raise ValueError("--duration-s must be positive.")
 
-    fft_gain = 1.0
-    if not args.no_fft_normalize:
-        num_samples = _infer_fft_num_samples(z["freqs_hz"], fps_in)
-        fft_gain = _temporal_fft_reconstruction_gain(num_samples, window="hann")
-    total_gain = float(args.gain) * float(fft_gain)
+    scale = float(args.scale)
 
     print(f"Loaded modal analysis: {args.modal_npz}")
     print(f"Reference shape: {frame_ref_bgr.shape[:2]}, modes: {mode_u.shape[0]}")
-    print(f"FFT normalization gain: {fft_gain:.8g}")
-    print(f"User gain: {float(args.gain):.8g}")
-    print(f"Total displacement gain: {total_gain:.8g}")
+    print("FFT normalization: disabled")
+    print(f"Manual displacement scale: {scale:.8g}")
 
     for mode_i in _mode_indices(mode_u.shape[0], args.mode_index):
         out_idx = mode_i + 1
         freq = float(selected_freqs[mode_i])
-        u = (mode_u[mode_i] * np.float32(total_gain)).astype(np.complex64, copy=False)
-        v = (mode_v[mode_i] * np.float32(total_gain)).astype(np.complex64, copy=False)
+        u = (mode_u[mode_i] * np.float32(scale)).astype(np.complex64, copy=False)
+        v = (mode_v[mode_i] * np.float32(scale)).astype(np.complex64, copy=False)
         np.savez_compressed(
             out_dir / f"mode_{out_idx:02d}.npz",
             freq_hz=np.array(freq, dtype=np.float32),
             mode_u=u,
             mode_v=v,
-            gain=np.array(total_gain, dtype=np.float32),
+            scale=np.array(scale, dtype=np.float32),
         )
         _save_mode_visuals(out_dir, out_idx, u, v, mask, float(args.preview_percentile))
         out_mp4 = out_dir / f"mode_{out_idx:02d}_{freq:.3f}Hz.mp4"
+        opencv_mp4 = out_dir / f"mode_{out_idx:02d}_{freq:.3f}Hz_opencv_tmp.mp4"
         _write_mode_video(
             frame_ref_bgr=frame_ref_bgr,
             mode_u=u,
             mode_v=v,
             freq_hz=freq,
             mask=mask,
-            out_path=out_mp4,
+            out_path=opencv_mp4,
             fps_out=fps_out,
             duration_s=float(args.duration_s),
             speed=float(args.speed),
-            gain=1.0,
         )
-        print(f"Saved mode {out_idx}: {freq:.6f} Hz -> {out_mp4}")
+        converted = _convert_to_h264(opencv_mp4, out_mp4)
+        suffix = "H.264" if converted else "OpenCV mp4v"
+        print(f"Saved mode {out_idx}: {freq:.6f} Hz -> {out_mp4} ({suffix})")
 
 
 def main(argv: list[str] | None = None) -> None:
