@@ -9,14 +9,11 @@ and displays:
 
     - base 3D surface points;
     - animated harmonic motion X(theta) = X + scale * real(phi * exp(j theta));
-    - principal-direction arrows whose length is modal amplitude and whose hue
-      is modal phase;
+    - phase-colored animated points;
     - view1/view2 camera frustums from modal_surface view configs.
 
-The arrows follow a Davis-style modal visualization convention: geometry
-encodes direction and amplitude, while color hue encodes phase. Since a 3D
-complex displacement can describe a local ellipse rather than a single line,
-the arrow direction is the principal axis of the per-point harmonic motion.
+The color hue encodes the current per-point modal phase definition. The viewer
+is only a display tool; it does not modify the latent field or camera configs.
 """
 
 from __future__ import annotations
@@ -68,8 +65,8 @@ def hsv_colors(phase: np.ndarray) -> np.ndarray:
     return np.asarray(rgb, dtype=np.float32)
 
 
-def principal_modal_axes(phi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute principal axis, amplitude, and phase for each complex 3D phi.
+def principal_modal_phases(phi: np.ndarray) -> np.ndarray:
+    """Compute the current principal-axis phase for each complex 3D phi.
 
     The harmonic displacement for one point is:
 
@@ -82,8 +79,6 @@ def principal_modal_axes(phi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.nd
     phi onto that principal direction.
     """
     phi = np.asarray(phi, dtype=np.complex64)
-    directions = np.zeros((phi.shape[0], 3), dtype=np.float32)
-    amplitudes = np.zeros((phi.shape[0],), dtype=np.float32)
     phases = np.zeros((phi.shape[0],), dtype=np.float32)
     real = np.real(phi).astype(np.float64)
     neg_imag = -np.imag(phi).astype(np.float64)
@@ -98,22 +93,10 @@ def principal_modal_axes(phi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.nd
         # The principal axis has a sign ambiguity. Orient it so the projected
         # complex scalar has nonnegative real part, which makes hue stable.
         if np.real(q) < 0:
-            direction = -direction
             q = -q
-        directions[i] = direction.astype(np.float32)
-        amplitudes[i] = np.float32(S[0])
         phases[i] = np.float32(np.angle(q))
 
-    return directions, amplitudes, phases
-
-
-def select_arrow_indices(amplitudes: np.ndarray, max_arrows: int) -> np.ndarray:
-    """Select a deterministic subset of arrows, preferring larger amplitudes."""
-    n = amplitudes.shape[0]
-    if max_arrows <= 0 or max_arrows >= n:
-        return np.arange(n, dtype=np.int64)
-    order = np.argsort(amplitudes)[::-1]
-    return np.sort(order[:max_arrows]).astype(np.int64)
+    return phases
 
 
 def animated_points(points: np.ndarray, phi: np.ndarray, phase_degrees: float, disp_scale: float) -> np.ndarray:
@@ -121,64 +104,6 @@ def animated_points(points: np.ndarray, phi: np.ndarray, phase_degrees: float, d
     theta = np.deg2rad(float(phase_degrees))
     displacement = np.real(phi * np.exp(1j * theta)).astype(np.float32)
     return points.astype(np.float32) + float(disp_scale) * displacement
-
-
-def make_arrow_point_cloud(
-    points: np.ndarray,
-    directions: np.ndarray,
-    amplitudes: np.ndarray,
-    colors: np.ndarray,
-    arrow_scale: float,
-    shaft_samples: int,
-    head_samples: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Represent arrows as a colored point cloud sampled on shafts and heads."""
-    if shaft_samples < 2:
-        raise ValueError("shaft_samples must be >= 2.")
-    if head_samples < 2:
-        raise ValueError("head_samples must be >= 2.")
-
-    amp_ref = float(np.percentile(amplitudes[amplitudes > 0], 95)) if np.any(amplitudes > 0) else 1.0
-    amp_ref = max(amp_ref, 1e-8)
-    arrow_points: list[np.ndarray] = []
-    arrow_colors: list[np.ndarray] = []
-    shaft_t = np.linspace(0.0, 1.0, shaft_samples, dtype=np.float32)[:, None]
-    head_t = np.linspace(0.0, 1.0, head_samples, dtype=np.float32)[:, None]
-
-    for point, direction, amplitude, color in zip(points, directions, amplitudes, colors):
-        length = float(arrow_scale) * float(amplitude) / amp_ref
-        if not np.isfinite(length) or length <= 0:
-            continue
-        norm = float(np.linalg.norm(direction))
-        if norm <= 1e-8:
-            continue
-        unit = direction.astype(np.float32) / norm
-        start = point.astype(np.float32)
-        end = start + np.float32(length) * unit
-
-        shaft = start[None, :] * (1.0 - shaft_t) + end[None, :] * shaft_t
-        arrow_points.append(shaft)
-        arrow_colors.append(np.repeat(color[None, :], shaft.shape[0], axis=0))
-
-        ref = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        if abs(float(np.dot(ref, unit))) > 0.95:
-            ref = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        side = np.cross(unit, ref)
-        side_norm = float(np.linalg.norm(side))
-        if side_norm <= 1e-8:
-            continue
-        side = side / side_norm
-        head_len = np.float32(0.25 * length)
-        head_width = np.float32(0.10 * length)
-        for sign in (-1.0, 1.0):
-            head_end = end - head_len * unit + np.float32(sign) * head_width * side
-            head = end[None, :] * (1.0 - head_t) + head_end[None, :] * head_t
-            arrow_points.append(head)
-            arrow_colors.append(np.repeat(color[None, :], head.shape[0], axis=0))
-
-    if not arrow_points:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
-    return np.concatenate(arrow_points, axis=0), np.concatenate(arrow_colors, axis=0)
 
 
 def compute_display_center(points: np.ndarray, mode: str) -> np.ndarray:
@@ -192,6 +117,21 @@ def compute_display_center(points: np.ndarray, mode: str) -> np.ndarray:
     raise ValueError(f"Unknown center mode {mode!r}.")
 
 
+def display_camera_pose(cfg: ViewConfig, display_center: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Return Viser camera pose fields in display coordinates."""
+    import viser.transforms as vtf
+
+    c2w = np.linalg.inv(cfg.world_to_camera)
+    fov = float(2.0 * np.arctan(0.5 * cfg.image_height / cfg.K[1, 1]))
+    aspect = float(cfg.image_width) / float(cfg.image_height)
+    return (
+        vtf.SO3.from_matrix(c2w[:3, :3]).wxyz,
+        c2w[:3, 3] - display_center,
+        fov,
+        aspect,
+    )
+
+
 def add_camera_frustum(
     server,
     name: str,
@@ -200,20 +140,27 @@ def add_camera_frustum(
     display_center: np.ndarray,
 ) -> None:
     """Add a camera frustum from a modal_surface world_to_camera matrix."""
-    import viser.transforms as vtf
-
-    c2w = np.linalg.inv(cfg.world_to_camera)
-    fov = float(2.0 * np.arctan(0.5 * cfg.image_height / cfg.K[1, 1]))
-    aspect = float(cfg.image_width) / float(cfg.image_height)
+    wxyz, position, fov, aspect = display_camera_pose(cfg, display_center)
     server.scene.add_camera_frustum(
         name,
         fov=fov,
         aspect=aspect,
         scale=0.25,
         color=color,
-        wxyz=vtf.SO3.from_matrix(c2w[:3, :3]).wxyz,
-        position=c2w[:3, 3] - display_center,
+        wxyz=wxyz,
+        position=position,
     )
+
+
+def set_client_to_view(event, cfg: ViewConfig, display_center: np.ndarray) -> None:
+    """Move the active Viser client camera to one modal_surface camera view."""
+    if event.client is None:
+        return
+    wxyz, position, fov, _ = display_camera_pose(cfg, display_center)
+    with event.client.atomic():
+        event.client.camera.wxyz = wxyz
+        event.client.camera.position = position
+        event.client.camera.fov = fov
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -222,15 +169,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--view1-config", required=True, type=Path, help="modal_surface view1_config.json.")
     parser.add_argument("--view2-config", required=True, type=Path, help="modal_surface view2_config.json.")
     parser.add_argument("--port", type=int, default=8891, help="Viser server port.")
-    parser.add_argument("--max-arrows", type=int, default=1500, help="Maximum principal-direction arrows to display.")
-    parser.add_argument("--arrow-scale", type=float, default=0.15, help="World-space length of the p95 principal arrow.")
     parser.add_argument("--disp-scale", type=float, default=0.5, help="Multiplier for animated full-complex displacement.")
     parser.add_argument("--point-size", type=float, default=0.015, help="Animated/base point cloud point size.")
-    parser.add_argument("--arrow-point-size", type=float, default=0.01, help="Point size used to draw sampled arrows.")
     parser.add_argument("--phase-degrees", type=float, default=0.0, help="Initial animation phase in degrees.")
     parser.add_argument("--fps", type=float, default=12.0, help="Playback FPS for the phase animation.")
-    parser.add_argument("--shaft-samples", type=int, default=8, help="Number of points sampled along each arrow shaft.")
-    parser.add_argument("--head-samples", type=int, default=4, help="Number of points sampled along each arrow head segment.")
     parser.add_argument(
         "--center-mode",
         choices=("bbox", "centroid", "none"),
@@ -260,8 +202,7 @@ def main() -> None:
 
     cfg1 = load_view_config(args.view1_config)
     cfg2 = load_view_config(args.view2_config)
-    directions, amplitudes, phases = principal_modal_axes(phi)
-    arrow_idx = select_arrow_indices(amplitudes, args.max_arrows)
+    phases = principal_modal_phases(phi)
     phase_colors = hsv_colors(phases)
     display_center = compute_display_center(points, args.center_mode)
     points_display = points - display_center[None, :]
@@ -271,16 +212,15 @@ def main() -> None:
     add_camera_frustum(server, "/cameras/view1", cfg1, (80, 150, 255), display_center)
     add_camera_frustum(server, "/cameras/view2", cfg2, (255, 130, 70), display_center)
 
-    handles = {"base": None, "animated": None, "arrows": None}
+    handles = {"base": None, "animated": None}
 
     phase_slider = server.gui.add_slider("Phase (deg)", min=0.0, max=360.0, step=1.0, initial_value=float(args.phase_degrees % 360.0))
     disp_scale_slider = server.gui.add_slider("Displacement scale", min=0.0, max=5.0, step=0.01, initial_value=float(args.disp_scale))
-    arrow_scale_slider = server.gui.add_slider("Arrow scale", min=0.0, max=2.0, step=0.01, initial_value=float(args.arrow_scale))
     point_size_slider = server.gui.add_slider("Point size", min=0.001, max=0.08, step=0.001, initial_value=float(args.point_size))
-    arrow_point_size_slider = server.gui.add_slider("Arrow point size", min=0.001, max=0.06, step=0.001, initial_value=float(args.arrow_point_size))
     show_base = server.gui.add_checkbox("Show base points", True)
     show_animated = server.gui.add_checkbox("Show animated points", True)
-    show_arrows = server.gui.add_checkbox("Show principal arrows", False)
+    go_view1_button = server.gui.add_button("Go to view1")
+    go_view2_button = server.gui.add_button("Go to view2")
     playing = server.gui.add_checkbox("Play", False)
     fps_slider = server.gui.add_slider("FPS", min=1.0, max=60.0, step=1.0, initial_value=float(args.fps))
 
@@ -309,46 +249,22 @@ def main() -> None:
                 point_size=float(point_size_slider.value),
             )
 
-    def redraw_arrows() -> None:
-        if handles["arrows"] is not None:
-            handles["arrows"].remove()
-            handles["arrows"] = None
-        if show_arrows.value:
-            arrow_points, arrow_colors = make_arrow_point_cloud(
-                points_display[arrow_idx],
-                directions[arrow_idx],
-                amplitudes[arrow_idx],
-                phase_colors[arrow_idx],
-                float(arrow_scale_slider.value),
-                int(args.shaft_samples),
-                int(args.head_samples),
-            )
-            handles["arrows"] = server.scene.add_point_cloud(
-                "/modal/principal_arrows",
-                points=arrow_points,
-                colors=arrow_colors,
-                point_size=float(arrow_point_size_slider.value),
-            )
-
     def redraw_all() -> None:
         redraw_base()
         redraw_dynamic()
-        redraw_arrows()
 
     phase_slider.on_update(lambda _: redraw_dynamic())
     disp_scale_slider.on_update(lambda _: redraw_dynamic())
     point_size_slider.on_update(lambda _: (redraw_base(), redraw_dynamic()))
-    arrow_scale_slider.on_update(lambda _: redraw_arrows())
-    arrow_point_size_slider.on_update(lambda _: redraw_arrows())
     show_base.on_update(lambda _: redraw_base())
     show_animated.on_update(lambda _: redraw_dynamic())
-    show_arrows.on_update(lambda _: redraw_arrows())
+    go_view1_button.on_click(lambda event: set_client_to_view(event, cfg1, display_center))
+    go_view2_button.on_click(lambda event: set_client_to_view(event, cfg2, display_center))
 
     redraw_all()
     print(f"Loaded {points.shape[0]} latent modal points.")
     print(f"Viewer center mode: {args.center_mode}")
     print(f"Viewer display center in original world coordinates: {display_center.tolist()}")
-    print(f"Showing {arrow_idx.shape[0]} principal-direction arrows.")
     print(f"Viser server running on http://localhost:{args.port}")
 
     def playback_loop() -> None:
