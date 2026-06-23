@@ -207,6 +207,30 @@ def _displacement_stats(mode_u: np.ndarray, mode_v: np.ndarray, mask: np.ndarray
     return {"p95": float(np.percentile(vals, 95)), "max": float(vals.max())}
 
 
+def _normalized_amplitude_depth_weight(mode_u: np.ndarray, mode_v: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
+    amp = np.sqrt((np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32))
+    finite = np.isfinite(amp)
+    if mask is not None:
+        valid = finite & mask.astype(bool, copy=False) & (amp > 0)
+    else:
+        valid = finite & (amp > 0)
+    vals = amp[valid]
+    if vals.size == 0:
+        return np.zeros_like(amp, dtype=np.float32)
+
+    lo = float(np.percentile(vals, 1))
+    hi = float(np.percentile(vals, 99))
+    if hi <= lo:
+        lo = 0.0
+        hi = max(float(vals.max()), 1.0)
+
+    depth_weight = np.clip((amp - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+    depth_weight[~finite] = 0.0
+    if mask is not None:
+        depth_weight *= mask.astype(np.float32)
+    return depth_weight
+
+
 def _write_mode_video(
     frame_ref_bgr: np.ndarray,
     mode_u: np.ndarray,
@@ -230,9 +254,7 @@ def _write_mode_video(
 
     depth_weight_field = None
     if render_config.backend == "gl_mesh" and render_config.depth_weight == "amplitude":
-        depth_weight_field = np.sqrt((np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32))
-        if mask is not None:
-            depth_weight_field *= mask.astype(np.float32)
+        depth_weight_field = _normalized_amplitude_depth_weight(mode_u, mode_v, mask)
     resources = create_render_resources((h, w), render_config, depth_weight_field=depth_weight_field)
     try:
         for frame_idx in range(n_frames):
