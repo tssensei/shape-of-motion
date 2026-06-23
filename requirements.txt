@@ -3,6 +3,8 @@ opencv-python
 imageio
 imageio-ffmpeg
 matplotlib
+pyopengl
+glfw
 tensorboard
 scikit-learn
 jaxtyping

@@ -12,6 +12,8 @@ matplotlib.use("Agg")
 from matplotlib.colors import hsv_to_rgb
 import numpy as np
 
+from modal_peak_pick.core.reconstruct import RenderConfig, create_render_resources, render_reference_frame
+
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--modal-npz", required=True, help="modal_analysis.npz exported by run_modal_peak_pick.py export.")
@@ -21,6 +23,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fps-out", type=float, default=None, help="Output FPS. Default uses the input modal-analysis FPS.")
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier for the modal oscillation.")
     parser.add_argument("--scale", type=float, default=1.0, help="Manual multiplier applied directly to raw complex mode_u/mode_v.")
+    parser.add_argument("--render-backend", choices=["gl_mesh", "forward_splat", "backward_warp"], default="gl_mesh", help="Frame reconstruction backend.")
+    parser.add_argument("--mesh-step", type=int, default=16, help="Regular mesh spacing in pixels for gl_mesh.")
+    parser.add_argument("--show-mesh", action="store_true", help="Overlay the deformed regular mesh on gl_mesh frames.")
+    parser.add_argument("--depth-weight", choices=["none", "amplitude"], default="amplitude", help="Vertex depth proxy used by gl_mesh.")
+    parser.add_argument("--synth-mask-mode", choices=["none", "modal", "dilated"], default="dilated", help="Mask used to gate synthesized displacement.")
+    parser.add_argument("--mask-dilate-iters", type=int, default=8, help="3x3 dilation iterations for --synth-mask-mode dilated.")
+    parser.add_argument("--fill-mode", choices=["reference", "inpaint"], default="inpaint", help="Hole filling mode for forward_splat.")
     parser.add_argument("--reference-video", default=None, help="Optional video path used to load a color reference frame.")
     parser.add_argument("--reference-time-s", type=float, default=None, help="Optional reference time for --reference-video.")
     parser.add_argument("--preview-percentile", type=float, default=99.0, help="Magnitude percentile used for HSV preview images.")
@@ -168,18 +177,34 @@ def _save_mode_visuals(
     cv2.imwrite(str(out_dir / f"mode_{mode_idx:02d}_v_hsv.png"), cv2.cvtColor(np.clip(v_rgb * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
 
-def _backward_warp(frame_bgr: np.ndarray, dx: np.ndarray, dy: np.ndarray) -> np.ndarray:
-    h, w = frame_bgr.shape[:2]
-    yy, xx = np.mgrid[0:h, 0:w]
-    map_x = xx.astype(np.float32) - dx.astype(np.float32)
-    map_y = yy.astype(np.float32) - dy.astype(np.float32)
-    return cv2.remap(
-        frame_bgr,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REFLECT101,
-    )
+def _build_synth_mask(mask: np.ndarray | None, mode: str, dilate_iters: int) -> np.ndarray | None:
+    if mode == "none" or mask is None:
+        return None
+    if mode == "modal":
+        return mask.astype(bool, copy=False)
+    if mode == "dilated":
+        if dilate_iters < 0:
+            raise ValueError("--mask-dilate-iters must be non-negative.")
+        if dilate_iters == 0:
+            return mask.astype(bool, copy=False)
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=int(dilate_iters))
+        return dilated > 0
+    raise ValueError(f"Unknown synth mask mode: {mode}")
+
+
+def _save_render_mask(out_dir: Path, mask: np.ndarray | None) -> None:
+    if mask is None:
+        return
+    cv2.imwrite(str(out_dir / "render_mask.png"), mask.astype(np.uint8) * 255)
+
+
+def _displacement_stats(mode_u: np.ndarray, mode_v: np.ndarray, mask: np.ndarray | None) -> dict[str, float]:
+    amp = np.sqrt((np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32))
+    vals = amp[mask] if mask is not None and np.any(mask) else amp.ravel()
+    if vals.size == 0:
+        return {"p95": 0.0, "max": 0.0}
+    return {"p95": float(np.percentile(vals, 95)), "max": float(vals.max())}
 
 
 def _write_mode_video(
@@ -192,6 +217,7 @@ def _write_mode_video(
     fps_out: float,
     duration_s: float,
     speed: float,
+    render_config: RenderConfig,
 ) -> None:
     h, w = frame_ref_bgr.shape[:2]
     if mode_u.shape != (h, w) or mode_v.shape != (h, w):
@@ -202,7 +228,12 @@ def _write_mode_video(
     if not writer.isOpened():
         raise RuntimeError(f"Cannot open video writer: {out_path}")
 
-    mask_f = None if mask is None else mask.astype(np.float32)
+    depth_weight_field = None
+    if render_config.backend == "gl_mesh" and render_config.depth_weight == "amplitude":
+        depth_weight_field = np.sqrt((np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32))
+        if mask is not None:
+            depth_weight_field *= mask.astype(np.float32)
+    resources = create_render_resources((h, w), render_config, depth_weight_field=depth_weight_field)
     try:
         for frame_idx in range(n_frames):
             t = float(frame_idx) / float(fps_out)
@@ -210,12 +241,19 @@ def _write_mode_video(
             phase_rel = (phase - np.complex64(1.0)).astype(np.complex64)
             dx = np.real(mode_u * phase_rel).astype(np.float32)
             dy = np.real(mode_v * phase_rel).astype(np.float32)
-            if mask_f is not None:
-                dx *= mask_f
-                dy *= mask_f
-            writer.write(_backward_warp(frame_ref_bgr, dx, dy))
+            writer.write(
+                render_reference_frame(
+                    frame_ref_bgr,
+                    dx,
+                    dy,
+                    config=render_config,
+                    mask=mask,
+                    resources=resources,
+                )
+            )
     finally:
         writer.release()
+        resources.close()
 
 
 def _mode_indices(num_modes: int, mode_index: int | None) -> list[int]:
@@ -290,18 +328,39 @@ def run(args: argparse.Namespace) -> None:
     print(f"Reference shape: {frame_ref_bgr.shape[:2]}, modes: {mode_u.shape[0]}")
     print("FFT normalization: disabled")
     print(f"Manual displacement scale: {scale:.8g}")
+    print(f"Render backend: {args.render_backend}")
+    print(f"Synthesis mask mode: {args.synth_mask_mode}")
+
+    synth_mask = _build_synth_mask(mask, args.synth_mask_mode, int(args.mask_dilate_iters))
+    _save_render_mask(out_dir, synth_mask)
+    active_pixels = int(synth_mask.sum()) if synth_mask is not None else frame_ref_bgr.shape[0] * frame_ref_bgr.shape[1]
+    print(f"Active displacement mask pixels: {active_pixels}")
+
+    render_config = RenderConfig(
+        backend=str(args.render_backend),
+        fill_mode=str(args.fill_mode),
+        use_mask=synth_mask is not None,
+        mesh_step=int(args.mesh_step),
+        show_mesh=bool(args.show_mesh),
+        depth_weight=str(args.depth_weight),
+    )
 
     for mode_i in _mode_indices(mode_u.shape[0], args.mode_index):
         out_idx = mode_i + 1
         freq = float(selected_freqs[mode_i])
         u = (mode_u[mode_i] * np.float32(scale)).astype(np.complex64, copy=False)
         v = (mode_v[mode_i] * np.float32(scale)).astype(np.complex64, copy=False)
+        stats = _displacement_stats(u, v, synth_mask)
+        print(f"Mode {out_idx} complex displacement amplitude: p95={stats['p95']:.4f}px max={stats['max']:.4f}px")
         np.savez_compressed(
             out_dir / f"mode_{out_idx:02d}.npz",
             freq_hz=np.array(freq, dtype=np.float32),
             mode_u=u,
             mode_v=v,
             scale=np.array(scale, dtype=np.float32),
+            render_backend=np.array(str(args.render_backend)),
+            synth_mask_mode=np.array(str(args.synth_mask_mode)),
+            mask_dilate_iters=np.array(int(args.mask_dilate_iters), dtype=np.int32),
         )
         _save_mode_visuals(out_dir, out_idx, u, v, mask, float(args.preview_percentile))
         out_mp4 = out_dir / f"mode_{out_idx:02d}_{freq:.3f}Hz.mp4"
@@ -311,11 +370,12 @@ def run(args: argparse.Namespace) -> None:
             mode_u=u,
             mode_v=v,
             freq_hz=freq,
-            mask=mask,
+            mask=synth_mask,
             out_path=opencv_mp4,
             fps_out=fps_out,
             duration_s=float(args.duration_s),
             speed=float(args.speed),
+            render_config=render_config,
         )
         converted = _convert_to_h264(opencv_mp4, out_mp4)
         suffix = "H.264" if converted else "OpenCV mp4v"
