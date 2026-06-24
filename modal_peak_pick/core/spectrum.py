@@ -63,6 +63,71 @@ def fft_over_time(
     return freqs_hz, U, V
 
 
+def dft_at_frequencies(
+    u: np.ndarray,
+    v: np.ndarray,
+    fps: float,
+    freqs_hz: np.ndarray | list[float],
+    detrend: bool = True,
+    window: str = "hann",
+    dft_block_w: int = 128,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate the temporal DFT at exact user-specified frequencies."""
+    if u.shape != v.shape or u.ndim != 3:
+        raise ValueError("u and v must have the same shape [T,H,W].")
+    if fps <= 0:
+        raise ValueError("fps must be positive.")
+    if dft_block_w <= 0:
+        raise ValueError("dft_block_w must be positive.")
+
+    freq_array = np.asarray(freqs_hz, dtype=np.float64).reshape(-1)
+    if freq_array.size == 0:
+        raise ValueError("At least one DFT frequency is required.")
+    if not np.all(np.isfinite(freq_array)):
+        raise ValueError("DFT frequencies must be finite.")
+    if np.any(freq_array < 0.0) or np.any(freq_array > float(fps) * 0.5):
+        raise ValueError(f"DFT frequencies must be in [0, Nyquist={float(fps) * 0.5:g}] Hz.")
+
+    num_samples, h, w = u.shape
+    if num_samples < 3:
+        raise ValueError("Need at least 3 temporal samples for DFT.")
+
+    U = np.empty((freq_array.size, h, w), dtype=np.complex64)
+    V = np.empty((freq_array.size, h, w), dtype=np.complex64)
+
+    temporal_window = None
+    if window.lower() == "hann":
+        temporal_window = _hann(num_samples).astype(np.float32)[:, None, None]
+    elif window.lower() not in {"none", "boxcar", "rect"}:
+        raise ValueError(f"Unsupported window: {window}")
+
+    t = (np.arange(num_samples, dtype=np.float64) / float(fps))[None, :]
+    basis = np.exp((-2j * np.pi) * freq_array[:, None] * t).astype(np.complex64, copy=False)
+
+    block_w = min(int(dft_block_w), w)
+    for x0 in range(0, w, block_w):
+        x1 = min(w, x0 + block_w)
+        ub = np.asarray(u[:, :, x0:x1], dtype=np.float32)
+        vb = np.asarray(v[:, :, x0:x1], dtype=np.float32)
+
+        if detrend:
+            ub = ub - ub.mean(axis=0, keepdims=True, dtype=np.float32)
+            vb = vb - vb.mean(axis=0, keepdims=True, dtype=np.float32)
+        else:
+            ub = ub.copy()
+            vb = vb.copy()
+
+        if temporal_window is not None:
+            ub *= temporal_window
+            vb *= temporal_window
+
+        for k in range(freq_array.size):
+            U[k, :, x0:x1] = np.tensordot(basis[k], ub, axes=(0, 0)).astype(np.complex64, copy=False)
+            V[k, :, x0:x1] = np.tensordot(basis[k], vb, axes=(0, 0)).astype(np.complex64, copy=False)
+
+    return freq_array.astype(np.float32), U, V
+
+
 def amplitude_map(U: np.ndarray, V: np.ndarray) -> np.ndarray:
     return np.sqrt((np.abs(U) ** 2 + np.abs(V) ** 2).astype(np.float32))
 
@@ -111,4 +176,3 @@ def snap_to_local_peak(
         return float(freqs_hz[np.argmin(np.abs(freqs_hz - float(f_click_hz)))])
     best = idx[np.argmax(power_spectrum[idx])]
     return float(freqs_hz[best])
-

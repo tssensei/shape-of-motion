@@ -14,7 +14,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--out", default="outputs/modal_analysis.npz", help="Output .npz path.")
     parser.add_argument("--freqs", default=None, help="Comma-separated selected frequencies in Hz.")
     parser.add_argument("--peaks-json", default=None, help="JSON file with selected_peaks_hz.")
-    parser.add_argument("--peak-window-hz", type=float, default=0.6, help="Snap selected frequencies to local peaks.")
     parser.add_argument("--mask", default=None, help="Optional binary ROI mask path (.npy or image).")
     parser.add_argument("--t0", type=float, default=0.0, help="Clip start time in seconds.")
     parser.add_argument("--t1", type=float, default=None, help="Clip end time in seconds.")
@@ -70,7 +69,7 @@ def run(args: argparse.Namespace) -> None:
     modes_v = []
     selected_freqs = []
     for idx, freq in enumerate(requested_freqs, start=1):
-        mode = select_mode_slice(result, freq, peak_window_hz=args.peak_window_hz, mode_idx=idx)
+        mode = select_mode_slice(result, freq, mode_idx=idx)
         modes_u.append(mode.U_slice)
         modes_v.append(mode.V_slice)
         selected_freqs.append(mode.freq_selected_hz)
@@ -95,7 +94,7 @@ def run(args: argparse.Namespace) -> None:
         source_mask=_opt_text(args.mask),
         requested_freqs_hz=np.asarray(requested_freqs, dtype=np.float32),
         selected_freqs_hz=np.asarray(selected_freqs, dtype=np.float32),
-        peak_window_hz=np.array(args.peak_window_hz, dtype=np.float32),
+        frequency_method=np.array("exact_dft"),
         flow_method=np.array(str(args.flow_method)),
         no_smooth=np.array(bool(args.no_smooth), dtype=np.uint8),
         sigma_b=np.array(args.sigma_b, dtype=np.float32),

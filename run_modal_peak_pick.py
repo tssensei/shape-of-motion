@@ -33,7 +33,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--out", default="outputs_modal/modal_analysis.npz", help="Output .npz path.")
     p_export.add_argument("--freqs", default=None, help="Comma-separated selected frequencies in Hz.")
     p_export.add_argument("--peaks-json", default=None, help="JSON file with selected_peaks_hz.")
-    p_export.add_argument("--peak-window-hz", type=float, default=0.6, help="Snap selected frequencies to local peaks.")
     p_export.add_argument("--mask", default=None, help="Optional binary ROI mask path (.npy or image).")
     p_export.add_argument("--t0", type=float, default=0.0, help="Clip start time in seconds.")
     p_export.add_argument("--t1", type=float, default=None, help="Clip end time in seconds.")

@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from modal_peak_pick.core.flow import compute_dense_flow_to_reference, contrast_weighted_smooth
-from modal_peak_pick.core.spectrum import fft_over_time, global_power_spectrum, snap_to_local_peak
+from modal_peak_pick.core.spectrum import dft_at_frequencies, fft_over_time, global_power_spectrum
 from modal_peak_pick.core.video_io import load_video_clip
 
 
@@ -164,21 +164,21 @@ def run_modal_analysis_from_video(
 
 def select_mode_slice(
     result: ModalAnalysisResult,
-    f_click_hz: float,
-    peak_window_hz: float,
+    f_hz: float,
     mode_idx: int = 1,
 ) -> ModeSlice:
-    f_selected = snap_to_local_peak(
-        result.freqs_hz,
-        result.power_spectrum,
-        f_click_hz,
-        window_hz=peak_window_hz,
+    selected_freqs_hz, U, V = dft_at_frequencies(
+        result.u,
+        result.v,
+        fps=result.fps,
+        freqs_hz=[float(f_hz)],
+        detrend=True,
+        window="hann",
     )
-    k = int(np.argmin(np.abs(result.freqs_hz - f_selected)))
     return ModeSlice(
         mode_idx=int(mode_idx),
-        freq_input_hz=float(f_click_hz),
-        freq_selected_hz=float(result.freqs_hz[k]),
-        U_slice=result.U[k].astype(np.complex64, copy=False),
-        V_slice=result.V[k].astype(np.complex64, copy=False),
+        freq_input_hz=float(f_hz),
+        freq_selected_hz=float(selected_freqs_hz[0]),
+        U_slice=U[0].astype(np.complex64, copy=False),
+        V_slice=V[0].astype(np.complex64, copy=False),
     )
