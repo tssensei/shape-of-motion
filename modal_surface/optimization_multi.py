@@ -229,6 +229,17 @@ def optimize_multi_view(
     old_to_new = np.full((points.shape[0],), -1, dtype=np.int64)
     old_to_new[active_indices] = np.arange(active_indices.size, dtype=np.int64)
     keep_obs = active[obs_point_index]
+    optional_point_fields = {}
+    if "point_source_view_mask" in data.files:
+        point_source_view_mask = data["point_source_view_mask"]
+        if point_source_view_mask.shape[0] != points.shape[0]:
+            raise ValueError("point_source_view_mask does not match points_world length.")
+        optional_point_fields["point_source_view_mask"] = point_source_view_mask[active_indices].astype(bool)
+    if "point_source_count" in data.files:
+        point_source_count = data["point_source_count"]
+        if point_source_count.shape[0] != points.shape[0]:
+            raise ValueError("point_source_count does not match points_world length.")
+        optional_point_fields["point_source_count"] = point_source_count[active_indices].astype(np.int32)
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -253,6 +264,7 @@ def optimize_multi_view(
         optimization_history=np.asarray(history, dtype=np.float32),
         alpha_history=np.asarray(alpha_history, dtype=np.complex64),
         source_observations=np.array(str(observations_path)),
+        **optional_point_fields,
     )
 
     if vis_dir is not None:

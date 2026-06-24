@@ -67,6 +67,25 @@ def hsv_colors(phase: np.ndarray) -> np.ndarray:
     return np.asarray(rgb, dtype=np.float32)
 
 
+def source_view_colors(
+    point_source_view_mask: np.ndarray,
+    camera_colors: list[tuple[int, int, int]],
+) -> np.ndarray:
+    """Color each point by the view or views that contributed its initial surface sample."""
+    if point_source_view_mask.ndim != 2:
+        raise ValueError(f"point_source_view_mask must have shape (N,V), got {point_source_view_mask.shape}.")
+    if point_source_view_mask.shape[1] > len(camera_colors):
+        raise ValueError("Not enough camera colors for point_source_view_mask.")
+
+    palette = np.asarray(camera_colors[: point_source_view_mask.shape[1]], dtype=np.float32) / 255.0
+    weights = point_source_view_mask.astype(np.float32)
+    counts = weights.sum(axis=1, keepdims=True)
+    colors = weights @ palette
+    colors = colors / np.maximum(counts, 1.0)
+    colors[counts[:, 0] == 0] = 0.58
+    return colors.astype(np.float32)
+
+
 def principal_modal_phases(phi: np.ndarray) -> np.ndarray:
     """Compute the current principal-axis phase for each complex 3D phi.
 
@@ -237,17 +256,39 @@ def main() -> None:
     ]
     for i, cfg in enumerate(view_configs):
         add_camera_frustum(server, f"/cameras/{cfg.view_id}", cfg, camera_colors[i % len(camera_colors)], display_center)
+    source_colors = None
+    if "point_source_view_mask" in latent.files:
+        point_source_view_mask = latent["point_source_view_mask"].astype(bool)
+        if point_source_view_mask.shape[0] != points.shape[0]:
+            raise ValueError("point_source_view_mask does not match points_world length.")
+        if point_source_view_mask.shape[1] != len(view_configs):
+            raise ValueError("point_source_view_mask view count does not match provided --view-config count.")
+        source_colors = source_view_colors(point_source_view_mask, camera_colors)
 
     handles = {"base": None, "animated": None}
 
+    color_options = ("Phase", "Source views")
     phase_slider = server.gui.add_slider("Phase (deg)", min=0.0, max=360.0, step=1.0, initial_value=float(args.phase_degrees % 360.0))
     disp_scale_slider = server.gui.add_slider("Displacement scale", min=0.0, max=5.0, step=0.01, initial_value=float(args.disp_scale))
     point_size_slider = server.gui.add_slider("Point size", min=0.001, max=0.08, step=0.001, initial_value=float(args.point_size))
+    color_mode = server.gui.add_dropdown("Color mode", options=color_options, initial_value="Phase")
     show_base = server.gui.add_checkbox("Show base points", True)
     show_animated = server.gui.add_checkbox("Show animated points", True)
     go_view_buttons = [(cfg, server.gui.add_button(f"Go to {cfg.view_id}")) for cfg in view_configs]
     playing = server.gui.add_checkbox("Play", False)
     fps_slider = server.gui.add_slider("FPS", min=1.0, max=60.0, step=1.0, initial_value=float(args.fps))
+
+    def dynamic_colors() -> np.ndarray:
+        if color_mode.value == "Phase":
+            return phase_colors
+        if color_mode.value == "Source views":
+            if source_colors is None:
+                raise ValueError(
+                    "This latent file does not contain point_source_view_mask. "
+                    "Re-run match-multi-views and optimize-multi-view with the updated code."
+                )
+            return source_colors
+        raise ValueError(f"Unknown color mode: {color_mode.value}")
 
     def redraw_base() -> None:
         if handles["base"] is not None:
@@ -270,7 +311,7 @@ def main() -> None:
             handles["animated"] = server.scene.add_point_cloud(
                 "/modal/animated_points",
                 points=moved,
-                colors=phase_colors,
+                colors=dynamic_colors(),
                 point_size=float(point_size_slider.value),
             )
 
@@ -281,6 +322,7 @@ def main() -> None:
     phase_slider.on_update(lambda _: redraw_dynamic())
     disp_scale_slider.on_update(lambda _: redraw_dynamic())
     point_size_slider.on_update(lambda _: (redraw_base(), redraw_dynamic()))
+    color_mode.on_update(lambda _: redraw_dynamic())
     show_base.on_update(lambda _: redraw_base())
     show_animated.on_update(lambda _: redraw_dynamic())
     for cfg, button in go_view_buttons:
