@@ -3,14 +3,14 @@
 This viewer is intentionally independent of the full SOM/Flow3D viewer. It
 only reads the modal_surface optimization output:
 
-    latent_field_12_*.npz
+    latent_field_*.npz
 
 and displays:
 
     - base 3D surface points;
     - animated harmonic motion X(theta) = X + scale * real(phi * exp(j theta));
     - phase-colored animated points;
-    - view1/view2 camera frustums from modal_surface view configs.
+    - camera frustums from modal_surface view configs.
 
 The color hue encodes the current per-point modal phase definition. The viewer
 is only a display tool; it does not modify the latent field or camera configs.
@@ -33,6 +33,7 @@ import numpy as np
 class ViewConfig:
     """Minimal camera fields needed to draw a Viser camera frustum."""
 
+    view_id: str
     image_width: int
     image_height: int
     K: np.ndarray
@@ -50,6 +51,7 @@ def load_view_config(path: Path) -> ViewConfig:
     if world_to_camera.shape != (4, 4):
         raise ValueError(f"{path} world_to_camera must have shape (4,4), got {world_to_camera.shape}.")
     return ViewConfig(
+        view_id=str(raw.get("view_id", path.stem.replace("_config", ""))),
         image_width=int(raw["image_width"]),
         image_height=int(raw["image_height"]),
         K=K,
@@ -165,9 +167,10 @@ def set_client_to_view(event, cfg: ViewConfig, display_center: np.ndarray) -> No
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize latent 3D modal fields with Viser.")
-    parser.add_argument("--latent", required=True, type=Path, help="latent_field_12_*.npz from optimize-two-view.")
-    parser.add_argument("--view1-config", required=True, type=Path, help="modal_surface view1_config.json.")
-    parser.add_argument("--view2-config", required=True, type=Path, help="modal_surface view2_config.json.")
+    parser.add_argument("--latent", required=True, type=Path, help="latent_field_*.npz from modal_surface optimization.")
+    parser.add_argument("--view-config", action="append", default=[], type=Path, help="modal_surface view*_config.json. Repeat once per view.")
+    parser.add_argument("--view1-config", default=None, type=Path, help="Legacy modal_surface view1_config.json.")
+    parser.add_argument("--view2-config", default=None, type=Path, help="Legacy modal_surface view2_config.json.")
     parser.add_argument("--port", type=int, default=8891, help="Viser server port.")
     parser.add_argument("--disp-scale", type=float, default=0.5, help="Multiplier for animated full-complex displacement.")
     parser.add_argument("--point-size", type=float, default=0.015, help="Animated/base point cloud point size.")
@@ -180,6 +183,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Viewer-only recentering mode. Does not modify latent/config files.",
     )
     return parser
+
+
+def collect_view_config_paths(args: argparse.Namespace) -> list[Path]:
+    config_paths = list(args.view_config or [])
+    legacy_paths = [path for path in [args.view1_config, args.view2_config] if path is not None]
+    if config_paths and legacy_paths:
+        raise ValueError("Use either repeated --view-config arguments or legacy --view1-config/--view2-config, not both.")
+    if legacy_paths:
+        config_paths = legacy_paths
+    if not config_paths:
+        raise ValueError("Provide at least one --view-config.")
+    return config_paths
 
 
 def main() -> None:
@@ -200,8 +215,11 @@ def main() -> None:
     if phi.shape != points.shape:
         raise ValueError(f"phi must have shape {points.shape}, got {phi.shape}")
 
-    cfg1 = load_view_config(args.view1_config)
-    cfg2 = load_view_config(args.view2_config)
+    view_config_paths = collect_view_config_paths(args)
+    view_configs = [load_view_config(path) for path in view_config_paths]
+    view_ids = [cfg.view_id for cfg in view_configs]
+    if len(set(view_ids)) != len(view_ids):
+        raise ValueError(f"Duplicate view_id values are not allowed: {view_ids}")
     phases = principal_modal_phases(phi)
     phase_colors = hsv_colors(phases)
     display_center = compute_display_center(points, args.center_mode)
@@ -209,8 +227,16 @@ def main() -> None:
 
     base_color = np.full((points.shape[0], 3), 0.58, dtype=np.float32)
     server = viser.ViserServer(port=args.port, verbose=False)
-    add_camera_frustum(server, "/cameras/view1", cfg1, (80, 150, 255), display_center)
-    add_camera_frustum(server, "/cameras/view2", cfg2, (255, 130, 70), display_center)
+    camera_colors = [
+        (80, 150, 255),
+        (255, 130, 70),
+        (95, 200, 120),
+        (210, 120, 255),
+        (255, 210, 80),
+        (80, 220, 220),
+    ]
+    for i, cfg in enumerate(view_configs):
+        add_camera_frustum(server, f"/cameras/{cfg.view_id}", cfg, camera_colors[i % len(camera_colors)], display_center)
 
     handles = {"base": None, "animated": None}
 
@@ -219,8 +245,7 @@ def main() -> None:
     point_size_slider = server.gui.add_slider("Point size", min=0.001, max=0.08, step=0.001, initial_value=float(args.point_size))
     show_base = server.gui.add_checkbox("Show base points", True)
     show_animated = server.gui.add_checkbox("Show animated points", True)
-    go_view1_button = server.gui.add_button("Go to view1")
-    go_view2_button = server.gui.add_button("Go to view2")
+    go_view_buttons = [(cfg, server.gui.add_button(f"Go to {cfg.view_id}")) for cfg in view_configs]
     playing = server.gui.add_checkbox("Play", False)
     fps_slider = server.gui.add_slider("FPS", min=1.0, max=60.0, step=1.0, initial_value=float(args.fps))
 
@@ -258,11 +283,12 @@ def main() -> None:
     point_size_slider.on_update(lambda _: (redraw_base(), redraw_dynamic()))
     show_base.on_update(lambda _: redraw_base())
     show_animated.on_update(lambda _: redraw_dynamic())
-    go_view1_button.on_click(lambda event: set_client_to_view(event, cfg1, display_center))
-    go_view2_button.on_click(lambda event: set_client_to_view(event, cfg2, display_center))
+    for cfg, button in go_view_buttons:
+        button.on_click(lambda event, cfg=cfg: set_client_to_view(event, cfg, display_center))
 
     redraw_all()
     print(f"Loaded {points.shape[0]} latent modal points.")
+    print(f"Loaded view configs: {view_ids}")
     print(f"Viewer center mode: {args.center_mode}")
     print(f"Viewer display center in original world coordinates: {display_center.tolist()}")
     print(f"Viser server running on http://localhost:{args.port}")
