@@ -48,8 +48,12 @@ def parse_freqs(text: str) -> list[float]:
     return vals
 
 
-def load_mask(mask_path: Optional[str], h: int, w: int) -> Optional[np.ndarray]:
+def load_mask(mask_path: Optional[str], h: int, w: int, dilate_iters: int = 0) -> Optional[np.ndarray]:
+    if dilate_iters < 0:
+        raise ValueError("dilate_iters must be non-negative.")
     if mask_path is None:
+        if dilate_iters > 0:
+            raise ValueError("Mask dilation requires a mask path.")
         return None
 
     path = Path(mask_path)
@@ -65,8 +69,13 @@ def load_mask(mask_path: Optional[str], h: int, w: int) -> Optional[np.ndarray]:
     if mask.shape[:2] != (h, w):
         mask = cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
     if np.issubdtype(mask.dtype, np.floating):
-        return mask > 0.5
-    return mask > 127
+        mask_bool = mask > 0.5
+    else:
+        mask_bool = mask > 127
+    if dilate_iters > 0:
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        mask_bool = cv2.dilate(mask_bool.astype(np.uint8), kernel, iterations=int(dilate_iters)) > 0
+    return mask_bool
 
 
 def run_modal_analysis(
@@ -129,6 +138,7 @@ def run_modal_analysis_from_video(
     sigma_b: float = 3.0,
     sigma_c: float = 0.0,
     mask_path: Optional[str] = None,
+    analysis_mask_dilate_iters: int = 0,
 ) -> ModalAnalysisResult:
     frames_gray, fps = load_video_clip(
         video_path,
@@ -139,7 +149,7 @@ def run_modal_analysis_from_video(
         max_frames=max_frames,
     )
     h, w = int(frames_gray.shape[1]), int(frames_gray.shape[2])
-    mask = load_mask(mask_path, h, w)
+    mask = load_mask(mask_path, h, w, dilate_iters=int(analysis_mask_dilate_iters))
     return run_modal_analysis(
         frames_gray=frames_gray,
         fps=fps,
@@ -172,4 +182,3 @@ def select_mode_slice(
         U_slice=result.U[k].astype(np.complex64, copy=False),
         V_slice=result.V[k].astype(np.complex64, copy=False),
     )
-

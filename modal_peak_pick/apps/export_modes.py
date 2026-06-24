@@ -24,6 +24,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-smooth", action="store_true", help="Disable contrast-weighted flow smoothing.")
     parser.add_argument("--sigma-b", type=float, default=3.0, help="Spatial smoothing sigma.")
     parser.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
+    parser.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
 
 
 def _read_requested_freqs(freqs_text: str | None, peaks_json: str | None) -> list[float]:
@@ -62,6 +63,7 @@ def run(args: argparse.Namespace) -> None:
         sigma_b=args.sigma_b,
         sigma_c=args.sigma_c,
         mask_path=args.mask,
+        analysis_mask_dilate_iters=getattr(args, "analysis_mask_dilate_iters", 0),
     )
 
     modes_u = []
@@ -112,4 +114,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

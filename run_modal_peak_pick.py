@@ -26,6 +26,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_pick.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
     p_pick.add_argument("--snap-window-hz", type=float, default=1.0, help="Peak snapping window.")
     p_pick.add_argument("--out-json", default="outputs_modal/selected_peaks.json", help="Selected peaks JSON path.")
+    p_pick.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
 
     p_export = sub.add_parser("export", help="Export selected complex 2D mode slices.")
     p_export.add_argument("--video", required=True, help="Input video path.")
@@ -42,6 +43,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--no-smooth", action="store_true", help="Disable contrast-weighted flow smoothing.")
     p_export.add_argument("--sigma-b", type=float, default=3.0, help="Spatial smoothing sigma.")
     p_export.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
+    p_export.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
 
     p_inspect = sub.add_parser("inspect", help="Save non-GUI spectrum and candidate mode previews.")
     p_inspect.add_argument("--video", required=True, help="Input video path.")
@@ -60,6 +62,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_inspect.add_argument("--max-freq-hz", type=float, default=None, help="Ignore candidates above this frequency.")
     p_inspect.add_argument("--peak-window-hz", type=float, default=0.6, help="Minimum spacing between candidate peaks.")
     p_inspect.add_argument("--preview-percentile", type=float, default=99.0, help="Display percentile for mode previews.")
+    p_inspect.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
 
     p_synthesize = sub.add_parser("synthesize", help="Synthesize fixed-frequency modal videos from exported .npz.")
     p_synthesize.add_argument("--modal-npz", required=True, help="modal_analysis.npz exported by the export command.")

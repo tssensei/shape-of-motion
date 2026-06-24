@@ -32,6 +32,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-freq-hz", type=float, default=None, help="Ignore candidates above this frequency.")
     parser.add_argument("--peak-window-hz", type=float, default=0.6, help="Minimum spacing between candidate peaks.")
     parser.add_argument("--preview-percentile", type=float, default=99.0, help="Display percentile for mode previews.")
+    parser.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
 
 
 def _phase_hsv(z: np.ndarray, lo: float, hi: float) -> np.ndarray:
@@ -202,6 +203,7 @@ def run(args: argparse.Namespace) -> None:
         sigma_b=args.sigma_b,
         sigma_c=args.sigma_c,
         mask_path=args.mask,
+        analysis_mask_dilate_iters=getattr(args, "analysis_mask_dilate_iters", 0),
     )
 
     peak_indices = _choose_candidate_peaks(
@@ -264,6 +266,7 @@ def run(args: argparse.Namespace) -> None:
         "no_smooth": bool(args.no_smooth),
         "sigma_b": float(args.sigma_b),
         "sigma_c": float(args.sigma_c),
+        "analysis_mask_dilate_iters": int(getattr(args, "analysis_mask_dilate_iters", 0)),
     }
     with (out_dir / "top_peaks.json").open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)

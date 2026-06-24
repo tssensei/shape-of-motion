@@ -271,6 +271,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
     parser.add_argument("--snap-window-hz", type=float, default=1.0, help="Peak snapping window.")
     parser.add_argument("--out-json", default="outputs/selected_peaks.json", help="Selected peaks JSON path.")
+    parser.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
 
 
 def run(args: argparse.Namespace) -> None:
@@ -285,6 +286,7 @@ def run(args: argparse.Namespace) -> None:
         sigma_b=args.sigma_b,
         sigma_c=args.sigma_c,
         mask_path=args.mask,
+        analysis_mask_dilate_iters=getattr(args, "analysis_mask_dilate_iters", 0),
     )
     ui = PeakPickingUI(
         frame_ref=result.frame_ref,
@@ -310,4 +312,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
