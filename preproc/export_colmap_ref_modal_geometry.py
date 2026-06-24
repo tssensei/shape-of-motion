@@ -5,19 +5,21 @@ surface-based modal optimization stage.
 
 The intended workflow is:
 
-1. Record stabilized modal videos for two static-ish viewpoints.
+1. Record stabilized modal videos for static-ish viewpoints.
 2. Export one reference image for each modal view, usually:
 
-       geometry/images/view1.png
-       geometry/images/view2.png
+       geometry/images/refs/view1.png
+       geometry/images/refs/view2.png
+       geometry/images/refs/view3.png
 
 3. Record an additional calibration sweep video around the same scene.
 4. Build a multi-view COLMAP sparse reconstruction from sweep frames plus the
-   two reference images. The two reference images must be registered in the
+   reference images. The reference images must be registered in the
    same COLMAP model, for example as:
 
        refs/view1.png
        refs/view2.png
+       refs/view3.png
 
 5. Run UniDepth on the reference images to get per-view disparity maps.
 6. Run this script to produce the view configs and aligned depth maps consumed
@@ -30,30 +32,31 @@ Example:
       --image-dir outputs_modal/bush4/geometry/sweep_colmap/images \
       --mask-dir outputs_modal/bush4/geometry/masks \
       --unidepth-disp-dir outputs_modal/bush4/geometry/unidepth_disp \
-      --view1-name refs/view1.png \
-      --view2-name refs/view2.png \
-      --view1-modal-npz outputs_modal/bush4/view1/modal_analysis_0p357hz.npz \
-      --view2-modal-npz outputs_modal/bush4/view2/modal_analysis_0p357hz.npz \
+      --view view1=refs/view1.png=outputs_modal/bush4/view1/modal_analysis_0p357hz.npz \
+      --view view2=refs/view2.png=outputs_modal/bush4/view2/modal_analysis_0p357hz.npz \
+      --view view3=refs/view3.png=outputs_modal/bush4/view3/modal_analysis_0p357hz.npz \
       --out-dir outputs_modal/bush4/geometry/modal_surface_colmap
 
 Outputs:
 
     view1_config.json
     view2_config.json
+    view3_config.json
     view1_depth.npy
     view2_depth.npy
+    view3_depth.npy
     view1_mask.npy
     view2_mask.npy
+    view3_mask.npy
     colmap_ref_pose_stats.json
 
 Why this exists:
 
-Two-view relative pose estimation from only view1/view2 is fragile for this
+Two-view relative pose estimation from only the modal reference views is fragile for this
 experiment: background structure can be close to planar, the vibrating bush is
 masked out, and monocular depth scale is uncertain. A calibration sweep gives
 COLMAP many rigid-background views, producing a more stable sparse model. This
-script then reads the already-registered reference view poses from that model
-instead of estimating pose from the two references alone.
+script then reads the already-registered reference view poses from that model.
 
 Depth scale alignment:
 
@@ -77,26 +80,33 @@ projecting them across views in modal_surface.
 Assumptions:
 
 - COLMAP TXT model uses PINHOLE cameras.
-- Reference image names passed via --view1-name/--view2-name are present in
+- Reference image names passed via --view are present in
   images.txt and have corresponding masks/depths keyed by their stem.
 - UniDepth outputs disparity .npy files, not metric z-depth directly.
 - The modal npz files define the target image size used by modal_surface.
-- This script exports only two reference views.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-# COLMAP sweep model + view1/view2 reference images
+# COLMAP sweep model + reference images
 # + UniDepth disparity
 # + modal_analysis npz
-# -> view1_config.json / view2_config.json / depth / mask
+# -> view*_config.json / depth / mask
+
+
+@dataclass(frozen=True)
+class ViewSpec:
+    label: str
+    colmap_name: str
+    modal_npz: Path
 
 def qvec_to_rotmat(qvec: np.ndarray) -> np.ndarray:
     qvec = np.asarray(qvec, dtype=np.float64)
@@ -520,16 +530,63 @@ def export_view(
     }
 
 
+def parse_view_spec(text: str) -> ViewSpec:
+    parts = text.split("=", 2)
+    if len(parts) != 3:
+        raise ValueError(
+            "Each --view must have format LABEL=COLMAP_NAME=MODAL_NPZ, "
+            f"got: {text}"
+        )
+    label, colmap_name, modal_npz = (part.strip() for part in parts)
+    if not label:
+        raise ValueError(f"View label cannot be empty in --view {text}")
+    if "/" in label or "\\" in label:
+        raise ValueError(f"View label must be a simple file prefix, got {label!r}")
+    if not colmap_name:
+        raise ValueError(f"COLMAP image name cannot be empty in --view {text}")
+    if not modal_npz:
+        raise ValueError(f"Modal npz path cannot be empty in --view {text}")
+    return ViewSpec(label=label, colmap_name=colmap_name, modal_npz=Path(modal_npz))
+
+
+def collect_view_specs(args: argparse.Namespace) -> list[ViewSpec]:
+    view_specs = [parse_view_spec(text) for text in (args.view or [])]
+    legacy_values = [args.view1_name, args.view2_name, args.view1_modal_npz, args.view2_modal_npz]
+    using_legacy = any(value is not None for value in legacy_values)
+
+    if view_specs and using_legacy:
+        raise ValueError("Use either repeated --view arguments or legacy --view1/--view2 arguments, not both.")
+    if not view_specs:
+        if not all(value is not None for value in legacy_values):
+            raise ValueError(
+                "Provide at least one --view LABEL=COLMAP_NAME=MODAL_NPZ, "
+                "or provide all legacy --view1-name/--view2-name/--view1-modal-npz/--view2-modal-npz arguments."
+            )
+        view_specs = [
+            ViewSpec("view1", str(args.view1_name), Path(args.view1_modal_npz)),
+            ViewSpec("view2", str(args.view2_name), Path(args.view2_modal_npz)),
+        ]
+
+    labels = [spec.label for spec in view_specs]
+    if len(set(labels)) != len(labels):
+        raise ValueError(f"Duplicate view labels are not allowed: {labels}")
+    colmap_names = [spec.colmap_name for spec in view_specs]
+    if len(set(colmap_names)) != len(colmap_names):
+        raise ValueError(f"Duplicate COLMAP image names are not allowed: {colmap_names}")
+    return view_specs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export modal_surface inputs from registered COLMAP reference views.")
     parser.add_argument("--model-dir", required=True, type=Path, help="COLMAP TXT model directory containing cameras/images/points3D.txt.")
     parser.add_argument("--image-dir", required=True, type=Path, help="COLMAP image root directory.")
     parser.add_argument("--mask-dir", required=True, type=Path, help="Reference foreground mask directory, keyed by view stem.")
     parser.add_argument("--unidepth-disp-dir", required=True, type=Path, help="UniDepth disparity .npy directory, keyed by view stem.")
-    parser.add_argument("--view1-name", required=True, help="View 1 COLMAP image name, e.g. refs/view1.png.")
-    parser.add_argument("--view2-name", required=True, help="View 2 COLMAP image name, e.g. refs/view2.png.")
-    parser.add_argument("--view1-modal-npz", required=True, type=Path, help="View 1 modal_analysis npz.")
-    parser.add_argument("--view2-modal-npz", required=True, type=Path, help="View 2 modal_analysis npz.")
+    parser.add_argument("--view", action="append", default=[], help="View spec LABEL=COLMAP_NAME=MODAL_NPZ. Repeat once per reference view.")
+    parser.add_argument("--view1-name", default=None, help="Legacy view 1 COLMAP image name, e.g. refs/view1.png.")
+    parser.add_argument("--view2-name", default=None, help="Legacy view 2 COLMAP image name, e.g. refs/view2.png.")
+    parser.add_argument("--view1-modal-npz", default=None, type=Path, help="Legacy view 1 modal_analysis npz.")
+    parser.add_argument("--view2-modal-npz", default=None, type=Path, help="Legacy view 2 modal_analysis npz.")
     parser.add_argument("--out-dir", required=True, type=Path, help="Output directory for modal_surface geometry files.")
     parser.add_argument("--min-depth-alignment-points", type=int, default=20, help="Minimum sparse observations for per-view depth scale alignment.")
     parser.add_argument("--disable-depth-alignment", action="store_true", help="Keep UniDepth depth in its original inverse-disparity scale.")
@@ -537,85 +594,85 @@ def main() -> None:
 
     if args.min_depth_alignment_points < 1:
         raise ValueError("--min-depth-alignment-points must be positive.")
+    view_specs = collect_view_specs(args)
 
     cameras = parse_cameras(args.model_dir / "cameras.txt")
     images = parse_images(args.model_dir / "images.txt")
     points3d = parse_points3d(args.model_dir / "points3D.txt")
 
-    missing = [name for name in [args.view1_name, args.view2_name] if name not in images]
+    missing = [spec.colmap_name for spec in view_specs if spec.colmap_name not in images]
     if missing:
         raise KeyError(f"Missing reference views in images.txt: {missing}. Found names include: {sorted(images.keys())[:20]}")
 
-    target_hw1 = load_modal_shape(args.view1_modal_npz)
-    target_hw2 = load_modal_shape(args.view2_modal_npz)
-    if target_hw1 != target_hw2:
-        raise ValueError(f"View modal shapes must match, got {target_hw1} and {target_hw2}.")
+    target_hws = {spec.label: load_modal_shape(spec.modal_npz) for spec in view_specs}
+    first_target_hw = target_hws[view_specs[0].label]
+    mismatched = {label: hw for label, hw in target_hws.items() if hw != first_target_hw}
+    if mismatched:
+        raise ValueError(f"View modal shapes must match {first_target_hw}, got mismatches: {mismatched}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    view1 = images[args.view1_name]
-    view2 = images[args.view2_name]
-    camera1 = cameras[int(view1["camera_id"])]
-    camera2 = cameras[int(view2["camera_id"])]
-    stats1 = export_view(
-        "view1",
-        args.view1_name,
-        view1,
-        camera1,
-        args.image_dir,
-        args.mask_dir,
-        args.unidepth_disp_dir,
-        args.view1_modal_npz,
-        target_hw1,
-        points3d,
-        args.min_depth_alignment_points,
-        args.disable_depth_alignment,
-        args.out_dir,
-    )
-    stats2 = export_view(
-        "view2",
-        args.view2_name,
-        view2,
-        camera2,
-        args.image_dir,
-        args.mask_dir,
-        args.unidepth_disp_dir,
-        args.view2_modal_npz,
-        target_hw2,
-        points3d,
-        args.min_depth_alignment_points,
-        args.disable_depth_alignment,
-        args.out_dir,
-    )
+    view_records: dict[str, dict[str, object]] = {}
+    stats_by_label: dict[str, dict[str, object]] = {}
+    for spec in view_specs:
+        image_record = images[spec.colmap_name]
+        camera_record = cameras[int(image_record["camera_id"])]
+        view_records[spec.label] = image_record
+        stats_by_label[spec.label] = export_view(
+            spec.label,
+            spec.colmap_name,
+            image_record,
+            camera_record,
+            args.image_dir,
+            args.mask_dir,
+            args.unidepth_disp_dir,
+            spec.modal_npz,
+            first_target_hw,
+            points3d,
+            args.min_depth_alignment_points,
+            args.disable_depth_alignment,
+            args.out_dir,
+        )
 
-    w2c1 = np.asarray(view1["world_to_camera"], dtype=np.float64)
-    w2c2 = np.asarray(view2["world_to_camera"], dtype=np.float64)
-    view1_to_view2 = w2c2 @ np.linalg.inv(w2c1)
-    baseline = float(np.linalg.norm(np.linalg.inv(w2c1)[:3, 3] - np.linalg.inv(w2c2)[:3, 3]))
+    reference_label = view_specs[0].label
+    reference_w2c = np.asarray(view_records[reference_label]["world_to_camera"], dtype=np.float64)
+    reference_c2w = np.linalg.inv(reference_w2c)
+    relative_transforms: dict[str, list[list[float]]] = {}
+    baselines: dict[str, float] = {}
+    for spec in view_specs[1:]:
+        w2c = np.asarray(view_records[spec.label]["world_to_camera"], dtype=np.float64)
+        c2w = np.linalg.inv(w2c)
+        key = f"{reference_label}_to_{spec.label}"
+        relative_transforms[key] = (w2c @ reference_c2w).astype(float).tolist()
+        baselines[key] = float(np.linalg.norm(reference_c2w[:3, 3] - c2w[:3, 3]))
+
     payload = {
         "model_dir": str(args.model_dir),
         "image_dir": str(args.image_dir),
-        "target_height": int(target_hw1[0]),
-        "target_width": int(target_hw1[1]),
+        "target_height": int(first_target_hw[0]),
+        "target_width": int(first_target_hw[1]),
         "depth_alignment_disabled": bool(args.disable_depth_alignment),
-        "view1": stats1,
-        "view2": stats2,
-        "view1_to_view2": view1_to_view2.astype(float).tolist(),
-        "baseline_colmap_units": baseline,
+        "reference_view": reference_label,
+        "views": stats_by_label,
+        "relative_transforms": relative_transforms,
+        "baselines_colmap_units": baselines,
         "outputs": {
-            "view1_config": "view1_config.json",
-            "view2_config": "view2_config.json",
-            "view1_depth": "view1_depth.npy",
-            "view2_depth": "view2_depth.npy",
-            "view1_mask": "view1_mask.npy",
-            "view2_mask": "view2_mask.npy",
+            spec.label: {
+                "config": f"{spec.label}_config.json",
+                "depth": f"{spec.label}_depth.npy",
+                "mask": f"{spec.label}_mask.npy",
+            }
+            for spec in view_specs
         },
     }
     with (args.out_dir / "colmap_ref_pose_stats.json").open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
-    print(f"view1 registered as {args.view1_name} with image_id={view1['image_id']}")
-    print(f"view2 registered as {args.view2_name} with image_id={view2['image_id']}")
-    print(f"COLMAP baseline: {baseline:.6g}")
+    for spec in view_specs:
+        image_record = view_records[spec.label]
+        print(f"{spec.label} registered as {spec.colmap_name} with image_id={image_record['image_id']}")
+    if baselines:
+        baseline_text = ", ".join(f"{key}={value:.6g}" for key, value in baselines.items())
+        print(f"COLMAP baselines: {baseline_text}")
     print(f"saved modal_surface geometry -> {args.out_dir}")
 
 
