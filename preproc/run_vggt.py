@@ -212,6 +212,28 @@ def extrinsic_to_world_to_camera(extrinsic: np.ndarray) -> np.ndarray:
     raise ValueError(f"Expected extrinsic shape (3,4) or (4,4), got {arr.shape}.")
 
 
+def depth_edge_mask(depth: np.ndarray, rtol: float) -> np.ndarray:
+    """Detect relative depth discontinuities with 4-neighbor comparisons."""
+    if rtol < 0:
+        raise ValueError("--depth-edge-rtol must be non-negative.")
+    depth = depth.astype(np.float32, copy=False)
+    valid = np.isfinite(depth) & (depth > 0)
+    edge = np.zeros(depth.shape, dtype=bool)
+
+    def mark_pair(a: np.ndarray, b: np.ndarray, out: np.ndarray) -> None:
+        pair_valid = valid[a] & valid[b]
+        denom = np.maximum(np.minimum(depth[a], depth[b]), 1e-6)
+        jump = np.zeros(pair_valid.shape, dtype=np.float32)
+        jump[pair_valid] = np.abs(depth[a][pair_valid] - depth[b][pair_valid]) / denom[pair_valid]
+        pair_edge = pair_valid & (jump > rtol)
+        out[a] |= pair_edge
+        out[b] |= pair_edge
+
+    mark_pair(np.s_[:, 1:], np.s_[:, :-1], edge)
+    mark_pair(np.s_[1:, :], np.s_[:-1, :], edge)
+    return edge
+
+
 def unproject_depth_samples(
     depth: np.ndarray,
     confidence: np.ndarray,
@@ -219,6 +241,7 @@ def unproject_depth_samples(
     K: np.ndarray,
     world_to_camera: np.ndarray,
     confidence_threshold: float,
+    depth_edge: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Unproject valid VGGT depth pixels above a VGGT confidence threshold."""
     if depth.shape != confidence.shape:
@@ -226,6 +249,10 @@ def unproject_depth_samples(
     if colors.shape[:2] != depth.shape:
         raise ValueError(f"Color/depth shape mismatch: {colors.shape[:2]} vs {depth.shape}.")
     valid = np.isfinite(depth) & (depth > 0) & np.isfinite(confidence) & (confidence >= confidence_threshold)
+    if depth_edge is not None:
+        if depth_edge.shape != depth.shape:
+            raise ValueError(f"Depth edge mask shape mismatch: {depth_edge.shape} vs {depth.shape}.")
+        valid &= ~depth_edge
     if not np.any(valid):
         return (
             np.zeros((0, 3), dtype=np.float32),
@@ -261,12 +288,25 @@ def export_vggt_points(
     extrinsics: np.ndarray,
     point_conf_percentile: float,
     max_points: int,
+    filter_depth_edges: bool,
+    depth_edge_rtol: float,
 ) -> tuple[Path, dict[str, Any]]:
     """Export a dense VGGT carrier point cloud to vggt_points.npz."""
     if not (0.0 <= point_conf_percentile <= 100.0):
         raise ValueError("--point-conf-percentile must be in [0, 100].")
     if max_points < 0:
         raise ValueError("--max-points must be non-negative.")
+    if depth_edge_rtol < 0:
+        raise ValueError("--depth-edge-rtol must be non-negative.")
+
+    depth_edge_masks: list[np.ndarray | None] = []
+    edge_filtered_points = 0
+    for view_idx in range(depth.shape[0]):
+        edge = depth_edge_mask(depth[view_idx], depth_edge_rtol) if filter_depth_edges else None
+        if edge is not None:
+            valid_edge_depth = edge & np.isfinite(depth[view_idx]) & (depth[view_idx] > 0)
+            edge_filtered_points += int(valid_edge_depth.sum())
+        depth_edge_masks.append(edge)
 
     valid_conf = depth_conf[np.isfinite(depth_conf) & np.isfinite(depth) & (depth > 0)]
     if valid_conf.size == 0:
@@ -287,6 +327,7 @@ def export_vggt_points(
             intrinsics[view_idx],
             world_to_camera,
             confidence_threshold,
+            depth_edge=depth_edge_masks[view_idx],
         )
         point_chunks.append(points)
         color_chunks.append(colors)
@@ -327,6 +368,9 @@ def export_vggt_points(
         "confidence_percentile": float(point_conf_percentile),
         "confidence_threshold": confidence_threshold,
         "confidence_filtering": True,
+        "filter_depth_edges": bool(filter_depth_edges),
+        "depth_edge_rtol": float(depth_edge_rtol),
+        "edge_filtered_points": int(edge_filtered_points),
         "max_points": int(max_points),
     }
     return out_path, stats
@@ -378,6 +422,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-tokens", action="store_true", help="Also save camera_and_register_tokens in raw output.")
     parser.add_argument("--export-points", action="store_true", help="Export VGGT unprojected carrier points to vggt_points.npz.")
     parser.add_argument("--point-conf-percentile", type=float, default=30.0, help="VGGT depth_conf percentile threshold used only while exporting fixed carrier points.")
+    parser.add_argument("--filter-depth-edges", action="store_true", help="Drop VGGT carrier points on local depth discontinuities.")
+    parser.add_argument("--depth-edge-rtol", type=float, default=0.03, help="Relative depth jump threshold for --filter-depth-edges.")
     parser.add_argument("--max-points", type=int, default=500000, help="Maximum saved carrier points; 0 keeps all points.")
     return parser
 
@@ -478,6 +524,8 @@ def main() -> None:
             extrinsics,
             point_conf_percentile=args.point_conf_percentile,
             max_points=args.max_points,
+            filter_depth_edges=args.filter_depth_edges,
+            depth_edge_rtol=args.depth_edge_rtol,
         )
         stats["carrier_points"] = point_stats
         print(f"Saved VGGT carrier points -> {point_path}")
