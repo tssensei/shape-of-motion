@@ -264,7 +264,7 @@ def build_carrier_observation_graph(
     front_percentile: float = 10.0,
     zbuffer_tau: float = 0.05,
     min_zbuffer_samples: int = 5,
-    min_observations: int = 2,
+    min_observations: int = 1,
     freq_tolerance_hz: float = 0.1,
 ) -> Path:
     """Build an N-view observation graph using VGGT carrier points."""

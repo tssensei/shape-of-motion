@@ -19,7 +19,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
     parser.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
     parser.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local carrier depths for visibility.")
-    parser.add_argument("--min-observations", type=int, default=2, help="Minimum observed views per carrier point.")
+    parser.add_argument(
+        "--min-observations",
+        type=int,
+        default=1,
+        help="Minimum observed views per carrier point. Default keeps view-local carrier observations.",
+    )
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
 
 

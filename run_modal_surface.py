@@ -59,7 +59,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_match_carrier.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
     p_match_carrier.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
     p_match_carrier.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local carrier depths for visibility.")
-    p_match_carrier.add_argument("--min-observations", type=int, default=2, help="Minimum observed views per carrier point.")
+    p_match_carrier.add_argument(
+        "--min-observations",
+        type=int,
+        default=1,
+        help="Minimum observed views per carrier point. Default keeps view-local carrier observations.",
+    )
     p_match_carrier.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
 
     p_opt_multi = sub.add_parser("optimize-multi-view", help="Optimize latent 3D modal displacement from N-view observations.")
