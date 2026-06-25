@@ -218,14 +218,13 @@ def unproject_depth_samples(
     colors: np.ndarray,
     K: np.ndarray,
     world_to_camera: np.ndarray,
-    confidence_threshold: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Unproject valid VGGT depth pixels above a confidence threshold."""
+    """Unproject valid VGGT depth pixels without confidence-based filtering."""
     if depth.shape != confidence.shape:
         raise ValueError(f"Depth/confidence shape mismatch: {depth.shape} vs {confidence.shape}.")
     if colors.shape[:2] != depth.shape:
         raise ValueError(f"Color/depth shape mismatch: {colors.shape[:2]} vs {depth.shape}.")
-    valid = np.isfinite(depth) & (depth > 0) & np.isfinite(confidence) & (confidence >= confidence_threshold)
+    valid = np.isfinite(depth) & (depth > 0)
     if not np.any(valid):
         return (
             np.zeros((0, 3), dtype=np.float32),
@@ -268,11 +267,6 @@ def export_vggt_points(
     if max_points < 0:
         raise ValueError("--max-points must be non-negative.")
 
-    valid_conf = depth_conf[np.isfinite(depth_conf) & np.isfinite(depth) & (depth > 0)]
-    if valid_conf.size == 0:
-        raise ValueError("VGGT depth/confidence produced no valid depth samples.")
-    confidence_threshold = float(np.percentile(valid_conf, point_conf_percentile))
-
     point_chunks: list[np.ndarray] = []
     color_chunks: list[np.ndarray] = []
     confidence_chunks: list[np.ndarray] = []
@@ -286,7 +280,6 @@ def export_vggt_points(
             images[view_idx],
             intrinsics[view_idx],
             world_to_camera,
-            confidence_threshold,
         )
         point_chunks.append(points)
         color_chunks.append(colors)
@@ -304,8 +297,7 @@ def export_vggt_points(
         raise ValueError("No VGGT carrier points survived confidence filtering.")
 
     if max_points > 0 and candidate_count > max_points:
-        keep = np.argpartition(confidence, -int(max_points))[-int(max_points) :]
-        keep = keep[np.argsort(keep)]
+        keep = np.linspace(0, candidate_count - 1, int(max_points), dtype=np.int64)
         points_world = points_world[keep]
         colors = colors[keep]
         confidence = confidence[keep]
@@ -326,7 +318,7 @@ def export_vggt_points(
         "candidate_points": candidate_count,
         "saved_points": int(points_world.shape[0]),
         "confidence_percentile": float(point_conf_percentile),
-        "confidence_threshold": confidence_threshold,
+        "confidence_filtering": False,
         "max_points": int(max_points),
     }
     return out_path, stats
@@ -377,7 +369,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"), help="Torch device for inference.")
     parser.add_argument("--save-tokens", action="store_true", help="Also save camera_and_register_tokens in raw output.")
     parser.add_argument("--export-points", action="store_true", help="Export VGGT unprojected carrier points to vggt_points.npz.")
-    parser.add_argument("--point-conf-percentile", type=float, default=30.0, help="Drop carrier depth samples below this confidence percentile.")
+    parser.add_argument("--point-conf-percentile", type=float, default=30.0, help="Deprecated for --export-points; confidence is saved but no longer filters points.")
     parser.add_argument("--max-points", type=int, default=500000, help="Maximum saved carrier points; 0 keeps all points.")
     return parser
 

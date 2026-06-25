@@ -244,7 +244,9 @@ def scene_transform(cameras: list[Camera], alignment: str) -> np.ndarray:
     """Return the display-space transform for points and cameras."""
     if alignment == "none":
         return np.eye(4, dtype=np.float64)
-    if alignment == "vggt":
+    if alignment == "viser":
+        return cameras[0].world_to_camera.copy()
+    if alignment == "glb":
         return np.linalg.inv(cameras[0].world_to_camera) @ OPENGL_CAMERA_CONVERSION
     raise ValueError(f"Unknown alignment mode {alignment!r}.")
 
@@ -262,7 +264,7 @@ def camera_display_pose(camera: Camera, transform: np.ndarray) -> tuple[np.ndarr
     import viser.transforms as vtf
 
     c2w = np.linalg.inv(camera.world_to_camera)
-    c2w_display = transform @ c2w @ OPENGL_CAMERA_CONVERSION
+    c2w_display = transform @ c2w
     fov = float(2.0 * np.arctan(0.5 * camera.image_height / camera.K[1, 1]))
     aspect = float(camera.image_width) / float(camera.image_height)
     return (
@@ -308,9 +310,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confidence-percentile", type=float, default=30.0, help="Confidence percentile when building points from vggt_outputs.")
     parser.add_argument(
         "--alignment",
-        choices=("vggt", "none"),
-        default="vggt",
-        help="Display transform. 'vggt' matches the VGGT demo scene alignment.",
+        choices=("viser", "glb", "none"),
+        default="viser",
+        help="Display transform. 'viser' uses camera-0 coordinates; 'glb' keeps the old VGGT GLB-style axis conversion.",
     )
     return parser
 
@@ -337,7 +339,7 @@ def main() -> None:
     frustum_scale = 0.08 * scale
 
     server = viser.ViserServer(port=args.port, verbose=False)
-    server.scene.add_point_cloud(
+    point_handle = server.scene.add_point_cloud(
         "/vggt/points",
         points=display_points,
         colors=colors.astype(np.float32) / 255.0,
@@ -365,12 +367,17 @@ def main() -> None:
         button.on_click(lambda event, camera=camera: set_client_to_camera(event, camera, transform))
 
     show_cameras = server.gui.add_checkbox("Show cameras", True)
+    point_size_slider = server.gui.add_slider("Point size", min=0.001, max=0.05, step=0.001, initial_value=float(args.point_size))
 
     def update_camera_visibility(_) -> None:
         for handle in camera_handles.values():
             handle.visible = bool(show_cameras.value)
 
+    def update_point_size(_) -> None:
+        point_handle.point_size = float(point_size_slider.value)
+
     show_cameras.on_update(update_camera_visibility)
+    point_size_slider.on_update(update_point_size)
 
     print(f"Loaded VGGT points: {points.shape[0]} from {point_source}")
     print(f"Loaded VGGT cameras: {[camera.label for camera in cameras]}")
