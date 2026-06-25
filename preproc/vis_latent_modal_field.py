@@ -1,14 +1,16 @@
-"""Interactive Viser visualization for the raw VGGT scene.
+"""Interactive Viser visualization for VGGT scenes and modal motion.
 
-This script intentionally does not read modal fields, modal observations, or
-latent displacement. It is a small diagnostic viewer for checking whether the
-VGGT point cloud and camera poses agree before any modal_surface processing is
-introduced.
+Without --latent, this script only shows the fixed VGGT point cloud and camera
+poses. With --latent, it displays optimized latent modal points and animates the
+complex displacement field:
+
+    X(t) = X0 + scale * Re(phi * exp(i * phase_t))
 """
 
 from __future__ import annotations
 
 import argparse
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -134,9 +136,81 @@ def load_points_from_export(path: Path, max_points: int) -> tuple[np.ndarray, np
     return points, colors
 
 
+def load_latent_field(path: Path, max_points: int) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Load optimized latent modal points, complex displacement, and optional RGB."""
+    z = np.load(str(path), allow_pickle=False)
+    required = ["points_world", "phi"]
+    missing = [key for key in required if key not in z.files]
+    if missing:
+        raise ValueError(f"{path} missing required latent arrays: {missing}.")
+    points = z["points_world"].astype(np.float32)
+    phi = z["phi"].astype(np.complex64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points_world must have shape (N,3), got {points.shape}.")
+    if phi.shape != points.shape:
+        raise ValueError(f"phi must have shape {points.shape}, got {phi.shape}.")
+
+    colors = None
+    if "colors" in z.files:
+        colors = z["colors"].astype(np.uint8)
+        if colors.shape != (points.shape[0], 3):
+            raise ValueError(f"colors must have shape (N,3), got {colors.shape}.")
+
+    valid = (
+        np.all(np.isfinite(points), axis=1)
+        & np.all(np.isfinite(phi.real), axis=1)
+        & np.all(np.isfinite(phi.imag), axis=1)
+    )
+    points = points[valid]
+    phi = phi[valid]
+    if colors is not None:
+        colors = colors[valid]
+    if max_points > 0 and points.shape[0] > max_points:
+        keep = np.linspace(0, points.shape[0] - 1, int(max_points), dtype=np.int64)
+        points = points[keep]
+        phi = phi[keep]
+        if colors is not None:
+            colors = colors[keep]
+    return points, phi, colors
+
+
 def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """Apply a 4x4 column-vector transform to row-major points."""
     return (points.astype(np.float64) @ transform[:3, :3].T + transform[:3, 3]).astype(np.float32)
+
+
+def transform_vectors(vectors: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Apply only the linear part of a display transform to row-major vectors."""
+    return (vectors.astype(np.complex128) @ transform[:3, :3].T).astype(np.complex64)
+
+
+def hsv_phase_colors(phi: np.ndarray) -> np.ndarray:
+    """Color by phase of the strongest complex displacement component."""
+    if phi.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    amp = np.abs(phi)
+    component = np.argmax(amp, axis=1)
+    phase = np.angle(phi[np.arange(phi.shape[0]), component])
+    hue = (phase + np.pi) / (2.0 * np.pi)
+    h = (hue * 6.0) % 6.0
+    i = np.floor(h).astype(np.int32)
+    f = h - i
+    q = 1.0 - f
+    t = f
+    rgb = np.zeros((phi.shape[0], 3), dtype=np.float32)
+    masks = [i == k for k in range(6)]
+    rgb[masks[0]] = np.stack([np.ones_like(f[masks[0]]), t[masks[0]], np.zeros_like(f[masks[0]])], axis=1)
+    rgb[masks[1]] = np.stack([q[masks[1]], np.ones_like(f[masks[1]]), np.zeros_like(f[masks[1]])], axis=1)
+    rgb[masks[2]] = np.stack([np.zeros_like(f[masks[2]]), np.ones_like(f[masks[2]]), t[masks[2]]], axis=1)
+    rgb[masks[3]] = np.stack([np.zeros_like(f[masks[3]]), q[masks[3]], np.ones_like(f[masks[3]])], axis=1)
+    rgb[masks[4]] = np.stack([t[masks[4]], np.zeros_like(f[masks[4]]), np.ones_like(f[masks[4]])], axis=1)
+    rgb[masks[5]] = np.stack([np.ones_like(f[masks[5]]), np.zeros_like(f[masks[5]]), q[masks[5]]], axis=1)
+    return (255.0 * np.clip(rgb, 0.0, 1.0)).astype(np.uint8)
+
+
+def colors_to_float(colors: np.ndarray) -> np.ndarray:
+    """Convert uint8 RGB to Viser float colors."""
+    return colors.astype(np.float32) / 255.0
 
 
 def scene_transform(cameras: list[Camera], alignment: str) -> np.ndarray:
@@ -203,9 +277,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize the raw VGGT point cloud and camera poses with Viser.")
     parser.add_argument("--vggt-outputs", required=True, type=Path, help="vggt_outputs.npz from preproc/run_vggt.py.")
     parser.add_argument("--points", required=True, type=Path, help="Fixed vggt_points.npz from --export-points.")
+    parser.add_argument("--latent", type=Path, default=None, help="Optional latent_field_*.npz to animate modal displacement.")
     parser.add_argument("--port", type=int, default=8891, help="Viser server port.")
     parser.add_argument("--point-size", type=float, default=0.004, help="Point cloud point size.")
     parser.add_argument("--max-points", type=int, default=10000, help="Maximum points to display; 0 keeps all.")
+    parser.add_argument("--fps", type=float, default=12.0, help="Initial modal animation FPS.")
+    parser.add_argument("--motion-scale", type=float, default=0.02, help="Initial modal displacement scale.")
+    parser.add_argument("--max-motion-scale", type=float, default=0.2, help="Maximum GUI modal displacement scale.")
     parser.add_argument(
         "--alignment",
         choices=("viser", "glb", "none"),
@@ -222,30 +300,60 @@ def main() -> None:
 
     vggt = load_vggt_outputs(args.vggt_outputs.expanduser())
     cameras = build_cameras(vggt)
-    points, colors = load_points_from_export(args.points.expanduser(), args.max_points)
+    raw_points, raw_colors = load_points_from_export(args.points.expanduser(), args.max_points)
     point_source = str(args.points)
+    points = raw_points
+    colors = raw_colors
+    phi = None
+    latent_has_colors = False
+    if args.latent is not None:
+        points, phi, latent_colors = load_latent_field(args.latent.expanduser(), args.max_points)
+        point_source = str(args.latent)
+        if latent_colors is not None:
+            colors = latent_colors
+            latent_has_colors = True
+        else:
+            colors = hsv_phase_colors(phi)
     if points.shape[0] == 0:
-        raise ValueError("No VGGT points were loaded.")
+        raise ValueError("No points were loaded.")
 
     transform = scene_transform(cameras, args.alignment)
-    display_points = transform_points(points, transform)
-    scale = scene_scale(display_points)
+    base_display_points = transform_points(points, transform)
+    display_phi = transform_vectors(phi, transform) if phi is not None else None
+    scale = scene_scale(base_display_points)
     frustum_scale = 0.08 * scale
 
     server = viser.ViserServer(port=args.port, verbose=False)
     point_handle = {"handle": None}
-    point_colors = colors.astype(np.float32) / 255.0
+    point_lock = threading.Lock()
+    rgb_colors = colors_to_float(colors)
+    phase_colors = colors_to_float(hsv_phase_colors(phi)) if phi is not None else rgb_colors
+    animation = {"phase": 0.0, "motion_scale": float(args.motion_scale)}
+
+    def current_points() -> np.ndarray:
+        if display_phi is None:
+            return base_display_points
+        phase = float(animation["phase"])
+        displacement = np.real(display_phi * np.exp(1j * phase)).astype(np.float32)
+        return (base_display_points + float(animation["motion_scale"]) * displacement).astype(np.float32)
+
+    def current_colors() -> np.ndarray:
+        if phi is not None and "color_scheme" in gui_handles and gui_handles["color_scheme"].value == "phase":
+            return phase_colors
+        return rgb_colors
 
     def redraw_points(point_size: float) -> None:
-        if point_handle["handle"] is not None:
-            point_handle["handle"].remove()
-        point_handle["handle"] = server.scene.add_point_cloud(
-            "/vggt/points",
-            points=display_points,
-            colors=point_colors,
-            point_size=float(point_size),
-        )
+        with point_lock:
+            if point_handle["handle"] is not None:
+                point_handle["handle"].remove()
+            point_handle["handle"] = server.scene.add_point_cloud(
+                "/vggt/points",
+                points=current_points(),
+                colors=current_colors(),
+                point_size=float(point_size),
+            )
 
+    gui_handles = {}
     redraw_points(float(args.point_size))
 
     camera_colors = [
@@ -270,6 +378,24 @@ def main() -> None:
 
     show_cameras = server.gui.add_checkbox("Show cameras", True)
     point_size_slider = server.gui.add_slider("Point size", min=0.0002, max=0.008, step=0.0001, initial_value=float(args.point_size))
+    gui_handles["point_size"] = point_size_slider
+    if phi is not None:
+        play_checkbox = server.gui.add_checkbox("Play", False)
+        fps_slider = server.gui.add_slider("FPS", min=1.0, max=60.0, step=1.0, initial_value=float(args.fps))
+        max_motion_scale = max(float(args.max_motion_scale), float(args.motion_scale), 1e-6)
+        motion_scale_slider = server.gui.add_slider(
+            "Motion scale",
+            min=0.0,
+            max=max_motion_scale,
+            step=max_motion_scale / 200.0,
+            initial_value=float(args.motion_scale),
+        )
+        color_options = ("rgb", "phase") if latent_has_colors else ("phase",)
+        color_scheme = server.gui.add_dropdown("Color scheme", color_options, initial_value=color_options[0])
+        gui_handles["play"] = play_checkbox
+        gui_handles["fps"] = fps_slider
+        gui_handles["motion_scale"] = motion_scale_slider
+        gui_handles["color_scheme"] = color_scheme
 
     def update_camera_visibility(_) -> None:
         for handle in camera_handles.values():
@@ -278,10 +404,38 @@ def main() -> None:
     def update_point_size(_) -> None:
         redraw_points(float(point_size_slider.value))
 
+    def update_motion_scale(_) -> None:
+        if phi is None:
+            return
+        animation["motion_scale"] = float(gui_handles["motion_scale"].value)
+        with point_lock:
+            point_handle["handle"].points = current_points()
+
+    def update_color_scheme(_) -> None:
+        with point_lock:
+            point_handle["handle"].colors = current_colors()
+
     show_cameras.on_update(update_camera_visibility)
     point_size_slider.on_update(update_point_size)
+    if phi is not None:
+        gui_handles["motion_scale"].on_update(update_motion_scale)
+        gui_handles["color_scheme"].on_update(update_color_scheme)
 
-    print(f"Loaded VGGT points: {points.shape[0]} from {point_source}")
+        def animate_points() -> None:
+            while True:
+                fps = max(float(gui_handles["fps"].value), 1.0)
+                if bool(gui_handles["play"].value):
+                    animation["phase"] = (float(animation["phase"]) + 2.0 * np.pi / fps) % (2.0 * np.pi)
+                    with point_lock:
+                        point_handle["handle"].points = current_points()
+                time.sleep(1.0 / fps)
+
+        threading.Thread(target=animate_points, daemon=True).start()
+
+    print(f"Loaded displayed points: {points.shape[0]} from {point_source}")
+    if args.latent is not None:
+        print(f"Loaded latent modal displacement: {args.latent}")
+        print(f"Initial motion scale: {args.motion_scale}")
     print(f"Loaded VGGT cameras: {[camera.label for camera in cameras]}")
     print(f"Alignment: {args.alignment}")
     print(f"Display scene scale: {scale:.6g}")

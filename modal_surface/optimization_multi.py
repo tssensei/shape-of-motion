@@ -240,6 +240,11 @@ def optimize_multi_view(
         if point_source_count.shape[0] != points.shape[0]:
             raise ValueError("point_source_count does not match points_world length.")
         optional_point_fields["point_source_count"] = point_source_count[active_indices].astype(np.int32)
+    if "colors" in data.files:
+        colors = data["colors"]
+        if colors.shape != (points.shape[0], 3):
+            raise ValueError("colors must have shape (N,3) and match points_world length.")
+        optional_point_fields["colors"] = colors[active_indices].astype(np.uint8)
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
