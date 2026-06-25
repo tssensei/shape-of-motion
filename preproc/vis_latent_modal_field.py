@@ -10,10 +10,12 @@ complex displacement field:
 from __future__ import annotations
 
 import argparse
+import json
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -174,6 +176,37 @@ def load_latent_field(path: Path, max_points: int) -> tuple[np.ndarray, np.ndarr
     return points, phi, colors
 
 
+def load_latent_manifest(path: Path) -> list[dict[str, Any]]:
+    """Load a modal_modes_manifest.json and resolve latent paths."""
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    modes = payload.get("modes")
+    if not isinstance(modes, list) or len(modes) == 0:
+        raise ValueError(f"{path} must contain a non-empty modes list.")
+    out: list[dict[str, Any]] = []
+    labels: set[str] = set()
+    for i, item in enumerate(modes):
+        if not isinstance(item, dict):
+            raise ValueError(f"Manifest mode entry {i} is not an object.")
+        latent_value = item.get("latent_path")
+        if not isinstance(latent_value, str) or not latent_value:
+            raise ValueError(f"Manifest mode entry {i} missing latent_path.")
+        latent_path = Path(latent_value)
+        if not latent_path.is_absolute():
+            latent_path = path.parent / latent_path
+        freq = float(item.get("freq_hz", 0.0))
+        mode_index = int(item.get("mode_index", i))
+        label = str(item.get("label", f"{mode_index}: {freq:.6f} Hz"))
+        if label in labels:
+            label = f"{label} [{i}]"
+        labels.add(label)
+        entry = dict(item)
+        entry["label"] = label
+        entry["latent_path"] = latent_path
+        out.append(entry)
+    return out
+
+
 def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """Apply a 4x4 column-vector transform to row-major points."""
     return (points.astype(np.float64) @ transform[:3, :3].T + transform[:3, 3]).astype(np.float32)
@@ -278,6 +311,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vggt-outputs", required=True, type=Path, help="vggt_outputs.npz from preproc/run_vggt.py.")
     parser.add_argument("--points", required=True, type=Path, help="Fixed vggt_points.npz from --export-points.")
     parser.add_argument("--latent", type=Path, default=None, help="Optional latent_field_*.npz to animate modal displacement.")
+    parser.add_argument("--latent-manifest", type=Path, default=None, help="Optional modal_modes_manifest.json for frequency selection.")
     parser.add_argument("--port", type=int, default=8891, help="Viser server port.")
     parser.add_argument("--point-size", type=float, default=0.004, help="Point cloud point size.")
     parser.add_argument("--max-points", type=int, default=10000, help="Maximum points to display; 0 keeps all.")
@@ -301,46 +335,72 @@ def main() -> None:
     vggt = load_vggt_outputs(args.vggt_outputs.expanduser())
     cameras = build_cameras(vggt)
     raw_points, raw_colors = load_points_from_export(args.points.expanduser(), args.max_points)
-    point_source = str(args.points)
-    points = raw_points
-    colors = raw_colors
-    phi = None
-    latent_has_colors = False
-    if args.latent is not None:
-        points, phi, latent_colors = load_latent_field(args.latent.expanduser(), args.max_points)
-        point_source = str(args.latent)
+    if args.latent is not None and args.latent_manifest is not None:
+        raise ValueError("Use either --latent or --latent-manifest, not both.")
+    latent_entries = load_latent_manifest(args.latent_manifest.expanduser()) if args.latent_manifest is not None else []
+    initial_latent = args.latent.expanduser() if args.latent is not None else None
+    if initial_latent is None and latent_entries:
+        initial_latent = latent_entries[0]["latent_path"]
+
+    initial_points = raw_points
+    initial_colors = raw_colors
+    initial_phi = None
+    initial_source = str(args.points)
+    initial_has_rgb = False
+    if initial_latent is not None:
+        initial_points, initial_phi, latent_colors = load_latent_field(initial_latent, args.max_points)
+        initial_source = str(initial_latent)
         if latent_colors is not None:
-            colors = latent_colors
-            latent_has_colors = True
+            initial_colors = latent_colors
+            initial_has_rgb = True
         else:
-            colors = hsv_phase_colors(phi)
-    if points.shape[0] == 0:
+            initial_colors = hsv_phase_colors(initial_phi)
+    if initial_points.shape[0] == 0:
         raise ValueError("No points were loaded.")
 
     transform = scene_transform(cameras, args.alignment)
-    base_display_points = transform_points(points, transform)
-    display_phi = transform_vectors(phi, transform) if phi is not None else None
-    scale = scene_scale(base_display_points)
+
+    def make_display_state(
+        points_in: np.ndarray,
+        phi_in: np.ndarray | None,
+        colors_in: np.ndarray,
+        has_rgb: bool,
+        source: str,
+    ) -> dict[str, Any]:
+        base_points = transform_points(points_in, transform)
+        display_phi_local = transform_vectors(phi_in, transform) if phi_in is not None else None
+        rgb = colors_to_float(colors_in)
+        phase = colors_to_float(hsv_phase_colors(phi_in)) if phi_in is not None else rgb
+        return {
+            "base_display_points": base_points,
+            "display_phi": display_phi_local,
+            "phi": phi_in,
+            "rgb_colors": rgb,
+            "phase_colors": phase,
+            "latent_has_rgb": has_rgb,
+            "point_source": source,
+        }
+
+    state = make_display_state(initial_points, initial_phi, initial_colors, initial_has_rgb, initial_source)
+    scale = scene_scale(state["base_display_points"])
     frustum_scale = 0.08 * scale
 
     server = viser.ViserServer(port=args.port, verbose=False)
     point_handle = {"handle": None}
     point_lock = threading.Lock()
-    rgb_colors = colors_to_float(colors)
-    phase_colors = colors_to_float(hsv_phase_colors(phi)) if phi is not None else rgb_colors
     animation = {"phase": 0.0, "motion_scale": float(args.motion_scale)}
 
     def current_points() -> np.ndarray:
-        if display_phi is None:
-            return base_display_points
+        if state["display_phi"] is None:
+            return state["base_display_points"]
         phase = float(animation["phase"])
-        displacement = np.real(display_phi * np.exp(1j * phase)).astype(np.float32)
-        return (base_display_points + float(animation["motion_scale"]) * displacement).astype(np.float32)
+        displacement = np.real(state["display_phi"] * np.exp(1j * phase)).astype(np.float32)
+        return (state["base_display_points"] + float(animation["motion_scale"]) * displacement).astype(np.float32)
 
     def current_colors() -> np.ndarray:
-        if phi is not None and "color_scheme" in gui_handles and gui_handles["color_scheme"].value == "phase":
-            return phase_colors
-        return rgb_colors
+        if state["phi"] is not None and "color_scheme" in gui_handles and gui_handles["color_scheme"].value == "phase":
+            return state["phase_colors"]
+        return state["rgb_colors"]
 
     def redraw_points(point_size: float) -> None:
         with point_lock:
@@ -379,7 +439,14 @@ def main() -> None:
     show_cameras = server.gui.add_checkbox("Show cameras", True)
     point_size_slider = server.gui.add_slider("Point size", min=0.0002, max=0.008, step=0.0001, initial_value=float(args.point_size))
     gui_handles["point_size"] = point_size_slider
-    if phi is not None:
+    if latent_entries:
+        labels = tuple(str(entry["label"]) for entry in latent_entries)
+        frequency_dropdown = server.gui.add_dropdown("Frequency", labels, initial_value=labels[0])
+        gui_handles["frequency"] = frequency_dropdown
+        entry_by_label = {str(entry["label"]): entry for entry in latent_entries}
+    else:
+        entry_by_label = {}
+    if state["phi"] is not None:
         play_checkbox = server.gui.add_checkbox("Play", False)
         fps_slider = server.gui.add_slider("FPS", min=1.0, max=60.0, step=1.0, initial_value=float(args.fps))
         max_motion_scale = max(float(args.max_motion_scale), float(args.motion_scale), 1e-6)
@@ -390,7 +457,7 @@ def main() -> None:
             step=max_motion_scale / 200.0,
             initial_value=float(args.motion_scale),
         )
-        color_options = ("rgb", "phase") if latent_has_colors else ("phase",)
+        color_options = ("rgb", "phase") if state["latent_has_rgb"] else ("phase",)
         color_scheme = server.gui.add_dropdown("Color scheme", color_options, initial_value=color_options[0])
         gui_handles["play"] = play_checkbox
         gui_handles["fps"] = fps_slider
@@ -405,7 +472,7 @@ def main() -> None:
         redraw_points(float(point_size_slider.value))
 
     def update_motion_scale(_) -> None:
-        if phi is None:
+        if state["phi"] is None:
             return
         animation["motion_scale"] = float(gui_handles["motion_scale"].value)
         redraw_points(float(gui_handles["point_size"].value))
@@ -413,9 +480,24 @@ def main() -> None:
     def update_color_scheme(_) -> None:
         redraw_points(float(gui_handles["point_size"].value))
 
+    def update_frequency(_) -> None:
+        nonlocal state
+        label = str(gui_handles["frequency"].value)
+        entry = entry_by_label[label]
+        latent_path = Path(entry["latent_path"]).expanduser()
+        points_new, phi_new, colors_new = load_latent_field(latent_path, args.max_points)
+        has_rgb = colors_new is not None
+        if colors_new is None:
+            colors_new = hsv_phase_colors(phi_new)
+        state = make_display_state(points_new, phi_new, colors_new, has_rgb, str(latent_path))
+        animation["phase"] = 0.0
+        redraw_points(float(gui_handles["point_size"].value))
+
     show_cameras.on_update(update_camera_visibility)
     point_size_slider.on_update(update_point_size)
-    if phi is not None:
+    if latent_entries:
+        gui_handles["frequency"].on_update(update_frequency)
+    if state["phi"] is not None:
         gui_handles["motion_scale"].on_update(update_motion_scale)
         gui_handles["color_scheme"].on_update(update_color_scheme)
 
@@ -429,9 +511,11 @@ def main() -> None:
 
         threading.Thread(target=animate_points, daemon=True).start()
 
-    print(f"Loaded displayed points: {points.shape[0]} from {point_source}")
-    if args.latent is not None:
-        print(f"Loaded latent modal displacement: {args.latent}")
+    print(f"Loaded displayed points: {state['base_display_points'].shape[0]} from {state['point_source']}")
+    if args.latent is not None or args.latent_manifest is not None:
+        if args.latent_manifest is not None:
+            print(f"Loaded latent manifest: {args.latent_manifest}")
+        print(f"Loaded latent modal displacement: {state['point_source']}")
         print(f"Initial motion scale: {args.motion_scale}")
     print(f"Loaded VGGT cameras: {[camera.label for camera in cameras]}")
     print(f"Alignment: {args.alignment}")
