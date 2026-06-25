@@ -233,12 +233,20 @@ def main() -> None:
     frustum_scale = 0.08 * scale
 
     server = viser.ViserServer(port=args.port, verbose=False)
-    point_handle = server.scene.add_point_cloud(
-        "/vggt/points",
-        points=display_points,
-        colors=colors.astype(np.float32) / 255.0,
-        point_size=float(args.point_size),
-    )
+    point_handle = {"handle": None}
+    point_colors = colors.astype(np.float32) / 255.0
+
+    def redraw_points(point_size: float) -> None:
+        if point_handle["handle"] is not None:
+            point_handle["handle"].remove()
+        point_handle["handle"] = server.scene.add_point_cloud(
+            "/vggt/points",
+            points=display_points,
+            colors=point_colors,
+            point_size=float(point_size),
+        )
+
+    redraw_points(float(args.point_size))
 
     camera_colors = [
         (80, 150, 255),
@@ -261,14 +269,14 @@ def main() -> None:
         button.on_click(lambda event, camera=camera: set_client_to_camera(event, camera, transform))
 
     show_cameras = server.gui.add_checkbox("Show cameras", True)
-    point_size_slider = server.gui.add_slider("Point size", min=0.001, max=0.05, step=0.001, initial_value=float(args.point_size))
+    point_size_slider = server.gui.add_slider("Point size", min=0.0002, max=0.008, step=0.0001, initial_value=float(args.point_size))
 
     def update_camera_visibility(_) -> None:
         for handle in camera_handles.values():
             handle.visible = bool(show_cameras.value)
 
     def update_point_size(_) -> None:
-        point_handle.point_size = float(point_size_slider.value)
+        redraw_points(float(point_size_slider.value))
 
     show_cameras.on_update(update_camera_visibility)
     point_size_slider.on_update(update_point_size)
