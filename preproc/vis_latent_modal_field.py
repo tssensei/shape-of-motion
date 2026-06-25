@@ -408,12 +408,10 @@ def main() -> None:
         if phi is None:
             return
         animation["motion_scale"] = float(gui_handles["motion_scale"].value)
-        with point_lock:
-            point_handle["handle"].points = current_points()
+        redraw_points(float(gui_handles["point_size"].value))
 
     def update_color_scheme(_) -> None:
-        with point_lock:
-            point_handle["handle"].colors = current_colors()
+        redraw_points(float(gui_handles["point_size"].value))
 
     show_cameras.on_update(update_camera_visibility)
     point_size_slider.on_update(update_point_size)
@@ -426,8 +424,7 @@ def main() -> None:
                 fps = max(float(gui_handles["fps"].value), 1.0)
                 if bool(gui_handles["play"].value):
                     animation["phase"] = (float(animation["phase"]) + 2.0 * np.pi / fps) % (2.0 * np.pi)
-                    with point_lock:
-                        point_handle["handle"].points = current_points()
+                    redraw_points(float(gui_handles["point_size"].value))
                 time.sleep(1.0 / fps)
 
         threading.Thread(target=animate_points, daemon=True).start()
