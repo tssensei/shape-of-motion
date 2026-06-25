@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 
 
 OPENGL_CAMERA_CONVERSION = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float64)
@@ -72,7 +71,7 @@ def extrinsic_to_world_to_camera(extrinsic: np.ndarray) -> np.ndarray:
 def load_vggt_outputs(path: Path) -> dict[str, np.ndarray]:
     """Load required VGGT raw output arrays."""
     z = np.load(str(path), allow_pickle=False)
-    required = ["image_paths", "processed_hw", "extrinsics", "intrinsics", "depth", "depth_conf"]
+    required = ["image_paths", "processed_hw", "extrinsics", "intrinsics"]
     missing = [key for key in required if key not in z.files]
     if missing:
         raise ValueError(f"{path} missing required VGGT output arrays: {missing}.")
@@ -83,8 +82,6 @@ def load_vggt_outputs(path: Path) -> dict[str, np.ndarray]:
         "processed_hw": z["processed_hw"].astype(np.int32),
         "extrinsics": normalize_matrix_array(z["extrinsics"], num_images, "extrinsics"),
         "intrinsics": normalize_matrix_array(z["intrinsics"], num_images, "intrinsics"),
-        "depth": normalize_depth_array(z["depth"], num_images),
-        "depth_conf": normalize_depth_array(z["depth_conf"], num_images),
     }
 
 
@@ -114,125 +111,27 @@ def build_cameras(vggt: dict[str, np.ndarray]) -> list[Camera]:
     return cameras
 
 
-def read_resized_image(path: str | bytes | Path, target_hw: tuple[int, int]) -> np.ndarray:
-    """Read one RGB image and resize it to VGGT processed resolution."""
-    if isinstance(path, bytes):
-        path = path.decode("utf-8")
-    image = Image.open(Path(str(path)).expanduser()).convert("RGB")
-    target_h, target_w = target_hw
-    image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
-    return np.asarray(image, dtype=np.uint8)
-
-
-def unproject_depth(
-    depth: np.ndarray,
-    confidence: np.ndarray,
-    colors: np.ndarray,
-    K: np.ndarray,
-    world_to_camera: np.ndarray,
-    confidence_threshold: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Unproject one VGGT depth map into world-space colored points."""
-    valid = np.isfinite(depth) & (depth > 0) & np.isfinite(confidence) & (confidence >= confidence_threshold)
-    if not np.any(valid):
-        return (
-            np.zeros((0, 3), dtype=np.float32),
-            np.zeros((0, 3), dtype=np.uint8),
-            np.zeros((0,), dtype=np.float32),
-        )
-
-    yy, xx = np.nonzero(valid)
-    z = depth[yy, xx].astype(np.float64)
-    fx, fy = float(K[0, 0]), float(K[1, 1])
-    cx, cy = float(K[0, 2]), float(K[1, 2])
-    x = (xx.astype(np.float64) - cx) * z / fx
-    y = (yy.astype(np.float64) - cy) * z / fy
-    points_cam = np.stack([x, y, z, np.ones_like(z)], axis=1)
-    camera_to_world = np.linalg.inv(world_to_camera)
-    points_world_h = points_cam @ camera_to_world.T
-    return (
-        points_world_h[:, :3].astype(np.float32),
-        colors[yy, xx].astype(np.uint8),
-        confidence[yy, xx].astype(np.float32),
-    )
-
-
-def load_points_from_vggt_outputs(
-    vggt: dict[str, np.ndarray],
-    cameras: list[Camera],
-    confidence_percentile: float,
-    max_points: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build a point cloud from VGGT depth, confidence, intrinsics, and poses."""
-    if not (0.0 <= confidence_percentile <= 100.0):
-        raise ValueError("--confidence-percentile must be in [0, 100].")
-    if max_points < 0:
-        raise ValueError("--max-points must be non-negative.")
-
-    depth = vggt["depth"]
-    depth_conf = vggt["depth_conf"]
-    valid_conf = depth_conf[np.isfinite(depth_conf) & np.isfinite(depth) & (depth > 0)]
-    if valid_conf.size == 0:
-        raise ValueError("VGGT outputs contain no finite positive depth samples.")
-    threshold = float(np.percentile(valid_conf, confidence_percentile))
-
-    processed_hw = (int(vggt["processed_hw"][0]), int(vggt["processed_hw"][1]))
-    point_chunks: list[np.ndarray] = []
-    color_chunks: list[np.ndarray] = []
-    confidence_chunks: list[np.ndarray] = []
-    for i, camera in enumerate(cameras):
-        colors = read_resized_image(vggt["image_paths"][i], processed_hw)
-        points_i, colors_i, confidence_i = unproject_depth(
-            depth[i],
-            depth_conf[i],
-            colors,
-            camera.K,
-            camera.world_to_camera,
-            threshold,
-        )
-        point_chunks.append(points_i)
-        color_chunks.append(colors_i)
-        confidence_chunks.append(confidence_i)
-
-    points = np.concatenate(point_chunks, axis=0)
-    colors = np.concatenate(color_chunks, axis=0)
-    confidence = np.concatenate(confidence_chunks, axis=0)
-    if max_points > 0 and points.shape[0] > max_points:
-        # Match the VGGT demo behavior: keep an evenly spaced subset after
-        # confidence filtering instead of selecting only the highest scores.
-        keep = np.linspace(0, points.shape[0] - 1, int(max_points), dtype=np.int64)
-        points = points[keep]
-        colors = colors[keep]
-        confidence = confidence[keep]
-    return points.astype(np.float32), colors.astype(np.uint8), confidence.astype(np.float32)
-
-
-def load_points_from_export(path: Path, max_points: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_points_from_export(path: Path, max_points: int) -> tuple[np.ndarray, np.ndarray]:
     """Load a point cloud exported by preproc/run_vggt.py --export-points."""
     z = np.load(str(path), allow_pickle=False)
-    required = ["points_world", "colors", "confidence"]
+    required = ["points_world", "colors"]
     missing = [key for key in required if key not in z.files]
     if missing:
         raise ValueError(f"{path} missing required point arrays: {missing}.")
     points = z["points_world"].astype(np.float32)
     colors = z["colors"].astype(np.uint8)
-    confidence = z["confidence"].astype(np.float32)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"points_world must have shape (N,3), got {points.shape}.")
     if colors.shape != (points.shape[0], 3):
         raise ValueError(f"colors must have shape (N,3), got {colors.shape}.")
-    if confidence.shape != (points.shape[0],):
-        raise ValueError(f"confidence must have shape (N,), got {confidence.shape}.")
-    valid = np.all(np.isfinite(points), axis=1) & np.isfinite(confidence)
+    valid = np.all(np.isfinite(points), axis=1)
     points = points[valid]
     colors = colors[valid]
-    confidence = confidence[valid]
     if max_points > 0 and points.shape[0] > max_points:
         keep = np.linspace(0, points.shape[0] - 1, int(max_points), dtype=np.int64)
         points = points[keep]
         colors = colors[keep]
-        confidence = confidence[keep]
-    return points, colors, confidence
+    return points, colors
 
 
 def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
@@ -303,11 +202,10 @@ def set_client_to_camera(event, camera: Camera, transform: np.ndarray) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize the raw VGGT point cloud and camera poses with Viser.")
     parser.add_argument("--vggt-outputs", required=True, type=Path, help="vggt_outputs.npz from preproc/run_vggt.py.")
-    parser.add_argument("--points", default=None, type=Path, help="Optional vggt_points.npz from --export-points.")
+    parser.add_argument("--points", required=True, type=Path, help="Fixed vggt_points.npz from --export-points.")
     parser.add_argument("--port", type=int, default=8891, help="Viser server port.")
     parser.add_argument("--point-size", type=float, default=0.004, help="Point cloud point size.")
     parser.add_argument("--max-points", type=int, default=10000, help="Maximum points to display; 0 keeps all.")
-    parser.add_argument("--confidence-percentile", type=float, default=30.0, help="Confidence percentile when building points from vggt_outputs.")
     parser.add_argument(
         "--alignment",
         choices=("viser", "glb", "none"),
@@ -324,12 +222,8 @@ def main() -> None:
 
     vggt = load_vggt_outputs(args.vggt_outputs.expanduser())
     cameras = build_cameras(vggt)
-    if args.points is not None:
-        points, colors, confidence = load_points_from_export(args.points.expanduser(), args.max_points)
-        point_source = str(args.points)
-    else:
-        points, colors, confidence = load_points_from_vggt_outputs(vggt, cameras, args.confidence_percentile, args.max_points)
-        point_source = "vggt_outputs depth"
+    points, colors = load_points_from_export(args.points.expanduser(), args.max_points)
+    point_source = str(args.points)
     if points.shape[0] == 0:
         raise ValueError("No VGGT points were loaded.")
 
@@ -383,7 +277,6 @@ def main() -> None:
     print(f"Loaded VGGT cameras: {[camera.label for camera in cameras]}")
     print(f"Alignment: {args.alignment}")
     print(f"Display scene scale: {scale:.6g}")
-    print(f"Confidence p50/p90: {np.percentile(confidence, [50, 90]).tolist()}")
     for camera in cameras:
         center = np.linalg.inv(camera.world_to_camera)[:3, 3]
         display_center = transform_points(center[None, :], transform)[0]

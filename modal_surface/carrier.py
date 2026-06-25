@@ -26,50 +26,23 @@ from modal_surface.geometry import bilinear_sample, erode_mask, in_image_with_ma
 from modal_surface.io import ViewConfig, ensure_modal_shape, load_mask, load_modal_npz, load_view_config
 
 
-def _mode_amplitude(mode_u: np.ndarray, mode_v: np.ndarray) -> np.ndarray:
-    return np.sqrt((np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32))
-
-
-def _confidence_map(mode_u: np.ndarray, mode_v: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    amp = _mode_amplitude(mode_u, mode_v)
-    vals = amp[mask] if np.any(mask) else amp.ravel()
-    scale = float(np.percentile(vals, 95)) if vals.size else 1.0
-    scale = max(scale, 1e-6)
-    return np.clip(amp / scale, 0.0, 1.0).astype(np.float32)
-
-
-def _normalize_confidence(confidence: np.ndarray) -> np.ndarray:
-    out = np.zeros_like(confidence, dtype=np.float32)
-    valid = np.isfinite(confidence) & (confidence > 0)
-    if not np.any(valid):
-        return out
-    scale = float(np.percentile(confidence[valid], 95))
-    scale = max(scale, 1e-6)
-    out[valid] = np.clip(confidence[valid] / scale, 0.0, 1.0)
-    return out
-
-
 def _load_carrier_points(path: str | Path) -> dict[str, np.ndarray]:
     z = np.load(str(path), allow_pickle=False)
-    required = ["points_world", "confidence"]
+    required = ["points_world"]
     missing = [k for k in required if k not in z.files]
     if missing:
         raise ValueError(f"Carrier point file {path} missing required keys: {missing}.")
 
     points = z["points_world"].astype(np.float32)
-    confidence = z["confidence"].astype(np.float32)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"points_world must have shape (N,3), got {points.shape}.")
-    if confidence.shape != (points.shape[0],):
-        raise ValueError(f"confidence must have shape (N,), got {confidence.shape}.")
 
-    keep = np.all(np.isfinite(points), axis=1) & np.isfinite(confidence)
+    keep = np.all(np.isfinite(points), axis=1)
     if not np.any(keep):
         raise ValueError("No finite carrier points were found.")
 
     out: dict[str, np.ndarray] = {
         "points_world": points[keep],
-        "confidence": confidence[keep],
         "original_indices": np.where(keep)[0].astype(np.int32),
     }
     if "colors" in z.files:
@@ -205,7 +178,6 @@ def _local_depth_stats(
 
 def _append_view_observations(
     points_world: np.ndarray,
-    carrier_confidence: np.ndarray,
     view_index: int,
     cfg: ViewConfig,
     modal: dict[str, np.ndarray],
@@ -245,7 +217,6 @@ def _append_view_observations(
 
     mode_u = modal["mode_u"][mode_index].astype(np.complex64)
     mode_v = modal["mode_v"][mode_index].astype(np.complex64)
-    modal_confidence = _confidence_map(mode_u, mode_v, valid_mask)
     added = 0
     for point_idx in candidate_indices.tolist():
         x = int(rounded_x[point_idx])
@@ -272,14 +243,12 @@ def _append_view_observations(
         sample_xy = pixels_xy[point_idx : point_idx + 1]
         y_u = bilinear_sample(mode_u, sample_xy)[0]
         y_v = bilinear_sample(mode_v, sample_xy)[0]
-        modal_weight = float(bilinear_sample(modal_confidence, sample_xy)[0])
-        confidence = float(carrier_confidence[point_idx]) * modal_weight
         obs_point_indices.append(point_idx)
         obs_view_indices.append(view_index)
         obs_pixels.append([float(pixels_xy[point_idx, 0]), float(pixels_xy[point_idx, 1])])
         obs_y.append([complex(y_u), complex(y_v)])
         obs_j.append(jacobians[candidate_to_row[point_idx]].astype(np.float32))
-        obs_confidence.append(confidence)
+        obs_confidence.append(1.0)
         added += 1
     return added
 
@@ -312,7 +281,6 @@ def build_carrier_observation_graph(
 
     carrier = _load_carrier_points(carrier_points_path)
     points_world_all = carrier["points_world"]
-    carrier_confidence = _normalize_confidence(carrier["confidence"])
     configs, modals, view_freqs_hz, reference_freq_hz = _load_view_inputs(
         view_config_paths,
         modal_npz_paths,
@@ -330,7 +298,6 @@ def build_carrier_observation_graph(
     for view_index, (cfg, modal) in enumerate(zip(configs, modals)):
         count = _append_view_observations(
             points_world_all,
-            carrier_confidence,
             view_index,
             cfg,
             modal,
@@ -406,7 +373,6 @@ def build_carrier_observation_graph(
         source_carrier_points=np.array(str(carrier_points_path)),
         source_view_configs=np.asarray([str(path) for path in view_config_paths]),
         source_modal_npzs=np.asarray([str(path) for path in modal_npz_paths]),
-        carrier_confidence=carrier_confidence[active_old_indices].astype(np.float32),
         **optional_point_fields,
     )
     return out
