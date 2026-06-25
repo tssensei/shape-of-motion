@@ -60,6 +60,12 @@ def _load_carrier_points(path: str | Path) -> dict[str, np.ndarray]:
         if source_pixels_xy.shape != (points.shape[0], 2):
             raise ValueError(f"source_pixels_xy must have shape (N,2), got {source_pixels_xy.shape}.")
         out["source_pixels_xy"] = source_pixels_xy[keep]
+    for key in ("source_image_height", "source_image_width"):
+        if key in z.files:
+            value = int(np.asarray(z[key]).item())
+            if value <= 0:
+                raise ValueError(f"{key} must be positive, got {value}.")
+            out[key] = np.array(value, dtype=np.int32)
     return out
 
 
@@ -176,6 +182,55 @@ def _local_depth_stats(
     return float(z_front), float(z_med)
 
 
+def _subset_carrier_points(carrier: dict[str, np.ndarray], keep: np.ndarray) -> dict[str, np.ndarray]:
+    n = carrier["points_world"].shape[0]
+    out: dict[str, np.ndarray] = {}
+    for key, value in carrier.items():
+        if value.shape[:1] == (n,):
+            out[key] = value[keep]
+        else:
+            out[key] = value
+    return out
+
+
+def _source_mask_keep(carrier: dict[str, np.ndarray], configs: Sequence[ViewConfig], erode_iters: int) -> np.ndarray:
+    if erode_iters < 0:
+        raise ValueError("source_mask_erode_iters must be non-negative.")
+    required = ["source_view_index", "source_pixels_xy", "source_image_height", "source_image_width"]
+    missing = [key for key in required if key not in carrier]
+    if missing:
+        raise ValueError(
+            "Carrier point file is missing source-mask metadata "
+            f"{missing}. Re-run preproc/run_vggt.py --export-points with the current code."
+        )
+
+    source_view_index = carrier["source_view_index"]
+    source_pixels_xy = carrier["source_pixels_xy"]
+    source_h = int(np.asarray(carrier["source_image_height"]).item())
+    source_w = int(np.asarray(carrier["source_image_width"]).item())
+    keep = np.zeros((carrier["points_world"].shape[0],), dtype=bool)
+
+    for view_idx, cfg in enumerate(configs):
+        rows = np.where(source_view_index == view_idx)[0]
+        if rows.size == 0:
+            continue
+        mask = load_mask(cfg.mask_path, (cfg.image_height, cfg.image_width))
+        valid_mask = erode_mask(mask, erode_iters)
+        scale_x = float(cfg.image_width) / float(source_w)
+        scale_y = float(cfg.image_height) / float(source_h)
+        finite = np.all(np.isfinite(source_pixels_xy[rows]), axis=1)
+        x = np.full((rows.size,), -1, dtype=np.int32)
+        y = np.full((rows.size,), -1, dtype=np.int32)
+        x[finite] = np.rint(source_pixels_xy[rows[finite], 0] * scale_x).astype(np.int32)
+        y[finite] = np.rint(source_pixels_xy[rows[finite], 1] * scale_y).astype(np.int32)
+        inside = finite & (x >= 0) & (x < cfg.image_width) & (y >= 0) & (y < cfg.image_height)
+        if not np.any(inside):
+            continue
+        inside_rows = rows[inside]
+        keep[inside_rows] = valid_mask[y[inside], x[inside]]
+    return keep
+
+
 def _append_view_observations(
     points_world: np.ndarray,
     view_index: int,
@@ -260,6 +315,7 @@ def build_carrier_observation_graph(
     out_path: str | Path,
     mode_index: int = 0,
     mask_erode_iters: int = 1,
+    source_mask_erode_iters: int = 1,
     zbuffer_radius: int = 5,
     front_percentile: float = 10.0,
     zbuffer_tau: float = 0.05,
@@ -280,13 +336,19 @@ def build_carrier_observation_graph(
         raise ValueError("min_zbuffer_samples must be at least 1.")
 
     carrier = _load_carrier_points(carrier_points_path)
-    points_world_all = carrier["points_world"]
     configs, modals, view_freqs_hz, reference_freq_hz = _load_view_inputs(
         view_config_paths,
         modal_npz_paths,
         mode_index,
         freq_tolerance_hz,
     )
+    source_mask_candidate_count = int(carrier["points_world"].shape[0])
+    source_keep = _source_mask_keep(carrier, configs, source_mask_erode_iters)
+    source_mask_kept_count = int(source_keep.sum())
+    if source_mask_kept_count == 0:
+        raise ValueError("No VGGT carrier points survived source-mask filtering.")
+    carrier = _subset_carrier_points(carrier, source_keep)
+    points_world_all = carrier["points_world"]
 
     obs_point_indices: list[int] = []
     obs_view_indices: list[int] = []
@@ -368,6 +430,9 @@ def build_carrier_observation_graph(
         zbuffer_tau=np.array(zbuffer_tau, dtype=np.float32),
         min_zbuffer_samples=np.array(min_zbuffer_samples, dtype=np.int32),
         mask_erode_iters=np.array(mask_erode_iters, dtype=np.int32),
+        source_mask_erode_iters=np.array(source_mask_erode_iters, dtype=np.int32),
+        source_mask_candidate_count=np.array(source_mask_candidate_count, dtype=np.int32),
+        source_mask_kept_count=np.array(source_mask_kept_count, dtype=np.int32),
         candidate_point_count=np.array(points_world_all.shape[0], dtype=np.int32),
         observations_per_view=np.asarray(observations_per_view, dtype=np.int32),
         source_carrier_points=np.array(str(carrier_points_path)),

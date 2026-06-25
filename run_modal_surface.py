@@ -14,6 +14,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_match_carrier.add_argument("--out", required=True, help="Output observation graph .npz path.")
     p_match_carrier.add_argument("--mode-index", type=int, default=0, help="Selected modal frequency index.")
     p_match_carrier.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
+    p_match_carrier.add_argument("--source-mask-erode-iters", type=int, default=1, help="3x3 erosion iterations for filtering VGGT carrier points by their source-view mask.")
     p_match_carrier.add_argument("--zbuffer-radius", type=int, default=5, help="Local robust z-buffer window radius in pixels.")
     p_match_carrier.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
     p_match_carrier.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")

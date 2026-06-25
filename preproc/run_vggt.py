@@ -360,6 +360,8 @@ def export_vggt_points(
         confidence=confidence.astype(np.float32),
         source_view_index=source_view_index.astype(np.int32),
         source_pixels_xy=source_pixels_xy.astype(np.float32),
+        source_image_height=np.array(depth.shape[1], dtype=np.int32),
+        source_image_width=np.array(depth.shape[2], dtype=np.int32),
     )
     stats = {
         "path": out_path.name,
