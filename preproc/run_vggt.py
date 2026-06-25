@@ -13,6 +13,15 @@ and exports selected reference views to the modal_surface geometry contract:
     view*_depth.npy
     view*_mask.npy
 
+Optionally, it can also export a VGGT carrier point cloud:
+
+    vggt_points.npz
+
+The carrier point cloud is built directly from VGGT depth, intrinsics, and
+extrinsics. It is meant for the modal_surface carrier route, where visibility is
+handled by projecting this point cloud into each modal view with a robust
+z-buffer instead of using external depth maps.
+
 Example:
 
     python shape-of-motion/preproc/run_vggt.py \
@@ -160,6 +169,38 @@ def normalize_matrix_array(array: np.ndarray, num_images: int, name: str) -> np.
     return arr
 
 
+def normalize_image_array(images: np.ndarray, num_images: int) -> np.ndarray:
+    """Normalize common VGGT image tensor layouts to uint8 RGB (N,H,W,3)."""
+    arr = np.asarray(images)
+    if arr.ndim == 5 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 4:
+        raise ValueError(f"Could not normalize image array to (N,H,W,3), got {images.shape}.")
+    if arr.shape[0] != num_images:
+        raise ValueError(f"Image view count {arr.shape[0]} does not match image count {num_images}.")
+    if arr.shape[1] in (1, 3, 4):
+        arr = np.moveaxis(arr, 1, -1)
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    if arr.shape[-1] != 3:
+        raise ValueError(f"Expected RGB image array, got {arr.shape}.")
+
+    arr = arr.astype(np.float32)
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return np.zeros(arr.shape, dtype=np.uint8)
+    finite_vals = arr[finite]
+    if float(finite_vals.min()) < 0.0:
+        lo = float(np.percentile(finite_vals, 1))
+        hi = float(np.percentile(finite_vals, 99))
+        arr = (arr - lo) / max(hi - lo, 1e-6)
+    elif float(finite_vals.max()) <= 1.5:
+        arr = arr * 255.0
+    return np.clip(arr, 0.0, 255.0).astype(np.uint8)
+
+
 def extrinsic_to_world_to_camera(extrinsic: np.ndarray) -> np.ndarray:
     arr = np.asarray(extrinsic, dtype=np.float64)
     if arr.shape == (4, 4):
@@ -169,6 +210,126 @@ def extrinsic_to_world_to_camera(extrinsic: np.ndarray) -> np.ndarray:
         out[:3, :4] = arr
         return out
     raise ValueError(f"Expected extrinsic shape (3,4) or (4,4), got {arr.shape}.")
+
+
+def unproject_depth_samples(
+    depth: np.ndarray,
+    confidence: np.ndarray,
+    colors: np.ndarray,
+    K: np.ndarray,
+    world_to_camera: np.ndarray,
+    confidence_threshold: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Unproject valid VGGT depth pixels above a confidence threshold."""
+    if depth.shape != confidence.shape:
+        raise ValueError(f"Depth/confidence shape mismatch: {depth.shape} vs {confidence.shape}.")
+    if colors.shape[:2] != depth.shape:
+        raise ValueError(f"Color/depth shape mismatch: {colors.shape[:2]} vs {depth.shape}.")
+    valid = np.isfinite(depth) & (depth > 0) & np.isfinite(confidence) & (confidence >= confidence_threshold)
+    if not np.any(valid):
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.uint8),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0, 2), dtype=np.float32),
+        )
+
+    yy, xx = np.nonzero(valid)
+    z = depth[yy, xx].astype(np.float64)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    x = (xx.astype(np.float64) - cx) * z / fx
+    y = (yy.astype(np.float64) - cy) * z / fy
+    points_cam = np.stack([x, y, z, np.ones_like(z)], axis=1)
+    camera_to_world = np.linalg.inv(world_to_camera)
+    points_world_h = points_cam @ camera_to_world.T
+    pixels_xy = np.stack([xx, yy], axis=1).astype(np.float32)
+    return (
+        points_world_h[:, :3].astype(np.float32),
+        colors[yy, xx].astype(np.uint8),
+        confidence[yy, xx].astype(np.float32),
+        pixels_xy,
+    )
+
+
+def export_vggt_points(
+    out_dir: Path,
+    depth: np.ndarray,
+    depth_conf: np.ndarray,
+    images: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    point_conf_percentile: float,
+    max_points: int,
+) -> tuple[Path, dict[str, Any]]:
+    """Export a dense VGGT carrier point cloud to vggt_points.npz."""
+    if not (0.0 <= point_conf_percentile <= 100.0):
+        raise ValueError("--point-conf-percentile must be in [0, 100].")
+    if max_points < 0:
+        raise ValueError("--max-points must be non-negative.")
+
+    valid_conf = depth_conf[np.isfinite(depth_conf) & np.isfinite(depth) & (depth > 0)]
+    if valid_conf.size == 0:
+        raise ValueError("VGGT depth/confidence produced no valid depth samples.")
+    confidence_threshold = float(np.percentile(valid_conf, point_conf_percentile))
+
+    point_chunks: list[np.ndarray] = []
+    color_chunks: list[np.ndarray] = []
+    confidence_chunks: list[np.ndarray] = []
+    source_view_chunks: list[np.ndarray] = []
+    source_pixel_chunks: list[np.ndarray] = []
+    for view_idx in range(depth.shape[0]):
+        world_to_camera = extrinsic_to_world_to_camera(extrinsics[view_idx])
+        points, colors, confidence, pixels_xy = unproject_depth_samples(
+            depth[view_idx],
+            depth_conf[view_idx],
+            images[view_idx],
+            intrinsics[view_idx],
+            world_to_camera,
+            confidence_threshold,
+        )
+        point_chunks.append(points)
+        color_chunks.append(colors)
+        confidence_chunks.append(confidence)
+        source_view_chunks.append(np.full((points.shape[0],), view_idx, dtype=np.int32))
+        source_pixel_chunks.append(pixels_xy)
+
+    points_world = np.concatenate(point_chunks, axis=0)
+    colors = np.concatenate(color_chunks, axis=0)
+    confidence = np.concatenate(confidence_chunks, axis=0)
+    source_view_index = np.concatenate(source_view_chunks, axis=0)
+    source_pixels_xy = np.concatenate(source_pixel_chunks, axis=0)
+    candidate_count = int(points_world.shape[0])
+    if candidate_count == 0:
+        raise ValueError("No VGGT carrier points survived confidence filtering.")
+
+    if max_points > 0 and candidate_count > max_points:
+        keep = np.argpartition(confidence, -int(max_points))[-int(max_points) :]
+        keep = keep[np.argsort(keep)]
+        points_world = points_world[keep]
+        colors = colors[keep]
+        confidence = confidence[keep]
+        source_view_index = source_view_index[keep]
+        source_pixels_xy = source_pixels_xy[keep]
+
+    out_path = out_dir / "vggt_points.npz"
+    np.savez_compressed(
+        out_path,
+        points_world=points_world.astype(np.float32),
+        colors=colors.astype(np.uint8),
+        confidence=confidence.astype(np.float32),
+        source_view_index=source_view_index.astype(np.int32),
+        source_pixels_xy=source_pixels_xy.astype(np.float32),
+    )
+    stats = {
+        "path": out_path.name,
+        "candidate_points": candidate_count,
+        "saved_points": int(points_world.shape[0]),
+        "confidence_percentile": float(point_conf_percentile),
+        "confidence_threshold": confidence_threshold,
+        "max_points": int(max_points),
+    }
+    return out_path, stats
 
 
 def save_view_config(
@@ -215,6 +376,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-resolution", type=int, default=512, help="VGGT-Omega preprocessing resolution.")
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"), help="Torch device for inference.")
     parser.add_argument("--save-tokens", action="store_true", help="Also save camera_and_register_tokens in raw output.")
+    parser.add_argument("--export-points", action="store_true", help="Export VGGT unprojected carrier points to vggt_points.npz.")
+    parser.add_argument("--point-conf-percentile", type=float, default=30.0, help="Drop carrier depth samples below this confidence percentile.")
+    parser.add_argument("--max-points", type=int, default=500000, help="Maximum saved carrier points; 0 keeps all points.")
     return parser
 
 
@@ -280,6 +444,7 @@ def main() -> None:
     intrinsics = normalize_matrix_array(to_numpy(intrinsics_t), len(image_paths), "intrinsics")
     depth = normalize_depth_array(to_numpy(predictions["depth"]), len(image_paths))
     depth_conf = normalize_depth_array(to_numpy(predictions["depth_conf"]), len(image_paths))
+    processed_images = normalize_image_array(to_numpy(predictions["images"]), len(image_paths))
 
     raw_payload = {
         "image_paths": np.asarray(image_names),
@@ -303,6 +468,19 @@ def main() -> None:
         "raw_output": raw_path.name,
         "views": {},
     }
+    if args.export_points:
+        point_path, point_stats = export_vggt_points(
+            out_dir,
+            depth,
+            depth_conf,
+            processed_images,
+            intrinsics,
+            extrinsics,
+            point_conf_percentile=args.point_conf_percentile,
+            max_points=args.max_points,
+        )
+        stats["carrier_points"] = point_stats
+        print(f"Saved VGGT carrier points -> {point_path}")
 
     for spec in view_specs:
         view_idx = resolved_to_index[resolved(spec.image_path)]

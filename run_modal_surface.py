@@ -48,6 +48,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_match_multi.add_argument("--depth-window-radius", type=int, default=2, help="Depth consistency window radius.")
     p_match_multi.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
 
+    p_match_carrier = sub.add_parser("match-carrier-views", help="Build an N-view observation graph from VGGT carrier points.")
+    p_match_carrier.add_argument("--carrier-points", required=True, help="VGGT carrier points .npz path.")
+    p_match_carrier.add_argument("--view-config", action="append", required=True, help="View JSON config path. Repeat per view.")
+    p_match_carrier.add_argument("--modal-npz", action="append", required=True, help="modal_analysis.npz path. Repeat per view.")
+    p_match_carrier.add_argument("--out", required=True, help="Output observation graph .npz path.")
+    p_match_carrier.add_argument("--mode-index", type=int, default=0, help="Selected modal frequency index.")
+    p_match_carrier.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
+    p_match_carrier.add_argument("--zbuffer-radius", type=int, default=5, help="Local robust z-buffer window radius in pixels.")
+    p_match_carrier.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
+    p_match_carrier.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
+    p_match_carrier.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local carrier depths for visibility.")
+    p_match_carrier.add_argument("--min-observations", type=int, default=2, help="Minimum observed views per carrier point.")
+    p_match_carrier.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
+
     p_opt_multi = sub.add_parser("optimize-multi-view", help="Optimize latent 3D modal displacement from N-view observations.")
     p_opt_multi.add_argument("--observations", required=True, help="Multi-view observation graph .npz path.")
     p_opt_multi.add_argument("--out", required=True, help="Output latent_field multi-view .npz path.")
@@ -81,6 +95,11 @@ def main(argv: list[str] | None = None) -> None:
         from modal_surface.apps import match_multi_views
 
         match_multi_views.run(args)
+        return
+    if args.command == "match-carrier-views":
+        from modal_surface.apps import match_carrier_views
+
+        match_carrier_views.run(args)
         return
     if args.command == "optimize-multi-view":
         from modal_surface.apps import optimize_multi_view
