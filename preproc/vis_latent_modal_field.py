@@ -563,16 +563,10 @@ def main() -> None:
             return state["phase_colors"]
         return state["rgb_colors"]
 
-    def _require_point_handle():
-        handle = point_handle["handle"]
-        if handle is None:
-            raise RuntimeError("Point cloud handle has not been initialized.")
-        return handle
-
-    def init_points(point_size: float) -> None:
+    def redraw_points(point_size: float) -> None:
         with point_lock:
             if point_handle["handle"] is not None:
-                raise RuntimeError("Point cloud handle was initialized more than once.")
+                point_handle["handle"].remove()
             point_handle["handle"] = server.scene.add_point_cloud(
                 "/vggt/points",
                 points=current_points(),
@@ -580,20 +574,8 @@ def main() -> None:
                 point_size=float(point_size),
             )
 
-    def update_point_positions() -> None:
-        with point_lock:
-            _require_point_handle().points = current_points()
-
-    def update_point_colors() -> None:
-        with point_lock:
-            _require_point_handle().colors = current_colors()
-
-    def update_point_size_value(point_size: float) -> None:
-        with point_lock:
-            _require_point_handle().point_size = float(point_size)
-
     gui_handles = {}
-    init_points(float(args.point_size))
+    redraw_points(float(args.point_size))
 
     camera_colors = [
         (80, 150, 255),
@@ -696,7 +678,7 @@ def main() -> None:
         runtime["qdot"].fill(0.0)
         if gui_handles["drive_mode"].value == "oscillator":
             set_oscillator_state()
-        update_point_positions()
+        redraw_points(float(gui_handles["point_size"].value))
 
     def trigger_impulse(_) -> None:
         if runtime is None:
@@ -706,7 +688,7 @@ def main() -> None:
         omega = runtime["omega"]
         runtime["q"].fill(0.0)
         runtime["qdot"] = (enabled.astype(np.float64) * gain * omega * np.exp(1j * phase)).astype(np.complex64)
-        update_point_positions()
+        redraw_points(float(gui_handles["point_size"].value))
 
     def step_runtime(dt: float) -> None:
         if runtime is None:
@@ -733,23 +715,23 @@ def main() -> None:
             handle.visible = bool(show_cameras.value)
 
     def update_point_size(_) -> None:
-        update_point_size_value(float(point_size_slider.value))
+        redraw_points(float(point_size_slider.value))
 
     def update_motion_scale(_) -> None:
         if runtime_data is None:
             return
         animation["motion_scale"] = float(gui_handles["motion_scale"].value)
-        update_point_positions()
+        redraw_points(float(gui_handles["point_size"].value))
 
     def update_color_scheme(_) -> None:
-        update_point_colors()
+        redraw_points(float(gui_handles["point_size"].value))
 
     def update_modal_controls(_) -> None:
         if runtime is None:
             return
         if gui_handles["drive_mode"].value == "oscillator":
             set_oscillator_state()
-        update_point_positions()
+        redraw_points(float(gui_handles["point_size"].value))
 
     show_cameras.on_update(update_camera_visibility)
     point_size_slider.on_update(update_point_size)
@@ -769,14 +751,18 @@ def main() -> None:
         def animate_points() -> None:
             last_time = time.perf_counter()
             while True:
-                fps = max(float(gui_handles["fps"].value), 1.0)
-                now = time.perf_counter()
-                dt = min(now - last_time, 0.25)
-                last_time = now
-                if bool(gui_handles["play"].value):
-                    step_runtime(dt)
-                    update_point_positions()
-                time.sleep(1.0 / fps)
+                try:
+                    fps = max(float(gui_handles["fps"].value), 1.0)
+                    now = time.perf_counter()
+                    dt = min(now - last_time, 0.25)
+                    last_time = now
+                    if bool(gui_handles["play"].value):
+                        step_runtime(dt)
+                        redraw_points(float(gui_handles["point_size"].value))
+                    time.sleep(1.0 / fps)
+                except Exception as exc:
+                    print(f"Animation thread failed: {type(exc).__name__}: {exc}", flush=True)
+                    raise
 
         threading.Thread(target=animate_points, daemon=True).start()
 
