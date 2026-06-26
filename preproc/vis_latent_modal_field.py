@@ -389,6 +389,89 @@ def hsv_phase_colors_for_modes(phi_modes: np.ndarray) -> np.ndarray:
     return hsv_phase_colors(pseudo_phi)
 
 
+def hsv_phase_value_colors(phase: np.ndarray, value: np.ndarray) -> np.ndarray:
+    """Map phase to hue and amplitude to value for Davis-style mode previews."""
+    hue = (np.asarray(phase, dtype=np.float32) + np.pi) / (2.0 * np.pi)
+    value = np.clip(np.asarray(value, dtype=np.float32), 0.0, 1.0)
+    h = (hue * 6.0) % 6.0
+    i = np.floor(h).astype(np.int32)
+    f = h - i
+    q = 1.0 - f
+    t = f
+    rgb = np.zeros((phase.shape[0], 3), dtype=np.float32)
+    masks = [i == k for k in range(6)]
+    rgb[masks[0]] = np.stack([np.ones_like(f[masks[0]]), t[masks[0]], np.zeros_like(f[masks[0]])], axis=1)
+    rgb[masks[1]] = np.stack([q[masks[1]], np.ones_like(f[masks[1]]), np.zeros_like(f[masks[1]])], axis=1)
+    rgb[masks[2]] = np.stack([np.zeros_like(f[masks[2]]), np.ones_like(f[masks[2]]), t[masks[2]]], axis=1)
+    rgb[masks[3]] = np.stack([np.zeros_like(f[masks[3]]), q[masks[3]], np.ones_like(f[masks[3]])], axis=1)
+    rgb[masks[4]] = np.stack([t[masks[4]], np.zeros_like(f[masks[4]]), np.ones_like(f[masks[4]])], axis=1)
+    rgb[masks[5]] = np.stack([np.ones_like(f[masks[5]]), np.zeros_like(f[masks[5]]), q[masks[5]]], axis=1)
+    return (255.0 * np.clip(rgb * value[:, None], 0.0, 1.0)).astype(np.uint8)
+
+
+def quat_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
+    """Convert a scalar-first unit quaternion to a 3x3 rotation matrix."""
+    q = np.asarray(wxyz, dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(q))
+    if norm <= 0:
+        raise ValueError("Camera quaternion has zero norm.")
+    w, x, y, z = q / norm
+    return np.asarray(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def view_projection_jacobian(points_display: np.ndarray, camera_wxyz: np.ndarray, camera_position: np.ndarray) -> np.ndarray:
+    """Compute d([x/z,y/z]) / dX_display for a Viser display-space camera."""
+    points = np.asarray(points_display, dtype=np.float64)
+    position = np.asarray(camera_position, dtype=np.float64).reshape(3)
+    R_c2w = quat_wxyz_to_matrix(np.asarray(camera_wxyz, dtype=np.float64))
+    R_w2c = R_c2w.T
+    points_cam = (points - position[None, :]) @ R_w2c.T
+    x = points_cam[:, 0]
+    y = points_cam[:, 1]
+    z = points_cam[:, 2]
+    eps = 1e-6
+    z_safe = np.where(np.abs(z) < eps, np.sign(z + eps) * eps, z)
+    J_cam = np.zeros((points.shape[0], 2, 3), dtype=np.float64)
+    J_cam[:, 0, 0] = 1.0 / z_safe
+    J_cam[:, 0, 2] = -x / (z_safe * z_safe)
+    J_cam[:, 1, 1] = 1.0 / z_safe
+    J_cam[:, 1, 2] = -y / (z_safe * z_safe)
+    return np.einsum("nij,jk->nik", J_cam, R_w2c).astype(np.float32)
+
+
+def projected_2d_phase_colors(
+    points_display: np.ndarray,
+    phi_display: np.ndarray,
+    camera_wxyz: np.ndarray,
+    camera_position: np.ndarray,
+) -> np.ndarray:
+    """Color one 3D mode by its projected 2D complex phase in the current view."""
+    J = view_projection_jacobian(points_display, camera_wxyz, camera_position)
+    y = np.einsum("nij,nj->ni", J, phi_display.astype(np.complex64)).astype(np.complex64)
+    amp_uv = np.abs(y)
+    component = np.argmax(amp_uv, axis=1)
+    phase = np.angle(y[np.arange(y.shape[0]), component])
+    amp = np.sqrt(np.sum((amp_uv**2).astype(np.float32), axis=1))
+    finite = np.isfinite(amp) & np.isfinite(phase)
+    if np.any(finite):
+        scale = float(np.percentile(amp[finite], 95))
+    else:
+        scale = 1.0
+    if scale <= 1e-8:
+        scale = 1.0
+    value = np.zeros_like(amp, dtype=np.float32)
+    value[finite] = np.clip(amp[finite] / scale, 0.0, 1.0)
+    phase = np.where(np.isfinite(phase), phase, 0.0)
+    return hsv_phase_value_colors(phase.astype(np.float32), value)
+
+
 def colors_to_float(colors: np.ndarray) -> np.ndarray:
     """Convert uint8 RGB to Viser float colors."""
     return colors.astype(np.float32) / 255.0
@@ -575,6 +658,80 @@ def main() -> None:
             )
 
     gui_handles = {}
+    default_camera_wxyz, default_camera_position, _, _ = camera_display_pose(cameras[0], transform)
+    phase_camera = {
+        "wxyz": np.asarray(default_camera_wxyz, dtype=np.float64),
+        "position": np.asarray(default_camera_position, dtype=np.float64),
+        "timer": None,
+    }
+
+    def selected_phase_mode_index() -> int:
+        if runtime_data is None:
+            return 0
+        if "phase_mode" not in gui_handles:
+            return 0
+        label = str(gui_handles["phase_mode"].value)
+        try:
+            return list(runtime_data.labels).index(label)
+        except ValueError as exc:
+            raise ValueError(f"Unknown phase mode label: {label}") from exc
+
+    def update_projected_phase_colors(camera_wxyz: np.ndarray, camera_position: np.ndarray, *, redraw: bool) -> None:
+        if state["display_phi"] is None:
+            return
+        mode_index = selected_phase_mode_index()
+        state["phase_colors"] = colors_to_float(
+            projected_2d_phase_colors(
+                state["base_display_points"],
+                state["display_phi"][mode_index],
+                np.asarray(camera_wxyz, dtype=np.float64),
+                np.asarray(camera_position, dtype=np.float64),
+            )
+        )
+        phase_camera["wxyz"] = np.asarray(camera_wxyz, dtype=np.float64)
+        phase_camera["position"] = np.asarray(camera_position, dtype=np.float64)
+        if redraw and "color_scheme" in gui_handles and gui_handles["color_scheme"].value == "phase":
+            redraw_points(float(gui_handles["point_size"].value))
+
+    def update_projected_phase_from_client(client, *, redraw: bool) -> None:
+        if client is None:
+            return
+        update_projected_phase_colors(client.camera.wxyz, client.camera.position, redraw=redraw)
+
+    def schedule_projected_phase_from_client(client) -> None:
+        if client is None or state["display_phi"] is None:
+            return
+        if "color_scheme" in gui_handles and gui_handles["color_scheme"].value != "phase":
+            return
+        timer = phase_camera.get("timer")
+        if timer is not None:
+            timer.cancel()
+
+        def _update() -> None:
+            update_projected_phase_from_client(client, redraw=True)
+
+        next_timer = threading.Timer(0.2, _update)
+        next_timer.daemon = True
+        phase_camera["timer"] = next_timer
+        next_timer.start()
+
+    def register_client_camera_updates(client) -> None:
+        camera = client.camera
+        if not hasattr(camera, "on_update"):
+            print("Current Viser camera handle does not expose on_update; use 'Update view phase colors' manually.", flush=True)
+            return
+
+        @camera.on_update
+        def _(_) -> None:
+            schedule_projected_phase_from_client(client)
+
+    if hasattr(server, "on_client_connect"):
+        @server.on_client_connect
+        def _(client) -> None:
+            register_client_camera_updates(client)
+    else:
+        print("Current Viser server does not expose on_client_connect; use 'Update view phase colors' manually.", flush=True)
+
     redraw_points(float(args.point_size))
 
     camera_colors = [
@@ -595,7 +752,12 @@ def main() -> None:
             frustum_scale,
         )
         button = server.gui.add_button(f"Go to {camera.label}")
-        button.on_click(lambda event, camera=camera: set_client_to_camera(event, camera, transform))
+
+        def _go_to_camera(event, camera=camera) -> None:
+            set_client_to_camera(event, camera, transform)
+            update_projected_phase_from_client(event.client, redraw=True)
+
+        button.on_click(_go_to_camera)
 
     show_cameras = server.gui.add_checkbox("Show cameras", True)
     point_size_slider = server.gui.add_slider("Point size", min=0.0002, max=0.008, step=0.0001, initial_value=float(args.point_size))
@@ -616,6 +778,8 @@ def main() -> None:
         damping_slider = server.gui.add_slider("Damping", min=0.0, max=0.5, step=0.005, initial_value=float(args.damping))
         color_options = ("rgb", "phase") if state["latent_has_rgb"] else ("phase",)
         color_scheme = server.gui.add_dropdown("Color scheme", color_options, initial_value=color_options[0])
+        phase_mode = server.gui.add_dropdown("Phase mode", runtime_data.labels, initial_value=runtime_data.labels[0])
+        update_phase_button = server.gui.add_button("Update view phase colors")
         reset_button = server.gui.add_button("Reset modal state")
         impulse_button = server.gui.add_button("Trigger impulse")
         gui_handles["play"] = play_checkbox
@@ -624,6 +788,8 @@ def main() -> None:
         gui_handles["drive_mode"] = drive_mode
         gui_handles["damping"] = damping_slider
         gui_handles["color_scheme"] = color_scheme
+        gui_handles["phase_mode"] = phase_mode
+        gui_handles["update_phase"] = update_phase_button
         gui_handles["reset"] = reset_button
         gui_handles["impulse"] = impulse_button
 
@@ -723,8 +889,23 @@ def main() -> None:
         animation["motion_scale"] = float(gui_handles["motion_scale"].value)
         redraw_points(float(gui_handles["point_size"].value))
 
-    def update_color_scheme(_) -> None:
+    def update_color_scheme(event) -> None:
+        if "color_scheme" in gui_handles and gui_handles["color_scheme"].value == "phase":
+            if getattr(event, "client", None) is not None:
+                update_projected_phase_from_client(event.client, redraw=False)
+            else:
+                update_projected_phase_colors(phase_camera["wxyz"], phase_camera["position"], redraw=False)
         redraw_points(float(gui_handles["point_size"].value))
+
+    def update_phase_mode(event) -> None:
+        if getattr(event, "client", None) is not None:
+            update_projected_phase_from_client(event.client, redraw=False)
+        else:
+            update_projected_phase_colors(phase_camera["wxyz"], phase_camera["position"], redraw=False)
+        redraw_points(float(gui_handles["point_size"].value))
+
+    def update_phase_from_button(event) -> None:
+        update_projected_phase_from_client(event.client, redraw=True)
 
     def update_modal_controls(_) -> None:
         if runtime is None:
@@ -737,8 +918,11 @@ def main() -> None:
     point_size_slider.on_update(update_point_size)
     if runtime_data is not None:
         set_oscillator_state()
+        update_projected_phase_colors(phase_camera["wxyz"], phase_camera["position"], redraw=True)
         gui_handles["motion_scale"].on_update(update_motion_scale)
         gui_handles["color_scheme"].on_update(update_color_scheme)
+        gui_handles["phase_mode"].on_update(update_phase_mode)
+        gui_handles["update_phase"].on_click(update_phase_from_button)
         gui_handles["drive_mode"].on_update(reset_runtime_state)
         gui_handles["damping"].on_update(update_modal_controls)
         gui_handles["reset"].on_click(reset_runtime_state)
