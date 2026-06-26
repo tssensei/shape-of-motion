@@ -451,14 +451,16 @@ def projected_2d_phase_colors(
     phi_display: np.ndarray,
     camera_wxyz: np.ndarray,
     camera_position: np.ndarray,
+    component_index: int,
 ) -> np.ndarray:
-    """Color one 3D mode by its projected 2D complex phase in the current view."""
+    """Color one projected 2D component of one 3D mode in the current view."""
+    if component_index not in (0, 1):
+        raise ValueError(f"component_index must be 0 for projected u or 1 for projected v, got {component_index}.")
     J = view_projection_jacobian(points_display, camera_wxyz, camera_position)
     y = np.einsum("nij,nj->ni", J, phi_display.astype(np.complex64)).astype(np.complex64)
-    amp_uv = np.abs(y)
-    component = np.argmax(amp_uv, axis=1)
-    phase = np.angle(y[np.arange(y.shape[0]), component])
-    amp = np.sqrt(np.sum((amp_uv**2).astype(np.float32), axis=1))
+    component = y[:, component_index]
+    phase = np.angle(component)
+    amp = np.abs(component).astype(np.float32)
     finite = np.isfinite(amp) & np.isfinite(phase)
     if np.any(finite):
         scale = float(np.percentile(amp[finite], 95))
@@ -664,28 +666,41 @@ def main() -> None:
         "position": np.asarray(default_camera_position, dtype=np.float64),
         "timer": None,
     }
+    phase_component_options: tuple[str, ...] = ()
+    phase_component_lookup: dict[str, tuple[int, int]] = {}
+    if runtime_data is not None:
+        labels: list[str] = []
+        for mode_i, label in enumerate(runtime_data.labels):
+            for component_i, component_name in enumerate(("projected u", "projected v")):
+                option = f"{label} {component_name}"
+                labels.append(option)
+                phase_component_lookup[option] = (mode_i, component_i)
+        phase_component_options = tuple(labels)
 
-    def selected_phase_mode_index() -> int:
+    def selected_phase_component() -> tuple[int, int]:
         if runtime_data is None:
-            return 0
-        if "phase_mode" not in gui_handles:
-            return 0
-        label = str(gui_handles["phase_mode"].value)
+            return 0, 0
+        if "phase_component" not in gui_handles:
+            return 0, 0
+        label = str(gui_handles["phase_component"].value)
         try:
-            return list(runtime_data.labels).index(label)
+            return phase_component_lookup[label]
         except ValueError as exc:
-            raise ValueError(f"Unknown phase mode label: {label}") from exc
+            raise ValueError(f"Unknown phase component label: {label}") from exc
+        except KeyError as exc:
+            raise ValueError(f"Unknown phase component label: {label}") from exc
 
     def update_projected_phase_colors(camera_wxyz: np.ndarray, camera_position: np.ndarray, *, redraw: bool) -> None:
         if state["display_phi"] is None:
             return
-        mode_index = selected_phase_mode_index()
+        mode_index, component_index = selected_phase_component()
         state["phase_colors"] = colors_to_float(
             projected_2d_phase_colors(
                 state["base_display_points"],
                 state["display_phi"][mode_index],
                 np.asarray(camera_wxyz, dtype=np.float64),
                 np.asarray(camera_position, dtype=np.float64),
+                component_index,
             )
         )
         phase_camera["wxyz"] = np.asarray(camera_wxyz, dtype=np.float64)
@@ -778,7 +793,11 @@ def main() -> None:
         damping_slider = server.gui.add_slider("Damping", min=0.0, max=0.5, step=0.005, initial_value=float(args.damping))
         color_options = ("rgb", "phase") if state["latent_has_rgb"] else ("phase",)
         color_scheme = server.gui.add_dropdown("Color scheme", color_options, initial_value=color_options[0])
-        phase_mode = server.gui.add_dropdown("Phase mode", runtime_data.labels, initial_value=runtime_data.labels[0])
+        phase_component = server.gui.add_dropdown(
+            "Phase component",
+            phase_component_options,
+            initial_value=phase_component_options[0],
+        )
         update_phase_button = server.gui.add_button("Update view phase colors")
         reset_button = server.gui.add_button("Reset modal state")
         impulse_button = server.gui.add_button("Trigger impulse")
@@ -788,7 +807,7 @@ def main() -> None:
         gui_handles["drive_mode"] = drive_mode
         gui_handles["damping"] = damping_slider
         gui_handles["color_scheme"] = color_scheme
-        gui_handles["phase_mode"] = phase_mode
+        gui_handles["phase_component"] = phase_component
         gui_handles["update_phase"] = update_phase_button
         gui_handles["reset"] = reset_button
         gui_handles["impulse"] = impulse_button
@@ -897,7 +916,7 @@ def main() -> None:
                 update_projected_phase_colors(phase_camera["wxyz"], phase_camera["position"], redraw=False)
         redraw_points(float(gui_handles["point_size"].value))
 
-    def update_phase_mode(event) -> None:
+    def update_phase_component(event) -> None:
         if getattr(event, "client", None) is not None:
             update_projected_phase_from_client(event.client, redraw=False)
         else:
@@ -921,7 +940,7 @@ def main() -> None:
         update_projected_phase_colors(phase_camera["wxyz"], phase_camera["position"], redraw=True)
         gui_handles["motion_scale"].on_update(update_motion_scale)
         gui_handles["color_scheme"].on_update(update_color_scheme)
-        gui_handles["phase_mode"].on_update(update_phase_mode)
+        gui_handles["phase_component"].on_update(update_phase_component)
         gui_handles["update_phase"].on_click(update_phase_from_button)
         gui_handles["drive_mode"].on_update(reset_runtime_state)
         gui_handles["damping"].on_update(update_modal_controls)
