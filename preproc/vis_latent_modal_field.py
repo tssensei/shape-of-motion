@@ -602,9 +602,9 @@ def set_client_to_camera(event, camera: Camera, transform: np.ndarray, look_at: 
         return
     wxyz, position, fov, _ = camera_display_pose(camera, transform)
     with event.client.atomic():
-        event.client.camera.wxyz = wxyz
         event.client.camera.position = position
         event.client.camera.look_at = look_at
+        event.client.camera.wxyz = wxyz
         event.client.camera.fov = fov
 
 
