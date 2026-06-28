@@ -558,6 +558,14 @@ def scene_scale(points: np.ndarray) -> float:
     return max(float(np.linalg.norm(hi - lo)), 1e-3)
 
 
+def camera_forward_orbit_center(display_points: np.ndarray) -> np.ndarray:
+    """Return a robust orbit center from points in front of display-space camera 1."""
+    in_front = display_points[:, 2] > 0
+    if not np.any(in_front):
+        raise ValueError("No displayed points are in front of camera1; cannot set camera-forward orbit center.")
+    return np.median(display_points[in_front], axis=0).astype(np.float32)
+
+
 def camera_display_pose(camera: Camera, transform: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
     """Return Viser pose fields for one VGGT camera."""
     import viser.transforms as vtf
@@ -588,7 +596,7 @@ def add_camera_frustum(server, camera: Camera, transform: np.ndarray, color: tup
     )
 
 
-def set_client_to_camera(event, camera: Camera, transform: np.ndarray) -> None:
+def set_client_to_camera(event, camera: Camera, transform: np.ndarray, look_at: np.ndarray) -> None:
     """Move the active Viser client camera to a VGGT camera pose."""
     if event.client is None:
         return
@@ -596,6 +604,7 @@ def set_client_to_camera(event, camera: Camera, transform: np.ndarray) -> None:
     with event.client.atomic():
         event.client.camera.wxyz = wxyz
         event.client.camera.position = position
+        event.client.camera.look_at = look_at
         event.client.camera.fov = fov
 
 
@@ -701,6 +710,7 @@ def main() -> None:
     )
     scale = scene_scale(state["base_display_points"])
     frustum_scale = 0.08 * scale
+    orbit_center = camera_forward_orbit_center(state["base_display_points"])
 
     server = viser.ViserServer(port=args.port, verbose=False)
     point_handle = {"handle": None}
@@ -829,6 +839,7 @@ def main() -> None:
         next_timer.start()
 
     def register_client_camera_updates(client) -> None:
+        client.camera.look_at = orbit_center
         camera = client.camera
         if not hasattr(camera, "on_update"):
             print("Current Viser camera handle does not expose on_update; use 'Update view phase colors' manually.", flush=True)
@@ -867,7 +878,7 @@ def main() -> None:
         button = server.gui.add_button(f"Go to {camera.label}")
 
         def _go_to_camera(event, camera=camera) -> None:
-            set_client_to_camera(event, camera, transform)
+            set_client_to_camera(event, camera, transform, orbit_center)
             update_projected_phase_from_client(event.client, redraw=True)
 
         button.on_click(_go_to_camera)
