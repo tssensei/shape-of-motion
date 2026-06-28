@@ -48,6 +48,8 @@ class ModalRuntimeData:
     freqs_hz: np.ndarray
     labels: tuple[str, ...]
     colors: np.ndarray | None
+    obs_count_per_point: np.ndarray | None
+    refined_mask: np.ndarray | None
     source: str
 
 
@@ -214,6 +216,16 @@ def _load_latent_arrays(path: Path) -> dict[str, np.ndarray]:
         if colors.shape != (points.shape[0], 3):
             raise ValueError(f"{path} colors must have shape (N,3), got {colors.shape}.")
         out["colors"] = colors
+    if "obs_count_per_point" in z.files:
+        obs_count = z["obs_count_per_point"].astype(np.int32)
+        if obs_count.shape != (points.shape[0],):
+            raise ValueError(f"{path} obs_count_per_point must have shape ({points.shape[0]},), got {obs_count.shape}.")
+        out["obs_count_per_point"] = obs_count
+    if "single_view_refined_mask" in z.files:
+        refined = z["single_view_refined_mask"].astype(bool)
+        if refined.shape != (points.shape[0],):
+            raise ValueError(f"{path} single_view_refined_mask must have shape ({points.shape[0]},), got {refined.shape}.")
+        out["single_view_refined_mask"] = refined
     return out
 
 
@@ -232,12 +244,22 @@ def load_single_runtime_mode(path: Path, max_points: int) -> ModalRuntimeData:
     colors = arrays.get("colors")
     if colors is not None:
         colors = colors[valid]
+    obs_count = arrays.get("obs_count_per_point")
+    if obs_count is not None:
+        obs_count = obs_count[valid]
+    refined_mask = arrays.get("single_view_refined_mask")
+    if refined_mask is not None:
+        refined_mask = refined_mask[valid]
     if max_points > 0 and points.shape[0] > max_points:
         keep = np.linspace(0, points.shape[0] - 1, int(max_points), dtype=np.int64)
         points = points[keep]
         phi = phi[keep]
         if colors is not None:
             colors = colors[keep]
+        if obs_count is not None:
+            obs_count = obs_count[keep]
+        if refined_mask is not None:
+            refined_mask = refined_mask[keep]
     freq = float(np.asarray(arrays.get("freq_hz", np.array(1.0, dtype=np.float32))).item())
     return ModalRuntimeData(
         points=points,
@@ -245,6 +267,8 @@ def load_single_runtime_mode(path: Path, max_points: int) -> ModalRuntimeData:
         freqs_hz=np.asarray([freq], dtype=np.float32),
         labels=(f"0: {freq:.6f} Hz",),
         colors=colors,
+        obs_count_per_point=obs_count.astype(np.int32, copy=False) if obs_count is not None else None,
+        refined_mask=refined_mask.astype(bool, copy=False) if refined_mask is not None else None,
         source=str(path),
     )
 
@@ -289,6 +313,8 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
     labels: list[str] = []
     valid: np.ndarray | None = None
     colors: np.ndarray | None = None
+    obs_count_per_point: np.ndarray | None = None
+    refined_mask: np.ndarray | None = None
     for mode_i, entry in enumerate(entries):
         latent_path = Path(entry["latent_path"]).expanduser()
         arrays = _load_latent_arrays(latent_path)
@@ -299,6 +325,10 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
             valid = np.all(np.isfinite(points), axis=1)
             if "colors" in arrays:
                 colors = arrays["colors"]
+            if "obs_count_per_point" in arrays:
+                obs_count_per_point = arrays["obs_count_per_point"]
+            if "single_view_refined_mask" in arrays:
+                refined_mask = arrays["single_view_refined_mask"].copy()
         else:
             ref_points = first["points"]
             if points.shape != ref_points.shape:
@@ -311,6 +341,18 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
                     f"Manifest mode {entry['label']} does not share the same points_world as the first mode. "
                     "Davis-style modal superposition requires one common carrier point set."
                 )
+            if obs_count_per_point is not None:
+                if "obs_count_per_point" not in arrays:
+                    raise ValueError(f"Manifest mode {entry['label']} is missing obs_count_per_point.")
+                if not np.array_equal(arrays["obs_count_per_point"], obs_count_per_point):
+                    raise ValueError(f"Manifest mode {entry['label']} has inconsistent obs_count_per_point.")
+            elif "obs_count_per_point" in arrays:
+                raise ValueError("Manifest modes must either all include obs_count_per_point or none of them should.")
+            if "single_view_refined_mask" in arrays:
+                if refined_mask is None:
+                    refined_mask = arrays["single_view_refined_mask"].copy()
+                else:
+                    refined_mask |= arrays["single_view_refined_mask"]
         assert valid is not None
         valid &= np.all(np.isfinite(phi.real), axis=1) & np.all(np.isfinite(phi.imag), axis=1)
         phi_list.append(phi)
@@ -323,18 +365,26 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
     points_out = first["points"][valid]
     phi_out = np.stack([phi[valid] for phi in phi_list], axis=0).astype(np.complex64, copy=False)
     colors_out = colors[valid] if colors is not None else None
+    obs_count_out = obs_count_per_point[valid] if obs_count_per_point is not None else None
+    refined_out = refined_mask[valid] if refined_mask is not None else None
     if max_points > 0 and points_out.shape[0] > max_points:
         keep = np.linspace(0, points_out.shape[0] - 1, int(max_points), dtype=np.int64)
         points_out = points_out[keep]
         phi_out = phi_out[:, keep, :]
         if colors_out is not None:
             colors_out = colors_out[keep]
+        if obs_count_out is not None:
+            obs_count_out = obs_count_out[keep]
+        if refined_out is not None:
+            refined_out = refined_out[keep]
     return ModalRuntimeData(
         points=points_out.astype(np.float32, copy=False),
         phi_modes=phi_out,
         freqs_hz=np.asarray(freqs, dtype=np.float32),
         labels=tuple(labels),
         colors=colors_out.astype(np.uint8, copy=False) if colors_out is not None else None,
+        obs_count_per_point=obs_count_out.astype(np.int32, copy=False) if obs_count_out is not None else None,
+        refined_mask=refined_out.astype(bool, copy=False) if refined_out is not None else None,
         source=str(path),
     )
 
@@ -407,6 +457,16 @@ def hsv_phase_value_colors(phase: np.ndarray, value: np.ndarray) -> np.ndarray:
     rgb[masks[4]] = np.stack([t[masks[4]], np.zeros_like(f[masks[4]]), np.ones_like(f[masks[4]])], axis=1)
     rgb[masks[5]] = np.stack([np.ones_like(f[masks[5]]), np.zeros_like(f[masks[5]]), q[masks[5]]], axis=1)
     return (255.0 * np.clip(rgb * value[:, None], 0.0, 1.0)).astype(np.uint8)
+
+
+def obs_count_colors(obs_count: np.ndarray) -> np.ndarray:
+    """Diagnostic colors: one-view red, two-view blue, three-plus green."""
+    counts = np.asarray(obs_count, dtype=np.int32)
+    colors = np.zeros((counts.shape[0], 3), dtype=np.uint8)
+    colors[counts <= 1] = np.asarray([255, 110, 40], dtype=np.uint8)
+    colors[counts == 2] = np.asarray([70, 140, 255], dtype=np.uint8)
+    colors[counts >= 3] = np.asarray([70, 210, 120], dtype=np.uint8)
+    return colors
 
 
 def quat_wxyz_to_matrix(wxyz: np.ndarray) -> np.ndarray:
@@ -585,10 +645,14 @@ def main() -> None:
     initial_phi_modes = None
     initial_source = str(args.points)
     initial_has_rgb = False
+    initial_obs_count = None
+    initial_refined_mask = None
     if runtime_data is not None:
         initial_points = runtime_data.points
         initial_phi_modes = runtime_data.phi_modes
         initial_source = runtime_data.source
+        initial_obs_count = runtime_data.obs_count_per_point
+        initial_refined_mask = runtime_data.refined_mask
         if runtime_data.colors is not None:
             initial_colors = runtime_data.colors
             initial_has_rgb = True
@@ -605,22 +669,36 @@ def main() -> None:
         colors_in: np.ndarray,
         has_rgb: bool,
         source: str,
+        obs_count_in: np.ndarray | None,
+        refined_mask_in: np.ndarray | None,
     ) -> dict[str, Any]:
         base_points = transform_points(points_in, transform)
         display_phi_local = transform_vectors(phi_modes_in, transform) if phi_modes_in is not None else None
         rgb = colors_to_float(colors_in)
         phase = colors_to_float(hsv_phase_colors_for_modes(phi_modes_in)) if phi_modes_in is not None else rgb
+        obs_colors = colors_to_float(obs_count_colors(obs_count_in)) if obs_count_in is not None else rgb
         return {
             "base_display_points": base_points,
             "display_phi": display_phi_local,
             "phi_modes": phi_modes_in,
             "rgb_colors": rgb,
             "phase_colors": phase,
+            "obs_count_colors": obs_colors,
+            "obs_count_per_point": obs_count_in,
+            "refined_mask": refined_mask_in,
             "latent_has_rgb": has_rgb,
             "point_source": source,
         }
 
-    state = make_display_state(initial_points, initial_phi_modes, initial_colors, initial_has_rgb, initial_source)
+    state = make_display_state(
+        initial_points,
+        initial_phi_modes,
+        initial_colors,
+        initial_has_rgb,
+        initial_source,
+        initial_obs_count,
+        initial_refined_mask,
+    )
     scale = scene_scale(state["base_display_points"])
     frustum_scale = 0.08 * scale
 
@@ -637,25 +715,45 @@ def main() -> None:
             "qdot": np.zeros(runtime_data.freqs_hz.shape[0], dtype=np.complex64),
         }
 
-    def current_points() -> np.ndarray:
-        if state["display_phi"] is None or runtime is None:
-            return state["base_display_points"]
-        displacement = np.real(np.einsum("knc,k->nc", state["display_phi"], runtime["q"])).astype(np.float32)
-        return (state["base_display_points"] + float(animation["motion_scale"]) * displacement).astype(np.float32)
+    def display_mask() -> np.ndarray:
+        mask = np.ones((state["base_display_points"].shape[0],), dtype=bool)
+        if "show_obs_count_ge2" in gui_handles and bool(gui_handles["show_obs_count_ge2"].value):
+            obs_count = state["obs_count_per_point"]
+            if obs_count is None:
+                return np.zeros_like(mask)
+            mask &= obs_count >= 2
+        if "show_refined_only" in gui_handles and bool(gui_handles["show_refined_only"].value):
+            refined = state["refined_mask"]
+            if refined is None:
+                return np.zeros_like(mask)
+            mask &= refined.astype(bool, copy=False)
+        return mask
 
-    def current_colors() -> np.ndarray:
-        if state["phi_modes"] is not None and "color_scheme" in gui_handles and gui_handles["color_scheme"].value == "phase":
-            return state["phase_colors"]
-        return state["rgb_colors"]
+    def current_points(mask: np.ndarray) -> np.ndarray:
+        if state["display_phi"] is None or runtime is None:
+            points = state["base_display_points"]
+        else:
+            displacement = np.real(np.einsum("knc,k->nc", state["display_phi"], runtime["q"])).astype(np.float32)
+            points = (state["base_display_points"] + float(animation["motion_scale"]) * displacement).astype(np.float32)
+        return points[mask]
+
+    def current_colors(mask: np.ndarray) -> np.ndarray:
+        if state["phi_modes"] is not None and "color_scheme" in gui_handles:
+            if gui_handles["color_scheme"].value == "phase":
+                return state["phase_colors"][mask]
+            if gui_handles["color_scheme"].value == "obs_count":
+                return state["obs_count_colors"][mask]
+        return state["rgb_colors"][mask]
 
     def redraw_points(point_size: float) -> None:
         with point_lock:
             if point_handle["handle"] is not None:
                 point_handle["handle"].remove()
+            mask = display_mask()
             point_handle["handle"] = server.scene.add_point_cloud(
                 "/vggt/points",
-                points=current_points(),
-                colors=current_colors(),
+                points=current_points(mask),
+                colors=current_colors(mask),
                 point_size=float(point_size),
             )
 
@@ -791,13 +889,21 @@ def main() -> None:
         )
         drive_mode = server.gui.add_dropdown("Drive mode", ("oscillator", "free_decay"), initial_value=str(args.drive_mode))
         damping_slider = server.gui.add_slider("Damping", min=0.0, max=0.5, step=0.005, initial_value=float(args.damping))
-        color_options = ("rgb", "phase") if state["latent_has_rgb"] else ("phase",)
-        color_scheme = server.gui.add_dropdown("Color scheme", color_options, initial_value=color_options[0])
+        color_options = ["rgb", "phase"] if state["latent_has_rgb"] else ["phase"]
+        if state["obs_count_per_point"] is not None:
+            color_options.append("obs_count")
+        color_scheme = server.gui.add_dropdown("Color scheme", tuple(color_options), initial_value=color_options[0])
         phase_component = server.gui.add_dropdown(
             "Phase component",
             phase_component_options,
             initial_value=phase_component_options[0],
         )
+        if state["obs_count_per_point"] is not None:
+            show_obs_count_ge2 = server.gui.add_checkbox("Show obs_count>=2 only", False)
+            gui_handles["show_obs_count_ge2"] = show_obs_count_ge2
+        if state["refined_mask"] is not None:
+            show_refined_only = server.gui.add_checkbox("Show refined points only", False)
+            gui_handles["show_refined_only"] = show_refined_only
         update_phase_button = server.gui.add_button("Update view phase colors")
         reset_button = server.gui.add_button("Reset modal state")
         impulse_button = server.gui.add_button("Trigger impulse")
@@ -926,6 +1032,9 @@ def main() -> None:
     def update_phase_from_button(event) -> None:
         update_projected_phase_from_client(event.client, redraw=True)
 
+    def update_display_filter(_) -> None:
+        redraw_points(float(gui_handles["point_size"].value))
+
     def update_modal_controls(_) -> None:
         if runtime is None:
             return
@@ -942,6 +1051,10 @@ def main() -> None:
         gui_handles["color_scheme"].on_update(update_color_scheme)
         gui_handles["phase_component"].on_update(update_phase_component)
         gui_handles["update_phase"].on_click(update_phase_from_button)
+        if "show_obs_count_ge2" in gui_handles:
+            gui_handles["show_obs_count_ge2"].on_update(update_display_filter)
+        if "show_refined_only" in gui_handles:
+            gui_handles["show_refined_only"].on_update(update_display_filter)
         gui_handles["drive_mode"].on_update(reset_runtime_state)
         gui_handles["damping"].on_update(update_modal_controls)
         gui_handles["reset"].on_click(reset_runtime_state)
