@@ -31,6 +31,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--iterations", type=int, default=8, help="Alternating optimization iterations.")
     parser.add_argument("--ridge-mu", type=float, default=1e-4, help="Per-point ridge regularization.")
     parser.add_argument("--outlier-frac", type=float, default=0.0, help="Fraction of worst residual points dropped per iteration.")
+    parser.add_argument("--single-view-smooth-lambda", type=float, default=0.0, help="Anchor-prior weight for refining points observed by only one view.")
+    parser.add_argument("--single-view-smooth-k", type=int, default=8, help="Number of reliable anchor neighbors used for single-view refinement.")
+    parser.add_argument(
+        "--single-view-anchor-min-observations",
+        type=int,
+        default=2,
+        help="Minimum observation count for points used as single-view smoothing anchors.",
+    )
 
 
 def _load_modal_freqs(paths: list[str]) -> list[np.ndarray]:
@@ -88,9 +96,13 @@ def _latent_stats(latent_path: Path, observation_path: Path) -> dict[str, Any]:
     observations = np.load(str(observation_path), allow_pickle=False)
     obs_residual = latent["obs_residual"].astype(np.float32)
     point_residual = latent["point_residual"].astype(np.float32)
+    refined_count = None
+    if "single_view_refined_mask" in latent.files:
+        refined_count = int(latent["single_view_refined_mask"].astype(bool).sum())
     return {
         "num_points": int(latent["points_world"].shape[0]),
         "num_observations": int(latent["obs_point_index"].shape[0]),
+        "single_view_refined_count": refined_count,
         "obs_residual_median": float(np.median(obs_residual)),
         "obs_residual_p90": float(np.percentile(obs_residual, 90)),
         "point_residual_median": float(np.median(point_residual)),
@@ -152,6 +164,9 @@ def run(args: argparse.Namespace) -> None:
             iterations=args.iterations,
             ridge_mu=args.ridge_mu,
             outlier_frac=args.outlier_frac,
+            single_view_smooth_lambda=args.single_view_smooth_lambda,
+            single_view_smooth_k=args.single_view_smooth_k,
+            single_view_anchor_min_observations=args.single_view_anchor_min_observations,
         )
         freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
         modes.append(
@@ -185,6 +200,9 @@ def run(args: argparse.Namespace) -> None:
             "iterations": int(args.iterations),
             "ridge_mu": float(args.ridge_mu),
             "outlier_frac": float(args.outlier_frac),
+            "single_view_smooth_lambda": float(args.single_view_smooth_lambda),
+            "single_view_smooth_k": int(args.single_view_smooth_k),
+            "single_view_anchor_min_observations": int(args.single_view_anchor_min_observations),
         },
         "modes": modes,
     }

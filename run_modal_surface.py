@@ -34,6 +34,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_opt_multi.add_argument("--iterations", type=int, default=8, help="Alternating optimization iterations.")
     p_opt_multi.add_argument("--ridge-mu", type=float, default=1e-4, help="Per-point ridge regularization.")
     p_opt_multi.add_argument("--outlier-frac", type=float, default=0.05, help="Fraction of worst residual points dropped per iteration.")
+    p_opt_multi.add_argument("--single-view-smooth-lambda", type=float, default=0.0, help="Anchor-prior weight for refining points observed by only one view.")
+    p_opt_multi.add_argument("--single-view-smooth-k", type=int, default=8, help="Number of reliable anchor neighbors used for single-view refinement.")
+    p_opt_multi.add_argument(
+        "--single-view-anchor-min-observations",
+        type=int,
+        default=2,
+        help="Minimum observation count for points used as single-view smoothing anchors.",
+    )
 
     p_solve = sub.add_parser("solve-carrier-modes", help="Batch solve VGGT carrier modal fields for multiple mode indices.")
     p_solve.add_argument("--carrier-points", required=True, help="VGGT carrier points .npz path.")
@@ -52,6 +60,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_solve.add_argument("--iterations", type=int, default=8, help="Alternating optimization iterations.")
     p_solve.add_argument("--ridge-mu", type=float, default=1e-4, help="Per-point ridge regularization.")
     p_solve.add_argument("--outlier-frac", type=float, default=0.0, help="Fraction of worst residual points dropped per iteration.")
+    p_solve.add_argument("--single-view-smooth-lambda", type=float, default=0.0, help="Anchor-prior weight for refining points observed by only one view.")
+    p_solve.add_argument("--single-view-smooth-k", type=int, default=8, help="Number of reliable anchor neighbors used for single-view refinement.")
+    p_solve.add_argument(
+        "--single-view-anchor-min-observations",
+        type=int,
+        default=2,
+        help="Minimum observation count for points used as single-view smoothing anchors.",
+    )
 
     return parser
 

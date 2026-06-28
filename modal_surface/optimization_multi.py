@@ -90,6 +90,90 @@ def _point_residuals(num_points: int, obs_point_index: np.ndarray, obs_residual:
     return out
 
 
+def _refine_single_view_points(
+    points: np.ndarray,
+    phi: np.ndarray,
+    obs_y: np.ndarray,
+    obs_J: np.ndarray,
+    obs_confidence: np.ndarray,
+    obs_point_index: np.ndarray,
+    obs_view_index: np.ndarray,
+    obs_by_point: list[np.ndarray],
+    obs_count_per_point: np.ndarray,
+    active: np.ndarray,
+    alphas: np.ndarray,
+    ridge_mu: float,
+    smooth_lambda: float,
+    smooth_k: int,
+    anchor_min_observations: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if smooth_lambda < 0:
+        raise ValueError("single_view_smooth_lambda must be non-negative.")
+    if smooth_k <= 0:
+        raise ValueError("single_view_smooth_k must be positive.")
+    if anchor_min_observations < 2:
+        raise ValueError("single_view_anchor_min_observations must be at least 2.")
+    refined = np.zeros((points.shape[0],), dtype=bool)
+    anchor_distance = np.full((points.shape[0],), np.inf, dtype=np.float32)
+    if smooth_lambda == 0:
+        return phi, refined, anchor_distance
+
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError as exc:
+        raise ImportError(
+            "single-view smoothing requires scipy.spatial.cKDTree. "
+            "Install scipy in the active environment or run with --single-view-smooth-lambda 0."
+        ) from exc
+
+    active_counts = np.where(active, obs_count_per_point, 0)
+    single_indices = np.where(active & (active_counts == 1))[0]
+    anchor_indices = np.where(active & (active_counts >= int(anchor_min_observations)))[0]
+    if single_indices.size == 0:
+        return phi, refined, anchor_distance
+    if anchor_indices.size == 0:
+        raise ValueError("single-view smoothing found no active anchor points.")
+
+    k = min(int(smooth_k), int(anchor_indices.size))
+    tree = cKDTree(points[anchor_indices].astype(np.float64))
+    distances, neighbor_rows = tree.query(points[single_indices].astype(np.float64), k=k)
+    if k == 1:
+        distances = distances[:, None]
+        neighbor_rows = neighbor_rows[:, None]
+
+    eye = np.eye(3, dtype=np.complex128)
+    refined_phi = phi.copy()
+    smooth_weight = np.sqrt(float(smooth_lambda))
+    for local_i, point_idx in enumerate(single_indices.tolist()):
+        rows = obs_by_point[point_idx]
+        if rows.size != 1:
+            continue
+
+        neighbor_indices = anchor_indices[neighbor_rows[local_i]]
+        d = distances[local_i].astype(np.float64)
+        valid_neighbors = np.isfinite(d)
+        if not np.any(valid_neighbors):
+            continue
+        neighbor_indices = neighbor_indices[valid_neighbors]
+        d = d[valid_neighbors]
+        weights = 1.0 / np.maximum(d, 1e-6)
+        weights = weights / np.sum(weights)
+        phi_anchor = np.sum(weights[:, None] * phi[neighbor_indices].astype(np.complex128), axis=0)
+
+        data_weights = np.sqrt(np.maximum(obs_confidence[rows].astype(np.float64), 0.0))
+        alpha_rows = alphas[obs_view_index[rows]].astype(np.complex128)
+        A_data = (data_weights[:, None, None] * alpha_rows[:, None, None] * obs_J[rows].astype(np.complex128)).reshape(-1, 3)
+        b_data = (data_weights[:, None] * obs_y[rows].astype(np.complex128)).reshape(-1)
+        A = np.vstack([A_data, smooth_weight * eye])
+        b = np.concatenate([b_data, smooth_weight * phi_anchor])
+        lhs = A.conj().T @ A + float(ridge_mu) * eye
+        rhs = A.conj().T @ b
+        refined_phi[point_idx] = np.linalg.solve(lhs, rhs).astype(np.complex64)
+        refined[point_idx] = True
+        anchor_distance[point_idx] = float(np.sum(weights * d))
+    return refined_phi, refined, anchor_distance
+
+
 def _scatter_mode_image(
     out_path: Path,
     pixels_xy: np.ndarray,
@@ -160,12 +244,21 @@ def optimize_multi_view(
     iterations: int = 8,
     ridge_mu: float = 1e-4,
     outlier_frac: float = 0.05,
+    single_view_smooth_lambda: float = 0.0,
+    single_view_smooth_k: int = 8,
+    single_view_anchor_min_observations: int = 2,
 ) -> Path:
     """Optimize shared phi_i and per-view complex alpha_v from observation rows."""
     if iterations <= 0:
         raise ValueError("iterations must be positive.")
     if not (0.0 <= outlier_frac < 0.5):
         raise ValueError("outlier_frac must be in [0, 0.5).")
+    if single_view_smooth_lambda < 0:
+        raise ValueError("single_view_smooth_lambda must be non-negative.")
+    if single_view_smooth_k <= 0:
+        raise ValueError("single_view_smooth_k must be positive.")
+    if single_view_anchor_min_observations < 2:
+        raise ValueError("single_view_anchor_min_observations must be at least 2.")
 
     data = np.load(str(observations_path), allow_pickle=False)
     points = data["points_world"].astype(np.float32)
@@ -175,6 +268,9 @@ def optimize_multi_view(
     obs_y = data["obs_y"].astype(np.complex64)
     obs_J = data["obs_J"].astype(np.float32)
     obs_confidence = data["obs_confidence"].astype(np.float32)
+    if "obs_count_per_point" not in data.files:
+        raise ValueError("Observation graph is missing obs_count_per_point.")
+    obs_count_per_point = data["obs_count_per_point"].astype(np.int32)
     view_ids = data["view_ids"]
     num_views = int(view_ids.shape[0])
 
@@ -184,6 +280,8 @@ def optimize_multi_view(
         raise ValueError(f"obs_y must have shape (O,2), got {obs_y.shape}.")
     if obs_J.shape != (obs_y.shape[0], 2, 3):
         raise ValueError(f"obs_J must have shape (O,2,3), got {obs_J.shape}.")
+    if obs_count_per_point.shape != (points.shape[0],):
+        raise ValueError(f"obs_count_per_point must have shape ({points.shape[0]},), got {obs_count_per_point.shape}.")
     if np.any(obs_point_index < 0) or np.any(obs_point_index >= points.shape[0]):
         raise ValueError("obs_point_index contains invalid point indices.")
     if np.any(obs_view_index < 0) or np.any(obs_view_index >= num_views):
@@ -225,6 +323,30 @@ def optimize_multi_view(
                 drop_indices = active_indices[np.argsort(point_residual[active_indices])[-drop_count:]]
                 active[drop_indices] = False
 
+    single_view_refined_mask = np.zeros((points.shape[0],), dtype=bool)
+    single_view_anchor_distance = np.full((points.shape[0],), np.inf, dtype=np.float32)
+    if single_view_smooth_lambda > 0:
+        phi, single_view_refined_mask, single_view_anchor_distance = _refine_single_view_points(
+            points,
+            phi,
+            obs_y,
+            obs_J,
+            obs_confidence,
+            obs_point_index,
+            obs_view_index,
+            obs_by_point,
+            obs_count_per_point,
+            active,
+            alphas,
+            ridge_mu,
+            single_view_smooth_lambda,
+            single_view_smooth_k,
+            single_view_anchor_min_observations,
+        )
+        pred_y = _predict_observations(obs_J, obs_point_index, obs_view_index, phi, alphas)
+        obs_residual = _obs_residual(obs_y, pred_y)
+        point_residual = _point_residuals(points.shape[0], obs_point_index, obs_residual, active)
+
     active_indices = np.where(active)[0]
     old_to_new = np.full((points.shape[0],), -1, dtype=np.int64)
     old_to_new[active_indices] = np.arange(active_indices.size, dtype=np.int64)
@@ -257,6 +379,12 @@ def optimize_multi_view(
         freq_hz=data["freq_hz"].astype(np.float32),
         mode_index=data["mode_index"].astype(np.int32),
         point_residual=point_residual[active_indices].astype(np.float32),
+        obs_count_per_point=obs_count_per_point[active_indices].astype(np.int32),
+        single_view_refined_mask=single_view_refined_mask[active_indices].astype(bool),
+        single_view_anchor_distance=single_view_anchor_distance[active_indices].astype(np.float32),
+        single_view_smooth_lambda=np.array(single_view_smooth_lambda, dtype=np.float32),
+        single_view_smooth_k=np.array(single_view_smooth_k, dtype=np.int32),
+        single_view_anchor_min_observations=np.array(single_view_anchor_min_observations, dtype=np.int32),
         obs_point_index=old_to_new[obs_point_index[keep_obs]].astype(np.int32),
         obs_view_index=obs_view_index[keep_obs].astype(np.int32),
         obs_pixels_xy=obs_pixels_xy[keep_obs].astype(np.float32),
