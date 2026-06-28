@@ -11,6 +11,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def _require_scipy_for_graph_smoothing():
+    try:
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+        from scipy.spatial import cKDTree
+    except ImportError as exc:
+        raise ImportError(
+            "graph smoothing requires scipy.sparse and scipy.spatial.cKDTree. "
+            "Install scipy in the active environment or run with --graph-smooth-lambda 0."
+        ) from exc
+    return sp, spla, cKDTree
+
+
 def _observations_by_point(num_points: int, obs_point_index: np.ndarray) -> list[np.ndarray]:
     return [np.where(obs_point_index == i)[0] for i in range(num_points)]
 
@@ -42,6 +55,236 @@ def _solve_phi_points(
         rhs = A.conj().T @ b
         phi[point_idx] = np.linalg.solve(lhs, rhs).astype(np.complex64)
     return phi
+
+
+def _point_view_masks(num_points: int, obs_point_index: np.ndarray, obs_view_index: np.ndarray, num_views: int) -> np.ndarray:
+    masks = np.zeros((num_points, num_views), dtype=bool)
+    masks[obs_point_index, obs_view_index] = True
+    return masks
+
+
+def _obs_count_weights(
+    obs_count_per_point: np.ndarray,
+    weight_1: float,
+    weight_2: float,
+    weight_3plus: float,
+) -> np.ndarray:
+    if weight_1 < 0 or weight_2 < 0 or weight_3plus < 0:
+        raise ValueError("obs-count weights must be non-negative.")
+    weights = np.full((obs_count_per_point.shape[0],), float(weight_3plus), dtype=np.float32)
+    weights[obs_count_per_point <= 1] = float(weight_1)
+    weights[obs_count_per_point == 2] = float(weight_2)
+    return weights
+
+
+def _build_graph_edges(
+    points: np.ndarray,
+    active: np.ndarray,
+    point_view_masks: np.ndarray,
+    graph_smooth_k: int,
+    graph_auto_radius_scale: float,
+    graph_min_shared_views: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    if graph_smooth_k <= 0:
+        raise ValueError("graph_smooth_k must be positive.")
+    if graph_auto_radius_scale <= 0:
+        raise ValueError("graph_auto_radius_scale must be positive.")
+    if graph_min_shared_views < 0:
+        raise ValueError("graph_min_shared_views must be non-negative.")
+
+    _, _, cKDTree = _require_scipy_for_graph_smoothing()
+    active_indices = np.where(active)[0]
+    if active_indices.size < 2:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((points.shape[0],), dtype=np.int32),
+            0.0,
+        )
+    k = min(int(graph_smooth_k) + 1, int(active_indices.size))
+    tree = cKDTree(points[active_indices].astype(np.float64))
+    distances, neighbor_rows = tree.query(points[active_indices].astype(np.float64), k=k)
+    if k == 1:
+        distances = distances[:, None]
+        neighbor_rows = neighbor_rows[:, None]
+    neighbor_distances = distances[:, 1:] if distances.shape[1] > 1 else distances
+    finite_neighbor_distances = neighbor_distances[np.isfinite(neighbor_distances) & (neighbor_distances > 0)]
+    if finite_neighbor_distances.size == 0:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((points.shape[0],), dtype=np.int32),
+            0.0,
+        )
+    radius = float(np.median(finite_neighbor_distances) * float(graph_auto_radius_scale))
+    if radius <= 0:
+        raise ValueError("graph auto radius is non-positive.")
+
+    edge_weights_by_pair: dict[tuple[int, int], float] = {}
+    for row, point_idx in enumerate(active_indices.tolist()):
+        for dist, neighbor_row in zip(distances[row, 1:], neighbor_rows[row, 1:]):
+            if not np.isfinite(dist) or dist <= 0 or dist > radius:
+                continue
+            neighbor_idx = int(active_indices[int(neighbor_row)])
+            if point_idx == neighbor_idx:
+                continue
+            if graph_min_shared_views > 0:
+                shared = int(np.logical_and(point_view_masks[point_idx], point_view_masks[neighbor_idx]).sum())
+                if shared < int(graph_min_shared_views):
+                    continue
+            a, b = sorted((int(point_idx), int(neighbor_idx)))
+            if (a, b) in edge_weights_by_pair:
+                continue
+            edge_weights_by_pair[(a, b)] = 1.0 / max(float(dist), 1e-6)
+
+    if not edge_weights_by_pair:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((points.shape[0],), dtype=np.int32),
+            radius,
+        )
+    sorted_pairs = sorted(edge_weights_by_pair)
+    edges = np.asarray(sorted_pairs, dtype=np.int64)
+    weights = np.asarray([edge_weights_by_pair[pair] for pair in sorted_pairs], dtype=np.float64)
+    weights = weights / max(float(np.median(weights)), 1e-12)
+    degree = np.zeros((points.shape[0],), dtype=np.int32)
+    np.add.at(degree, edges[:, 0], 1)
+    np.add.at(degree, edges[:, 1], 1)
+    return edges[:, 0], edges[:, 1], weights, degree, radius
+
+
+def _solve_phi_graph(
+    points: np.ndarray,
+    obs_y: np.ndarray,
+    obs_J: np.ndarray,
+    obs_confidence: np.ndarray,
+    obs_point_index: np.ndarray,
+    obs_view_index: np.ndarray,
+    obs_count_per_point: np.ndarray,
+    active: np.ndarray,
+    alphas: np.ndarray,
+    ridge_mu: float,
+    graph_smooth_lambda: float,
+    graph_smooth_k: int,
+    graph_auto_radius_scale: float,
+    graph_min_shared_views: int,
+    obs_count_weight_1: float,
+    obs_count_weight_2: float,
+    obs_count_weight_3plus: float,
+    num_views: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    if graph_smooth_lambda <= 0:
+        raise ValueError("_solve_phi_graph requires positive graph_smooth_lambda.")
+    sp, spla, _ = _require_scipy_for_graph_smoothing()
+    active_indices = np.where(active)[0]
+    if active_indices.size < 3:
+        raise ValueError("Too few active points for graph smoothing.")
+    active_to_col = np.full((points.shape[0],), -1, dtype=np.int64)
+    active_to_col[active_indices] = np.arange(active_indices.size, dtype=np.int64)
+    point_view_masks = _point_view_masks(points.shape[0], obs_point_index, obs_view_index, num_views)
+    edge_a, edge_b, edge_weights, graph_degree, graph_auto_radius = _build_graph_edges(
+        points,
+        active,
+        point_view_masks,
+        graph_smooth_k,
+        graph_auto_radius_scale,
+        graph_min_shared_views,
+    )
+    if edge_a.size == 0:
+        raise ValueError("Graph smoothing produced no valid edges; relax graph parameters or run with --graph-smooth-lambda 0.")
+
+    obs_count_weight_per_point = _obs_count_weights(
+        obs_count_per_point,
+        obs_count_weight_1,
+        obs_count_weight_2,
+        obs_count_weight_3plus,
+    )
+    keep_obs = active[obs_point_index]
+    obs_rows = np.where(keep_obs)[0]
+    data_rows = obs_rows.size * 2
+    edge_rows = edge_a.size * 3
+    ridge_rows = active_indices.size * 3
+    total_rows = data_rows + edge_rows + ridge_rows
+    total_cols = active_indices.size * 3
+
+    row_idx: list[np.ndarray] = []
+    col_idx: list[np.ndarray] = []
+    values: list[np.ndarray] = []
+    rhs = np.zeros((total_rows,), dtype=np.complex128)
+
+    data_base = np.arange(data_rows, dtype=np.int64).reshape(obs_rows.size, 2)
+    data_weights = np.sqrt(
+        np.maximum(obs_confidence[obs_rows].astype(np.float64), 0.0)
+        * np.maximum(obs_count_weight_per_point[obs_point_index[obs_rows]].astype(np.float64), 0.0)
+    )
+    alpha_rows = alphas[obs_view_index[obs_rows]].astype(np.complex128)
+    point_cols = active_to_col[obs_point_index[obs_rows]]
+    for comp in range(2):
+        rows = np.repeat(data_base[:, comp], 3)
+        cols = np.repeat(point_cols * 3, 3) + np.tile(np.arange(3, dtype=np.int64), obs_rows.size)
+        vals = (
+            data_weights[:, None]
+            * alpha_rows[:, None]
+            * obs_J[obs_rows, comp, :].astype(np.complex128)
+        ).reshape(-1)
+        row_idx.append(rows)
+        col_idx.append(cols)
+        values.append(vals)
+        rhs[data_base[:, comp]] = data_weights * obs_y[obs_rows, comp].astype(np.complex128)
+
+    edge_start = data_rows
+    smooth_weight = np.sqrt(float(graph_smooth_lambda) * np.maximum(edge_weights, 0.0))
+    edge_local_a = active_to_col[edge_a]
+    edge_local_b = active_to_col[edge_b]
+    for comp in range(3):
+        rows = edge_start + np.arange(edge_a.size, dtype=np.int64) * 3 + comp
+        row_idx.append(np.repeat(rows, 2))
+        col_idx.append(np.column_stack([edge_local_a * 3 + comp, edge_local_b * 3 + comp]).reshape(-1))
+        values.append(np.column_stack([smooth_weight, -smooth_weight]).reshape(-1).astype(np.complex128))
+
+    ridge_start = data_rows + edge_rows
+    if ridge_mu > 0:
+        ridge_weight = np.sqrt(float(ridge_mu))
+        cols = np.arange(ridge_rows, dtype=np.int64)
+        rows = ridge_start + cols
+        row_idx.append(rows)
+        col_idx.append(cols)
+        values.append(np.full((ridge_rows,), ridge_weight, dtype=np.complex128))
+
+    matrix = sp.coo_matrix(
+        (np.concatenate(values), (np.concatenate(row_idx), np.concatenate(col_idx))),
+        shape=(total_rows, total_cols),
+        dtype=np.complex128,
+    ).tocsr()
+    solution = spla.lsmr(matrix, rhs, atol=1e-6, btol=1e-6)[0]
+    phi = np.zeros((points.shape[0], 3), dtype=np.complex64)
+    phi[active_indices] = solution.reshape(active_indices.size, 3).astype(np.complex64)
+    return phi, graph_degree, obs_count_weight_per_point, edge_a, edge_b, graph_auto_radius
+
+
+def _graph_smooth_residual(
+    phi: np.ndarray,
+    edge_a: np.ndarray,
+    edge_b: np.ndarray,
+    active: np.ndarray,
+) -> np.ndarray:
+    residual = np.zeros((phi.shape[0],), dtype=np.float32)
+    counts = np.zeros((phi.shape[0],), dtype=np.float64)
+    if edge_a.size == 0:
+        residual[~active] = np.inf
+        return residual
+    diff = np.linalg.norm(phi[edge_a] - phi[edge_b], axis=1).astype(np.float64)
+    np.add.at(residual, edge_a, diff)
+    np.add.at(residual, edge_b, diff)
+    np.add.at(counts, edge_a, 1.0)
+    np.add.at(counts, edge_b, 1.0)
+    residual = (residual.astype(np.float64) / np.maximum(counts, 1.0)).astype(np.float32)
+    residual[~active] = np.inf
+    return residual
 
 
 def _predict_observations(obs_J: np.ndarray, obs_point_index: np.ndarray, obs_view_index: np.ndarray, phi: np.ndarray, alphas: np.ndarray) -> np.ndarray:
@@ -247,6 +490,13 @@ def optimize_multi_view(
     single_view_smooth_lambda: float = 0.0,
     single_view_smooth_k: int = 8,
     single_view_anchor_min_observations: int = 2,
+    graph_smooth_lambda: float = 0.0,
+    graph_smooth_k: int = 8,
+    graph_auto_radius_scale: float = 2.5,
+    graph_min_shared_views: int = 1,
+    obs_count_weight_1: float = 0.25,
+    obs_count_weight_2: float = 0.75,
+    obs_count_weight_3plus: float = 1.0,
 ) -> Path:
     """Optimize shared phi_i and per-view complex alpha_v from observation rows."""
     if iterations <= 0:
@@ -259,6 +509,16 @@ def optimize_multi_view(
         raise ValueError("single_view_smooth_k must be positive.")
     if single_view_anchor_min_observations < 2:
         raise ValueError("single_view_anchor_min_observations must be at least 2.")
+    if graph_smooth_lambda < 0:
+        raise ValueError("graph_smooth_lambda must be non-negative.")
+    if graph_smooth_k <= 0:
+        raise ValueError("graph_smooth_k must be positive.")
+    if graph_auto_radius_scale <= 0:
+        raise ValueError("graph_auto_radius_scale must be positive.")
+    if graph_min_shared_views < 0:
+        raise ValueError("graph_min_shared_views must be non-negative.")
+    if graph_smooth_lambda > 0 and single_view_smooth_lambda > 0:
+        raise ValueError("Use either graph smoothing or single-view smoothing, not both.")
 
     data = np.load(str(observations_path), allow_pickle=False)
     points = data["points_world"].astype(np.float32)
@@ -297,22 +557,58 @@ def optimize_multi_view(
     pred_y = np.zeros_like(obs_y, dtype=np.complex64)
     obs_residual = np.zeros((obs_y.shape[0],), dtype=np.float32)
     point_residual = np.zeros((points.shape[0],), dtype=np.float32)
+    graph_degree = np.zeros((points.shape[0],), dtype=np.int32)
+    graph_smooth_residual = np.zeros((points.shape[0],), dtype=np.float32)
+    obs_count_weight_per_point = np.ones((points.shape[0],), dtype=np.float32)
+    graph_edge_count = 0
+    graph_auto_radius = 0.0
 
     for it in range(iterations):
         if int(active.sum()) < 3:
             raise ValueError("Too few active points remain during optimization.")
-        phi = _solve_phi_points(obs_y, obs_J, obs_confidence, obs_view_index, obs_by_point, active, alphas, ridge_mu)
-        alphas = _solve_alphas(obs_y, obs_J, obs_point_index, obs_view_index, obs_confidence, active, phi, num_views)
+        if graph_smooth_lambda > 0:
+            phi, graph_degree, obs_count_weight_per_point, graph_edge_a, graph_edge_b, graph_auto_radius = _solve_phi_graph(
+                points,
+                obs_y,
+                obs_J,
+                obs_confidence,
+                obs_point_index,
+                obs_view_index,
+                obs_count_per_point,
+                active,
+                alphas,
+                ridge_mu,
+                graph_smooth_lambda,
+                graph_smooth_k,
+                graph_auto_radius_scale,
+                graph_min_shared_views,
+                obs_count_weight_1,
+                obs_count_weight_2,
+                obs_count_weight_3plus,
+                num_views,
+            )
+            graph_edge_count = int(graph_edge_a.size)
+            graph_smooth_residual = _graph_smooth_residual(phi, graph_edge_a, graph_edge_b, active)
+            alpha_confidence = obs_confidence * obs_count_weight_per_point[obs_point_index]
+        else:
+            phi = _solve_phi_points(obs_y, obs_J, obs_confidence, obs_view_index, obs_by_point, active, alphas, ridge_mu)
+            graph_smooth_residual = np.zeros((points.shape[0],), dtype=np.float32)
+            graph_smooth_residual[~active] = np.inf
+            alpha_confidence = obs_confidence
+        alphas = _solve_alphas(obs_y, obs_J, obs_point_index, obs_view_index, alpha_confidence, active, phi, num_views)
         pred_y = _predict_observations(obs_J, obs_point_index, obs_view_index, phi, alphas)
         obs_residual = _obs_residual(obs_y, pred_y)
         point_residual = _point_residuals(points.shape[0], obs_point_index, obs_residual, active)
         active_residual = point_residual[active]
+        active_graph_residual = graph_smooth_residual[active]
         history.append(
             [
                 float(it),
                 float(active.sum()),
                 float(active_residual.mean()),
                 float(np.median(active_residual)),
+                float(active_graph_residual.mean()),
+                float(np.median(active_graph_residual)),
             ]
         )
         alpha_history.append(alphas.copy())
@@ -380,6 +676,18 @@ def optimize_multi_view(
         mode_index=data["mode_index"].astype(np.int32),
         point_residual=point_residual[active_indices].astype(np.float32),
         obs_count_per_point=obs_count_per_point[active_indices].astype(np.int32),
+        obs_count_weight_per_point=obs_count_weight_per_point[active_indices].astype(np.float32),
+        graph_degree=graph_degree[active_indices].astype(np.int32),
+        graph_edge_count=np.array(graph_edge_count, dtype=np.int64),
+        graph_auto_radius=np.array(graph_auto_radius, dtype=np.float32),
+        graph_smooth_residual=graph_smooth_residual[active_indices].astype(np.float32),
+        graph_smooth_lambda=np.array(graph_smooth_lambda, dtype=np.float32),
+        graph_smooth_k=np.array(graph_smooth_k, dtype=np.int32),
+        graph_auto_radius_scale=np.array(graph_auto_radius_scale, dtype=np.float32),
+        graph_min_shared_views=np.array(graph_min_shared_views, dtype=np.int32),
+        obs_count_weight_1=np.array(obs_count_weight_1, dtype=np.float32),
+        obs_count_weight_2=np.array(obs_count_weight_2, dtype=np.float32),
+        obs_count_weight_3plus=np.array(obs_count_weight_3plus, dtype=np.float32),
         single_view_refined_mask=single_view_refined_mask[active_indices].astype(bool),
         single_view_anchor_distance=single_view_anchor_distance[active_indices].astype(np.float32),
         single_view_smooth_lambda=np.array(single_view_smooth_lambda, dtype=np.float32),

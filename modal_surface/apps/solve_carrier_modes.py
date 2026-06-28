@@ -39,6 +39,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=2,
         help="Minimum observation count for points used as single-view smoothing anchors.",
     )
+    parser.add_argument("--graph-smooth-lambda", type=float, default=0.0, help="Shared graph smoothness weight for all active points.")
+    parser.add_argument("--graph-smooth-k", type=int, default=8, help="Number of nearest neighbors used to build the graph.")
+    parser.add_argument("--graph-auto-radius-scale", type=float, default=2.5, help="Multiplier on median kth-neighbor distance for graph edge pruning.")
+    parser.add_argument("--graph-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a graph edge.")
+    parser.add_argument("--obs-count-weight-1", type=float, default=0.25, help="Data weight multiplier for points observed by one view.")
+    parser.add_argument("--obs-count-weight-2", type=float, default=0.75, help="Data weight multiplier for points observed by two views.")
+    parser.add_argument("--obs-count-weight-3plus", type=float, default=1.0, help="Data weight multiplier for points observed by three or more views.")
 
 
 def _load_modal_freqs(paths: list[str]) -> list[np.ndarray]:
@@ -99,10 +106,15 @@ def _latent_stats(latent_path: Path, observation_path: Path) -> dict[str, Any]:
     refined_count = None
     if "single_view_refined_mask" in latent.files:
         refined_count = int(latent["single_view_refined_mask"].astype(bool).sum())
+    graph_smooth_residual = latent["graph_smooth_residual"].astype(np.float32) if "graph_smooth_residual" in latent.files else None
     return {
         "num_points": int(latent["points_world"].shape[0]),
         "num_observations": int(latent["obs_point_index"].shape[0]),
         "single_view_refined_count": refined_count,
+        "graph_edge_count": int(np.asarray(latent["graph_edge_count"]).item()) if "graph_edge_count" in latent.files else None,
+        "graph_auto_radius": float(np.asarray(latent["graph_auto_radius"]).item()) if "graph_auto_radius" in latent.files else None,
+        "graph_smooth_residual_median": float(np.median(graph_smooth_residual)) if graph_smooth_residual is not None else None,
+        "graph_smooth_residual_p90": float(np.percentile(graph_smooth_residual, 90)) if graph_smooth_residual is not None else None,
         "obs_residual_median": float(np.median(obs_residual)),
         "obs_residual_p90": float(np.percentile(obs_residual, 90)),
         "point_residual_median": float(np.median(point_residual)),
@@ -167,6 +179,13 @@ def run(args: argparse.Namespace) -> None:
             single_view_smooth_lambda=args.single_view_smooth_lambda,
             single_view_smooth_k=args.single_view_smooth_k,
             single_view_anchor_min_observations=args.single_view_anchor_min_observations,
+            graph_smooth_lambda=args.graph_smooth_lambda,
+            graph_smooth_k=args.graph_smooth_k,
+            graph_auto_radius_scale=args.graph_auto_radius_scale,
+            graph_min_shared_views=args.graph_min_shared_views,
+            obs_count_weight_1=args.obs_count_weight_1,
+            obs_count_weight_2=args.obs_count_weight_2,
+            obs_count_weight_3plus=args.obs_count_weight_3plus,
         )
         freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
         modes.append(
@@ -203,6 +222,13 @@ def run(args: argparse.Namespace) -> None:
             "single_view_smooth_lambda": float(args.single_view_smooth_lambda),
             "single_view_smooth_k": int(args.single_view_smooth_k),
             "single_view_anchor_min_observations": int(args.single_view_anchor_min_observations),
+            "graph_smooth_lambda": float(args.graph_smooth_lambda),
+            "graph_smooth_k": int(args.graph_smooth_k),
+            "graph_auto_radius_scale": float(args.graph_auto_radius_scale),
+            "graph_min_shared_views": int(args.graph_min_shared_views),
+            "obs_count_weight_1": float(args.obs_count_weight_1),
+            "obs_count_weight_2": float(args.obs_count_weight_2),
+            "obs_count_weight_3plus": float(args.obs_count_weight_3plus),
         },
         "modes": modes,
     }

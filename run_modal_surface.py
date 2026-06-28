@@ -42,6 +42,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=2,
         help="Minimum observation count for points used as single-view smoothing anchors.",
     )
+    p_opt_multi.add_argument("--graph-smooth-lambda", type=float, default=0.0, help="Shared graph smoothness weight for all active points.")
+    p_opt_multi.add_argument("--graph-smooth-k", type=int, default=8, help="Number of nearest neighbors used to build the graph.")
+    p_opt_multi.add_argument("--graph-auto-radius-scale", type=float, default=2.5, help="Multiplier on median kth-neighbor distance for graph edge pruning.")
+    p_opt_multi.add_argument("--graph-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a graph edge.")
+    p_opt_multi.add_argument("--obs-count-weight-1", type=float, default=0.25, help="Data weight multiplier for points observed by one view.")
+    p_opt_multi.add_argument("--obs-count-weight-2", type=float, default=0.75, help="Data weight multiplier for points observed by two views.")
+    p_opt_multi.add_argument("--obs-count-weight-3plus", type=float, default=1.0, help="Data weight multiplier for points observed by three or more views.")
 
     p_solve = sub.add_parser("solve-carrier-modes", help="Batch solve VGGT carrier modal fields for multiple mode indices.")
     p_solve.add_argument("--carrier-points", required=True, help="VGGT carrier points .npz path.")
@@ -68,6 +75,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=2,
         help="Minimum observation count for points used as single-view smoothing anchors.",
     )
+    p_solve.add_argument("--graph-smooth-lambda", type=float, default=0.0, help="Shared graph smoothness weight for all active points.")
+    p_solve.add_argument("--graph-smooth-k", type=int, default=8, help="Number of nearest neighbors used to build the graph.")
+    p_solve.add_argument("--graph-auto-radius-scale", type=float, default=2.5, help="Multiplier on median kth-neighbor distance for graph edge pruning.")
+    p_solve.add_argument("--graph-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a graph edge.")
+    p_solve.add_argument("--obs-count-weight-1", type=float, default=0.25, help="Data weight multiplier for points observed by one view.")
+    p_solve.add_argument("--obs-count-weight-2", type=float, default=0.75, help="Data weight multiplier for points observed by two views.")
+    p_solve.add_argument("--obs-count-weight-3plus", type=float, default=1.0, help="Data weight multiplier for points observed by three or more views.")
 
     return parser
 

@@ -23,6 +23,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=2,
         help="Minimum observation count for points used as single-view smoothing anchors.",
     )
+    parser.add_argument("--graph-smooth-lambda", type=float, default=0.0, help="Shared graph smoothness weight for all active points.")
+    parser.add_argument("--graph-smooth-k", type=int, default=8, help="Number of nearest neighbors used to build the graph.")
+    parser.add_argument("--graph-auto-radius-scale", type=float, default=2.5, help="Multiplier on median kth-neighbor distance for graph edge pruning.")
+    parser.add_argument("--graph-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a graph edge.")
+    parser.add_argument("--obs-count-weight-1", type=float, default=0.25, help="Data weight multiplier for points observed by one view.")
+    parser.add_argument("--obs-count-weight-2", type=float, default=0.75, help="Data weight multiplier for points observed by two views.")
+    parser.add_argument("--obs-count-weight-3plus", type=float, default=1.0, help="Data weight multiplier for points observed by three or more views.")
 
 
 def run(args: argparse.Namespace) -> None:
@@ -37,5 +44,12 @@ def run(args: argparse.Namespace) -> None:
         single_view_smooth_lambda=args.single_view_smooth_lambda,
         single_view_smooth_k=args.single_view_smooth_k,
         single_view_anchor_min_observations=args.single_view_anchor_min_observations,
+        graph_smooth_lambda=args.graph_smooth_lambda,
+        graph_smooth_k=args.graph_smooth_k,
+        graph_auto_radius_scale=args.graph_auto_radius_scale,
+        graph_min_shared_views=args.graph_min_shared_views,
+        obs_count_weight_1=args.obs_count_weight_1,
+        obs_count_weight_2=args.obs_count_weight_2,
+        obs_count_weight_3plus=args.obs_count_weight_3plus,
     )
     print(f"Saved multi-view latent field -> {out}")
