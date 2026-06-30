@@ -25,6 +25,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
     parser.add_argument("--snr-good", type=float, default=3.0, help="SNR treated as a clear frequency peak for view-frequency weighting.")
     parser.add_argument("--view-weight-min", type=float, default=0.05, help="Minimum view-frequency reliability weight.")
+    parser.add_argument("--depth-weighting", choices=["none", "inverse-z"], default="none", help="Depth-based observation weighting method.")
+    parser.add_argument("--depth-weight-power", type=float, default=2.0, help="Power used by inverse-z depth weighting.")
+    parser.add_argument("--depth-weight-min", type=float, default=0.02, help="Minimum inverse-z depth weight.")
+    parser.add_argument("--depth-weight-reference-percentile", type=float, default=50.0, help="Per-view candidate-depth percentile used as inverse-z reference.")
+    parser.add_argument("--pair-weight", action="append", default=None, help="Weight for points observed by exactly two views, formatted as viewA,viewB,weight. Repeat per pair.")
     parser.add_argument(
         "--min-observations",
         type=int,
@@ -55,5 +60,10 @@ def run(args: argparse.Namespace) -> None:
         snr_exclude_hz=args.snr_exclude_hz,
         snr_good=args.snr_good,
         view_weight_min=args.view_weight_min,
+        depth_weighting=args.depth_weighting,
+        depth_weight_power=args.depth_weight_power,
+        depth_weight_min=args.depth_weight_min,
+        depth_weight_reference_percentile=args.depth_weight_reference_percentile,
+        pair_weight_specs=args.pair_weight,
     )
     print(f"Saved carrier-view observations -> {out}")

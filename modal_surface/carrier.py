@@ -266,6 +266,82 @@ def _local_depth_stats(
     return float(z_front), float(z_med)
 
 
+def _depth_weight(
+    z_value: float,
+    z_reference: float,
+    weighting: str,
+    power: float,
+    min_weight: float,
+) -> float:
+    if weighting == "none":
+        return 1.0
+    if weighting != "inverse-z":
+        raise ValueError("depth_weighting must be 'none' or 'inverse-z'.")
+    if z_value <= 0 or z_reference <= 0:
+        return float(min_weight)
+    weight = (float(z_reference) / float(z_value)) ** float(power)
+    return float(np.clip(weight, float(min_weight), 1.0))
+
+
+def _parse_pair_weight_specs(
+    pair_weight_specs: Sequence[str] | None,
+    configs: Sequence[ViewConfig],
+) -> tuple[dict[tuple[int, int], float], np.ndarray]:
+    if not pair_weight_specs:
+        return {}, np.asarray([], dtype=str)
+    view_ids = [cfg.view_id for cfg in configs]
+    if len(set(view_ids)) != len(view_ids):
+        raise ValueError("View ids must be unique when using --pair-weight.")
+    view_to_index = {view_id: idx for idx, view_id in enumerate(view_ids)}
+    pair_weights: dict[tuple[int, int], float] = {}
+    normalized_specs: list[str] = []
+    for raw in pair_weight_specs:
+        parts = [part.strip() for part in str(raw).split(",")]
+        if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2]:
+            raise ValueError(f"--pair-weight must have format viewA,viewB,weight, got: {raw}")
+        view_a, view_b, weight_text = parts
+        if view_a not in view_to_index:
+            raise ValueError(f"Unknown view id in --pair-weight: {view_a}. Known views: {view_ids}")
+        if view_b not in view_to_index:
+            raise ValueError(f"Unknown view id in --pair-weight: {view_b}. Known views: {view_ids}")
+        idx_a = view_to_index[view_a]
+        idx_b = view_to_index[view_b]
+        if idx_a == idx_b:
+            raise ValueError(f"--pair-weight must reference two different views, got: {raw}")
+        weight = float(weight_text)
+        if not np.isfinite(weight) or weight < 0:
+            raise ValueError(f"--pair-weight weight must be finite and non-negative, got: {raw}")
+        key = tuple(sorted((idx_a, idx_b)))
+        if key in pair_weights:
+            raise ValueError(f"Duplicate --pair-weight for pair {view_ids[key[0]]},{view_ids[key[1]]}.")
+        pair_weights[key] = weight
+        normalized_specs.append(f"{view_ids[key[0]]},{view_ids[key[1]]},{weight:g}")
+    return pair_weights, np.asarray(normalized_specs, dtype=str)
+
+
+def _pair_weight_per_point(
+    num_points: int,
+    obs_point_arr: np.ndarray,
+    obs_view_arr: np.ndarray,
+    counts: np.ndarray,
+    pair_weight_specs: Sequence[str] | None,
+    configs: Sequence[ViewConfig],
+) -> tuple[np.ndarray, np.ndarray]:
+    pair_weights, normalized_specs = _parse_pair_weight_specs(pair_weight_specs, configs)
+    out = np.ones((num_points,), dtype=np.float32)
+    if not pair_weights:
+        return out, normalized_specs
+    point_view_mask = np.zeros((num_points, len(configs)), dtype=bool)
+    point_view_mask[obs_point_arr, obs_view_arr] = True
+    for point_idx in np.where(counts == 2)[0].tolist():
+        views = np.where(point_view_mask[point_idx])[0]
+        if views.size != 2:
+            raise ValueError(f"Point {point_idx} has two observations but not two distinct observed views.")
+        key = tuple(sorted((int(views[0]), int(views[1]))))
+        out[point_idx] = float(pair_weights.get(key, 1.0))
+    return out, normalized_specs
+
+
 def _subset_carrier_points(carrier: dict[str, np.ndarray], keep: np.ndarray) -> dict[str, np.ndarray]:
     n = carrier["points_world"].shape[0]
     out: dict[str, np.ndarray] = {}
@@ -332,8 +408,14 @@ def _append_view_observations(
     obs_y: list[list[complex]],
     obs_j: list[np.ndarray],
     obs_confidence: list[float],
+    obs_depth_weight: list[float],
+    obs_camera_z: list[float],
     view_confidence: float,
-) -> int:
+    depth_weighting: str,
+    depth_weight_power: float,
+    depth_weight_min: float,
+    depth_weight_reference_percentile: float,
+) -> tuple[int, float]:
     expected_shape = (cfg.image_height, cfg.image_width)
     mask = load_mask(cfg.mask_path, expected_shape)
     valid_mask = erode_mask(mask, mask_erode_iters)
@@ -349,7 +431,8 @@ def _append_view_observations(
     )
     candidate_indices = np.where(candidate)[0]
     if candidate_indices.size == 0:
-        return 0
+        return 0, float("nan")
+    z_reference = float(np.percentile(z[candidate_indices], depth_weight_reference_percentile))
 
     buckets = _build_pixel_buckets(candidate_indices, rounded_x, rounded_y, cfg.image_width)
     jacobians = projection_jacobian(points_world[candidate_indices], cfg.K, cfg.world_to_camera)
@@ -388,9 +471,18 @@ def _append_view_observations(
         obs_pixels.append([float(pixels_xy[point_idx, 0]), float(pixels_xy[point_idx, 1])])
         obs_y.append([complex(y_u), complex(y_v)])
         obs_j.append(jacobians[candidate_to_row[point_idx]].astype(np.float32))
-        obs_confidence.append(float(view_confidence))
+        depth_weight = _depth_weight(
+            float(z[point_idx]),
+            z_reference,
+            depth_weighting,
+            depth_weight_power,
+            depth_weight_min,
+        )
+        obs_confidence.append(float(view_confidence) * depth_weight)
+        obs_depth_weight.append(depth_weight)
+        obs_camera_z.append(float(z[point_idx]))
         added += 1
-    return added
+    return added, z_reference
 
 
 def build_carrier_observation_graph(
@@ -412,6 +504,11 @@ def build_carrier_observation_graph(
     snr_exclude_hz: float = 0.08,
     snr_good: float = 3.0,
     view_weight_min: float = 0.05,
+    depth_weighting: str = "none",
+    depth_weight_power: float = 2.0,
+    depth_weight_min: float = 0.02,
+    depth_weight_reference_percentile: float = 50.0,
+    pair_weight_specs: Sequence[str] | None = None,
 ) -> Path:
     """Build an N-view observation graph using VGGT carrier points."""
     if min_observations < 1:
@@ -424,6 +521,14 @@ def build_carrier_observation_graph(
         raise ValueError("zbuffer_tau must be positive.")
     if min_zbuffer_samples < 1:
         raise ValueError("min_zbuffer_samples must be at least 1.")
+    if depth_weighting not in {"none", "inverse-z"}:
+        raise ValueError("depth_weighting must be 'none' or 'inverse-z'.")
+    if depth_weight_power <= 0:
+        raise ValueError("depth_weight_power must be positive.")
+    if not (0.0 <= depth_weight_min <= 1.0):
+        raise ValueError("depth_weight_min must be in [0, 1].")
+    if not (0.0 <= depth_weight_reference_percentile <= 100.0):
+        raise ValueError("depth_weight_reference_percentile must be in [0, 100].")
 
     carrier = _load_carrier_points(carrier_points_path)
     configs, modals, view_freqs_hz, reference_freq_hz = _load_view_inputs(
@@ -456,9 +561,12 @@ def build_carrier_observation_graph(
     obs_y: list[list[complex]] = []
     obs_j: list[np.ndarray] = []
     obs_confidence: list[float] = []
+    obs_depth_weight: list[float] = []
+    obs_camera_z: list[float] = []
     observations_per_view: list[int] = []
+    view_depth_reference_z: list[float] = []
     for view_index, (cfg, modal) in enumerate(zip(configs, modals)):
-        count = _append_view_observations(
+        count, z_reference = _append_view_observations(
             points_world_all,
             view_index,
             cfg,
@@ -475,15 +583,32 @@ def build_carrier_observation_graph(
             obs_y,
             obs_j,
             obs_confidence,
+            obs_depth_weight,
+            obs_camera_z,
             float(view_frequency_weights[view_index]),
+            depth_weighting,
+            depth_weight_power,
+            depth_weight_min,
+            depth_weight_reference_percentile,
         )
         observations_per_view.append(count)
+        view_depth_reference_z.append(z_reference)
 
     obs_point_arr = np.asarray(obs_point_indices, dtype=np.int64)
     obs_view_arr = np.asarray(obs_view_indices, dtype=np.int32)
     if obs_point_arr.size == 0:
         raise ValueError("No observations survived carrier z-buffer and mask checks.")
     counts = np.bincount(obs_point_arr, minlength=points_world_all.shape[0])
+    pair_weight_per_point, normalized_pair_weight_specs = _pair_weight_per_point(
+        points_world_all.shape[0],
+        obs_point_arr,
+        obs_view_arr,
+        counts,
+        pair_weight_specs,
+        configs,
+    )
+    obs_pair_weight = pair_weight_per_point[obs_point_arr].astype(np.float32)
+    obs_confidence_arr = np.asarray(obs_confidence, dtype=np.float32) * obs_pair_weight
     keep_points = counts >= int(min_observations)
     if not np.any(keep_points):
         raise ValueError("No carrier points satisfy min_observations.")
@@ -517,8 +642,13 @@ def build_carrier_observation_graph(
         obs_pixels_xy=np.asarray(obs_pixels, dtype=np.float32)[keep_obs],
         obs_y=np.asarray(obs_y, dtype=np.complex64)[keep_obs],
         obs_J=np.asarray(obs_j, dtype=np.float32)[keep_obs],
-        obs_confidence=np.asarray(obs_confidence, dtype=np.float32)[keep_obs],
+        obs_confidence=obs_confidence_arr[keep_obs],
+        obs_depth_weight=np.asarray(obs_depth_weight, dtype=np.float32)[keep_obs],
+        obs_pair_weight=obs_pair_weight[keep_obs],
+        obs_camera_z=np.asarray(obs_camera_z, dtype=np.float32)[keep_obs],
         obs_count_per_point=counts[active_old_indices].astype(np.int32),
+        pair_weight_per_point=pair_weight_per_point[active_old_indices],
+        pair_weight_specs=normalized_pair_weight_specs,
         view_ids=np.asarray([cfg.view_id for cfg in configs]),
         view_image_width=np.asarray([cfg.image_width for cfg in configs], dtype=np.int32),
         view_image_height=np.asarray([cfg.image_height for cfg in configs], dtype=np.int32),
@@ -529,6 +659,11 @@ def build_carrier_observation_graph(
         view_frequency_signal=reliability["signal"].astype(np.float32),
         view_frequency_noise=reliability["noise"].astype(np.float32),
         view_frequency_bin_hz=reliability["bin_hz"].astype(np.float32),
+        view_depth_reference_z=np.asarray(view_depth_reference_z, dtype=np.float32),
+        depth_weighting=np.array(str(depth_weighting)),
+        depth_weight_power=np.array(depth_weight_power, dtype=np.float32),
+        depth_weight_min=np.array(depth_weight_min, dtype=np.float32),
+        depth_weight_reference_percentile=np.array(depth_weight_reference_percentile, dtype=np.float32),
         snr_band_hz=np.array(snr_band_hz, dtype=np.float32),
         snr_exclude_hz=np.array(snr_exclude_hz, dtype=np.float32),
         snr_good=np.array(snr_good, dtype=np.float32),

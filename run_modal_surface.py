@@ -24,6 +24,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_match_carrier.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
     p_match_carrier.add_argument("--snr-good", type=float, default=3.0, help="SNR treated as a clear frequency peak for view-frequency weighting.")
     p_match_carrier.add_argument("--view-weight-min", type=float, default=0.05, help="Minimum view-frequency reliability weight.")
+    p_match_carrier.add_argument("--depth-weighting", choices=["none", "inverse-z"], default="none", help="Depth-based observation weighting method.")
+    p_match_carrier.add_argument("--depth-weight-power", type=float, default=2.0, help="Power used by inverse-z depth weighting.")
+    p_match_carrier.add_argument("--depth-weight-min", type=float, default=0.02, help="Minimum inverse-z depth weight.")
+    p_match_carrier.add_argument("--depth-weight-reference-percentile", type=float, default=50.0, help="Per-view candidate-depth percentile used as inverse-z reference.")
+    p_match_carrier.add_argument("--pair-weight", action="append", default=None, help="Weight for points observed by exactly two views, formatted as viewA,viewB,weight. Repeat per pair.")
     p_match_carrier.add_argument(
         "--min-observations",
         type=int,
@@ -72,6 +77,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_solve.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
     p_solve.add_argument("--snr-good", type=float, default=3.0, help="SNR treated as a clear frequency peak for view-frequency weighting.")
     p_solve.add_argument("--view-weight-min", type=float, default=0.05, help="Minimum view-frequency reliability weight.")
+    p_solve.add_argument("--depth-weighting", choices=["none", "inverse-z"], default="none", help="Depth-based observation weighting method.")
+    p_solve.add_argument("--depth-weight-power", type=float, default=2.0, help="Power used by inverse-z depth weighting.")
+    p_solve.add_argument("--depth-weight-min", type=float, default=0.02, help="Minimum inverse-z depth weight.")
+    p_solve.add_argument("--depth-weight-reference-percentile", type=float, default=50.0, help="Per-view candidate-depth percentile used as inverse-z reference.")
+    p_solve.add_argument("--pair-weight", action="append", default=None, help="Weight for points observed by exactly two views, formatted as viewA,viewB,weight. Repeat per pair.")
     p_solve.add_argument("--min-observations", type=int, default=1, help="Minimum observed views per carrier point.")
     p_solve.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
     p_solve.add_argument("--iterations", type=int, default=8, help="Alternating optimization iterations.")
