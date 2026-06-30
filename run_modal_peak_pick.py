@@ -43,6 +43,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--sigma-b", type=float, default=3.0, help="Spatial smoothing sigma.")
     p_export.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
     p_export.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
+    p_export.add_argument("--mode-amp-clamp", choices=["none", "local-ratio"], default="none", help="Optional robust amplitude clamp for exported complex modes.")
+    p_export.add_argument("--mode-amp-local-window", type=int, default=31, help="Odd local median window for --mode-amp-clamp local-ratio.")
+    p_export.add_argument("--mode-amp-ratio", type=float, default=5.0, help="Local median amplitude multiplier for --mode-amp-clamp local-ratio.")
+    p_export.add_argument("--mode-amp-global-percentile", type=float, default=99.7, help="Global mask percentile cap for --mode-amp-clamp local-ratio.")
 
     p_inspect = sub.add_parser("inspect", help="Save non-GUI spectrum and candidate mode previews.")
     p_inspect.add_argument("--video", required=True, help="Input video path.")
