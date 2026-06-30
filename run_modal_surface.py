@@ -19,6 +19,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_match_carrier.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
     p_match_carrier.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
     p_match_carrier.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local carrier depths for visibility.")
+    p_match_carrier.add_argument("--view-frequency-weighting", choices=["none", "local-snr"], default="none", help="View-frequency reliability weighting method.")
+    p_match_carrier.add_argument("--snr-band-hz", type=float, default=0.3, help="Half-width of the local spectrum band used for local-SNR noise estimation.")
+    p_match_carrier.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
+    p_match_carrier.add_argument("--snr-good", type=float, default=3.0, help="SNR treated as a clear frequency peak for view-frequency weighting.")
+    p_match_carrier.add_argument("--view-weight-min", type=float, default=0.05, help="Minimum view-frequency reliability weight.")
     p_match_carrier.add_argument(
         "--min-observations",
         type=int,
@@ -62,6 +67,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_solve.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
     p_solve.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
     p_solve.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local carrier depths for visibility.")
+    p_solve.add_argument("--view-frequency-weighting", choices=["none", "local-snr"], default="none", help="View-frequency reliability weighting method.")
+    p_solve.add_argument("--snr-band-hz", type=float, default=0.3, help="Half-width of the local spectrum band used for local-SNR noise estimation.")
+    p_solve.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
+    p_solve.add_argument("--snr-good", type=float, default=3.0, help="SNR treated as a clear frequency peak for view-frequency weighting.")
+    p_solve.add_argument("--view-weight-min", type=float, default=0.05, help="Minimum view-frequency reliability weight.")
     p_solve.add_argument("--min-observations", type=int, default=1, help="Minimum observed views per carrier point.")
     p_solve.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
     p_solve.add_argument("--iterations", type=int, default=8, help="Alternating optimization iterations.")

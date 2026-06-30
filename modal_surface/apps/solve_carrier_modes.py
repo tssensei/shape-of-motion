@@ -26,6 +26,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
     parser.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
     parser.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local carrier depths for visibility.")
+    parser.add_argument("--view-frequency-weighting", choices=["none", "local-snr"], default="none", help="View-frequency reliability weighting method.")
+    parser.add_argument("--snr-band-hz", type=float, default=0.3, help="Half-width of the local spectrum band used for local-SNR noise estimation.")
+    parser.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
+    parser.add_argument("--snr-good", type=float, default=3.0, help="SNR treated as a clear frequency peak for view-frequency weighting.")
+    parser.add_argument("--view-weight-min", type=float, default=0.05, help="Minimum view-frequency reliability weight.")
     parser.add_argument("--min-observations", type=int, default=1, help="Minimum observed views per carrier point.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
     parser.add_argument("--iterations", type=int, default=8, help="Alternating optimization iterations.")
@@ -129,6 +134,52 @@ def _latent_stats(latent_path: Path, observation_path: Path) -> dict[str, Any]:
     }
 
 
+def _json_float(value: float) -> float | None:
+    value = float(value)
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def _view_frequency_reliability(observation_path: Path) -> dict[str, Any]:
+    observations = np.load(str(observation_path), allow_pickle=False)
+    required = [
+        "view_ids",
+        "view_frequency_weights",
+        "view_frequency_snr",
+        "view_frequency_signal",
+        "view_frequency_noise",
+        "view_frequency_bin_hz",
+    ]
+    missing = [key for key in required if key not in observations.files]
+    if missing:
+        raise ValueError(f"{observation_path} missing view-frequency reliability fields: {missing}.")
+    view_ids = [str(v) for v in observations["view_ids"].tolist()]
+    weights = observations["view_frequency_weights"].astype(float)
+    snr = observations["view_frequency_snr"].astype(float)
+    signal = observations["view_frequency_signal"].astype(float)
+    noise = observations["view_frequency_noise"].astype(float)
+    bin_hz = observations["view_frequency_bin_hz"].astype(float)
+    return {
+        "weighting": str(np.asarray(observations["view_frequency_weighting"]).item()),
+        "snr_band_hz": float(np.asarray(observations["snr_band_hz"]).item()),
+        "snr_exclude_hz": float(np.asarray(observations["snr_exclude_hz"]).item()),
+        "snr_good": float(np.asarray(observations["snr_good"]).item()),
+        "view_weight_min": float(np.asarray(observations["view_weight_min"]).item()),
+        "views": [
+            {
+                "view_id": view_id,
+                "weight": _json_float(weights[idx]),
+                "snr": _json_float(snr[idx]),
+                "signal": _json_float(signal[idx]),
+                "noise": _json_float(noise[idx]),
+                "bin_hz": _json_float(bin_hz[idx]),
+            }
+            for idx, view_id in enumerate(view_ids)
+        ],
+    }
+
+
 def run(args: argparse.Namespace) -> None:
     """Solve all requested frequency indices and write a manifest."""
     view_configs = list(args.view_config)
@@ -168,6 +219,11 @@ def run(args: argparse.Namespace) -> None:
             min_zbuffer_samples=args.min_zbuffer_samples,
             min_observations=args.min_observations,
             freq_tolerance_hz=args.freq_tolerance_hz,
+            view_frequency_weighting=args.view_frequency_weighting,
+            snr_band_hz=args.snr_band_hz,
+            snr_exclude_hz=args.snr_exclude_hz,
+            snr_good=args.snr_good,
+            view_weight_min=args.view_weight_min,
         )
         optimize_multi_view(
             observations_path=obs_path,
@@ -197,6 +253,7 @@ def run(args: argparse.Namespace) -> None:
                 "observation_path": _rel(obs_path, out_dir),
                 "latent_path": _rel(latent_path, out_dir),
                 "vis_dir": _rel(mode_vis_dir, out_dir),
+                "view_frequency_reliability": _view_frequency_reliability(obs_path),
                 "stats": _latent_stats(latent_path, obs_path),
             }
         )
@@ -214,6 +271,11 @@ def run(args: argparse.Namespace) -> None:
             "front_percentile": float(args.front_percentile),
             "zbuffer_tau": float(args.zbuffer_tau),
             "min_zbuffer_samples": int(args.min_zbuffer_samples),
+            "view_frequency_weighting": str(args.view_frequency_weighting),
+            "snr_band_hz": float(args.snr_band_hz),
+            "snr_exclude_hz": float(args.snr_exclude_hz),
+            "snr_good": float(args.snr_good),
+            "view_weight_min": float(args.view_weight_min),
             "min_observations": int(args.min_observations),
             "freq_tolerance_hz": float(args.freq_tolerance_hz),
             "iterations": int(args.iterations),

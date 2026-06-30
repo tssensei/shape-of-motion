@@ -108,6 +108,90 @@ def _load_view_inputs(
     return configs, modals, np.asarray(freqs, dtype=np.float32), reference_freq_hz
 
 
+def _local_snr(
+    modal: dict[str, np.ndarray],
+    selected_freq_hz: float,
+    snr_band_hz: float,
+    snr_exclude_hz: float,
+) -> tuple[float, float, float, float]:
+    missing = [key for key in ("freqs_hz", "power_spectrum") if key not in modal]
+    if missing:
+        raise ValueError(f"local-snr weighting requires modal npz keys {missing}. Re-run run_modal_peak_pick.py export.")
+    freqs = np.asarray(modal["freqs_hz"], dtype=np.float64).reshape(-1)
+    power = np.asarray(modal["power_spectrum"], dtype=np.float64).reshape(-1)
+    if freqs.shape != power.shape or freqs.size == 0:
+        raise ValueError("freqs_hz and power_spectrum must be non-empty arrays with matching shape.")
+    finite = np.isfinite(freqs) & np.isfinite(power)
+    if not np.any(finite):
+        raise ValueError("freqs_hz/power_spectrum contain no finite entries.")
+    freq = float(selected_freq_hz)
+    finite_indices = np.where(finite)[0]
+    nearest_idx = int(finite_indices[np.argmin(np.abs(freqs[finite_indices] - freq))])
+    signal = float(power[nearest_idx])
+    bin_hz = float(freqs[nearest_idx])
+    noise_mask = (
+        finite
+        & (freqs >= freq - float(snr_band_hz))
+        & (freqs <= freq + float(snr_band_hz))
+        & (np.abs(freqs - freq) >= float(snr_exclude_hz))
+    )
+    if not np.any(noise_mask):
+        raise ValueError(
+            f"No frequency bins available for local SNR noise estimate around {freq:.6f} Hz. "
+            "Increase --snr-band-hz or decrease --snr-exclude-hz."
+        )
+    noise = float(np.median(power[noise_mask]))
+    snr = signal / max(noise, np.finfo(np.float64).eps)
+    return signal, noise, snr, bin_hz
+
+
+def _view_frequency_reliability(
+    modals: Sequence[dict[str, np.ndarray]],
+    view_freqs_hz: np.ndarray,
+    weighting: str,
+    snr_band_hz: float,
+    snr_exclude_hz: float,
+    snr_good: float,
+    view_weight_min: float,
+) -> dict[str, np.ndarray]:
+    if weighting not in {"none", "local-snr"}:
+        raise ValueError("view_frequency_weighting must be 'none' or 'local-snr'.")
+    if snr_band_hz <= 0:
+        raise ValueError("snr_band_hz must be positive.")
+    if snr_exclude_hz < 0:
+        raise ValueError("snr_exclude_hz must be non-negative.")
+    if snr_exclude_hz >= snr_band_hz:
+        raise ValueError("snr_exclude_hz must be smaller than snr_band_hz.")
+    if snr_good <= 1:
+        raise ValueError("snr_good must be greater than 1.")
+    if not (0.0 <= view_weight_min <= 1.0):
+        raise ValueError("view_weight_min must be in [0, 1].")
+
+    num_views = len(modals)
+    weights = np.ones((num_views,), dtype=np.float32)
+    snr = np.full((num_views,), np.nan, dtype=np.float32)
+    signal = np.full((num_views,), np.nan, dtype=np.float32)
+    noise = np.full((num_views,), np.nan, dtype=np.float32)
+    bin_hz = np.full((num_views,), np.nan, dtype=np.float32)
+    if weighting == "local-snr":
+        for view_idx, (modal, selected_freq_hz) in enumerate(zip(modals, view_freqs_hz)):
+            sig, noi, ratio, freq_bin = _local_snr(modal, float(selected_freq_hz), snr_band_hz, snr_exclude_hz)
+            signal[view_idx] = np.float32(sig)
+            noise[view_idx] = np.float32(noi)
+            snr[view_idx] = np.float32(ratio)
+            bin_hz[view_idx] = np.float32(freq_bin)
+        q = np.maximum(snr.astype(np.float64) - 1.0, 0.0)
+        denom = max(float(np.max(q)), float(snr_good) - 1.0)
+        weights = np.clip(q / max(denom, np.finfo(np.float64).eps), float(view_weight_min), 1.0).astype(np.float32)
+    return {
+        "weights": weights,
+        "snr": snr,
+        "signal": signal,
+        "noise": noise,
+        "bin_hz": bin_hz,
+    }
+
+
 def _candidate_mask(
     pixels_xy: np.ndarray,
     z: np.ndarray,
@@ -248,6 +332,7 @@ def _append_view_observations(
     obs_y: list[list[complex]],
     obs_j: list[np.ndarray],
     obs_confidence: list[float],
+    view_confidence: float,
 ) -> int:
     expected_shape = (cfg.image_height, cfg.image_width)
     mask = load_mask(cfg.mask_path, expected_shape)
@@ -303,7 +388,7 @@ def _append_view_observations(
         obs_pixels.append([float(pixels_xy[point_idx, 0]), float(pixels_xy[point_idx, 1])])
         obs_y.append([complex(y_u), complex(y_v)])
         obs_j.append(jacobians[candidate_to_row[point_idx]].astype(np.float32))
-        obs_confidence.append(1.0)
+        obs_confidence.append(float(view_confidence))
         added += 1
     return added
 
@@ -322,6 +407,11 @@ def build_carrier_observation_graph(
     min_zbuffer_samples: int = 5,
     min_observations: int = 1,
     freq_tolerance_hz: float = 0.1,
+    view_frequency_weighting: str = "none",
+    snr_band_hz: float = 0.3,
+    snr_exclude_hz: float = 0.08,
+    snr_good: float = 3.0,
+    view_weight_min: float = 0.05,
 ) -> Path:
     """Build an N-view observation graph using VGGT carrier points."""
     if min_observations < 1:
@@ -342,6 +432,16 @@ def build_carrier_observation_graph(
         mode_index,
         freq_tolerance_hz,
     )
+    reliability = _view_frequency_reliability(
+        modals,
+        view_freqs_hz,
+        view_frequency_weighting,
+        snr_band_hz,
+        snr_exclude_hz,
+        snr_good,
+        view_weight_min,
+    )
+    view_frequency_weights = reliability["weights"]
     source_mask_candidate_count = int(carrier["points_world"].shape[0])
     source_keep = _source_mask_keep(carrier, configs, source_mask_erode_iters)
     source_mask_kept_count = int(source_keep.sum())
@@ -375,6 +475,7 @@ def build_carrier_observation_graph(
             obs_y,
             obs_j,
             obs_confidence,
+            float(view_frequency_weights[view_index]),
         )
         observations_per_view.append(count)
 
@@ -422,6 +523,16 @@ def build_carrier_observation_graph(
         view_image_width=np.asarray([cfg.image_width for cfg in configs], dtype=np.int32),
         view_image_height=np.asarray([cfg.image_height for cfg in configs], dtype=np.int32),
         view_freqs_hz=view_freqs_hz.astype(np.float32),
+        view_frequency_weighting=np.array(str(view_frequency_weighting)),
+        view_frequency_weights=view_frequency_weights.astype(np.float32),
+        view_frequency_snr=reliability["snr"].astype(np.float32),
+        view_frequency_signal=reliability["signal"].astype(np.float32),
+        view_frequency_noise=reliability["noise"].astype(np.float32),
+        view_frequency_bin_hz=reliability["bin_hz"].astype(np.float32),
+        snr_band_hz=np.array(snr_band_hz, dtype=np.float32),
+        snr_exclude_hz=np.array(snr_exclude_hz, dtype=np.float32),
+        snr_good=np.array(snr_good, dtype=np.float32),
+        view_weight_min=np.array(view_weight_min, dtype=np.float32),
         freq_hz=np.array(reference_freq_hz, dtype=np.float32),
         mode_index=np.array(mode_index, dtype=np.int32),
         min_observations=np.array(min_observations, dtype=np.int32),
