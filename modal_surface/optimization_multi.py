@@ -1,4 +1,8 @@
-"""Optimize latent 3D modal displacement from N-view observations."""
+"""Optimize one latent 3D modal displacement from N-view observations.
+
+Each call solves one modal frequency. The saved ``alphas`` vector has shape
+``(V,)`` and represents the per-view slice ``alpha[:, k]`` for that mode.
+"""
 
 from __future__ import annotations
 
@@ -302,6 +306,7 @@ def _solve_alphas(
     phi: np.ndarray,
     num_views: int,
 ) -> np.ndarray:
+    """Solve per-view, per-current-mode complex offsets with view 0 fixed."""
     alphas = np.ones((num_views,), dtype=np.complex64)
     active_obs = active[obs_point_index]
     for view_idx in range(1, num_views):
@@ -498,7 +503,7 @@ def optimize_multi_view(
     obs_count_weight_2: float = 0.75,
     obs_count_weight_3plus: float = 1.0,
 ) -> Path:
-    """Optimize shared phi_i and per-view complex alpha_v from observation rows."""
+    """Optimize phi_i and per-view alpha_{v,k} for one current mode."""
     if iterations <= 0:
         raise ValueError("iterations must be positive.")
     if not (0.0 <= outlier_frac < 0.5):
@@ -533,6 +538,10 @@ def optimize_multi_view(
     obs_count_per_point = data["obs_count_per_point"].astype(np.int32)
     view_ids = data["view_ids"]
     num_views = int(view_ids.shape[0])
+    if "view_freqs_hz" in data.files:
+        alpha_view_freqs_hz = data["view_freqs_hz"].astype(np.float32)
+    else:
+        alpha_view_freqs_hz = np.full((num_views,), float(np.asarray(data["freq_hz"]).item()), dtype=np.float32)
 
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"points_world must have shape (N,3), got {points.shape}.")
@@ -546,6 +555,8 @@ def optimize_multi_view(
         raise ValueError("obs_point_index contains invalid point indices.")
     if np.any(obs_view_index < 0) or np.any(obs_view_index >= num_views):
         raise ValueError("obs_view_index contains invalid view indices.")
+    if alpha_view_freqs_hz.shape != (num_views,):
+        raise ValueError(f"alpha_view_freqs_hz must have shape ({num_views},), got {alpha_view_freqs_hz.shape}.")
 
     obs_by_point = _observations_by_point(points.shape[0], obs_point_index)
     active = np.ones((points.shape[0],), dtype=bool)
@@ -671,6 +682,10 @@ def optimize_multi_view(
         points_world=points[active_indices].astype(np.float32),
         phi=phi[active_indices].astype(np.complex64),
         alphas=alphas.astype(np.complex64),
+        alpha_by_view=alphas.astype(np.complex64),
+        alpha_semantics=np.array("per_view_per_mode"),
+        alpha_reference_view_index=np.array(0, dtype=np.int32),
+        alpha_view_freqs_hz=alpha_view_freqs_hz.astype(np.float32),
         view_ids=view_ids,
         freq_hz=data["freq_hz"].astype(np.float32),
         mode_index=data["mode_index"].astype(np.int32),

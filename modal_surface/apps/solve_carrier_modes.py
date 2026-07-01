@@ -185,6 +185,49 @@ def _view_frequency_reliability(observation_path: Path) -> dict[str, Any]:
     }
 
 
+def _alpha_by_view_diagnostics(latent_path: Path) -> list[dict[str, Any]]:
+    latent = np.load(str(latent_path), allow_pickle=False)
+    required = [
+        "view_ids",
+        "alphas",
+        "alpha_by_view",
+        "alpha_semantics",
+        "alpha_reference_view_index",
+        "alpha_view_freqs_hz",
+    ]
+    missing = [key for key in required if key not in latent.files]
+    if missing:
+        raise ValueError(f"{latent_path} missing alpha diagnostic fields: {missing}.")
+    semantics = str(np.asarray(latent["alpha_semantics"]).item())
+    if semantics != "per_view_per_mode":
+        raise ValueError(f"{latent_path} has unexpected alpha_semantics={semantics!r}.")
+    reference_view_index = int(np.asarray(latent["alpha_reference_view_index"]).item())
+    if reference_view_index != 0:
+        raise ValueError(f"{latent_path} has unexpected alpha_reference_view_index={reference_view_index}.")
+
+    view_ids = [str(v) for v in latent["view_ids"].tolist()]
+    saved_alphas = latent["alphas"].astype(np.complex64).reshape(-1)
+    alphas = latent["alpha_by_view"].astype(np.complex64).reshape(-1)
+    freqs_hz = latent["alpha_view_freqs_hz"].astype(np.float32).reshape(-1)
+    if saved_alphas.shape != alphas.shape or not np.array_equal(saved_alphas, alphas):
+        raise ValueError(f"{latent_path} alphas and alpha_by_view are inconsistent.")
+    if alphas.shape[0] != len(view_ids):
+        raise ValueError(f"{latent_path} alpha_by_view length does not match view_ids.")
+    if freqs_hz.shape[0] != len(view_ids):
+        raise ValueError(f"{latent_path} alpha_view_freqs_hz length does not match view_ids.")
+    return [
+        {
+            "view_id": view_id,
+            "freq_hz": _json_float(freqs_hz[idx]),
+            "real": _json_float(np.real(alphas[idx])),
+            "imag": _json_float(np.imag(alphas[idx])),
+            "abs": _json_float(np.abs(alphas[idx])),
+            "phase_rad": _json_float(np.angle(alphas[idx])),
+        }
+        for idx, view_id in enumerate(view_ids)
+    ]
+
+
 def run(args: argparse.Namespace) -> None:
     """Solve all requested frequency indices and write a manifest."""
     view_configs = list(args.view_config)
@@ -263,6 +306,7 @@ def run(args: argparse.Namespace) -> None:
                 "observation_path": _rel(obs_path, out_dir),
                 "latent_path": _rel(latent_path, out_dir),
                 "vis_dir": _rel(mode_vis_dir, out_dir),
+                "alpha_by_view": _alpha_by_view_diagnostics(latent_path),
                 "view_frequency_reliability": _view_frequency_reliability(obs_path),
                 "stats": _latent_stats(latent_path, obs_path),
             }
@@ -306,6 +350,8 @@ def run(args: argparse.Namespace) -> None:
             "obs_count_weight_1": float(args.obs_count_weight_1),
             "obs_count_weight_2": float(args.obs_count_weight_2),
             "obs_count_weight_3plus": float(args.obs_count_weight_3plus),
+            "alpha_model": "per_view_per_mode",
+            "alpha_reference_view_index": 0,
         },
         "modes": modes,
     }
