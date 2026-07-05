@@ -36,6 +36,15 @@ class SceneModel(nn.Module):
         modal_frame_view_indices: Tensor | None = None,
         modal_frame_local_indices: Tensor | None = None,
         modal_smooth_triplets: Tensor | None = None,
+        modal_consistency_y_real: Tensor | None = None,
+        modal_consistency_y_imag: Tensor | None = None,
+        modal_consistency_J: Tensor | None = None,
+        modal_consistency_gaussian_indices: Tensor | None = None,
+        modal_consistency_mode_indices: Tensor | None = None,
+        modal_consistency_group_indices: Tensor | None = None,
+        modal_consistency_group_count: int = 0,
+        modal_consistency_target_view_index: int = -1,
+        modal_consistency_fps: float = 0.0,
     ):
         super().__init__()
         if trajectory_type not in ("som_basis", "dct_center", "modal_activation"):
@@ -126,6 +135,67 @@ class SceneModel(nn.Module):
         self.register_buffer("modal_frame_view_indices", modal_frame_view_indices.long())
         self.register_buffer("modal_frame_local_indices", modal_frame_local_indices.long())
         self.register_buffer("modal_smooth_triplets", modal_smooth_triplets.long())
+        if modal_consistency_y_real is None:
+            modal_consistency_y_real = torch.empty(
+                0, 2, device=self.fg.params["means"].device, dtype=self.fg.params["means"].dtype
+            )
+        if modal_consistency_y_imag is None:
+            modal_consistency_y_imag = torch.empty_like(modal_consistency_y_real)
+        if modal_consistency_J is None:
+            modal_consistency_J = torch.empty(
+                0, 2, 3, device=self.fg.params["means"].device, dtype=self.fg.params["means"].dtype
+            )
+        if modal_consistency_gaussian_indices is None:
+            modal_consistency_gaussian_indices = torch.empty(
+                0, device=self.fg.params["means"].device, dtype=torch.long
+            )
+        if modal_consistency_mode_indices is None:
+            modal_consistency_mode_indices = torch.empty(
+                0, device=self.fg.params["means"].device, dtype=torch.long
+            )
+        if modal_consistency_group_indices is None:
+            modal_consistency_group_indices = torch.empty(
+                0, device=self.fg.params["means"].device, dtype=torch.long
+            )
+        self.register_buffer("modal_consistency_y_real", modal_consistency_y_real)
+        self.register_buffer("modal_consistency_y_imag", modal_consistency_y_imag)
+        self.register_buffer("modal_consistency_J", modal_consistency_J)
+        self.register_buffer(
+            "modal_consistency_gaussian_indices",
+            modal_consistency_gaussian_indices.long(),
+        )
+        self.register_buffer(
+            "modal_consistency_mode_indices",
+            modal_consistency_mode_indices.long(),
+        )
+        self.register_buffer(
+            "modal_consistency_group_indices",
+            modal_consistency_group_indices.long(),
+        )
+        self.register_buffer(
+            "modal_consistency_group_count",
+            torch.tensor(
+                int(modal_consistency_group_count),
+                device=self.fg.params["means"].device,
+                dtype=torch.long,
+            ),
+        )
+        self.register_buffer(
+            "modal_consistency_target_view_index",
+            torch.tensor(
+                int(modal_consistency_target_view_index),
+                device=self.fg.params["means"].device,
+                dtype=torch.long,
+            ),
+        )
+        self.register_buffer(
+            "modal_consistency_fps",
+            torch.tensor(
+                float(modal_consistency_fps),
+                device=self.fg.params["means"].device,
+                dtype=self.fg.params["means"].dtype,
+            ),
+        )
 
     @property
     def num_gaussians(self) -> int:
@@ -150,6 +220,10 @@ class SceneModel(nn.Module):
     @property
     def has_modal(self) -> bool:
         return self.modal is not None
+
+    @property
+    def has_modal_consistency(self) -> bool:
+        return int(self.modal_consistency_group_count.item()) > 0
 
     def compute_poses_bg(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -208,6 +282,72 @@ class SceneModel(nn.Module):
         nxt = activations[self.modal_smooth_triplets[:, 2]]
         accel = nxt - 2.0 * center + prev
         return accel.pow(2).sum(dim=-1).mean()
+
+    def compute_activation_modal_consistency_loss(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.modal is None or not self.has_modal_consistency:
+            zero = self.fg.params["means"].new_zeros(())
+            return zero, zero
+        if float(self.modal_consistency_fps.item()) <= 0:
+            raise ValueError("modal consistency requires positive fps")
+
+        target_view_index = int(self.modal_consistency_target_view_index.item())
+        target_mask = self.modal_frame_view_indices == target_view_index
+        if int(target_mask.sum().item()) == 0:
+            raise ValueError(
+                f"modal consistency target view index {target_view_index} has no frames"
+            )
+        target_ts = torch.where(target_mask)[0]
+        local_indices = self.modal_frame_local_indices[target_ts]
+        order = torch.argsort(local_indices)
+        target_ts = target_ts[order]
+        local_indices = local_indices[order]
+
+        activations = self.modal.params["activations"][target_ts]
+        act_complex = torch.complex(activations[..., 0], activations[..., 1])
+        dtype = activations.dtype
+        times = local_indices.to(device=activations.device, dtype=dtype) / self.modal_consistency_fps
+        freqs = self.modal_freqs_hz.to(device=activations.device, dtype=dtype)
+        phase_arg = -2.0 * torch.pi * freqs[:, None] * times[None, :]
+        phase = torch.complex(torch.cos(phase_arg), torch.sin(phase_arg))
+        activation_spectrum = torch.einsum("ft,tm->fm", phase, act_complex)
+        activation_spectrum = activation_spectrum / max(int(target_ts.numel()), 1)
+
+        phi = torch.complex(self.modal_phi_real, self.modal_phi_imag)
+        xhat = torch.einsum("fm,mgc->fgc", activation_spectrum, phi)
+        obs_xhat = xhat[
+            self.modal_consistency_mode_indices,
+            self.modal_consistency_gaussian_indices,
+        ]
+        J = self.modal_consistency_J.to(dtype=obs_xhat.dtype)
+        pred_y = torch.einsum("oij,oj->oi", J, obs_xhat)
+        target_y = torch.complex(
+            self.modal_consistency_y_real,
+            self.modal_consistency_y_imag,
+        )
+
+        eps = torch.finfo(dtype).eps
+        losses = []
+        for group_idx in range(int(self.modal_consistency_group_count.item())):
+            rows = self.modal_consistency_group_indices == group_idx
+            if int(rows.sum().item()) == 0:
+                continue
+            pred_group = pred_y[rows].reshape(-1)
+            target_group = target_y[rows].reshape(-1)
+            target_energy = (target_group.conj() * target_group).real.sum()
+            if float(target_energy.detach().item()) <= float(eps):
+                continue
+            pred_energy = (pred_group.conj() * pred_group).real.sum()
+            dot = (pred_group.conj() * target_group).sum()
+            denom = (pred_energy + eps) * (target_energy + eps)
+            corr = dot.abs().pow(2) / denom
+            losses.append(1.0 - corr.clamp(0.0, 1.0))
+
+        if not losses:
+            zero = self.fg.params["means"].new_zeros(())
+            return zero, zero
+        return torch.stack(losses).mean(), torch.tensor(
+            float(len(losses)), device=activations.device, dtype=dtype
+        )
 
     @torch.no_grad()
     def densify_modal_fields(self, should_split: torch.Tensor, should_dup: torch.Tensor):
@@ -343,6 +483,15 @@ class SceneModel(nn.Module):
         modal_frame_view_indices = None
         modal_frame_local_indices = None
         modal_smooth_triplets = None
+        modal_consistency_y_real = None
+        modal_consistency_y_imag = None
+        modal_consistency_J = None
+        modal_consistency_gaussian_indices = None
+        modal_consistency_mode_indices = None
+        modal_consistency_group_indices = None
+        modal_consistency_group_count = 0
+        modal_consistency_target_view_index = -1
+        modal_consistency_fps = 0.0
         if trajectory_type == "modal_activation":
             modal = ModalActivations.init_from_state_dict(
                 state_dict, prefix=f"{prefix}modal.params."
@@ -353,6 +502,28 @@ class SceneModel(nn.Module):
             modal_frame_view_indices = state_dict[f"{prefix}modal_frame_view_indices"]
             modal_frame_local_indices = state_dict[f"{prefix}modal_frame_local_indices"]
             modal_smooth_triplets = state_dict[f"{prefix}modal_smooth_triplets"]
+            if f"{prefix}modal_consistency_y_real" in state_dict:
+                modal_consistency_y_real = state_dict[f"{prefix}modal_consistency_y_real"]
+                modal_consistency_y_imag = state_dict[f"{prefix}modal_consistency_y_imag"]
+                modal_consistency_J = state_dict[f"{prefix}modal_consistency_J"]
+                modal_consistency_gaussian_indices = state_dict[
+                    f"{prefix}modal_consistency_gaussian_indices"
+                ]
+                modal_consistency_mode_indices = state_dict[
+                    f"{prefix}modal_consistency_mode_indices"
+                ]
+                modal_consistency_group_indices = state_dict[
+                    f"{prefix}modal_consistency_group_indices"
+                ]
+                modal_consistency_group_count = int(
+                    state_dict[f"{prefix}modal_consistency_group_count"].item()
+                )
+                modal_consistency_target_view_index = int(
+                    state_dict[f"{prefix}modal_consistency_target_view_index"].item()
+                )
+                modal_consistency_fps = float(
+                    state_dict[f"{prefix}modal_consistency_fps"].item()
+                )
 
         return SceneModel(
             Ks, 
@@ -371,6 +542,15 @@ class SceneModel(nn.Module):
             modal_frame_view_indices=modal_frame_view_indices,
             modal_frame_local_indices=modal_frame_local_indices,
             modal_smooth_triplets=modal_smooth_triplets,
+            modal_consistency_y_real=modal_consistency_y_real,
+            modal_consistency_y_imag=modal_consistency_y_imag,
+            modal_consistency_J=modal_consistency_J,
+            modal_consistency_gaussian_indices=modal_consistency_gaussian_indices,
+            modal_consistency_mode_indices=modal_consistency_mode_indices,
+            modal_consistency_group_indices=modal_consistency_group_indices,
+            modal_consistency_group_count=modal_consistency_group_count,
+            modal_consistency_target_view_index=modal_consistency_target_view_index,
+            modal_consistency_fps=modal_consistency_fps,
         )
 
     def render(

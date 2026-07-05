@@ -462,6 +462,8 @@ class Trainer:
 
         pred_depth = cast(torch.Tensor, rendered_all["depth"])
         pred_disp = 1.0 / (pred_depth + 1e-5)
+        valid_depth_masks = torch.isfinite(depths[..., None]) & (depths[..., None] > 0)
+        depth_masks = depth_masks * valid_depth_masks.float()
         tgt_disp = 1.0 / (depths[..., None] + 1e-5)
         depth_loss = masked_l1_loss(
             pred_disp,
@@ -593,8 +595,18 @@ class Trainer:
         if is_modal_activation:
             act_smooth_loss = self.model.compute_activation_smoothness_loss()
             loss += self.losses_cfg.w_act_smooth * act_smooth_loss
+            (
+                act_modal_consistency_loss,
+                act_modal_consistency_count,
+            ) = self.model.compute_activation_modal_consistency_loss()
+            loss += (
+                self.losses_cfg.w_act_modal_consistency
+                * act_modal_consistency_loss
+            )
         else:
             act_smooth_loss = torch.zeros((), device=self.device)
+            act_modal_consistency_loss = torch.zeros((), device=self.device)
+            act_modal_consistency_count = torch.zeros((), device=self.device)
 
         # Prepare stats for logging.
         stats = {
@@ -608,6 +620,8 @@ class Trainer:
             "train/small_accel_loss": small_accel_loss.item(),
             "train/dct_coef_loss": dct_coef_loss.item(),
             "train/act_smooth_loss": act_smooth_loss.item(),
+            "train/act_modal_consistency_loss": act_modal_consistency_loss.item(),
+            "train/act_modal_consistency_count": act_modal_consistency_count.item(),
             "train/z_acc_loss": z_accel_loss.item(),
             "train/local_iso_ray_loss": local_iso_ray_loss.item(),
             "train/local_iso_perp_loss": local_iso_perp_loss.item(),

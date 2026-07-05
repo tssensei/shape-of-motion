@@ -78,6 +78,30 @@ def init_fg_from_tracks_3d(
     return gaussians
 
 
+def init_fg_from_point_cloud(
+    points: torch.Tensor,
+    colors: torch.Tensor,
+) -> GaussianParams:
+    num_fg = points.shape[0]
+    if num_fg < 2:
+        raise ValueError("Point-cloud Gaussian initialization requires at least 2 points")
+
+    colors = colors.float()
+    if colors.max() > 1.0:
+        colors = colors / 255.0
+    colors = torch.logit(colors.clamp(1e-4, 1.0 - 1e-4))
+
+    k = min(3, num_fg - 1)
+    dists, _ = knn(points, k)
+    dists = torch.from_numpy(dists).to(points.device)
+    scales = dists.mean(dim=-1, keepdim=True)
+    scales = scales.clamp(torch.quantile(scales, 0.05), torch.quantile(scales, 0.95))
+    scales = torch.log(scales.repeat(1, 3))
+    quats = torch.rand(num_fg, 4, device=points.device)
+    opacities = torch.logit(torch.full((num_fg,), 0.7, device=points.device))
+    return GaussianParams(points, quats, scales, colors, opacities)
+
+
 def init_bg(
     points: StaticObservations,
 ) -> GaussianParams:

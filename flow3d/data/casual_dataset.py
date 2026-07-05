@@ -1,5 +1,6 @@
 import os
 import os.path as osp
+import json
 from dataclasses import dataclass
 from functools import partial
 from typing import Literal, cast
@@ -29,6 +30,7 @@ from flow3d.data.utils import (
 )
 from flow3d.data.colmap import get_colmap_camera_params_binary_strict
 from flow3d.transforms import rt_to_mat4
+from modal_surface.io import load_view_config, ViewConfig
 
 
 @dataclass
@@ -46,13 +48,16 @@ class DavisDataConfig:
         "depth_anything_v2",
         "unidepth_disp",
         "aligned_depth_colmap",
+        "aligned_depth_anything_vggt_bg",
     ] = "aligned_depth_anything"
-    camera_type: Literal["droid_recon", "megasam", "colmap"] = "megasam"
+    camera_type: Literal["droid_recon", "megasam", "colmap", "vggt"] = "megasam"
     track_2d_type: Literal["bootstapir", "tapir"] = "bootstapir"
     mask_erosion_radius: int = 3
     scene_norm_dict: tyro.conf.Suppress[SceneNormDict | None] = None
     num_targets_per_frame: int = 4
     load_from_cache: bool = False
+    vggt_view_configs: tyro.conf.Suppress[tuple[str, ...]] = ()
+    modal_frame_map: tyro.conf.Suppress[str | None] = None
 
 
 @dataclass
@@ -70,13 +75,16 @@ class CustomDataConfig:
         "depth_anything_v2",
         "unidepth_disp",
         "aligned_depth_colmap",
+        "aligned_depth_anything_vggt_bg",
     ] = "aligned_depth_anything"
-    camera_type: Literal["droid_recon", "megasam", "colmap"] = "megasam"
+    camera_type: Literal["droid_recon", "megasam", "colmap", "vggt"] = "megasam"
     track_2d_type: Literal["bootstapir", "tapir"] = "bootstapir"
     mask_erosion_radius: int = 7
     scene_norm_dict: tyro.conf.Suppress[SceneNormDict | None] = None
     num_targets_per_frame: int = 4
     load_from_cache: bool = False
+    vggt_view_configs: tyro.conf.Suppress[tuple[str, ...]] = ()
+    modal_frame_map: tyro.conf.Suppress[str | None] = None
 
 
 class CasualDataset(BaseDataset):
@@ -95,13 +103,16 @@ class CasualDataset(BaseDataset):
             "depth_anything_v2",
             "unidepth_disp",
             "aligned_depth_colmap",
+            "aligned_depth_anything_vggt_bg",
         ] = "aligned_depth_anything",
-        camera_type: Literal["droid_recon", "megasam", "colmap"] = "megasam",
+        camera_type: Literal["droid_recon", "megasam", "colmap", "vggt"] = "megasam",
         track_2d_type: Literal["bootstapir", "tapir"] = "bootstapir",
         mask_erosion_radius: int = 3,
         scene_norm_dict: SceneNormDict | None = None,
         num_targets_per_frame: int = 4,
         load_from_cache: bool = False,
+        vggt_view_configs: tuple[str, ...] = (),
+        modal_frame_map: str | None = None,
         **_,
     ):
         super().__init__()
@@ -136,6 +147,7 @@ class CasualDataset(BaseDataset):
         self.imgs: list[torch.Tensor | None] = [None for _ in self.frame_names]
         self.depths: list[torch.Tensor | None] = [None for _ in self.frame_names]
         self.masks: list[torch.Tensor | None] = [None for _ in self.frame_names]
+        self._vggt_frame_configs: list[ViewConfig] = []
 
         # load cameras
         img = self.get_image(0)
@@ -171,6 +183,55 @@ class CasualDataset(BaseDataset):
             )
             Ks = torch.from_numpy(Ks_np).float()
             w2cs = torch.from_numpy(w2cs_np).float()
+
+        elif camera_type == "vggt":
+            if not vggt_view_configs:
+                raise ValueError("camera_type='vggt' requires vggt_view_configs")
+            if modal_frame_map is None:
+                raise ValueError("camera_type='vggt' requires modal_frame_map")
+
+            view_configs = [load_view_config(path) for path in vggt_view_configs]
+            view_by_id = {cfg.view_id: cfg for cfg in view_configs}
+            if len(view_by_id) != len(view_configs):
+                raise ValueError("VGGT view configs must have unique view_id values")
+
+            with open(modal_frame_map, "r", encoding="utf-8") as f:
+                frame_map = json.load(f)
+            records = frame_map.get("frames")
+            if not isinstance(records, list):
+                raise ValueError(f"{modal_frame_map} must contain a frames list")
+            frame_to_record = {}
+            for record in records:
+                frame_name = record.get("frame_name")
+                if frame_name in frame_to_record:
+                    raise ValueError(f"Duplicate frame_name in modal frame map: {frame_name}")
+                frame_to_record[frame_name] = record
+
+            Ks_list = []
+            w2cs_list = []
+            frame_configs = []
+            for frame_name in self.frame_names:
+                if frame_name not in frame_to_record:
+                    raise ValueError(
+                        f"{modal_frame_map} is missing training frame {frame_name}"
+                    )
+                view_id = frame_to_record[frame_name].get("view_id")
+                if view_id not in view_by_id:
+                    raise ValueError(
+                        f"Frame {frame_name} uses view_id={view_id!r}, "
+                        "which is not present in vggt_view_configs"
+                    )
+                cfg = view_by_id[view_id]
+                K = cfg.K.astype(np.float32).copy()
+                K[0, :] *= float(W) / float(cfg.image_width)
+                K[1, :] *= float(H) / float(cfg.image_height)
+                Ks_list.append(K)
+                w2cs_list.append(cfg.world_to_camera.astype(np.float32))
+                frame_configs.append(cfg)
+
+            Ks = torch.from_numpy(np.stack(Ks_list)).float()
+            w2cs = torch.from_numpy(np.stack(w2cs_list)).float()
+            self._vggt_frame_configs = frame_configs
                 
         else:
             raise ValueError(f"Unknown camera type: {camera_type}")
@@ -179,8 +240,12 @@ class CasualDataset(BaseDataset):
             len(self.frame_names) == len(w2cs) == len(Ks)
         ), f"{len(self.frame_names)}, {len(w2cs)}, {len(Ks)}"
 
-        self.w2cs = w2cs[start:end]
-        self.Ks = Ks[start:end]
+        if camera_type == "vggt":
+            self.w2cs = w2cs
+            self.Ks = Ks
+        else:
+            self.w2cs = w2cs[start:end]
+            self.Ks = Ks[start:end]
         tstamps = torch.from_numpy(np.arange(0, end))
         tmask = (tstamps >= start) & (tstamps < end)
         self._keyframe_idcs = tstamps[tmask] - start
@@ -190,7 +255,9 @@ class CasualDataset(BaseDataset):
             cached_scene_norm_dict_path = os.path.join(
                 self.cache_dir, "scene_norm_dict.pth"
             )
-            if os.path.exists(cached_scene_norm_dict_path) and self.load_from_cache:
+            if camera_type == "vggt":
+                scene_norm_dict = SceneNormDict(scale=1.0, transfm=torch.eye(4))
+            elif os.path.exists(cached_scene_norm_dict_path) and self.load_from_cache:
                 guru.info("loading cached scene norm dict...")
                 scene_norm_dict = torch.load(
                     os.path.join(self.cache_dir, "scene_norm_dict.pth")
@@ -255,8 +322,9 @@ class CasualDataset(BaseDataset):
                 if depth.shape != (H, W):
                     depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_LINEAR)
                 self.depths[index] = torch.from_numpy(depth).float()
-               
-                
+            elif self.camera_type == "vggt":
+                self.depths[index] = self.load_depth(index, preserve_invalid=True)
+
         return self.depths[index] / self.scale
 
     def load_image(self, index) -> torch.Tensor:
@@ -284,12 +352,22 @@ class CasualDataset(BaseDataset):
         out_mask[fg_mask_erode > 0] = 1
         return torch.from_numpy(out_mask).float()
 
-    def load_depth(self, index) -> torch.Tensor:
+    def load_depth(self, index, preserve_invalid: bool = False) -> torch.Tensor:
         path = f"{self.depth_dir}/{self.frame_names[index]}.npy"
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Depth file not found: {path}")
         disp = np.load(path)
-        depth = 1.0 / np.clip(disp, a_min=1e-6, a_max=1e6)
+        if preserve_invalid:
+            valid = np.isfinite(disp) & (disp > 1e-6)
+            depth = np.zeros_like(disp, dtype=np.float32)
+            depth[valid] = 1.0 / np.clip(disp[valid], a_min=1e-6, a_max=1e6)
+        else:
+            valid = None
+            depth = 1.0 / np.clip(disp, a_min=1e-6, a_max=1e6)
         depth = torch.from_numpy(depth).float()
         depth = median_filter_2d(depth[None, None], 11, 1)[0, 0]
+        if valid is not None:
+            depth[~torch.from_numpy(valid)] = 0.0
         return depth
 
     def load_target_tracks(
@@ -471,6 +549,18 @@ class CasualDataset(BaseDataset):
         mask = tri_mask == 1  # fg mask
         data["masks"] = mask.float()
         data["valid_masks"] = valid_mask.float()
+
+        if self.camera_type == "vggt":
+            data["query_tracks_2d"] = torch.empty(0, 2)
+            data["target_ts"] = torch.tensor([index])
+            data["target_w2cs"] = self.w2cs[[index]]
+            data["target_Ks"] = self.Ks[[index]]
+            data["target_tracks_2d"] = torch.empty(1, 0, 2)
+            data["target_visibles"] = torch.empty(1, 0, dtype=torch.bool)
+            data["target_invisibles"] = torch.empty(1, 0, dtype=torch.bool)
+            data["target_confidences"] = torch.empty(1, 0)
+            data["target_track_depths"] = torch.empty(1, 0)
+            return data
 
         # (P, 2)
         query_tracks = self.load_target_tracks(index, [index])[:, 0, :2]

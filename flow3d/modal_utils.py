@@ -8,6 +8,14 @@ import numpy as np
 import torch
 from loguru import logger as guru
 
+from modal_surface.geometry import (
+    bilinear_sample,
+    erode_mask,
+    project_points,
+    projection_jacobian,
+)
+from modal_surface.io import load_view_config
+
 
 @dataclass(frozen=True)
 class ModalModeData:
@@ -24,6 +32,17 @@ class ModalFrameMap:
     frame_view_indices: torch.Tensor
     frame_local_indices: torch.Tensor
     smooth_triplets: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ModalConsistencyData:
+    y_real: torch.Tensor
+    y_imag: torch.Tensor
+    J: torch.Tensor
+    gaussian_indices: torch.Tensor
+    mode_indices: torch.Tensor
+    group_indices: torch.Tensor
+    group_count: int
 
 
 def load_modal_modes(manifest_path: str) -> list[ModalModeData]:
@@ -146,6 +165,144 @@ def interpolate_modal_modes_to_gaussians(
     )
     freqs_hz = torch.tensor([mode.freq_hz for mode in modes], device=device, dtype=dtype)
     return phi_real, phi_imag, freqs_hz, stats
+
+
+def _modal_mask_from_npz(modal: Any, shape: tuple[int, int]) -> np.ndarray:
+    if "mask" not in modal.files:
+        return np.ones(shape, dtype=bool)
+    mask = np.asarray(modal["mask"])
+    if mask.ndim != 2:
+        raise ValueError(f"modal mask must be 2D, got {mask.shape}")
+    if mask.shape != shape:
+        raise ValueError(f"modal mask shape {mask.shape} does not match {shape}")
+    if np.issubdtype(mask.dtype, np.floating):
+        return mask > 0.5
+    return mask > 0
+
+
+def load_modal_consistency_data(
+    gaussian_means: torch.Tensor,
+    modes: list[ModalModeData],
+    view_config_paths: tuple[str, ...],
+    modal_npz_paths: tuple[str, ...],
+    freq_tolerance_hz: float,
+    mask_erode_iters: int,
+) -> ModalConsistencyData | None:
+    if not view_config_paths and not modal_npz_paths:
+        return None
+    if len(view_config_paths) != len(modal_npz_paths):
+        raise ValueError(
+            "modal consistency view configs and modal npzs must have the same length"
+        )
+    if not modes:
+        raise ValueError("modal consistency requires at least one modal mode")
+    if freq_tolerance_hz < 0:
+        raise ValueError("modal consistency freq tolerance must be non-negative")
+    if mask_erode_iters < 0:
+        raise ValueError("modal consistency mask_erode_iters must be non-negative")
+
+    device = gaussian_means.device
+    dtype = gaussian_means.dtype
+    points_world = gaussian_means.detach().cpu().numpy().astype(np.float32)
+    obs_y: list[np.ndarray] = []
+    obs_J: list[np.ndarray] = []
+    gaussian_indices: list[np.ndarray] = []
+    mode_indices: list[np.ndarray] = []
+    group_indices: list[np.ndarray] = []
+    group_count = 0
+
+    for view_cfg_path, modal_path in zip(view_config_paths, modal_npz_paths):
+        cfg = load_view_config(view_cfg_path)
+        modal = np.load(str(modal_path), allow_pickle=False)
+        required = ["mode_u", "mode_v", "selected_freqs_hz"]
+        missing = [key for key in required if key not in modal.files]
+        if missing:
+            raise ValueError(f"{modal_path} missing required modal arrays: {missing}")
+        mode_u_all = modal["mode_u"]
+        mode_v_all = modal["mode_v"]
+        selected_freqs = modal["selected_freqs_hz"].astype(np.float32).reshape(-1)
+        if mode_u_all.ndim != 3 or mode_v_all.shape != mode_u_all.shape:
+            raise ValueError(f"{modal_path} mode_u/mode_v must have matching shape (K,H,W)")
+        height, width = int(mode_u_all.shape[1]), int(mode_u_all.shape[2])
+        if (height, width) != (cfg.image_height, cfg.image_width):
+            raise ValueError(
+                f"{modal_path} modal image shape {(height, width)} does not match "
+                f"view config {(cfg.image_height, cfg.image_width)}"
+            )
+        mask = erode_mask(_modal_mask_from_npz(modal, (height, width)), mask_erode_iters)
+        pixels_xy, z = project_points(points_world, cfg.K, cfg.world_to_camera)
+        finite_pixels = np.isfinite(pixels_xy).all(axis=1)
+        rounded_x = np.full((pixels_xy.shape[0],), -1, dtype=np.int64)
+        rounded_y = np.full((pixels_xy.shape[0],), -1, dtype=np.int64)
+        rounded_x[finite_pixels] = np.rint(pixels_xy[finite_pixels, 0]).astype(np.int64)
+        rounded_y[finite_pixels] = np.rint(pixels_xy[finite_pixels, 1]).astype(np.int64)
+        valid = (
+            finite_pixels
+            & np.isfinite(z)
+            & (z > 0)
+            & (pixels_xy[:, 0] >= 0)
+            & (pixels_xy[:, 0] < width - 1)
+            & (pixels_xy[:, 1] >= 0)
+            & (pixels_xy[:, 1] < height - 1)
+            & (rounded_x >= 0)
+            & (rounded_x < width)
+            & (rounded_y >= 0)
+            & (rounded_y < height)
+        )
+        valid_indices = np.where(valid)[0]
+        if valid_indices.size == 0:
+            raise ValueError(f"No modal consistency Gaussian projections survived for {cfg.view_id}")
+        valid_indices = valid_indices[mask[rounded_y[valid_indices], rounded_x[valid_indices]]]
+        if valid_indices.size == 0:
+            raise ValueError(f"No modal consistency Gaussian projections survived mask for {cfg.view_id}")
+        jacobians = projection_jacobian(points_world[valid_indices], cfg.K, cfg.world_to_camera)
+        sample_xy = pixels_xy[valid_indices]
+
+        for internal_mode_idx, mode in enumerate(modes):
+            source_mode_idx = int(mode.mode_index)
+            if source_mode_idx < 0 or source_mode_idx >= mode_u_all.shape[0]:
+                raise ValueError(
+                    f"{modal_path} does not contain mode_index={source_mode_idx}"
+                )
+            view_freq = float(selected_freqs[source_mode_idx])
+            if abs(view_freq - float(mode.freq_hz)) > freq_tolerance_hz:
+                raise ValueError(
+                    f"{modal_path} mode_index={source_mode_idx} frequency {view_freq:.6f} Hz "
+                    f"does not match manifest frequency {mode.freq_hz:.6f} Hz"
+                )
+            y_u = bilinear_sample(mode_u_all[source_mode_idx].astype(np.complex64), sample_xy)
+            y_v = bilinear_sample(mode_v_all[source_mode_idx].astype(np.complex64), sample_xy)
+            obs_y.append(np.stack([y_u, y_v], axis=1).astype(np.complex64))
+            obs_J.append(jacobians.astype(np.float32))
+            gaussian_indices.append(valid_indices.astype(np.int64))
+            mode_indices.append(
+                np.full((valid_indices.size,), internal_mode_idx, dtype=np.int64)
+            )
+            group_indices.append(
+                np.full((valid_indices.size,), group_count, dtype=np.int64)
+            )
+            group_count += 1
+
+    if not obs_y:
+        raise ValueError("No modal consistency observations were created")
+    obs_y_arr = np.concatenate(obs_y, axis=0)
+    obs_J_arr = np.concatenate(obs_J, axis=0)
+    gaussian_idx_arr = np.concatenate(gaussian_indices, axis=0)
+    mode_idx_arr = np.concatenate(mode_indices, axis=0)
+    group_idx_arr = np.concatenate(group_indices, axis=0)
+    guru.info(
+        f"Loaded {obs_y_arr.shape[0]} activation modal consistency observations "
+        f"across {group_count} view-frequency groups"
+    )
+    return ModalConsistencyData(
+        y_real=torch.as_tensor(obs_y_arr.real, device=device, dtype=dtype),
+        y_imag=torch.as_tensor(obs_y_arr.imag, device=device, dtype=dtype),
+        J=torch.as_tensor(obs_J_arr, device=device, dtype=dtype),
+        gaussian_indices=torch.as_tensor(gaussian_idx_arr, device=device, dtype=torch.long),
+        mode_indices=torch.as_tensor(mode_idx_arr, device=device, dtype=torch.long),
+        group_indices=torch.as_tensor(group_idx_arr, device=device, dtype=torch.long),
+        group_count=group_count,
+    )
 
 
 def load_modal_frame_map(

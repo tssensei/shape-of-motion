@@ -1,7 +1,7 @@
 import os
 import os.path as osp
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -25,6 +25,7 @@ from flow3d.data import (
 from flow3d.data.utils import to_device
 from flow3d.init_utils import (
     init_bg,
+    init_fg_from_point_cloud,
     init_fg_from_tracks_3d,
     init_identity_motion_bases,
     init_motion_params_with_dct,
@@ -35,6 +36,7 @@ from flow3d.init_utils import (
 )
 from flow3d.modal_utils import (
     interpolate_modal_modes_to_gaussians,
+    load_modal_consistency_data,
     load_modal_frame_map,
     load_modal_modes,
     resolve_required_modal_paths,
@@ -82,11 +84,19 @@ class TrainConfig:
     dct_init: Literal["tracks", "zero"] = "tracks"
     modal_manifest: str | None = None
     modal_frame_map: str | None = None
+    modal_carrier_points: str | None = None
+    vggt_view_configs: tuple[str, ...] = ()
     modal_knn: int = 8
     modal_interp_power: float = 2.0
     modal_interp_eps: float = 1e-6
     modal_warmup_epochs: int = 5
     modal_train_base_means: bool = False
+    modal_consistency_target_view_id: str | None = None
+    modal_consistency_fps: float = 0.0
+    modal_consistency_view_configs: tuple[str, ...] = ()
+    modal_consistency_modal_npzs: tuple[str, ...] = ()
+    modal_consistency_freq_tolerance_hz: float = 0.1
+    modal_consistency_mask_erode_iters: int = 1
     num_epochs: int = 200
     port: int | None = None
     vis_debug: bool = False 
@@ -98,6 +108,7 @@ class TrainConfig:
 
 
 def main(cfg: TrainConfig):
+    _inject_vggt_static_view_config(cfg)
     backup_code(cfg.work_dir)
     train_dataset, train_video_view, val_img_dataset, val_kpt_dataset = (
         get_train_val_datasets(cfg.data, load_val=True)
@@ -139,7 +150,7 @@ def main(cfg: TrainConfig):
         train_dataset,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_dl_workers,
-        persistent_workers=True,
+        persistent_workers=cfg.num_dl_workers > 0,
         collate_fn=BaseDataset.train_collate_fn,
     )
 
@@ -210,6 +221,7 @@ def initialize_and_checkpoint_model(
         cfg.trajectory_type,
         cfg.num_dct_bases,
         cfg.dct_init,
+        cfg.modal_carrier_points,
         vis=vis,
         port=port,
     )
@@ -224,7 +236,9 @@ def initialize_and_checkpoint_model(
             vis_init_params(server, fg_params, motion_bases)
 
 
-    camera_poses = init_trainable_poses(w2cs)
+    camera_poses = (
+        None if cfg.trajectory_type == "modal_activation" else init_trainable_poses(w2cs)
+    )
     modal = None
     modal_phi_real = None
     modal_phi_imag = None
@@ -232,6 +246,15 @@ def initialize_and_checkpoint_model(
     modal_frame_view_indices = None
     modal_frame_local_indices = None
     modal_smooth_triplets = None
+    modal_consistency_y_real = None
+    modal_consistency_y_imag = None
+    modal_consistency_J = None
+    modal_consistency_gaussian_indices = None
+    modal_consistency_mode_indices = None
+    modal_consistency_group_indices = None
+    modal_consistency_group_count = 0
+    modal_consistency_target_view_index = -1
+    modal_consistency_fps = 0.0
     if cfg.trajectory_type == "modal_activation":
         resolve_required_modal_paths(cfg.modal_manifest, cfg.modal_frame_map)
         modal_modes = load_modal_modes(cfg.modal_manifest)
@@ -253,6 +276,41 @@ def initialize_and_checkpoint_model(
         modal_frame_view_indices = frame_map.frame_view_indices
         modal_frame_local_indices = frame_map.frame_local_indices
         modal_smooth_triplets = frame_map.smooth_triplets
+        use_modal_consistency = bool(
+            cfg.modal_consistency_view_configs or cfg.modal_consistency_modal_npzs
+        )
+        if use_modal_consistency:
+            if cfg.modal_consistency_target_view_id is None:
+                raise ValueError(
+                    "modal consistency requires --modal-consistency-target-view-id"
+                )
+            if cfg.modal_consistency_target_view_id not in frame_map.view_ids:
+                raise ValueError(
+                    f"modal consistency target view {cfg.modal_consistency_target_view_id!r} "
+                    f"is not in modal frame map views {frame_map.view_ids}"
+                )
+            if cfg.modal_consistency_fps <= 0:
+                raise ValueError("modal consistency requires --modal-consistency-fps > 0")
+            modal_consistency = load_modal_consistency_data(
+                fg_params.params["means"],
+                modal_modes,
+                cfg.modal_consistency_view_configs,
+                cfg.modal_consistency_modal_npzs,
+                cfg.modal_consistency_freq_tolerance_hz,
+                cfg.modal_consistency_mask_erode_iters,
+            )
+            if modal_consistency is not None:
+                modal_consistency_y_real = modal_consistency.y_real
+                modal_consistency_y_imag = modal_consistency.y_imag
+                modal_consistency_J = modal_consistency.J
+                modal_consistency_gaussian_indices = modal_consistency.gaussian_indices
+                modal_consistency_mode_indices = modal_consistency.mode_indices
+                modal_consistency_group_indices = modal_consistency.group_indices
+                modal_consistency_group_count = modal_consistency.group_count
+                modal_consistency_target_view_index = frame_map.view_ids.index(
+                    cfg.modal_consistency_target_view_id
+                )
+                modal_consistency_fps = cfg.modal_consistency_fps
         modal = ModalActivations(
             torch.zeros(
                 motion_bases.num_frames,
@@ -286,6 +344,15 @@ def initialize_and_checkpoint_model(
         modal_frame_view_indices=modal_frame_view_indices,
         modal_frame_local_indices=modal_frame_local_indices,
         modal_smooth_triplets=modal_smooth_triplets,
+        modal_consistency_y_real=modal_consistency_y_real,
+        modal_consistency_y_imag=modal_consistency_y_imag,
+        modal_consistency_J=modal_consistency_J,
+        modal_consistency_gaussian_indices=modal_consistency_gaussian_indices,
+        modal_consistency_mode_indices=modal_consistency_mode_indices,
+        modal_consistency_group_indices=modal_consistency_group_indices,
+        modal_consistency_group_count=modal_consistency_group_count,
+        modal_consistency_target_view_index=modal_consistency_target_view_index,
+        modal_consistency_fps=modal_consistency_fps,
     )
 
     guru.info(f"Saving initialization to {ckpt_path}")
@@ -301,9 +368,43 @@ def init_model_from_tracks(
     trajectory_type: Literal["som_basis", "dct_center", "modal_activation"],
     num_dct_bases: int | None,
     dct_init: Literal["tracks", "zero"],
+    modal_carrier_points: str | None,
     vis: bool = False,
     port: int | None = None,
 ):
+    if trajectory_type == "modal_activation":
+        if modal_carrier_points is None:
+            raise ValueError("trajectory_type='modal_activation' requires modal_carrier_points")
+        if num_bg != 0:
+            raise ValueError("modal_activation v1 requires num_bg=0")
+        carrier = np.load(modal_carrier_points, allow_pickle=False)
+        required = {"points_world", "colors"}
+        missing = sorted(required - set(carrier.files))
+        if missing:
+            raise ValueError(f"{modal_carrier_points} missing required fields: {missing}")
+        points = carrier["points_world"].astype(np.float32)
+        colors = carrier["colors"].astype(np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"points_world must have shape (N,3), got {points.shape}")
+        if colors.shape != points.shape:
+            raise ValueError(f"colors must have shape {points.shape}, got {colors.shape}")
+        if points.shape[0] > num_fg:
+            sel = np.random.choice(points.shape[0], num_fg, replace=False)
+            points = points[sel]
+            colors = colors[sel]
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        points_th = torch.from_numpy(points).to(device)
+        colors_th = torch.from_numpy(colors).to(device)
+        fg_params = init_fg_from_point_cloud(points_th, colors_th).to(device)
+        motion_bases = init_identity_motion_bases(
+            train_dataset.num_frames, device, points_th.dtype
+        ).to(device)
+        bg_params = None
+        tracks_3d = None
+        cano_t = 0
+        return fg_params, motion_bases, bg_params, tracks_3d, cano_t
+
     tracks_3d = TrackObservations(*train_dataset.get_tracks_3d(num_fg))
     print(
         f"{tracks_3d.xyz.shape=} {tracks_3d.visibles.shape=} "
@@ -331,12 +432,6 @@ def init_model_from_tracks(
             tracks_3d, num_dct_bases, cano_t, dct_init=dct_init
         )
         motion_coefs = None
-    elif trajectory_type == "modal_activation":
-        motion_bases = init_identity_motion_bases(
-            tracks_3d.xyz.shape[1], device, tracks_3d.xyz.dtype
-        )
-        motion_coefs = None
-        traj_coefs = None
     else:
         raise ValueError(f"Unknown trajectory type: {trajectory_type}")
     motion_bases = motion_bases.to(device)
@@ -355,6 +450,24 @@ def init_model_from_tracks(
 
     tracks_3d = tracks_3d.to(device)
     return fg_params, motion_bases, bg_params, tracks_3d, cano_t
+
+
+def _inject_vggt_static_view_config(cfg: TrainConfig):
+    if cfg.trajectory_type != "modal_activation":
+        return
+    if not isinstance(cfg.data, CustomDataConfig):
+        return
+    if cfg.data.camera_type != "vggt":
+        return
+    if not cfg.vggt_view_configs:
+        raise ValueError("data.camera_type='vggt' requires --vggt-view-configs")
+    if cfg.modal_frame_map is None:
+        raise ValueError("data.camera_type='vggt' requires --modal-frame-map")
+    cfg.data = replace(
+        cfg.data,
+        vggt_view_configs=cfg.vggt_view_configs,
+        modal_frame_map=cfg.modal_frame_map,
+    )
 
 
 def backup_code(work_dir):
