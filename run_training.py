@@ -98,6 +98,11 @@ class TrainConfig:
     modal_stage2_train_opacities: bool = True
     modal_stage2_train_scales: bool = False
     modal_stage2_train_quats: bool = False
+    modal_stage2_train_bg_means: bool = False
+    modal_stage2_train_bg_colors: bool = True
+    modal_stage2_train_bg_opacities: bool = True
+    modal_stage2_train_bg_scales: bool = False
+    modal_stage2_train_bg_quats: bool = False
     modal_train_view_id: str | None = None
     modal_consistency_target_view_id: str | None = None
     modal_consistency_fps: float = 0.0
@@ -179,6 +184,11 @@ def main(cfg: TrainConfig):
         modal_stage2_train_opacities=cfg.modal_stage2_train_opacities,
         modal_stage2_train_scales=cfg.modal_stage2_train_scales,
         modal_stage2_train_quats=cfg.modal_stage2_train_quats,
+        modal_stage2_train_bg_means=cfg.modal_stage2_train_bg_means,
+        modal_stage2_train_bg_colors=cfg.modal_stage2_train_bg_colors,
+        modal_stage2_train_bg_opacities=cfg.modal_stage2_train_bg_opacities,
+        modal_stage2_train_bg_scales=cfg.modal_stage2_train_bg_scales,
+        modal_stage2_train_bg_quats=cfg.modal_stage2_train_bg_quats,
         modal_manifest=cfg.modal_manifest,
         modal_knn=cfg.modal_knn,
         modal_interp_power=cfg.modal_interp_power,
@@ -496,6 +506,11 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_stage2_train_opacities": cfg.modal_stage2_train_opacities,
         "modal_stage2_train_scales": cfg.modal_stage2_train_scales,
         "modal_stage2_train_quats": cfg.modal_stage2_train_quats,
+        "modal_stage2_train_bg_means": cfg.modal_stage2_train_bg_means,
+        "modal_stage2_train_bg_colors": cfg.modal_stage2_train_bg_colors,
+        "modal_stage2_train_bg_opacities": cfg.modal_stage2_train_bg_opacities,
+        "modal_stage2_train_bg_scales": cfg.modal_stage2_train_bg_scales,
+        "modal_stage2_train_bg_quats": cfg.modal_stage2_train_bg_quats,
         "modal_consistency_target_view_id": cfg.modal_consistency_target_view_id,
         "modal_consistency_fps": cfg.modal_consistency_fps,
         "modal_consistency_view_configs": cfg.modal_consistency_view_configs,
@@ -575,8 +590,6 @@ def init_model_from_tracks(
     if trajectory_type == "modal_activation":
         if modal_carrier_points is None:
             raise ValueError("trajectory_type='modal_activation' requires modal_carrier_points")
-        if num_bg != 0:
-            raise ValueError("modal_activation v1 requires num_bg=0")
         carrier = np.load(modal_carrier_points, allow_pickle=False)
         required = {"points_world", "colors"}
         missing = sorted(required - set(carrier.files))
@@ -601,6 +614,11 @@ def init_model_from_tracks(
             train_dataset.num_frames, device, points_th.dtype
         ).to(device)
         bg_params = None
+        if num_bg > 0:
+            bg_points = StaticObservations(*train_dataset.get_bkgd_points(num_bg))
+            assert bg_points.check_sizes()
+            bg_params = init_bg(bg_points)
+            bg_params = bg_params.to(device)
         tracks_3d = None
         cano_t = 0
         return fg_params, motion_bases, bg_params, tracks_3d, cano_t

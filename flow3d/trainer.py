@@ -53,6 +53,11 @@ class Trainer:
         modal_stage2_train_opacities: bool = True,
         modal_stage2_train_scales: bool = False,
         modal_stage2_train_quats: bool = False,
+        modal_stage2_train_bg_means: bool = False,
+        modal_stage2_train_bg_colors: bool = True,
+        modal_stage2_train_bg_opacities: bool = True,
+        modal_stage2_train_bg_scales: bool = False,
+        modal_stage2_train_bg_quats: bool = False,
         init_metadata: dict[str, Any] | None = None,
         modal_manifest: str | None = None,
         modal_knn: int = 8,
@@ -89,6 +94,11 @@ class Trainer:
         self.modal_stage2_train_opacities = modal_stage2_train_opacities
         self.modal_stage2_train_scales = modal_stage2_train_scales
         self.modal_stage2_train_quats = modal_stage2_train_quats
+        self.modal_stage2_train_bg_means = modal_stage2_train_bg_means
+        self.modal_stage2_train_bg_colors = modal_stage2_train_bg_colors
+        self.modal_stage2_train_bg_opacities = modal_stage2_train_bg_opacities
+        self.modal_stage2_train_bg_scales = modal_stage2_train_bg_scales
+        self.modal_stage2_train_bg_quats = modal_stage2_train_bg_quats
         self.init_metadata = init_metadata
         self.modal_manifest = modal_manifest
         self.modal_knn = modal_knn
@@ -179,6 +189,11 @@ class Trainer:
             "fg.params.opacities": self.modal_stage2_train_opacities,
             "fg.params.scales": self.modal_stage2_train_scales,
             "fg.params.quats": self.modal_stage2_train_quats,
+            "bg.params.means": self.modal_stage2_train_bg_means,
+            "bg.params.colors": self.modal_stage2_train_bg_colors,
+            "bg.params.opacities": self.modal_stage2_train_bg_opacities,
+            "bg.params.scales": self.modal_stage2_train_bg_scales,
+            "bg.params.quats": self.modal_stage2_train_bg_quats,
         }
         return trainable_fg_params.get(name, False)
 
