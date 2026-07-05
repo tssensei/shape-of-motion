@@ -120,6 +120,35 @@ class CameraPoses(nn.Module):
         t_new = (Rs_ @ ts + ts_)[..., 0]
         return self(R_new, t_new)
 
+
+class ModalActivations(nn.Module):
+    def __init__(self, activations: torch.Tensor):
+        super().__init__()
+        if activations.ndim != 3 or activations.shape[-1] != 2:
+            raise ValueError(
+                "modal activations must have shape (num_frames, num_modes, 2)"
+            )
+        self.params = nn.ParameterDict({"activations": nn.Parameter(activations)})
+
+    @staticmethod
+    def init_from_state_dict(
+        state_dict: dict[str, Tensor],
+        prefix: str,
+    ):
+        key = f"{prefix}activations"
+        if key not in state_dict:
+            raise ValueError(f"Missing modal activation parameter {key}")
+        return ModalActivations(state_dict[key])
+
+    @property
+    def num_frames(self) -> int:
+        return self.params["activations"].shape[0]
+
+    @property
+    def num_modes(self) -> int:
+        return self.params["activations"].shape[1]
+
+
 class GaussianParams(nn.Module):
     def __init__(
         self,

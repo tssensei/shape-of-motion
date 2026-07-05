@@ -41,6 +41,8 @@ class Trainer:
         validate_every: int = 500,
         validate_video_every: int = 1000,
         validate_viewer_assets_every: int = 100,
+        modal_warmup_epochs: int = 0,
+        modal_train_base_means: bool = False,
     ):
         self.device = device
         self.log_every = log_every
@@ -55,6 +57,8 @@ class Trainer:
         self.lr_cfg = lr_cfg
         self.losses_cfg = losses_cfg
         self.optim_cfg = optim_cfg
+        self.modal_warmup_epochs = modal_warmup_epochs
+        self.modal_train_base_means = modal_train_base_means
 
         self.reset_opacity_every = (
             self.optim_cfg.reset_opacity_every_n_controls * self.optim_cfg.control_every
@@ -74,6 +78,7 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=work_dir)
         self.global_step = 0
         self.epoch = 0
+        self._apply_modal_trainability()
 
         self.viewer = None
         if port is not None:
@@ -97,6 +102,28 @@ class Trainer:
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+        self._apply_modal_trainability()
+
+    def _modal_in_dynamic_stage(self) -> bool:
+        return (
+            self.model.trajectory_type == "modal_activation"
+            and self.epoch >= self.modal_warmup_epochs
+        )
+
+    def _apply_modal_trainability(self):
+        if self.model.trajectory_type != "modal_activation":
+            return
+        dynamic_stage = self._modal_in_dynamic_stage()
+        for name, param in self.model.named_parameters():
+            if name.startswith("motion_bases."):
+                trainable = False
+            elif name == "modal.params.activations":
+                trainable = dynamic_stage
+            elif dynamic_stage:
+                trainable = self.modal_train_base_means and name == "fg.params.means"
+            else:
+                trainable = not name.startswith("modal.")
+            param.requires_grad_(trainable)
 
     def save_checkpoint(self, path: str):
         model_dict = self.model.state_dict()
@@ -201,6 +228,8 @@ class Trainer:
 
     def compute_losses(self, batch):
         self.model.training = True
+        is_modal_activation = self.model.trajectory_type == "modal_activation"
+        use_track_terms = not is_modal_activation
 
         B = batch["imgs"].shape[0]
         W, H = img_wh = batch["imgs"].shape[2:0:-1]
@@ -251,12 +280,16 @@ class Trainer:
         device = means.device
         means = means.transpose(0, 1)
         quats = quats.transpose(0, 1)
-        # [(N, G, 3), ...].
-        target_ts_vec = torch.cat(target_ts)
-        # (B * N, G, 3).
-        target_means, _ = self.model.compute_poses_all(target_ts_vec)
-        target_means = target_means.transpose(0, 1)
-        target_mean_list = target_means.split(N)
+        if use_track_terms:
+            # [(N, G, 3), ...].
+            target_ts_vec = torch.cat(target_ts)
+            # (B * N, G, 3).
+            target_means, _ = self.model.compute_poses_all(target_ts_vec)
+            target_means = target_means.transpose(0, 1)
+            target_mean_list = target_means.split(N)
+        else:
+            target_ts_vec = None
+            target_mean_list = [None] * B
         num_frames = self.model.num_frames
 
         loss = 0.0
@@ -273,12 +306,16 @@ class Trainer:
                 w2cs[None, i],
                 Ks[None, i],
                 img_wh,
-                target_ts=target_ts[i],
-                target_w2cs=target_w2cs[i],
+                target_ts=target_ts[i] if use_track_terms else None,
+                target_w2cs=target_w2cs[i] if use_track_terms else None,
                 bg_color=bg_color,
                 means=means[i],
                 quats=quats[i],
-                target_means=target_mean_list[i].transpose(0, 1),
+                target_means=(
+                    target_mean_list[i].transpose(0, 1)
+                    if target_mean_list[i] is not None
+                    else None
+                ),
                 return_depth=True,
                 return_mask=self.model.has_bg,
             )
@@ -309,8 +346,20 @@ class Trainer:
         bg_colors = torch.cat(bg_colors, dim=0)
 
         # Compute losses.
-        # (B * N).
-        frame_intervals = (ts.repeat_interleave(N) - target_ts_vec).abs()
+        if use_track_terms:
+            assert target_ts_vec is not None
+            # (B * N).
+            frame_intervals = (ts.repeat_interleave(N) - target_ts_vec).abs()
+            # (P_all, 2).
+            tracks_2d = torch.cat(
+                [x.reshape(-1, 2) for x in target_tracks_2d], dim=0
+            )
+            # (P_all,).
+            visibles = torch.cat([x.reshape(-1) for x in target_visibles], dim=0)
+            # (P_all,).
+            confidences = torch.cat(
+                [x.reshape(-1) for x in target_confidences], dim=0
+            )
         if not self.model.has_bg:
             imgs = (
                 imgs * masks[..., None]
@@ -321,14 +370,12 @@ class Trainer:
                 imgs * valid_masks[..., None]
                 + (1.0 - valid_masks[..., None]) * bg_colors[:, None, None]
             )
-        # (P_all, 2).
-        tracks_2d = torch.cat([x.reshape(-1, 2) for x in target_tracks_2d], dim=0)
-        # (P_all,)
-        visibles = torch.cat([x.reshape(-1) for x in target_visibles], dim=0)
-        # (P_all,)
-        confidences = torch.cat([x.reshape(-1) for x in target_confidences], dim=0)
 
-        if rendered_all["rend_normal"] != None and rendered_all["surf_normal"] != None:
+        if (
+            not is_modal_activation
+            and rendered_all["rend_normal"] != None
+            and rendered_all["surf_normal"] != None
+        ):
             # 2DGS normal consistency
             rendered_normals = cast(torch.Tensor, rendered_all["rend_normal"])
             surf_normals = cast(torch.Tensor, rendered_all["surf_normal"])
@@ -363,42 +410,51 @@ class Trainer:
             )
         loss += mask_loss * self.losses_cfg.w_mask
 
-        # (B * N, H * W, 3).
-        pred_tracks_3d = (
-            rendered_all["tracks_3d"].permute(0, 3, 1, 2, 4).reshape(-1, H * W, 3)  # type: ignore
-        )
-        pred_tracks_2d = torch.einsum(
-            "bij,bpj->bpi", torch.cat(target_Ks), pred_tracks_3d
-        )
-        # (B * N, H * W, 1).
-        mapped_depth = torch.clamp(pred_tracks_2d[..., 2:], min=1e-6)
-        # (B * N, H * W, 2).
-        pred_tracks_2d = pred_tracks_2d[..., :2] / mapped_depth
+        if use_track_terms:
+            # (B * N, H * W, 3).
+            pred_tracks_3d = (
+                rendered_all["tracks_3d"]
+                .permute(0, 3, 1, 2, 4)
+                .reshape(-1, H * W, 3)  # type: ignore
+            )
+            pred_tracks_2d = torch.einsum(
+                "bij,bpj->bpi", torch.cat(target_Ks), pred_tracks_3d
+            )
+            # (B * N, H * W, 1).
+            mapped_depth = torch.clamp(pred_tracks_2d[..., 2:], min=1e-6)
+            # (B * N, H * W, 2).
+            pred_tracks_2d = pred_tracks_2d[..., :2] / mapped_depth
 
-        # (B * N).
-        w_interval = torch.exp(-2 * frame_intervals / num_frames)
-        # w_track_loss = min(1, (self.max_steps - self.global_step) / 6000)
-        track_weights = confidences[..., None] * w_interval
+            # (B * N).
+            w_interval = torch.exp(-2 * frame_intervals / num_frames)
+            # w_track_loss = min(1, (self.max_steps - self.global_step) / 6000)
+            track_weights = confidences[..., None] * w_interval
 
-        # (B, H, W).
-        masks_flatten = torch.zeros_like(masks)
-        for i in range(B):
-            # This takes advantage of the fact that the query 2D tracks are
-            # always on the grid.
-            query_pixels = query_tracks_2d[i].to(torch.int64)
-            masks_flatten[i, query_pixels[:, 1], query_pixels[:, 0]] = 1.0
-        # (B * N, H * W).
-        masks_flatten = (
-            masks_flatten.reshape(-1, H * W).tile(1, N).reshape(-1, H * W) > 0.5
-        )
+            # (B, H, W).
+            masks_flatten = torch.zeros_like(masks)
+            for i in range(B):
+                # This takes advantage of the fact that the query 2D tracks are
+                # always on the grid.
+                query_pixels = query_tracks_2d[i].to(torch.int64)
+                masks_flatten[i, query_pixels[:, 1], query_pixels[:, 0]] = 1.0
+            # (B * N, H * W).
+            masks_flatten = (
+                masks_flatten.reshape(-1, H * W).tile(1, N).reshape(-1, H * W) > 0.5
+            )
 
-        track_2d_loss = masked_l1_loss(
-            pred_tracks_2d[masks_flatten][visibles],
-            tracks_2d[visibles],
-            mask=track_weights[visibles],
-            quantile=0.98,
-        ) / max(H, W)
-        loss += track_2d_loss * self.losses_cfg.w_track
+            track_2d_loss = masked_l1_loss(
+                pred_tracks_2d[masks_flatten][visibles],
+                tracks_2d[visibles],
+                mask=track_weights[visibles],
+                quantile=0.98,
+            ) / max(H, W)
+            loss += track_2d_loss * self.losses_cfg.w_track
+        else:
+            mapped_depth = None
+            masks_flatten = None
+            track_weights = None
+            visibles = None
+            track_2d_loss = torch.zeros((), device=device)
 
         depth_masks = (
             masks[..., None] if not self.model.has_bg else valid_masks[..., None]
@@ -415,16 +471,24 @@ class Trainer:
         )
         loss += depth_loss * self.losses_cfg.w_depth_reg
 
-        # mapped depth loss (using cached depth with EMA)
-        #  mapped_depth_loss = 0.0
-        mapped_depth_gt = torch.cat([x.reshape(-1) for x in target_track_depths], dim=0)
-        mapped_depth_loss = masked_l1_loss(
-            1 / (mapped_depth[masks_flatten][visibles] + 1e-5),
-            1 / (mapped_depth_gt[visibles, None] + 1e-5),
-            track_weights[visibles],
-        )
-
-        loss += mapped_depth_loss * self.losses_cfg.w_depth_const
+        if use_track_terms:
+            # mapped depth loss (using cached depth with EMA)
+            #  mapped_depth_loss = 0.0
+            assert mapped_depth is not None
+            assert masks_flatten is not None
+            assert visibles is not None
+            assert track_weights is not None
+            mapped_depth_gt = torch.cat(
+                [x.reshape(-1) for x in target_track_depths], dim=0
+            )
+            mapped_depth_loss = masked_l1_loss(
+                1 / (mapped_depth[masks_flatten][visibles] + 1e-5),
+                1 / (mapped_depth_gt[visibles, None] + 1e-5),
+                track_weights[visibles],
+            )
+            loss += mapped_depth_loss * self.losses_cfg.w_depth_const
+        else:
+            mapped_depth_loss = torch.zeros((), device=device)
 
         #  depth_gradient_loss = 0.0
         depth_gradient_loss = compute_gradient_loss(
@@ -443,10 +507,13 @@ class Trainer:
             )
             loss += small_accel_loss * self.losses_cfg.w_smooth_bases
             dct_coef_loss = torch.zeros((), device=self.device)
-        else:
+        elif self.model.trajectory_type == "dct_center":
             small_accel_loss = torch.zeros((), device=self.device)
             dct_coef_loss = self.model.fg.params["traj_coefs"].pow(2).mean()
             loss += dct_coef_loss * self.losses_cfg.w_dct_coef
+        else:
+            small_accel_loss = torch.zeros((), device=self.device)
+            dct_coef_loss = torch.zeros((), device=self.device)
 
         # tracks should be smooth
         ts = torch.clamp(ts, min=1, max=num_frames - 2)
@@ -455,7 +522,7 @@ class Trainer:
         means_fg_nbs = means_fg_nbs.reshape(
             means_fg_nbs.shape[0], 3, -1, 3
         )  # [G, 3, n, 3]
-        if self.losses_cfg.w_smooth_tracks > 0:
+        if not is_modal_activation and self.losses_cfg.w_smooth_tracks > 0:
             small_accel_loss_tracks = 0.5 * (
                 (2 * means_fg_nbs[:, 1:-1] - means_fg_nbs[:, :-2] - means_fg_nbs[:, 2:])
                 .norm(dim=-1)
@@ -468,7 +535,8 @@ class Trainer:
         local_iso_dist_loss = torch.zeros((), device=self.device)
         local_iso_num_edges = torch.zeros((), device=self.device)
         local_iso_is_active = (
-            self.global_step >= self.losses_cfg.local_iso_start_step
+            not is_modal_activation
+            and self.global_step >= self.losses_cfg.local_iso_start_step
             and (
                 self.losses_cfg.w_local_iso_ray > 0
                 or self.losses_cfg.w_local_iso_perp > 0
@@ -497,15 +565,16 @@ class Trainer:
 
         # Constrain the std of scales.
         # TODO: do we want to penalize before or after exp?
-        loss += (
-            self.losses_cfg.w_scale_var
-            * torch.var(torch.exp(self.model.fg.params["scales"]), dim=-1).mean()
-        )
-        if self.model.bg is not None:
+        if not is_modal_activation:
             loss += (
                 self.losses_cfg.w_scale_var
-                * torch.var(torch.exp(self.model.bg.params["scales"]), dim=-1).mean()
+                * torch.var(torch.exp(self.model.fg.params["scales"]), dim=-1).mean()
             )
+            if self.model.bg is not None:
+                loss += (
+                    self.losses_cfg.w_scale_var
+                    * torch.var(torch.exp(self.model.bg.params["scales"]), dim=-1).mean()
+                )
         
         if self.model.fg.params["means"].isnan().sum() > 0:
             import ipdb
@@ -514,10 +583,18 @@ class Trainer:
         # loss += 0.01 * self.opacity_activation(self.opacities).abs().mean()
 
         # Acceleration along ray direction should be small.
-        z_accel_loss = compute_z_acc_loss(means_fg_nbs, w2cs)
+        if is_modal_activation:
+            z_accel_loss = torch.zeros((), device=self.device)
+        else:
+            z_accel_loss = compute_z_acc_loss(means_fg_nbs, w2cs)
 
 
         loss += self.losses_cfg.w_z_accel * z_accel_loss
+        if is_modal_activation:
+            act_smooth_loss = self.model.compute_activation_smoothness_loss()
+            loss += self.losses_cfg.w_act_smooth * act_smooth_loss
+        else:
+            act_smooth_loss = torch.zeros((), device=self.device)
 
         # Prepare stats for logging.
         stats = {
@@ -530,6 +607,7 @@ class Trainer:
             "train/track_2d_loss": track_2d_loss.item(),
             "train/small_accel_loss": small_accel_loss.item(),
             "train/dct_coef_loss": dct_coef_loss.item(),
+            "train/act_smooth_loss": act_smooth_loss.item(),
             "train/z_acc_loss": z_accel_loss.item(),
             "train/local_iso_ray_loss": local_iso_ray_loss.item(),
             "train/local_iso_perp_loss": local_iso_perp_loss.item(),
@@ -569,6 +647,8 @@ class Trainer:
             self.writer.add_scalar(k, v, self.global_step)
 
     def run_control_steps(self):
+        if self._modal_in_dynamic_stage():
+            return
         global_step = self.global_step
         # Adaptive gaussian control.
         cfg = self.optim_cfg
@@ -663,6 +743,7 @@ class Trainer:
         num_bg_dups = int(should_bg_dup.sum().item())
 
         fg_param_map = self.model.fg.densify_params(should_fg_split, should_fg_dup)
+        self.model.densify_modal_fields(should_fg_split, should_fg_dup)
         for param_name, new_params in fg_param_map.items():
             full_param_name = f"fg.params.{param_name}"
             optimizer = self.optimizers[full_param_name]
@@ -732,6 +813,7 @@ class Trainer:
         should_bg_cull = should_cull[num_fg:]
 
         fg_param_map = self.model.fg.cull_params(should_fg_cull)
+        self.model.cull_modal_fields(should_fg_cull)
         for param_name, new_params in fg_param_map.items():
             full_param_name = f"fg.params.{param_name}"
             optimizer = self.optimizers[full_param_name]
@@ -758,7 +840,10 @@ class Trainer:
         # Reset gaussian opacities.
         new_val = torch.logit(torch.tensor(0.8 * self.optim_cfg.cull_opacity_threshold))
         for part in ["fg", "bg"]:
-            part_params = getattr(self.model, part).reset_opacities(new_val)
+            part_module = getattr(self.model, part)
+            if part_module is None:
+                continue
+            part_params = part_module.reset_opacities(new_val)
             # Modify optimizer states by new assignment.
             for param_name, new_params in part_params.items():
                 full_param_name = f"{part}.params.{param_name}"
@@ -779,8 +864,9 @@ class Trainer:
         # e.g. fg.params.means
         # lr config is a nested dict for each fg/bg part
         for name, params in self.model.named_parameters():
-            if self.model.trajectory_type == "dct_center" and name.startswith(
-                "motion_bases."
+            if (
+                self.model.trajectory_type in ("dct_center", "modal_activation")
+                and name.startswith("motion_bases.")
             ):
                 continue
             part, _, field = name.split(".")

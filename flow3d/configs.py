@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -36,12 +36,17 @@ class CameraPoseLRConfig:
     ts: float = 1e-3
 
 @dataclass
+class ModalLRConfig:
+    activations: float = 1e-2
+
+@dataclass
 class SceneLRConfig:
     fg: FGLRConfig
     bg: BGLRConfig
     motion_bases: MotionLRConfig
     camera_poses: CameraPoseLRConfig
     camera_scales: CameraScalesLRConfig
+    modal: ModalLRConfig = field(default_factory=ModalLRConfig)
 
 
 @dataclass
@@ -57,6 +62,7 @@ class LossesConfig:
     w_scale_var: float = 0.01
     w_z_accel: float = 1.0
     w_dct_coef: float = 1e-4
+    w_act_smooth: float = 10.0
     w_local_iso_ray: float = 0.0
     w_local_iso_perp: float = 0.00
     w_local_iso_dist: float = 0.0

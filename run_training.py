@@ -26,18 +26,25 @@ from flow3d.data.utils import to_device
 from flow3d.init_utils import (
     init_bg,
     init_fg_from_tracks_3d,
+    init_identity_motion_bases,
     init_motion_params_with_dct,
     init_motion_params_with_procrustes,
     run_initial_optim,
     vis_init_params,
     init_trainable_poses,
 )
+from flow3d.modal_utils import (
+    interpolate_modal_modes_to_gaussians,
+    load_modal_frame_map,
+    load_modal_modes,
+    resolve_required_modal_paths,
+)
+from flow3d.params import CameraScales, ModalActivations
 from flow3d.scene_model import SceneModel
 from flow3d.tensor_dataclass import StaticObservations, TrackObservations
 from flow3d.trainer import Trainer
 from flow3d.validator import Validator
 from flow3d.vis.utils import get_server
-from flow3d.params import CameraScales
 
 torch.set_float32_matmul_precision("high")
 
@@ -70,9 +77,16 @@ class TrainConfig:
     num_fg: int = 40_000
     num_bg: int = 100_000
     num_motion_bases: int = 10
-    trajectory_type: Literal["som_basis", "dct_center"] = "som_basis"
+    trajectory_type: Literal["som_basis", "dct_center", "modal_activation"] = "som_basis"
     num_dct_bases: int | None = None
     dct_init: Literal["tracks", "zero"] = "tracks"
+    modal_manifest: str | None = None
+    modal_frame_map: str | None = None
+    modal_knn: int = 8
+    modal_interp_power: float = 2.0
+    modal_interp_eps: float = 1e-6
+    modal_warmup_epochs: int = 5
+    modal_train_base_means: bool = False
     num_epochs: int = 200
     port: int | None = None
     vis_debug: bool = False 
@@ -117,6 +131,8 @@ def main(cfg: TrainConfig):
         cfg.optim,
         work_dir=cfg.work_dir,
         port=cfg.port,
+        modal_warmup_epochs=cfg.modal_warmup_epochs,
+        modal_train_base_means=cfg.modal_train_base_means,
     )
 
     train_loader = DataLoader(
@@ -209,6 +225,48 @@ def initialize_and_checkpoint_model(
 
 
     camera_poses = init_trainable_poses(w2cs)
+    modal = None
+    modal_phi_real = None
+    modal_phi_imag = None
+    modal_freqs_hz = None
+    modal_frame_view_indices = None
+    modal_frame_local_indices = None
+    modal_smooth_triplets = None
+    if cfg.trajectory_type == "modal_activation":
+        resolve_required_modal_paths(cfg.modal_manifest, cfg.modal_frame_map)
+        modal_modes = load_modal_modes(cfg.modal_manifest)
+        modal_phi_real, modal_phi_imag, modal_freqs_hz, _ = (
+            interpolate_modal_modes_to_gaussians(
+                fg_params.params["means"],
+                modal_modes,
+                cfg.modal_knn,
+                cfg.modal_interp_power,
+                cfg.modal_interp_eps,
+            )
+        )
+        frame_map = load_modal_frame_map(
+            cfg.modal_frame_map,
+            train_dataset,
+            motion_bases.num_frames,
+            device,
+        )
+        modal_frame_view_indices = frame_map.frame_view_indices
+        modal_frame_local_indices = frame_map.frame_local_indices
+        modal_smooth_triplets = frame_map.smooth_triplets
+        modal = ModalActivations(
+            torch.zeros(
+                motion_bases.num_frames,
+                len(modal_modes),
+                2,
+                device=device,
+                dtype=fg_params.params["means"].dtype,
+            )
+        )
+        guru.info(
+            f"Initialized modal_activation with {len(modal_modes)} modes, "
+            f"{len(frame_map.view_ids)} views, "
+            f"{modal_smooth_triplets.shape[0]} smoothness triplets"
+        )
 
     model = SceneModel(
         Ks, 
@@ -221,6 +279,13 @@ def initialize_and_checkpoint_model(
         trajectory_type=cfg.trajectory_type,
         cano_t=cano_t,
         num_dct_bases=cfg.num_dct_bases,
+        modal=modal,
+        modal_phi_real=modal_phi_real,
+        modal_phi_imag=modal_phi_imag,
+        modal_freqs_hz=modal_freqs_hz,
+        modal_frame_view_indices=modal_frame_view_indices,
+        modal_frame_local_indices=modal_frame_local_indices,
+        modal_smooth_triplets=modal_smooth_triplets,
     )
 
     guru.info(f"Saving initialization to {ckpt_path}")
@@ -233,7 +298,7 @@ def init_model_from_tracks(
     num_fg: int,
     num_bg: int,
     num_motion_bases: int,
-    trajectory_type: Literal["som_basis", "dct_center"],
+    trajectory_type: Literal["som_basis", "dct_center", "modal_activation"],
     num_dct_bases: int | None,
     dct_init: Literal["tracks", "zero"],
     vis: bool = False,
@@ -261,11 +326,19 @@ def init_model_from_tracks(
             tracks_3d, num_motion_bases, rot_type, cano_t, vis=vis, port=port
         )
         traj_coefs = None
-    else:
+    elif trajectory_type == "dct_center":
         motion_bases, traj_coefs, tracks_3d = init_motion_params_with_dct(
             tracks_3d, num_dct_bases, cano_t, dct_init=dct_init
         )
         motion_coefs = None
+    elif trajectory_type == "modal_activation":
+        motion_bases = init_identity_motion_bases(
+            tracks_3d.xyz.shape[1], device, tracks_3d.xyz.dtype
+        )
+        motion_coefs = None
+        traj_coefs = None
+    else:
+        raise ValueError(f"Unknown trajectory type: {trajectory_type}")
     motion_bases = motion_bases.to(device)
 
     fg_params = init_fg_from_tracks_3d(

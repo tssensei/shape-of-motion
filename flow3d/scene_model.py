@@ -8,6 +8,7 @@ from torch import Tensor
 
 from flow3d.params import (
     GaussianParams,
+    ModalActivations,
     MotionBases,
     CameraScales,
     CameraPoses,
@@ -28,14 +29,22 @@ class SceneModel(nn.Module):
         trajectory_type: str = "som_basis",
         cano_t: int | None = None,
         num_dct_bases: int | None = None,
+        modal: ModalActivations | None = None,
+        modal_phi_real: Tensor | None = None,
+        modal_phi_imag: Tensor | None = None,
+        modal_freqs_hz: Tensor | None = None,
+        modal_frame_view_indices: Tensor | None = None,
+        modal_frame_local_indices: Tensor | None = None,
+        modal_smooth_triplets: Tensor | None = None,
     ):
         super().__init__()
-        if trajectory_type not in ("som_basis", "dct_center"):
+        if trajectory_type not in ("som_basis", "dct_center", "modal_activation"):
             raise ValueError(f"Unknown trajectory type: {trajectory_type}")
         self.num_frames = motion_bases.num_frames
         self.trajectory_type = trajectory_type
         self.fg = fg_params
         self.motion_bases = motion_bases
+        self.modal = modal
         self.bg = bg_params
         scene_scale = 1.0 if bg_params is None else bg_params.scene_scale
         self.register_buffer("bg_scene_scale", torch.as_tensor(scene_scale))
@@ -70,6 +79,54 @@ class SceneModel(nn.Module):
             )
         self.register_buffer("dct_basis", dct_basis)
 
+        if trajectory_type == "modal_activation":
+            if modal is None:
+                raise ValueError("modal_activation requires modal activations")
+            if modal_phi_real is None or modal_phi_imag is None:
+                raise ValueError("modal_activation requires modal phi real/imag tensors")
+            if modal_phi_real.shape != modal_phi_imag.shape:
+                raise ValueError("modal phi real/imag tensors must have matching shapes")
+            if modal_phi_real.ndim != 3 or modal_phi_real.shape[-1] != 3:
+                raise ValueError("modal phi tensors must have shape (K, G, 3)")
+            if modal_phi_real.shape[1] != self.num_fg_gaussians:
+                raise ValueError("modal phi Gaussian dimension does not match foreground")
+            if modal_phi_real.shape[0] != modal.num_modes:
+                raise ValueError("modal phi mode count does not match activations")
+            if modal.num_frames != self.num_frames:
+                raise ValueError("modal activation frame count does not match model")
+        else:
+            if modal_phi_real is None:
+                modal_phi_real = torch.empty(
+                    0, self.num_fg_gaussians, 3, device=self.fg.params["means"].device
+                )
+            if modal_phi_imag is None:
+                modal_phi_imag = torch.empty_like(modal_phi_real)
+
+        if modal_freqs_hz is None:
+            modal_freqs_hz = torch.empty(
+                modal_phi_real.shape[0],
+                device=self.fg.params["means"].device,
+                dtype=self.fg.params["means"].dtype,
+            )
+        if modal_frame_view_indices is None:
+            modal_frame_view_indices = torch.full(
+                (self.num_frames,), -1, device=self.fg.params["means"].device
+            )
+        if modal_frame_local_indices is None:
+            modal_frame_local_indices = torch.full(
+                (self.num_frames,), -1, device=self.fg.params["means"].device
+            )
+        if modal_smooth_triplets is None:
+            modal_smooth_triplets = torch.empty(
+                0, 3, device=self.fg.params["means"].device, dtype=torch.long
+            )
+        self.register_buffer("modal_phi_real", modal_phi_real)
+        self.register_buffer("modal_phi_imag", modal_phi_imag)
+        self.register_buffer("modal_freqs_hz", modal_freqs_hz)
+        self.register_buffer("modal_frame_view_indices", modal_frame_view_indices.long())
+        self.register_buffer("modal_frame_local_indices", modal_frame_local_indices.long())
+        self.register_buffer("modal_smooth_triplets", modal_smooth_triplets.long())
+
     @property
     def num_gaussians(self) -> int:
         return self.num_bg_gaussians + self.num_fg_gaussians
@@ -89,6 +146,10 @@ class SceneModel(nn.Module):
     @property
     def has_bg(self) -> bool:
         return self.bg is not None
+
+    @property
+    def has_modal(self) -> bool:
+        return self.modal is not None
 
     def compute_poses_bg(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -119,6 +180,52 @@ class SceneModel(nn.Module):
         basis = self.dct_basis[ts].to(dtype=traj_coefs.dtype, device=traj_coefs.device)
         return torch.einsum("bk,gkc->gbc", basis, traj_coefs)
 
+    def compute_modal_offsets(
+        self, ts: torch.Tensor, inds: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.modal is None:
+            raise RuntimeError("compute_modal_offsets requires modal activations")
+        activations = self.modal.params["activations"][ts]
+        phi_real = self.modal_phi_real
+        phi_imag = self.modal_phi_imag
+        if inds is not None:
+            phi_real = phi_real[:, inds]
+            phi_imag = phi_imag[:, inds]
+        real = activations[..., 0]
+        imag = activations[..., 1]
+        return torch.einsum("bk,kgc->gbc", real, phi_real) - torch.einsum(
+            "bk,kgc->gbc", imag, phi_imag
+        )
+
+    def compute_activation_smoothness_loss(self) -> torch.Tensor:
+        if self.modal is None:
+            return self.fg.params["means"].new_zeros(())
+        if self.modal_smooth_triplets.numel() == 0:
+            return self.modal.params["activations"].sum() * 0.0
+        activations = self.modal.params["activations"]
+        prev = activations[self.modal_smooth_triplets[:, 0]]
+        center = activations[self.modal_smooth_triplets[:, 1]]
+        nxt = activations[self.modal_smooth_triplets[:, 2]]
+        accel = nxt - 2.0 * center + prev
+        return accel.pow(2).sum(dim=-1).mean()
+
+    @torch.no_grad()
+    def densify_modal_fields(self, should_split: torch.Tensor, should_dup: torch.Tensor):
+        if not self.has_modal:
+            return
+        for name in ("modal_phi_real", "modal_phi_imag"):
+            x = getattr(self, name)
+            x_dup = x[:, should_dup]
+            x_split = x[:, should_split].repeat(1, 2, 1)
+            setattr(self, name, torch.cat([x[:, ~should_split], x_dup, x_split], dim=1))
+
+    @torch.no_grad()
+    def cull_modal_fields(self, should_cull: torch.Tensor):
+        if not self.has_modal:
+            return
+        self.modal_phi_real = self.modal_phi_real[:, ~should_cull]
+        self.modal_phi_imag = self.modal_phi_imag[:, ~should_cull]
+
     def compute_poses_fg(
         self, ts: torch.Tensor | None, inds: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -133,6 +240,9 @@ class SceneModel(nn.Module):
         if ts is not None:
             if self.trajectory_type == "dct_center":
                 means = means[:, None] + self.compute_dct_offsets(ts, inds)
+                quats = quats[:, None].expand(-1, ts.shape[0], -1)
+            elif self.trajectory_type == "modal_activation":
+                means = means[:, None] + self.compute_modal_offsets(ts, inds)
                 quats = quats[:, None].expand(-1, ts.shape[0], -1)
             else:
                 transfms = self.compute_transforms(ts, inds)  # (G, B, 3, 4)
@@ -213,9 +323,12 @@ class SceneModel(nn.Module):
                 state_dict, prefix=f"{prefix}camera_poses.params."
             )
 
-        trajectory_type = (
-            "dct_center" if f"{prefix}fg.params.traj_coefs" in state_dict else "som_basis"
-        )
+        if f"{prefix}modal.params.activations" in state_dict:
+            trajectory_type = "modal_activation"
+        elif f"{prefix}fg.params.traj_coefs" in state_dict:
+            trajectory_type = "dct_center"
+        else:
+            trajectory_type = "som_basis"
         cano_t = None
         if f"{prefix}cano_t" in state_dict:
             cano_t_tensor = state_dict[f"{prefix}cano_t"]
@@ -223,6 +336,23 @@ class SceneModel(nn.Module):
         num_dct_bases = None
         if f"{prefix}fg.params.traj_coefs" in state_dict:
             num_dct_bases = state_dict[f"{prefix}fg.params.traj_coefs"].shape[1]
+        modal = None
+        modal_phi_real = None
+        modal_phi_imag = None
+        modal_freqs_hz = None
+        modal_frame_view_indices = None
+        modal_frame_local_indices = None
+        modal_smooth_triplets = None
+        if trajectory_type == "modal_activation":
+            modal = ModalActivations.init_from_state_dict(
+                state_dict, prefix=f"{prefix}modal.params."
+            )
+            modal_phi_real = state_dict[f"{prefix}modal_phi_real"]
+            modal_phi_imag = state_dict[f"{prefix}modal_phi_imag"]
+            modal_freqs_hz = state_dict[f"{prefix}modal_freqs_hz"]
+            modal_frame_view_indices = state_dict[f"{prefix}modal_frame_view_indices"]
+            modal_frame_local_indices = state_dict[f"{prefix}modal_frame_local_indices"]
+            modal_smooth_triplets = state_dict[f"{prefix}modal_smooth_triplets"]
 
         return SceneModel(
             Ks, 
@@ -234,6 +364,13 @@ class SceneModel(nn.Module):
             trajectory_type=trajectory_type,
             cano_t=cano_t,
             num_dct_bases=num_dct_bases,
+            modal=modal,
+            modal_phi_real=modal_phi_real,
+            modal_phi_imag=modal_phi_imag,
+            modal_freqs_hz=modal_freqs_hz,
+            modal_frame_view_indices=modal_frame_view_indices,
+            modal_frame_local_indices=modal_frame_local_indices,
+            modal_smooth_triplets=modal_smooth_triplets,
         )
 
     def render(

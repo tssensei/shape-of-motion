@@ -421,14 +421,26 @@ class Validator:
         # Render motion coefficient video.
         if self.model.trajectory_type == "som_basis":
             coef_values = self.model.fg.get_coefs()
+        elif self.model.trajectory_type == "modal_activation":
+            coef_values = torch.linalg.norm(
+                torch.stack(
+                    [self.model.modal_phi_real, self.model.modal_phi_imag],
+                    dim=-1,
+                ),
+                dim=(-1, -2),
+            ).transpose(0, 1)
+            if coef_values.shape[1] < 3:
+                coef_values = F.pad(coef_values, (0, 3 - coef_values.shape[1]))
+            motion_coef_colors = coef_values[:, :3]
         else:
             coef_values = self.model.fg.params["traj_coefs"].flatten(1)
-        with torch.random.fork_rng():
-            torch.random.manual_seed(0)
-            motion_coef_colors = torch.pca_lowrank(
-                coef_values[None],
-                q=3,
-            )[0][0]
+        if self.model.trajectory_type != "modal_activation":
+            with torch.random.fork_rng():
+                torch.random.manual_seed(0)
+                motion_coef_colors = torch.pca_lowrank(
+                    coef_values[None],
+                    q=3,
+                )[0][0]
         motion_coef_min = motion_coef_colors.min(0)[0]
         motion_coef_range = (motion_coef_colors.max(0)[0] - motion_coef_min).clamp_min(
             1e-6
