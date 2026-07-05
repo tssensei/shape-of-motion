@@ -90,6 +90,14 @@ class TrainConfig:
     modal_interp_eps: float = 1e-6
     modal_warmup_epochs: int = 5
     modal_train_base_means: bool = False
+    modal_stage1_data_dir: str | None = None
+    modal_stage1_frame_map: str | None = None
+    modal_stage1_epochs: int = 0
+    modal_stage2_train_base_means: bool = True
+    modal_stage2_train_colors: bool = True
+    modal_stage2_train_opacities: bool = True
+    modal_stage2_train_scales: bool = False
+    modal_stage2_train_quats: bool = False
     modal_train_view_id: str | None = None
     modal_consistency_target_view_id: str | None = None
     modal_consistency_fps: float = 0.0
@@ -114,6 +122,12 @@ class TrainConfig:
 
 def main(cfg: TrainConfig):
     _inject_vggt_static_view_config(cfg)
+    stage1_data_cfg = _make_modal_stage1_data_config(cfg)
+    effective_modal_warmup_epochs = (
+        cfg.modal_stage1_epochs
+        if stage1_data_cfg is not None
+        else cfg.modal_warmup_epochs
+    )
     ckpt_path = f"{cfg.work_dir}/checkpoints/last.ckpt"
     init_metadata = _make_init_metadata(cfg)
     _validate_checkpoint_policy(ckpt_path, cfg.resume, init_metadata)
@@ -122,7 +136,15 @@ def main(cfg: TrainConfig):
     train_dataset, train_video_view, val_img_dataset, val_kpt_dataset = (
         get_train_val_datasets(cfg.data, load_val=True)
     )
-    guru.info(f"Training dataset has {train_dataset.num_frames} frames")
+    guru.info(f"Stage 2 dynamic dataset has {train_dataset.num_frames} frames")
+    stage1_dataset = None
+    if stage1_data_cfg is not None:
+        stage1_dataset, _, _, _ = get_train_val_datasets(
+            stage1_data_cfg, load_val=False
+        )
+        guru.info(
+            f"Stage 1 canonical dataset has {stage1_dataset.num_frames} frames"
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -150,8 +172,13 @@ def main(cfg: TrainConfig):
         cfg.optim,
         work_dir=cfg.work_dir,
         port=cfg.port,
-        modal_warmup_epochs=cfg.modal_warmup_epochs,
+        modal_warmup_epochs=effective_modal_warmup_epochs,
         modal_train_base_means=cfg.modal_train_base_means,
+        modal_stage2_train_base_means=cfg.modal_stage2_train_base_means,
+        modal_stage2_train_colors=cfg.modal_stage2_train_colors,
+        modal_stage2_train_opacities=cfg.modal_stage2_train_opacities,
+        modal_stage2_train_scales=cfg.modal_stage2_train_scales,
+        modal_stage2_train_quats=cfg.modal_stage2_train_quats,
         modal_manifest=cfg.modal_manifest,
         modal_knn=cfg.modal_knn,
         modal_interp_power=cfg.modal_interp_power,
@@ -167,6 +194,16 @@ def main(cfg: TrainConfig):
             cfg.modal_consistency_min_zbuffer_samples
         ),
     )
+
+    stage1_loader = None
+    if stage1_dataset is not None:
+        stage1_loader = DataLoader(
+            stage1_dataset,
+            batch_size=min(cfg.batch_size, stage1_dataset.num_frames),
+            num_workers=cfg.num_dl_workers,
+            persistent_workers=cfg.num_dl_workers > 0,
+            collate_fn=BaseDataset.train_collate_fn,
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -206,10 +243,16 @@ def main(cfg: TrainConfig):
         )
     ):
         trainer.set_epoch(epoch)
-        for batch in train_loader:
+        if stage1_loader is not None and epoch < cfg.modal_stage1_epochs:
+            active_loader = stage1_loader
+            stage_name = "stage1"
+        else:
+            active_loader = train_loader
+            stage_name = "stage2"
+        for batch in active_loader:
             batch = to_device(batch, device)
             loss = trainer.train_step(batch)
-            pbar.set_description(f"Loss: {loss:.6f}")
+            pbar.set_description(f"{stage_name} Loss: {loss:.6f}")
 
         if validator is not None:
             if (epoch > 0 and epoch % cfg.validate_every == 0) or (
@@ -421,6 +464,12 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "depth_type": getattr(data, "depth_type", None),
         "camera_type": getattr(data, "camera_type", None),
         "modal_train_view_id": getattr(data, "modal_train_view_id", None),
+        "load_depths": getattr(data, "load_depths", None),
+    }
+    stage1_metadata = {
+        "data_dir": cfg.modal_stage1_data_dir,
+        "frame_map": cfg.modal_stage1_frame_map,
+        "epochs": cfg.modal_stage1_epochs,
     }
     metadata = {
         "trajectory_type": cfg.trajectory_type,
@@ -437,6 +486,16 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_knn": cfg.modal_knn,
         "modal_interp_power": cfg.modal_interp_power,
         "modal_interp_eps": cfg.modal_interp_eps,
+        "modal_warmup_epochs": cfg.modal_warmup_epochs,
+        "modal_train_base_means": cfg.modal_train_base_means,
+        "modal_stage1": stage1_metadata,
+        "modal_stage2_train_base_means": (
+            cfg.modal_stage2_train_base_means or cfg.modal_train_base_means
+        ),
+        "modal_stage2_train_colors": cfg.modal_stage2_train_colors,
+        "modal_stage2_train_opacities": cfg.modal_stage2_train_opacities,
+        "modal_stage2_train_scales": cfg.modal_stage2_train_scales,
+        "modal_stage2_train_quats": cfg.modal_stage2_train_quats,
         "modal_consistency_target_view_id": cfg.modal_consistency_target_view_id,
         "modal_consistency_fps": cfg.modal_consistency_fps,
         "modal_consistency_view_configs": cfg.modal_consistency_view_configs,
@@ -454,6 +513,9 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_consistency_pred_energy_eps": (
             cfg.loss.modal_consistency_pred_energy_eps
         ),
+        "w_act_smooth": cfg.loss.w_act_smooth,
+        "w_act_mag": cfg.loss.w_act_mag,
+        "w_act_modal_consistency": cfg.loss.w_act_modal_consistency,
         "data": data_metadata,
     }
     return {key: _metadata_value(value) for key, value in metadata.items()}
@@ -588,6 +650,58 @@ def init_model_from_tracks(
 
     tracks_3d = tracks_3d.to(device)
     return fg_params, motion_bases, bg_params, tracks_3d, cano_t
+
+
+def _make_modal_stage1_data_config(
+    cfg: TrainConfig,
+) -> DavisDataConfig | CustomDataConfig | None:
+    has_stage1_data = (
+        cfg.modal_stage1_data_dir is not None
+        or cfg.modal_stage1_frame_map is not None
+    )
+    if cfg.trajectory_type != "modal_activation":
+        if has_stage1_data or cfg.modal_stage1_epochs != 0:
+            raise ValueError("modal stage1 options require modal_activation")
+        return None
+    if not has_stage1_data:
+        if cfg.modal_stage1_epochs != 0:
+            raise ValueError(
+                "--modal-stage1-epochs requires --modal-stage1-data-dir and "
+                "--modal-stage1-frame-map"
+            )
+        return None
+    if cfg.modal_stage1_data_dir is None or cfg.modal_stage1_frame_map is None:
+        raise ValueError(
+            "Stage 1 requires both --modal-stage1-data-dir and "
+            "--modal-stage1-frame-map"
+        )
+    if cfg.modal_stage1_epochs <= 0:
+        raise ValueError("Stage 1 requires --modal-stage1-epochs > 0")
+    if not isinstance(cfg.data, (CustomDataConfig, DavisDataConfig)):
+        raise ValueError("modal stage1 requires custom or davis data")
+    if not cfg.vggt_view_configs:
+        raise ValueError("modal stage1 requires --vggt-view-configs")
+    if (
+        cfg.loss.w_depth_reg != 0.0
+        or cfg.loss.w_depth_grad != 0.0
+        or cfg.loss.w_depth_const != 0.0
+    ):
+        raise ValueError(
+            "Stage 1 currently disables depth loading, so set "
+            "--loss.w-depth-reg 0 --loss.w-depth-grad 0 --loss.w-depth-const 0"
+        )
+
+    return replace(
+        cfg.data,
+        data_dir=cfg.modal_stage1_data_dir,
+        start=0,
+        end=-1,
+        camera_type="vggt",
+        vggt_view_configs=cfg.vggt_view_configs,
+        modal_frame_map=cfg.modal_stage1_frame_map,
+        modal_train_view_id=None,
+        load_depths=False,
+    )
 
 
 def _inject_vggt_static_view_config(cfg: TrainConfig):

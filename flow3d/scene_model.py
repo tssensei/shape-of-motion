@@ -366,6 +366,11 @@ class SceneModel(nn.Module):
         accel = nxt - 2.0 * center + prev
         return accel.pow(2).sum(dim=-1).mean()
 
+    def compute_activation_magnitude_loss(self) -> torch.Tensor:
+        if self.modal is None:
+            return self.fg.params["means"].new_zeros(())
+        return self.modal.params["activations"].pow(2).sum(dim=-1).mean()
+
     def compute_activation_modal_consistency_loss(
         self,
         loss_type: str = "aligned_l2",

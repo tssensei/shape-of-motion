@@ -59,6 +59,7 @@ class DavisDataConfig:
     vggt_view_configs: tyro.conf.Suppress[tuple[str, ...]] = ()
     modal_frame_map: tyro.conf.Suppress[str | None] = None
     modal_train_view_id: tyro.conf.Suppress[str | None] = None
+    load_depths: tyro.conf.Suppress[bool] = True
 
 
 @dataclass
@@ -87,6 +88,7 @@ class CustomDataConfig:
     vggt_view_configs: tyro.conf.Suppress[tuple[str, ...]] = ()
     modal_frame_map: tyro.conf.Suppress[str | None] = None
     modal_train_view_id: tyro.conf.Suppress[str | None] = None
+    load_depths: tyro.conf.Suppress[bool] = True
 
 
 class CasualDataset(BaseDataset):
@@ -116,6 +118,7 @@ class CasualDataset(BaseDataset):
         vggt_view_configs: tuple[str, ...] = (),
         modal_frame_map: str | None = None,
         modal_train_view_id: str | None = None,
+        load_depths: bool = True,
         **_,
     ):
         super().__init__()
@@ -130,6 +133,7 @@ class CasualDataset(BaseDataset):
         self.has_validation = False
         self.mask_erosion_radius = mask_erosion_radius
         self.camera_type = camera_type
+        self.load_depths = load_depths
 
         self.img_dir = f"{data_dir}/{image_type}/{res}"
         self.img_ext = os.path.splitext(os.listdir(self.img_dir)[0])[1]
@@ -584,6 +588,12 @@ class CasualDataset(BaseDataset):
     def __getitem__(self, index: int):
         index = np.random.randint(0, self.num_frames)
         # index = 0
+        img = self.get_image(index)
+        depth = (
+            self.get_depth(index)
+            if self.load_depths
+            else torch.ones_like(img[..., 0])
+        )
         data = {
             # ().
             "frame_names": self.frame_names[index],
@@ -594,8 +604,8 @@ class CasualDataset(BaseDataset):
             # (3, 3).
             "Ks": self.Ks[index],
             # (H, W, 3).
-            "imgs": self.get_image(index),
-            "depths": self.get_depth(index),
+            "imgs": img,
+            "depths": depth,
         }
 
         tri_mask = self.get_mask(index)

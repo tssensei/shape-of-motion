@@ -27,7 +27,7 @@ def main(cfg: RenderConfig):
 
     train_cfg_path = f"{cfg.work_dir}/cfg.yaml"
     with open(train_cfg_path, "r") as file:
-        train_cfg = yaml.safe_load(file)
+        train_cfg = yaml.load(file, Loader=yaml.FullLoader)
 
     renderer = Renderer.init_from_checkpoint(
         ckpt_path,

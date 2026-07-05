@@ -38,7 +38,7 @@ class CameraPoseLRConfig:
 
 @dataclass
 class ModalLRConfig:
-    activations: float = 1e-2
+    activations: float = 1e-3
 
 @dataclass
 class SceneLRConfig:
@@ -64,6 +64,7 @@ class LossesConfig:
     w_z_accel: float = 1.0
     w_dct_coef: float = 1e-4
     w_act_smooth: float = 10.0
+    w_act_mag: float = 0.001
     w_act_modal_consistency: float = 0.0
     modal_consistency_loss_type: Literal["corr", "aligned_l2"] = "aligned_l2"
     modal_consistency_beta_abs_max: float = 10.0

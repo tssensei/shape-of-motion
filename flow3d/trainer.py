@@ -48,6 +48,11 @@ class Trainer:
         validate_viewer_assets_every: int = 100,
         modal_warmup_epochs: int = 0,
         modal_train_base_means: bool = False,
+        modal_stage2_train_base_means: bool = False,
+        modal_stage2_train_colors: bool = True,
+        modal_stage2_train_opacities: bool = True,
+        modal_stage2_train_scales: bool = False,
+        modal_stage2_train_quats: bool = False,
         init_metadata: dict[str, Any] | None = None,
         modal_manifest: str | None = None,
         modal_knn: int = 8,
@@ -77,6 +82,13 @@ class Trainer:
         self.optim_cfg = optim_cfg
         self.modal_warmup_epochs = modal_warmup_epochs
         self.modal_train_base_means = modal_train_base_means
+        self.modal_stage2_train_base_means = (
+            modal_stage2_train_base_means or modal_train_base_means
+        )
+        self.modal_stage2_train_colors = modal_stage2_train_colors
+        self.modal_stage2_train_opacities = modal_stage2_train_opacities
+        self.modal_stage2_train_scales = modal_stage2_train_scales
+        self.modal_stage2_train_quats = modal_stage2_train_quats
         self.init_metadata = init_metadata
         self.modal_manifest = modal_manifest
         self.modal_knn = modal_knn
@@ -155,10 +167,20 @@ class Trainer:
             elif name == "modal.params.activations":
                 trainable = dynamic_stage
             elif dynamic_stage:
-                trainable = self.modal_train_base_means and name == "fg.params.means"
+                trainable = self._modal_stage2_param_trainable(name)
             else:
                 trainable = not name.startswith("modal.")
             param.requires_grad_(trainable)
+
+    def _modal_stage2_param_trainable(self, name: str) -> bool:
+        trainable_fg_params = {
+            "fg.params.means": self.modal_stage2_train_base_means,
+            "fg.params.colors": self.modal_stage2_train_colors,
+            "fg.params.opacities": self.modal_stage2_train_opacities,
+            "fg.params.scales": self.modal_stage2_train_scales,
+            "fg.params.quats": self.modal_stage2_train_quats,
+        }
+        return trainable_fg_params.get(name, False)
 
     @torch.no_grad()
     def _refresh_modal_post_warmup_if_needed(self):
@@ -710,6 +732,8 @@ class Trainer:
         if is_modal_activation:
             act_smooth_loss = self.model.compute_activation_smoothness_loss()
             loss += self.losses_cfg.w_act_smooth * act_smooth_loss
+            act_mag_loss = self.model.compute_activation_magnitude_loss()
+            loss += self.losses_cfg.w_act_mag * act_mag_loss
             (
                 act_modal_consistency_loss,
                 act_modal_consistency_count,
@@ -724,6 +748,7 @@ class Trainer:
             )
         else:
             act_smooth_loss = torch.zeros((), device=self.device)
+            act_mag_loss = torch.zeros((), device=self.device)
             act_modal_consistency_loss = torch.zeros((), device=self.device)
             act_modal_consistency_count = torch.zeros((), device=self.device)
 
@@ -739,6 +764,7 @@ class Trainer:
             "train/small_accel_loss": small_accel_loss.item(),
             "train/dct_coef_loss": dct_coef_loss.item(),
             "train/act_smooth_loss": act_smooth_loss.item(),
+            "train/act_mag_loss": act_mag_loss.item(),
             "train/act_modal_consistency_loss": act_modal_consistency_loss.item(),
             "train/act_modal_consistency_count": act_modal_consistency_count.item(),
             "train/z_acc_loss": z_accel_loss.item(),
@@ -749,6 +775,7 @@ class Trainer:
             "train/num_gaussians": self.model.num_gaussians,
             "train/num_fg_gaussians": self.model.num_fg_gaussians,
             "train/num_bg_gaussians": self.model.num_bg_gaussians,
+            "train/modal_dynamic_stage": float(self._modal_in_dynamic_stage()),
         }
 
         # Compute metrics.

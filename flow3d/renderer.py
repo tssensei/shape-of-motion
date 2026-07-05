@@ -50,7 +50,7 @@ class Renderer:
         model = SceneModel.init_from_state_dict(state_dict)
         model.use_2dgs = use_2dgs
         model = model.to(device)
-        print(f"num gs: {model.fg.num_gaussians + model.bg.num_gaussians}")
+        print(f"num gs: {model.num_gaussians}")
         renderer = Renderer(model, device, *args, **kwargs)
         renderer.global_step = ckpt.get("global_step", 0)
         renderer.epoch = ckpt.get("epoch", 0)
