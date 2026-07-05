@@ -1,7 +1,7 @@
 import functools
 import time
 from dataclasses import asdict
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -20,6 +20,11 @@ from flow3d.loss_utils import (
     masked_l1_loss,
 )
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
+from flow3d.modal_utils import (
+    interpolate_modal_modes_to_gaussians,
+    load_modal_consistency_data,
+    load_modal_modes,
+)
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import get_server
 from flow3d.vis.viewer import DynamicViewer
@@ -43,6 +48,19 @@ class Trainer:
         validate_viewer_assets_every: int = 100,
         modal_warmup_epochs: int = 0,
         modal_train_base_means: bool = False,
+        init_metadata: dict[str, Any] | None = None,
+        modal_manifest: str | None = None,
+        modal_knn: int = 8,
+        modal_interp_power: float = 2.0,
+        modal_interp_eps: float = 1e-6,
+        modal_consistency_view_configs: tuple[str, ...] = (),
+        modal_consistency_modal_npzs: tuple[str, ...] = (),
+        modal_consistency_freq_tolerance_hz: float = 0.1,
+        modal_consistency_mask_erode_iters: int = 1,
+        modal_consistency_zbuffer_radius: int = 5,
+        modal_consistency_front_percentile: float = 10.0,
+        modal_consistency_zbuffer_tau: float = 0.05,
+        modal_consistency_min_zbuffer_samples: int = 5,
     ):
         self.device = device
         self.log_every = log_every
@@ -59,6 +77,22 @@ class Trainer:
         self.optim_cfg = optim_cfg
         self.modal_warmup_epochs = modal_warmup_epochs
         self.modal_train_base_means = modal_train_base_means
+        self.init_metadata = init_metadata
+        self.modal_manifest = modal_manifest
+        self.modal_knn = modal_knn
+        self.modal_interp_power = modal_interp_power
+        self.modal_interp_eps = modal_interp_eps
+        self.modal_consistency_view_configs = modal_consistency_view_configs
+        self.modal_consistency_modal_npzs = modal_consistency_modal_npzs
+        self.modal_consistency_freq_tolerance_hz = modal_consistency_freq_tolerance_hz
+        self.modal_consistency_mask_erode_iters = modal_consistency_mask_erode_iters
+        self.modal_consistency_zbuffer_radius = modal_consistency_zbuffer_radius
+        self.modal_consistency_front_percentile = modal_consistency_front_percentile
+        self.modal_consistency_zbuffer_tau = modal_consistency_zbuffer_tau
+        self.modal_consistency_min_zbuffer_samples = (
+            modal_consistency_min_zbuffer_samples
+        )
+        self._modal_post_warmup_refreshed = False
 
         self.reset_opacity_every = (
             self.optim_cfg.reset_opacity_every_n_controls * self.optim_cfg.control_every
@@ -102,6 +136,7 @@ class Trainer:
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+        self._refresh_modal_post_warmup_if_needed()
         self._apply_modal_trainability()
 
     def _modal_in_dynamic_stage(self) -> bool:
@@ -125,6 +160,79 @@ class Trainer:
                 trainable = not name.startswith("modal.")
             param.requires_grad_(trainable)
 
+    @torch.no_grad()
+    def _refresh_modal_post_warmup_if_needed(self):
+        if self.model.trajectory_type != "modal_activation":
+            return
+        if self._modal_post_warmup_refreshed:
+            return
+        if not self._modal_in_dynamic_stage():
+            return
+        if self.modal_manifest is None:
+            raise ValueError("modal post-warmup refresh requires modal_manifest")
+
+        guru.info(
+            "Refreshing modal fields after warmup from current Gaussian means"
+        )
+        modal_modes = load_modal_modes(self.modal_manifest)
+        modal_phi_real, modal_phi_imag, modal_freqs_hz, _ = (
+            interpolate_modal_modes_to_gaussians(
+                self.model.fg.params["means"],
+                modal_modes,
+                self.modal_knn,
+                self.modal_interp_power,
+                self.modal_interp_eps,
+            )
+        )
+        self.model.set_modal_fields(modal_phi_real, modal_phi_imag, modal_freqs_hz)
+
+        use_modal_consistency = bool(
+            self.modal_consistency_view_configs or self.modal_consistency_modal_npzs
+        )
+        if use_modal_consistency:
+            target_view_index = int(
+                self.model.modal_consistency_target_view_index.item()
+            )
+            fps = float(self.model.modal_consistency_fps.item())
+            if target_view_index < 0:
+                raise ValueError(
+                    "modal consistency refresh requires target view index"
+                )
+            if fps <= 0:
+                raise ValueError("modal consistency refresh requires positive fps")
+            modal_consistency = load_modal_consistency_data(
+                self.model.fg.params["means"],
+                modal_modes,
+                self.modal_consistency_view_configs,
+                self.modal_consistency_modal_npzs,
+                self.modal_consistency_freq_tolerance_hz,
+                self.modal_consistency_mask_erode_iters,
+                self.modal_consistency_zbuffer_radius,
+                self.modal_consistency_front_percentile,
+                self.modal_consistency_zbuffer_tau,
+                self.modal_consistency_min_zbuffer_samples,
+            )
+            self.model.set_modal_consistency_data(
+                modal_consistency.y_real,
+                modal_consistency.y_imag,
+                modal_consistency.J,
+                modal_consistency.gaussian_indices,
+                modal_consistency.mode_indices,
+                modal_consistency.group_indices,
+                modal_consistency.group_count,
+                target_view_index=target_view_index,
+                fps=fps,
+            )
+            guru.info(
+                "Refreshed modal consistency cache with "
+                f"{modal_consistency.y_real.shape[0]} observations across "
+                f"{modal_consistency.group_count} view-frequency groups"
+            )
+        else:
+            self.model.set_modal_consistency_data()
+
+        self._modal_post_warmup_refreshed = True
+
     def save_checkpoint(self, path: str):
         model_dict = self.model.state_dict()
         optimizer_dict = {k: v.state_dict() for k, v in self.optimizers.items()}
@@ -135,6 +243,7 @@ class Trainer:
             "schedulers": scheduler_dict,
             "global_step": self.global_step,
             "epoch": self.epoch,
+            "init_metadata": self.init_metadata,
         }
         torch.save(ckpt, path)
         guru.info(f"Saved checkpoint at {self.global_step=} to {path}")
@@ -150,7 +259,13 @@ class Trainer:
         model = model.to(device)
         print(use_2dgs)
         model.use_2dgs = use_2dgs
-        trainer = Trainer(model, device, *args, **kwargs)
+        trainer = Trainer(
+            model,
+            device,
+            *args,
+            init_metadata=ckpt.get("init_metadata"),
+            **kwargs,
+        )
         if "optimizers" in ckpt:
             trainer.load_checkpoint_optimizers(ckpt["optimizers"])
         if "schedulers" in ckpt:
@@ -598,7 +713,11 @@ class Trainer:
             (
                 act_modal_consistency_loss,
                 act_modal_consistency_count,
-            ) = self.model.compute_activation_modal_consistency_loss()
+            ) = self.model.compute_activation_modal_consistency_loss(
+                self.losses_cfg.modal_consistency_loss_type,
+                self.losses_cfg.modal_consistency_beta_abs_max,
+                self.losses_cfg.modal_consistency_pred_energy_eps,
+            )
             loss += (
                 self.losses_cfg.w_act_modal_consistency
                 * act_modal_consistency_loss

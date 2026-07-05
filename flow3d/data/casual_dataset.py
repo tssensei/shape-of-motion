@@ -58,6 +58,7 @@ class DavisDataConfig:
     load_from_cache: bool = False
     vggt_view_configs: tyro.conf.Suppress[tuple[str, ...]] = ()
     modal_frame_map: tyro.conf.Suppress[str | None] = None
+    modal_train_view_id: tyro.conf.Suppress[str | None] = None
 
 
 @dataclass
@@ -85,6 +86,7 @@ class CustomDataConfig:
     load_from_cache: bool = False
     vggt_view_configs: tyro.conf.Suppress[tuple[str, ...]] = ()
     modal_frame_map: tyro.conf.Suppress[str | None] = None
+    modal_train_view_id: tyro.conf.Suppress[str | None] = None
 
 
 class CasualDataset(BaseDataset):
@@ -113,6 +115,7 @@ class CasualDataset(BaseDataset):
         load_from_cache: bool = False,
         vggt_view_configs: tuple[str, ...] = (),
         modal_frame_map: str | None = None,
+        modal_train_view_id: str | None = None,
         **_,
     ):
         super().__init__()
@@ -136,13 +139,64 @@ class CasualDataset(BaseDataset):
         self.cache_dir = f"{data_dir}/flow3d_preprocessed/{res}"
         frame_names = [os.path.splitext(p)[0] for p in sorted(os.listdir(self.img_dir))]
 
+        if modal_train_view_id is not None:
+            if camera_type != "vggt":
+                raise ValueError("modal_train_view_id requires camera_type='vggt'")
+            if modal_frame_map is None:
+                raise ValueError("modal_train_view_id requires modal_frame_map")
+            with open(modal_frame_map, "r", encoding="utf-8") as f:
+                frame_map = json.load(f)
+            records = frame_map.get("frames")
+            if not isinstance(records, list):
+                raise ValueError(f"{modal_frame_map} must contain a frames list")
+            frame_to_record = {}
+            for record in records:
+                frame_name = record.get("frame_name")
+                if frame_name is None:
+                    raise ValueError(
+                        f"Frame record in {modal_frame_map} is missing frame_name"
+                    )
+                if frame_name in frame_to_record:
+                    raise ValueError(
+                        f"Duplicate frame_name in modal frame map: {frame_name}"
+                    )
+                frame_to_record[frame_name] = record
+            missing = [name for name in frame_names if name not in frame_to_record]
+            if missing:
+                preview = ", ".join(missing[:5])
+                raise ValueError(
+                    f"{modal_frame_map} is missing {len(missing)} image frames, "
+                    f"first missing: {preview}"
+                )
+            frame_names = [
+                name
+                for name in frame_names
+                if frame_to_record[name].get("view_id") == modal_train_view_id
+            ]
+            if not frame_names:
+                raise ValueError(
+                    f"No training frames found for modal_train_view_id={modal_train_view_id!r}"
+                )
+            guru.info(
+                f"Filtered modal training frames to view_id={modal_train_view_id!r}: "
+                f"{len(frame_names)} frames"
+            )
+
         if end == -1:
             end = len(frame_names)
         self.start = start
-        # end = 71
-        end = len(frame_names)
+        if start < 0 or end < start or end > len(frame_names):
+            raise ValueError(
+                f"Invalid frame range start={start}, end={end}, "
+                f"available frames={len(frame_names)}"
+            )
         self.end = end
         self.frame_names = frame_names[start:end]
+        if not self.frame_names:
+            raise ValueError(
+                f"Selected empty frame range start={start}, end={end}, "
+                f"available frames={len(frame_names)}"
+            )
 
         self.imgs: list[torch.Tensor | None] = [None for _ in self.frame_names]
         self.depths: list[torch.Tensor | None] = [None for _ in self.frame_names]

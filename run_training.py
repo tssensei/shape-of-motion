@@ -3,7 +3,7 @@ import os.path as osp
 import shutil
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import numpy as np
 import torch
@@ -36,7 +36,6 @@ from flow3d.init_utils import (
 )
 from flow3d.modal_utils import (
     interpolate_modal_modes_to_gaussians,
-    load_modal_consistency_data,
     load_modal_frame_map,
     load_modal_modes,
     resolve_required_modal_paths,
@@ -91,12 +90,17 @@ class TrainConfig:
     modal_interp_eps: float = 1e-6
     modal_warmup_epochs: int = 5
     modal_train_base_means: bool = False
+    modal_train_view_id: str | None = None
     modal_consistency_target_view_id: str | None = None
     modal_consistency_fps: float = 0.0
     modal_consistency_view_configs: tuple[str, ...] = ()
     modal_consistency_modal_npzs: tuple[str, ...] = ()
     modal_consistency_freq_tolerance_hz: float = 0.1
     modal_consistency_mask_erode_iters: int = 1
+    modal_consistency_zbuffer_radius: int = 5
+    modal_consistency_front_percentile: float = 10.0
+    modal_consistency_zbuffer_tau: float = 0.05
+    modal_consistency_min_zbuffer_samples: int = 5
     num_epochs: int = 200
     port: int | None = None
     vis_debug: bool = False 
@@ -105,10 +109,15 @@ class TrainConfig:
     validate_every: int = 50
     save_videos_every: int = 50
     use_2dgs: bool = False
+    resume: bool = False
 
 
 def main(cfg: TrainConfig):
     _inject_vggt_static_view_config(cfg)
+    ckpt_path = f"{cfg.work_dir}/checkpoints/last.ckpt"
+    init_metadata = _make_init_metadata(cfg)
+    _validate_checkpoint_policy(ckpt_path, cfg.resume, init_metadata)
+
     backup_code(cfg.work_dir)
     train_dataset, train_video_view, val_img_dataset, val_kpt_dataset = (
         get_train_val_datasets(cfg.data, load_val=True)
@@ -122,13 +131,12 @@ def main(cfg: TrainConfig):
     with open(f"{cfg.work_dir}/cfg.yaml", "w") as f:
         yaml.dump(asdict(cfg), f, default_flow_style=False)
 
-    # if checkpoint exists
-    ckpt_path = f"{cfg.work_dir}/checkpoints/last.ckpt"
     initialize_and_checkpoint_model(
         cfg,
         train_dataset,
         device,
         ckpt_path,
+        init_metadata,
         vis=cfg.vis_debug,
         port=cfg.port,
     )
@@ -144,6 +152,20 @@ def main(cfg: TrainConfig):
         port=cfg.port,
         modal_warmup_epochs=cfg.modal_warmup_epochs,
         modal_train_base_means=cfg.modal_train_base_means,
+        modal_manifest=cfg.modal_manifest,
+        modal_knn=cfg.modal_knn,
+        modal_interp_power=cfg.modal_interp_power,
+        modal_interp_eps=cfg.modal_interp_eps,
+        modal_consistency_view_configs=cfg.modal_consistency_view_configs,
+        modal_consistency_modal_npzs=cfg.modal_consistency_modal_npzs,
+        modal_consistency_freq_tolerance_hz=cfg.modal_consistency_freq_tolerance_hz,
+        modal_consistency_mask_erode_iters=cfg.modal_consistency_mask_erode_iters,
+        modal_consistency_zbuffer_radius=cfg.modal_consistency_zbuffer_radius,
+        modal_consistency_front_percentile=cfg.modal_consistency_front_percentile,
+        modal_consistency_zbuffer_tau=cfg.modal_consistency_zbuffer_tau,
+        modal_consistency_min_zbuffer_samples=(
+            cfg.modal_consistency_min_zbuffer_samples
+        ),
     )
 
     train_loader = DataLoader(
@@ -206,6 +228,7 @@ def initialize_and_checkpoint_model(
     train_dataset: BaseDataset,
     device: torch.device,
     ckpt_path: str,
+    init_metadata: dict[str, Any],
     vis: bool = False,
     port: int | None = None,
 ):
@@ -280,6 +303,13 @@ def initialize_and_checkpoint_model(
             cfg.modal_consistency_view_configs or cfg.modal_consistency_modal_npzs
         )
         if use_modal_consistency:
+            if len(cfg.modal_consistency_view_configs) != len(
+                cfg.modal_consistency_modal_npzs
+            ):
+                raise ValueError(
+                    "modal consistency view configs and modal npzs must have "
+                    "the same length"
+                )
             if cfg.modal_consistency_target_view_id is None:
                 raise ValueError(
                     "modal consistency requires --modal-consistency-target-view-id"
@@ -291,26 +321,26 @@ def initialize_and_checkpoint_model(
                 )
             if cfg.modal_consistency_fps <= 0:
                 raise ValueError("modal consistency requires --modal-consistency-fps > 0")
-            modal_consistency = load_modal_consistency_data(
-                fg_params.params["means"],
-                modal_modes,
-                cfg.modal_consistency_view_configs,
-                cfg.modal_consistency_modal_npzs,
-                cfg.modal_consistency_freq_tolerance_hz,
-                cfg.modal_consistency_mask_erode_iters,
-            )
-            if modal_consistency is not None:
-                modal_consistency_y_real = modal_consistency.y_real
-                modal_consistency_y_imag = modal_consistency.y_imag
-                modal_consistency_J = modal_consistency.J
-                modal_consistency_gaussian_indices = modal_consistency.gaussian_indices
-                modal_consistency_mode_indices = modal_consistency.mode_indices
-                modal_consistency_group_indices = modal_consistency.group_indices
-                modal_consistency_group_count = modal_consistency.group_count
-                modal_consistency_target_view_index = frame_map.view_ids.index(
-                    cfg.modal_consistency_target_view_id
+            if cfg.modal_consistency_zbuffer_radius < 0:
+                raise ValueError(
+                    "modal consistency zbuffer radius must be non-negative"
                 )
-                modal_consistency_fps = cfg.modal_consistency_fps
+            if not (0.0 <= cfg.modal_consistency_front_percentile <= 100.0):
+                raise ValueError(
+                    "modal consistency front percentile must be in [0, 100]"
+                )
+            if cfg.modal_consistency_zbuffer_tau <= 0:
+                raise ValueError(
+                    "modal consistency zbuffer tau must be positive"
+                )
+            if cfg.modal_consistency_min_zbuffer_samples < 1:
+                raise ValueError(
+                    "modal consistency min zbuffer samples must be at least 1"
+                )
+            modal_consistency_target_view_index = frame_map.view_ids.index(
+                cfg.modal_consistency_target_view_id
+            )
+            modal_consistency_fps = cfg.modal_consistency_fps
         modal = ModalActivations(
             torch.zeros(
                 motion_bases.num_frames,
@@ -357,7 +387,115 @@ def initialize_and_checkpoint_model(
 
     guru.info(f"Saving initialization to {ckpt_path}")
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-    torch.save({"model": model.state_dict(), "epoch": 0, "global_step": 0}, ckpt_path)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "epoch": 0,
+            "global_step": 0,
+            "init_metadata": init_metadata,
+        },
+        ckpt_path,
+    )
+
+
+def _metadata_value(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [_metadata_value(v) for v in value]
+    if isinstance(value, list):
+        return [_metadata_value(v) for v in value]
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    return value
+
+
+def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
+    data = cfg.data
+    data_metadata = {
+        "type": type(data).__name__,
+        "data_dir": getattr(data, "data_dir", None),
+        "start": getattr(data, "start", None),
+        "end": getattr(data, "end", None),
+        "res": getattr(data, "res", None),
+        "image_type": getattr(data, "image_type", None),
+        "mask_type": getattr(data, "mask_type", None),
+        "depth_type": getattr(data, "depth_type", None),
+        "camera_type": getattr(data, "camera_type", None),
+        "modal_train_view_id": getattr(data, "modal_train_view_id", None),
+    }
+    metadata = {
+        "trajectory_type": cfg.trajectory_type,
+        "num_fg": cfg.num_fg,
+        "num_bg": cfg.num_bg,
+        "num_motion_bases": cfg.num_motion_bases,
+        "num_dct_bases": cfg.num_dct_bases,
+        "dct_init": cfg.dct_init,
+        "modal_manifest": cfg.modal_manifest,
+        "modal_frame_map": cfg.modal_frame_map,
+        "modal_carrier_points": cfg.modal_carrier_points,
+        "modal_train_view_id": cfg.modal_train_view_id,
+        "vggt_view_configs": cfg.vggt_view_configs,
+        "modal_knn": cfg.modal_knn,
+        "modal_interp_power": cfg.modal_interp_power,
+        "modal_interp_eps": cfg.modal_interp_eps,
+        "modal_consistency_target_view_id": cfg.modal_consistency_target_view_id,
+        "modal_consistency_fps": cfg.modal_consistency_fps,
+        "modal_consistency_view_configs": cfg.modal_consistency_view_configs,
+        "modal_consistency_modal_npzs": cfg.modal_consistency_modal_npzs,
+        "modal_consistency_freq_tolerance_hz": cfg.modal_consistency_freq_tolerance_hz,
+        "modal_consistency_mask_erode_iters": cfg.modal_consistency_mask_erode_iters,
+        "modal_consistency_zbuffer_radius": cfg.modal_consistency_zbuffer_radius,
+        "modal_consistency_front_percentile": cfg.modal_consistency_front_percentile,
+        "modal_consistency_zbuffer_tau": cfg.modal_consistency_zbuffer_tau,
+        "modal_consistency_min_zbuffer_samples": (
+            cfg.modal_consistency_min_zbuffer_samples
+        ),
+        "modal_consistency_loss_type": cfg.loss.modal_consistency_loss_type,
+        "modal_consistency_beta_abs_max": cfg.loss.modal_consistency_beta_abs_max,
+        "modal_consistency_pred_energy_eps": (
+            cfg.loss.modal_consistency_pred_energy_eps
+        ),
+        "data": data_metadata,
+    }
+    return {key: _metadata_value(value) for key, value in metadata.items()}
+
+
+def _validate_checkpoint_policy(
+    ckpt_path: str,
+    resume: bool,
+    expected_metadata: dict[str, Any],
+):
+    if not os.path.exists(ckpt_path):
+        if resume:
+            raise ValueError(
+                f"--resume was set but checkpoint does not exist: {ckpt_path}"
+            )
+        return
+
+    if not resume:
+        raise ValueError(
+            f"Checkpoint already exists at {ckpt_path}. "
+            "Use a new work_dir or pass --resume."
+        )
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    actual_metadata = ckpt.get("init_metadata")
+    if actual_metadata is None:
+        raise ValueError(
+            f"Checkpoint {ckpt_path} has no init_metadata; "
+            "use a new work_dir for this run."
+        )
+    if actual_metadata != expected_metadata:
+        keys = sorted(set(actual_metadata) | set(expected_metadata))
+        mismatched = [
+            key
+            for key in keys
+            if actual_metadata.get(key) != expected_metadata.get(key)
+        ]
+        preview = ", ".join(mismatched[:8])
+        raise ValueError(
+            "Checkpoint init_metadata does not match current config. "
+            f"Mismatched keys: {preview}. Use a new work_dir for this run."
+        )
 
 
 def init_model_from_tracks(
@@ -453,9 +591,16 @@ def init_model_from_tracks(
 
 
 def _inject_vggt_static_view_config(cfg: TrainConfig):
+    if cfg.modal_train_view_id is not None:
+        if cfg.trajectory_type != "modal_activation":
+            raise ValueError("--modal-train-view-id requires modal_activation")
+        if not isinstance(cfg.data, (CustomDataConfig, DavisDataConfig)):
+            raise ValueError("--modal-train-view-id requires custom or davis data")
+        if cfg.data.camera_type != "vggt":
+            raise ValueError("--modal-train-view-id requires data.camera_type='vggt'")
     if cfg.trajectory_type != "modal_activation":
         return
-    if not isinstance(cfg.data, CustomDataConfig):
+    if not isinstance(cfg.data, (CustomDataConfig, DavisDataConfig)):
         return
     if cfg.data.camera_type != "vggt":
         return
@@ -467,6 +612,7 @@ def _inject_vggt_static_view_config(cfg: TrainConfig):
         cfg.data,
         vggt_view_configs=cfg.vggt_view_configs,
         modal_frame_map=cfg.modal_frame_map,
+        modal_train_view_id=cfg.modal_train_view_id,
     )
 
 

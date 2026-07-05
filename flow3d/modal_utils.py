@@ -180,6 +180,100 @@ def _modal_mask_from_npz(modal: Any, shape: tuple[int, int]) -> np.ndarray:
     return mask > 0
 
 
+def _build_pixel_buckets(
+    point_indices: np.ndarray,
+    rounded_x: np.ndarray,
+    rounded_y: np.ndarray,
+    width: int,
+) -> dict[int, np.ndarray]:
+    if point_indices.size == 0:
+        return {}
+    linear = (
+        rounded_y[point_indices].astype(np.int64) * int(width)
+        + rounded_x[point_indices].astype(np.int64)
+    )
+    order = np.argsort(linear)
+    linear_sorted = linear[order]
+    point_sorted = point_indices[order]
+    keys, starts, counts = np.unique(
+        linear_sorted, return_index=True, return_counts=True
+    )
+    return {
+        int(k): point_sorted[int(s) : int(s + c)]
+        for k, s, c in zip(keys, starts, counts)
+    }
+
+
+def _local_depth_stats(
+    buckets: dict[int, np.ndarray],
+    z: np.ndarray,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    radius: int,
+    front_percentile: float,
+    min_samples: int,
+) -> tuple[float, float] | None:
+    parts: list[np.ndarray] = []
+    x0 = max(0, x - radius)
+    x1 = min(width, x + radius + 1)
+    y0 = max(0, y - radius)
+    y1 = min(height, y + radius + 1)
+    for yy in range(y0, y1):
+        base = yy * width
+        for xx in range(x0, x1):
+            idx = buckets.get(base + xx)
+            if idx is not None:
+                parts.append(idx)
+    if not parts:
+        return None
+    indices = parts[0] if len(parts) == 1 else np.concatenate(parts)
+    vals = z[indices]
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size < min_samples:
+        return None
+    z_front, z_med = np.percentile(vals, [front_percentile, 50])
+    return float(z_front), float(z_med)
+
+
+def _zbuffer_visible_indices(
+    candidate_indices: np.ndarray,
+    rounded_x: np.ndarray,
+    rounded_y: np.ndarray,
+    z: np.ndarray,
+    width: int,
+    height: int,
+    zbuffer_radius: int,
+    front_percentile: float,
+    zbuffer_tau: float,
+    min_zbuffer_samples: int,
+) -> np.ndarray:
+    buckets = _build_pixel_buckets(candidate_indices, rounded_x, rounded_y, width)
+    keep = []
+    for point_idx in candidate_indices.tolist():
+        stats = _local_depth_stats(
+            buckets,
+            z,
+            int(rounded_x[point_idx]),
+            int(rounded_y[point_idx]),
+            width,
+            height,
+            zbuffer_radius,
+            front_percentile,
+            min_zbuffer_samples,
+        )
+        if stats is None:
+            continue
+        z_front, z_med = stats
+        if z_med <= 0:
+            continue
+        rel = abs(float(z[point_idx]) - z_front) / max(abs(z_med), 1e-6)
+        if rel < zbuffer_tau:
+            keep.append(point_idx)
+    return np.asarray(keep, dtype=np.int64)
+
+
 def load_modal_consistency_data(
     gaussian_means: torch.Tensor,
     modes: list[ModalModeData],
@@ -187,6 +281,10 @@ def load_modal_consistency_data(
     modal_npz_paths: tuple[str, ...],
     freq_tolerance_hz: float,
     mask_erode_iters: int,
+    zbuffer_radius: int = 5,
+    front_percentile: float = 10.0,
+    zbuffer_tau: float = 0.05,
+    min_zbuffer_samples: int = 5,
 ) -> ModalConsistencyData | None:
     if not view_config_paths and not modal_npz_paths:
         return None
@@ -200,6 +298,16 @@ def load_modal_consistency_data(
         raise ValueError("modal consistency freq tolerance must be non-negative")
     if mask_erode_iters < 0:
         raise ValueError("modal consistency mask_erode_iters must be non-negative")
+    if zbuffer_radius < 0:
+        raise ValueError("modal consistency zbuffer_radius must be non-negative")
+    if not (0.0 <= front_percentile <= 100.0):
+        raise ValueError("modal consistency front_percentile must be in [0, 100]")
+    if zbuffer_tau <= 0:
+        raise ValueError("modal consistency zbuffer_tau must be positive")
+    if min_zbuffer_samples < 1:
+        raise ValueError(
+            "modal consistency min_zbuffer_samples must be at least 1"
+        )
 
     device = gaussian_means.device
     dtype = gaussian_means.dtype
@@ -255,6 +363,27 @@ def load_modal_consistency_data(
         valid_indices = valid_indices[mask[rounded_y[valid_indices], rounded_x[valid_indices]]]
         if valid_indices.size == 0:
             raise ValueError(f"No modal consistency Gaussian projections survived mask for {cfg.view_id}")
+        mask_valid_count = int(valid_indices.size)
+        valid_indices = _zbuffer_visible_indices(
+            valid_indices,
+            rounded_x,
+            rounded_y,
+            z,
+            width,
+            height,
+            zbuffer_radius,
+            front_percentile,
+            zbuffer_tau,
+            min_zbuffer_samples,
+        )
+        if valid_indices.size == 0:
+            raise ValueError(
+                f"No modal consistency Gaussian projections survived z-buffer for {cfg.view_id}"
+            )
+        guru.info(
+            f"Modal consistency view {cfg.view_id}: z-buffer kept "
+            f"{valid_indices.size}/{mask_valid_count} masked projections"
+        )
         jacobians = projection_jacobian(points_world[valid_indices], cfg.K, cfg.world_to_camera)
         sample_xy = pixels_xy[valid_indices]
 

@@ -225,6 +225,89 @@ class SceneModel(nn.Module):
     def has_modal_consistency(self) -> bool:
         return int(self.modal_consistency_group_count.item()) > 0
 
+    @torch.no_grad()
+    def set_modal_fields(
+        self,
+        modal_phi_real: Tensor,
+        modal_phi_imag: Tensor,
+        modal_freqs_hz: Tensor,
+    ):
+        if self.modal is None:
+            raise RuntimeError("set_modal_fields requires modal activations")
+        device = self.fg.params["means"].device
+        dtype = self.fg.params["means"].dtype
+        modal_phi_real = modal_phi_real.to(device=device, dtype=dtype)
+        modal_phi_imag = modal_phi_imag.to(device=device, dtype=dtype)
+        modal_freqs_hz = modal_freqs_hz.to(device=device, dtype=dtype)
+        if modal_phi_real.shape != modal_phi_imag.shape:
+            raise ValueError("modal phi real/imag tensors must have matching shapes")
+        expected_shape = (self.modal.num_modes, self.num_fg_gaussians, 3)
+        if tuple(modal_phi_real.shape) != expected_shape:
+            raise ValueError(
+                f"modal phi tensors must have shape {expected_shape}, "
+                f"got {tuple(modal_phi_real.shape)}"
+            )
+        if tuple(modal_freqs_hz.shape) != (self.modal.num_modes,):
+            raise ValueError(
+                f"modal_freqs_hz must have shape {(self.modal.num_modes,)}, "
+                f"got {tuple(modal_freqs_hz.shape)}"
+            )
+        self.modal_phi_real = modal_phi_real
+        self.modal_phi_imag = modal_phi_imag
+        self.modal_freqs_hz = modal_freqs_hz
+
+    @torch.no_grad()
+    def set_modal_consistency_data(
+        self,
+        y_real: Tensor | None = None,
+        y_imag: Tensor | None = None,
+        J: Tensor | None = None,
+        gaussian_indices: Tensor | None = None,
+        mode_indices: Tensor | None = None,
+        group_indices: Tensor | None = None,
+        group_count: int = 0,
+        target_view_index: int | None = None,
+        fps: float | None = None,
+    ):
+        device = self.fg.params["means"].device
+        dtype = self.fg.params["means"].dtype
+        if y_real is None:
+            y_real = torch.empty(0, 2, device=device, dtype=dtype)
+        if y_imag is None:
+            y_imag = torch.empty_like(y_real)
+        if J is None:
+            J = torch.empty(0, 2, 3, device=device, dtype=dtype)
+        if gaussian_indices is None:
+            gaussian_indices = torch.empty(0, device=device, dtype=torch.long)
+        if mode_indices is None:
+            mode_indices = torch.empty(0, device=device, dtype=torch.long)
+        if group_indices is None:
+            group_indices = torch.empty(0, device=device, dtype=torch.long)
+
+        self.modal_consistency_y_real = y_real.to(device=device, dtype=dtype)
+        self.modal_consistency_y_imag = y_imag.to(device=device, dtype=dtype)
+        self.modal_consistency_J = J.to(device=device, dtype=dtype)
+        self.modal_consistency_gaussian_indices = gaussian_indices.to(
+            device=device, dtype=torch.long
+        )
+        self.modal_consistency_mode_indices = mode_indices.to(
+            device=device, dtype=torch.long
+        )
+        self.modal_consistency_group_indices = group_indices.to(
+            device=device, dtype=torch.long
+        )
+        self.modal_consistency_group_count = torch.tensor(
+            int(group_count), device=device, dtype=torch.long
+        )
+        if target_view_index is not None:
+            self.modal_consistency_target_view_index = torch.tensor(
+                int(target_view_index), device=device, dtype=torch.long
+            )
+        if fps is not None:
+            self.modal_consistency_fps = torch.tensor(
+                float(fps), device=device, dtype=dtype
+            )
+
     def compute_poses_bg(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -283,10 +366,23 @@ class SceneModel(nn.Module):
         accel = nxt - 2.0 * center + prev
         return accel.pow(2).sum(dim=-1).mean()
 
-    def compute_activation_modal_consistency_loss(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def compute_activation_modal_consistency_loss(
+        self,
+        loss_type: str = "aligned_l2",
+        beta_abs_max: float = 10.0,
+        pred_energy_eps: float = 1e-8,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.modal is None or not self.has_modal_consistency:
             zero = self.fg.params["means"].new_zeros(())
             return zero, zero
+        if loss_type not in {"corr", "aligned_l2"}:
+            raise ValueError(
+                f"Unknown modal consistency loss type {loss_type!r}"
+            )
+        if beta_abs_max <= 0:
+            raise ValueError("modal consistency beta_abs_max must be positive")
+        if pred_energy_eps <= 0:
+            raise ValueError("modal consistency pred_energy_eps must be positive")
         if float(self.modal_consistency_fps.item()) <= 0:
             raise ValueError("modal consistency requires positive fps")
 
@@ -325,7 +421,9 @@ class SceneModel(nn.Module):
             self.modal_consistency_y_imag,
         )
 
-        eps = torch.finfo(dtype).eps
+        eps = torch.as_tensor(
+            float(pred_energy_eps), device=activations.device, dtype=dtype
+        )
         losses = []
         for group_idx in range(int(self.modal_consistency_group_count.item())):
             rows = self.modal_consistency_group_indices == group_idx
@@ -338,9 +436,26 @@ class SceneModel(nn.Module):
                 continue
             pred_energy = (pred_group.conj() * pred_group).real.sum()
             dot = (pred_group.conj() * target_group).sum()
-            denom = (pred_energy + eps) * (target_energy + eps)
-            corr = dot.abs().pow(2) / denom
-            losses.append(1.0 - corr.clamp(0.0, 1.0))
+            if loss_type == "corr":
+                denom = (pred_energy + eps) * (target_energy + eps)
+                corr = dot.abs().pow(2) / denom
+                losses.append(1.0 - corr.clamp(0.0, 1.0))
+            else:
+                if float(pred_energy.detach().item()) <= float(eps):
+                    beta = torch.ones((), device=pred_y.device, dtype=pred_y.dtype)
+                else:
+                    beta = dot / (pred_energy + eps)
+                    beta_abs = beta.abs()
+                    max_abs = torch.as_tensor(
+                        float(beta_abs_max),
+                        device=pred_y.device,
+                        dtype=beta_abs.dtype,
+                    )
+                    scale = torch.clamp(max_abs / beta_abs.clamp_min(eps), max=1.0)
+                    beta = beta * scale.to(dtype=beta.dtype)
+                residual = beta * pred_group - target_group
+                residual_energy = (residual.conj() * residual).real.sum()
+                losses.append(residual_energy / (target_energy + eps))
 
         if not losses:
             zero = self.fg.params["means"].new_zeros(())
