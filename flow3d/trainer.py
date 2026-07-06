@@ -58,6 +58,8 @@ class Trainer:
         modal_stage2_train_bg_opacities: bool = True,
         modal_stage2_train_bg_scales: bool = False,
         modal_stage2_train_bg_quats: bool = False,
+        modal_stage2_lr_fg_scales: float | None = None,
+        modal_stage2_lr_fg_quats: float | None = None,
         init_metadata: dict[str, Any] | None = None,
         modal_manifest: str | None = None,
         modal_knn: int = 8,
@@ -99,6 +101,8 @@ class Trainer:
         self.modal_stage2_train_bg_opacities = modal_stage2_train_bg_opacities
         self.modal_stage2_train_bg_scales = modal_stage2_train_bg_scales
         self.modal_stage2_train_bg_quats = modal_stage2_train_bg_quats
+        self.modal_stage2_lr_fg_scales = modal_stage2_lr_fg_scales
+        self.modal_stage2_lr_fg_quats = modal_stage2_lr_fg_quats
         self.init_metadata = init_metadata
         self.modal_manifest = modal_manifest
         self.modal_knn = modal_knn
@@ -160,6 +164,7 @@ class Trainer:
         self.epoch = epoch
         self._refresh_modal_post_warmup_if_needed()
         self._apply_modal_trainability()
+        self._apply_modal_stage2_lr_overrides()
 
     def _modal_in_dynamic_stage(self) -> bool:
         return (
@@ -196,6 +201,21 @@ class Trainer:
             "bg.params.quats": self.modal_stage2_train_bg_quats,
         }
         return trainable_fg_params.get(name, False)
+
+    def _apply_modal_stage2_lr_overrides(self):
+        if not self._modal_in_dynamic_stage():
+            return
+        lr_overrides = {
+            "fg.params.scales": self.modal_stage2_lr_fg_scales,
+            "fg.params.quats": self.modal_stage2_lr_fg_quats,
+        }
+        for name, lr in lr_overrides.items():
+            if lr is None:
+                continue
+            if name not in self.optimizers:
+                raise ValueError(f"Missing optimizer for modal Stage 2 LR override: {name}")
+            for group in self.optimizers[name].param_groups:
+                group["lr"] = float(lr)
 
     @torch.no_grad()
     def _refresh_modal_post_warmup_if_needed(self):
@@ -362,6 +382,7 @@ class Trainer:
             opt.zero_grad(set_to_none=True)
         for sched in self.scheduler.values():
             sched.step()
+        self._apply_modal_stage2_lr_overrides()
 
         self.log_dict(stats)
         self.global_step += 1
@@ -719,16 +740,15 @@ class Trainer:
 
         # Constrain the std of scales.
         # TODO: do we want to penalize before or after exp?
-        if not is_modal_activation:
+        loss += (
+            self.losses_cfg.w_scale_var
+            * torch.var(torch.exp(self.model.fg.params["scales"]), dim=-1).mean()
+        )
+        if self.model.bg is not None:
             loss += (
                 self.losses_cfg.w_scale_var
-                * torch.var(torch.exp(self.model.fg.params["scales"]), dim=-1).mean()
+                * torch.var(torch.exp(self.model.bg.params["scales"]), dim=-1).mean()
             )
-            if self.model.bg is not None:
-                loss += (
-                    self.losses_cfg.w_scale_var
-                    * torch.var(torch.exp(self.model.bg.params["scales"]), dim=-1).mean()
-                )
         
         if self.model.fg.params["means"].isnan().sum() > 0:
             import ipdb

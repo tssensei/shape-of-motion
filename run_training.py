@@ -103,6 +103,8 @@ class TrainConfig:
     modal_stage2_train_bg_opacities: bool = True
     modal_stage2_train_bg_scales: bool = False
     modal_stage2_train_bg_quats: bool = False
+    modal_stage2_lr_fg_scales: float | None = None
+    modal_stage2_lr_fg_quats: float | None = None
     modal_train_view_id: str | None = None
     modal_consistency_target_view_id: str | None = None
     modal_consistency_fps: float = 0.0
@@ -189,6 +191,8 @@ def main(cfg: TrainConfig):
         modal_stage2_train_bg_opacities=cfg.modal_stage2_train_bg_opacities,
         modal_stage2_train_bg_scales=cfg.modal_stage2_train_bg_scales,
         modal_stage2_train_bg_quats=cfg.modal_stage2_train_bg_quats,
+        modal_stage2_lr_fg_scales=cfg.modal_stage2_lr_fg_scales,
+        modal_stage2_lr_fg_quats=cfg.modal_stage2_lr_fg_quats,
         modal_manifest=cfg.modal_manifest,
         modal_knn=cfg.modal_knn,
         modal_interp_power=cfg.modal_interp_power,
@@ -511,6 +515,8 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_stage2_train_bg_opacities": cfg.modal_stage2_train_bg_opacities,
         "modal_stage2_train_bg_scales": cfg.modal_stage2_train_bg_scales,
         "modal_stage2_train_bg_quats": cfg.modal_stage2_train_bg_quats,
+        "modal_stage2_lr_fg_scales": cfg.modal_stage2_lr_fg_scales,
+        "modal_stage2_lr_fg_quats": cfg.modal_stage2_lr_fg_quats,
         "modal_consistency_target_view_id": cfg.modal_consistency_target_view_id,
         "modal_consistency_fps": cfg.modal_consistency_fps,
         "modal_consistency_view_configs": cfg.modal_consistency_view_configs,
