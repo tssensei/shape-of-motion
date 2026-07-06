@@ -536,6 +536,11 @@ def optimize_multi_view(
     if "obs_count_per_point" not in data.files:
         raise ValueError("Observation graph is missing obs_count_per_point.")
     obs_count_per_point = data["obs_count_per_point"].astype(np.int32)
+    obs_sample_count_per_point = (
+        data["obs_sample_count_per_point"].astype(np.int32)
+        if "obs_sample_count_per_point" in data.files
+        else obs_count_per_point
+    )
     view_ids = data["view_ids"]
     num_views = int(view_ids.shape[0])
     if "view_freqs_hz" in data.files:
@@ -551,6 +556,11 @@ def optimize_multi_view(
         raise ValueError(f"obs_J must have shape (O,2,3), got {obs_J.shape}.")
     if obs_count_per_point.shape != (points.shape[0],):
         raise ValueError(f"obs_count_per_point must have shape ({points.shape[0]},), got {obs_count_per_point.shape}.")
+    if obs_sample_count_per_point.shape != (points.shape[0],):
+        raise ValueError(
+            f"obs_sample_count_per_point must have shape ({points.shape[0]},), "
+            f"got {obs_sample_count_per_point.shape}."
+        )
     if np.any(obs_point_index < 0) or np.any(obs_point_index >= points.shape[0]):
         raise ValueError("obs_point_index contains invalid point indices.")
     if np.any(obs_view_index < 0) or np.any(obs_view_index >= num_views):
@@ -699,6 +709,7 @@ def optimize_multi_view(
         mode_index=data["mode_index"].astype(np.int32),
         point_residual=point_residual[active_indices].astype(np.float32),
         obs_count_per_point=obs_count_per_point[active_indices].astype(np.int32),
+        obs_sample_count_per_point=obs_sample_count_per_point[active_indices].astype(np.int32),
         obs_count_weight_per_point=obs_count_weight_per_point[active_indices].astype(np.float32),
         graph_degree=graph_degree[active_indices].astype(np.int32),
         graph_edge_count=np.array(graph_edge_count, dtype=np.int64),

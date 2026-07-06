@@ -30,6 +30,18 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--modal-npz", action="append", required=True, help="modal_analysis.npz path. Repeat per view.")
     parser.add_argument("--out-dir", required=True, help="Output directory for observations, latents, vis, and manifest.")
     parser.add_argument("--mode-indices", default="all", help="Comma-separated zero-based mode indices, or 'all'.")
+    parser.add_argument(
+        "--observation-sampling",
+        choices=["gaussian-center", "pixel-candidates"],
+        default="gaussian-center",
+        help="Observation graph sampling mode.",
+    )
+    parser.add_argument("--pixel-sample-stride", type=int, default=4, help="Pixel grid stride for pixel-candidates sampling.")
+    parser.add_argument("--pixel-candidate-k", type=int, default=4, help="Number of nearby projected Gaussians supervised by each sampled pixel.")
+    parser.add_argument("--pixel-search-radius", type=int, default=6, help="Search radius in pixels for pixel-candidates sampling.")
+    parser.add_argument("--pixel-weight-sigma", type=float, default=3.0, help="Gaussian pixel-distance weighting sigma for pixel-candidates observations.")
+    parser.add_argument("--pixel-min-mode-amp-percentile", type=float, default=50.0, help="Discard sampled modal pixels below this foreground amplitude percentile.")
+    parser.add_argument("--pixel-max-samples-per-view", type=int, default=20000, help="Maximum sampled modal pixels per view before candidate expansion.")
     parser.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
     parser.add_argument("--zbuffer-radius", type=int, default=5, help="Local robust z-buffer window radius in pixels.")
     parser.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
@@ -92,6 +104,11 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
     latent = np.load(str(latent_path), allow_pickle=False)
     observations = np.load(str(observation_path), allow_pickle=False)
     obs_count = latent["obs_count_per_point"].astype(np.int32)
+    obs_sample_count = (
+        latent["obs_sample_count_per_point"].astype(np.int32)
+        if "obs_sample_count_per_point" in latent.files
+        else obs_count
+    )
     gaussian_indices = latent["gaussian_indices"].astype(np.int32)
     stats.update(
         {
@@ -100,10 +117,15 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
             "unobserved_output_count": int((obs_count == 0).sum()),
             "obs_count_p50": _json_float(np.percentile(obs_count, 50)),
             "obs_count_p90": _json_float(np.percentile(obs_count, 90)),
+            "obs_sample_count_p50": _json_float(np.percentile(obs_sample_count, 50)),
+            "obs_sample_count_p90": _json_float(np.percentile(obs_sample_count, 90)),
             "gaussian_indices_contiguous": bool(np.array_equal(gaussian_indices, np.arange(gaussian_indices.shape[0], dtype=np.int32))),
             "preserved_all_points": bool(np.asarray(observations["preserved_all_points"]).item())
             if "preserved_all_points" in observations.files
             else False,
+            "observation_sampling": str(np.asarray(observations["observation_sampling"]).item())
+            if "observation_sampling" in observations.files
+            else "gaussian-center",
         }
     )
     return stats
@@ -112,16 +134,25 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
 def _print_observation_sanity(obs_path: Path, num_fg: int) -> None:
     observations = np.load(str(obs_path), allow_pickle=False)
     obs_count = observations["obs_count_per_point"].astype(np.int32)
+    obs_sample_count = (
+        observations["obs_sample_count_per_point"].astype(np.int32)
+        if "obs_sample_count_per_point" in observations.files
+        else obs_count
+    )
     view_ids = observations["view_ids"].astype(str)
     obs_view_index = observations["obs_view_index"].astype(np.int32)
     per_view = np.bincount(obs_view_index, minlength=view_ids.shape[0])
     per_view_text = ", ".join(f"{view_ids[i]}={int(per_view[i])}" for i in range(view_ids.shape[0]))
     obs_percentiles = np.percentile(obs_count, [0, 50, 90, 100])
+    obs_sample_percentiles = np.percentile(obs_sample_count, [0, 50, 90, 100])
     print(
         "Observation sanity: "
         f"points={num_fg}, total_obs={obs_view_index.shape[0]}, per_view=[{per_view_text}], "
-        f"obs_count p0/p50/p90/max="
+        f"view_count p0/p50/p90/max="
         f"{obs_percentiles[0]:.0f}/{obs_percentiles[1]:.0f}/{obs_percentiles[2]:.0f}/{obs_percentiles[3]:.0f}, "
+        f"sample_count p0/p50/p90/max="
+        f"{obs_sample_percentiles[0]:.0f}/{obs_sample_percentiles[1]:.0f}/"
+        f"{obs_sample_percentiles[2]:.0f}/{obs_sample_percentiles[3]:.0f}, "
         f"unobserved={int((obs_count == 0).sum())}"
     )
 
@@ -183,6 +214,13 @@ def run(args: argparse.Namespace) -> None:
                 "point_type": np.array("foreground_gaussian_center"),
                 "source_checkpoint": np.array(str(args.input_ckpt)),
             },
+            observation_sampling=args.observation_sampling,
+            pixel_sample_stride=args.pixel_sample_stride,
+            pixel_candidate_k=args.pixel_candidate_k,
+            pixel_search_radius=args.pixel_search_radius,
+            pixel_weight_sigma=args.pixel_weight_sigma,
+            pixel_min_mode_amp_percentile=args.pixel_min_mode_amp_percentile,
+            pixel_max_samples_per_view=args.pixel_max_samples_per_view,
         )
         _print_observation_sanity(obs_path, fg_means.shape[0])
         optimize_multi_view(
@@ -228,6 +266,13 @@ def run(args: argparse.Namespace) -> None:
         "mode_indices": mode_indices,
         "parameters": {
             "mask_erode_iters": int(args.mask_erode_iters),
+            "observation_sampling": str(args.observation_sampling),
+            "pixel_sample_stride": int(args.pixel_sample_stride),
+            "pixel_candidate_k": int(args.pixel_candidate_k),
+            "pixel_search_radius": int(args.pixel_search_radius),
+            "pixel_weight_sigma": float(args.pixel_weight_sigma),
+            "pixel_min_mode_amp_percentile": float(args.pixel_min_mode_amp_percentile),
+            "pixel_max_samples_per_view": int(args.pixel_max_samples_per_view),
             "zbuffer_radius": int(args.zbuffer_radius),
             "front_percentile": float(args.front_percentile),
             "zbuffer_tau": float(args.zbuffer_tau),
