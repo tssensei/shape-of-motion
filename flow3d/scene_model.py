@@ -110,15 +110,6 @@ class SceneModel(nn.Module):
                 raise ValueError("modal phi real/imag tensors must have matching shapes")
             if modal_phi_real.ndim != 3 or modal_phi_real.shape[-1] != 3:
                 raise ValueError("modal phi tensors must have shape (K, G, 3)")
-            if modal_phi_real.shape[0] == 0:
-                modal_phi_real = torch.empty(
-                    0,
-                    self.num_fg_gaussians,
-                    3,
-                    device=self.fg.params["means"].device,
-                    dtype=self.fg.params["means"].dtype,
-                )
-                modal_phi_imag = torch.empty_like(modal_phi_real)
             if modal_phi_real.shape[1] != self.num_fg_gaussians:
                 raise ValueError("modal phi Gaussian dimension does not match foreground")
             if modal_phi_real.shape[0] != modal.num_modes:
@@ -136,6 +127,15 @@ class SceneModel(nn.Module):
                 raise ValueError("modal phi real/imag tensors must have matching shapes")
             if modal_phi_real.ndim != 3 or modal_phi_real.shape[-1] != 3:
                 raise ValueError("modal phi tensors must have shape (K, G, 3)")
+            if modal_phi_real.shape[0] == 0:
+                modal_phi_real = torch.empty(
+                    0,
+                    self.num_fg_gaussians,
+                    3,
+                    device=self.fg.params["means"].device,
+                    dtype=self.fg.params["means"].dtype,
+                )
+                modal_phi_imag = torch.empty_like(modal_phi_real)
             if modal_phi_real.shape[1] != self.num_fg_gaussians:
                 raise ValueError("modal phi Gaussian dimension does not match foreground")
 
