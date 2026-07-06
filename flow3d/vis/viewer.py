@@ -86,6 +86,7 @@ class DynamicViewer(Viewer):
         orbit_center: np.ndarray | None = None,
         camera_frustum_scale: float = 1.0,
         playback_groups: tuple[ViewerPlaybackGroup, ...] = (),
+        modal_freqs_hz: tuple[float, ...] = (),
     ):
         self.num_frames = num_frames
         self.work_dir = Path(work_dir)
@@ -93,6 +94,7 @@ class DynamicViewer(Viewer):
         self.orbit_center = None if orbit_center is None else np.asarray(orbit_center, dtype=np.float32)
         self.camera_frustum_scale = float(camera_frustum_scale)
         self.playback_groups = tuple(playback_groups)
+        self.modal_freqs_hz = tuple(float(freq) for freq in modal_freqs_hz)
         for group in self.playback_groups:
             if len(group.global_timestamps) == 0:
                 raise ValueError(f"Playback group {group.label!r} has no frames")
@@ -153,6 +155,7 @@ class DynamicViewer(Viewer):
 
         self._render_track_checkbox = server.gui.add_checkbox("Render tracks", False)
         self._render_track_checkbox.on_update(self.rerender)
+        self._define_modal_playback_guis()
         self._define_camera_guis()
 
         tabs = server.gui.add_tab_group()
@@ -200,6 +203,80 @@ class DynamicViewer(Viewer):
             return local_t
         local_t = min(max(local_t, 0), len(group.global_timestamps) - 1)
         return int(group.global_timestamps[local_t])
+
+    def _define_modal_playback_guis(self) -> None:
+        self._modal_playback_handles = None
+        if not self.modal_freqs_hz:
+            return
+        with self.server.gui.add_folder("Modal playback"):
+            drive = self.server.gui.add_dropdown(
+                "Drive",
+                options=("static", "oscillator"),
+                initial_value="static",
+            )
+            motion_scale = self.server.gui.add_slider(
+                "Motion scale",
+                min=0.0,
+                max=10.0,
+                step=0.01,
+                initial_value=1.0,
+            )
+            modes = []
+            for mode_idx, freq_hz in enumerate(self.modal_freqs_hz):
+                enabled = self.server.gui.add_checkbox(f"Mode {mode_idx} enable", True)
+                gain = self.server.gui.add_slider(
+                    f"Mode {mode_idx} gain",
+                    min=0.0,
+                    max=5.0,
+                    step=0.01,
+                    initial_value=1.0,
+                )
+                phase = self.server.gui.add_slider(
+                    f"Mode {mode_idx} phase",
+                    min=-np.pi,
+                    max=np.pi,
+                    step=0.01,
+                    initial_value=0.0,
+                )
+                modes.append(
+                    {
+                        "enabled": enabled,
+                        "gain": gain,
+                        "phase": phase,
+                        "freq_hz": float(freq_hz),
+                    }
+                )
+                enabled.on_update(self.rerender)
+                gain.on_update(self.rerender)
+                phase.on_update(self.rerender)
+            drive.on_update(self.rerender)
+            motion_scale.on_update(self.rerender)
+        self._modal_playback_handles = {
+            "drive": drive,
+            "motion_scale": motion_scale,
+            "modes": tuple(modes),
+        }
+
+    def current_modal_oscillator(self) -> tuple[np.ndarray, float] | None:
+        handles = getattr(self, "_modal_playback_handles", None)
+        if handles is None or str(handles["drive"].value) != "oscillator":
+            return None
+        if not hasattr(self, "_playback_guis"):
+            timestep = 0
+            fps = 15.0
+        else:
+            timestep = int(self._playback_guis[0].value)
+            fps = max(float(self._playback_guis[5].value), 1.0e-6)
+        time_s = float(timestep) / fps
+        q_values = []
+        for mode in handles["modes"]:
+            if bool(mode["enabled"].value):
+                amp = float(mode["gain"].value)
+            else:
+                amp = 0.0
+            phase = 2.0 * np.pi * float(mode["freq_hz"]) * time_s + float(mode["phase"].value)
+            q_values.append(amp * np.exp(1j * phase))
+        return np.asarray(q_values, dtype=np.complex64), float(handles["motion_scale"].value)
 
     def _set_default_orbit_center(self) -> None:
         if self.orbit_center is None or not hasattr(self.server, "on_client_connect"):

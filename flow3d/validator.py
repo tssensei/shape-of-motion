@@ -432,9 +432,12 @@ class Validator:
             if coef_values.shape[1] < 3:
                 coef_values = F.pad(coef_values, (0, 3 - coef_values.shape[1]))
             motion_coef_colors = coef_values[:, :3]
+        elif self.model.trajectory_type == "static":
+            coef_values = self.model.fg.get_colors()
+            motion_coef_colors = coef_values[:, :3]
         else:
             coef_values = self.model.fg.params["traj_coefs"].flatten(1)
-        if self.model.trajectory_type != "modal_activation":
+        if self.model.trajectory_type not in ("modal_activation", "static"):
             with torch.random.fork_rng():
                 torch.random.manual_seed(0)
                 motion_coef_colors = torch.pca_lowrank(

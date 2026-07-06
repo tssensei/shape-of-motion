@@ -160,6 +160,11 @@ class Trainer:
                 model.modal_frame_view_indices,
                 model.modal_frame_local_indices,
             )
+            modal_freqs_hz = ()
+            if model.has_modal_field:
+                modal_freqs_hz = tuple(
+                    float(x) for x in model.modal_freqs_hz.detach().cpu().numpy()
+                )
             self.viewer = DynamicViewer(
                 server,
                 self.render_fn,
@@ -167,6 +172,7 @@ class Trainer:
                 work_dir,
                 mode="training",
                 playback_groups=playback_groups,
+                modal_freqs_hz=modal_freqs_hz,
             )
 
         # metrics
@@ -531,7 +537,31 @@ class Trainer:
         if self.viewer is not None:
             t = self.viewer.current_timestep()
         self.model.training = False
-        img = self.model.render(t, w2c[None], K[None], img_wh)["img"][0]
+        means = None
+        quats = None
+        render_t = t
+        modal_oscillator = (
+            self.viewer.current_modal_oscillator()
+            if self.viewer is not None
+            else None
+        )
+        if modal_oscillator is not None:
+            q_np, motion_scale = modal_oscillator
+            base_means, base_quats = self.model.compute_poses_all(None)
+            means = base_means[:, 0].clone()
+            quats = base_quats[:, 0]
+            q = torch.from_numpy(q_np).to(self.device)
+            fg_offsets = self.model.compute_synthetic_modal_offsets(q, motion_scale)
+            means[: self.model.num_fg_gaussians] += fg_offsets
+            render_t = None
+        img = self.model.render(
+            render_t,
+            w2c[None],
+            K[None],
+            img_wh,
+            means=means,
+            quats=quats,
+        )["img"][0]
         return (img.cpu().numpy() * 255.0).astype(np.uint8)
 
     def train_step(self, batch):
@@ -573,7 +603,7 @@ class Trainer:
     def compute_losses(self, batch):
         self.model.training = True
         is_modal_activation = self.model.trajectory_type == "modal_activation"
-        use_track_terms = not is_modal_activation
+        use_track_terms = self.model.trajectory_type in ("som_basis", "dct_center")
 
         B = batch["imgs"].shape[0]
         W, H = img_wh = batch["imgs"].shape[2:0:-1]
@@ -868,7 +898,7 @@ class Trainer:
         means_fg_nbs = means_fg_nbs.reshape(
             means_fg_nbs.shape[0], 3, -1, 3
         )  # [G, 3, n, 3]
-        if not is_modal_activation and self.losses_cfg.w_smooth_tracks > 0:
+        if use_track_terms and self.losses_cfg.w_smooth_tracks > 0:
             small_accel_loss_tracks = 0.5 * (
                 (2 * means_fg_nbs[:, 1:-1] - means_fg_nbs[:, :-2] - means_fg_nbs[:, 2:])
                 .norm(dim=-1)
@@ -881,7 +911,7 @@ class Trainer:
         local_iso_dist_loss = torch.zeros((), device=self.device)
         local_iso_num_edges = torch.zeros((), device=self.device)
         local_iso_is_active = (
-            not is_modal_activation
+            use_track_terms
             and self.global_step >= self.losses_cfg.local_iso_start_step
             and (
                 self.losses_cfg.w_local_iso_ray > 0
@@ -928,7 +958,7 @@ class Trainer:
         # loss += 0.01 * self.opacity_activation(self.opacities).abs().mean()
 
         # Acceleration along ray direction should be small.
-        if is_modal_activation:
+        if not use_track_terms:
             z_accel_loss = torch.zeros((), device=self.device)
         else:
             z_accel_loss = compute_z_acc_loss(means_fg_nbs, w2cs)
@@ -1231,7 +1261,7 @@ class Trainer:
         # lr config is a nested dict for each fg/bg part
         for name, params in self.model.named_parameters():
             if (
-                self.model.trajectory_type in ("dct_center", "modal_activation")
+                self.model.trajectory_type in ("dct_center", "modal_activation", "static")
                 and name.startswith("motion_bases.")
             ):
                 continue

@@ -17,12 +17,13 @@ torch.set_float32_matmul_precision("high")
 class RenderConfig:
     work_dir: str
     port: int = 8890
+    ckpt_path: str | None = None
 
 
 def main(cfg: RenderConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt_path = f"{cfg.work_dir}/checkpoints/last.ckpt"
+    ckpt_path = cfg.ckpt_path or f"{cfg.work_dir}/checkpoints/last.ckpt"
     assert os.path.exists(ckpt_path)
 
     train_cfg_path = f"{cfg.work_dir}/cfg.yaml"

@@ -61,6 +61,7 @@ class DavisDataConfig:
     modal_train_view_id: tyro.conf.Suppress[str | None] = None
     modal_max_local_frames_per_view: tyro.conf.Suppress[int | None] = None
     load_depths: tyro.conf.Suppress[bool] = True
+    load_tracks: tyro.conf.Suppress[bool] = True
 
 
 @dataclass
@@ -91,6 +92,7 @@ class CustomDataConfig:
     modal_train_view_id: tyro.conf.Suppress[str | None] = None
     modal_max_local_frames_per_view: tyro.conf.Suppress[int | None] = None
     load_depths: tyro.conf.Suppress[bool] = True
+    load_tracks: tyro.conf.Suppress[bool] = True
 
 
 class CasualDataset(BaseDataset):
@@ -122,6 +124,7 @@ class CasualDataset(BaseDataset):
         modal_train_view_id: str | None = None,
         modal_max_local_frames_per_view: int | None = None,
         load_depths: bool = True,
+        load_tracks: bool = True,
         **_,
     ):
         super().__init__()
@@ -137,6 +140,7 @@ class CasualDataset(BaseDataset):
         self.mask_erosion_radius = mask_erosion_radius
         self.camera_type = camera_type
         self.load_depths = load_depths
+        self.load_tracks = load_tracks
 
         self.img_dir = f"{data_dir}/{image_type}/{res}"
         self.img_ext = os.path.splitext(os.listdir(self.img_dir)[0])[1]
@@ -644,7 +648,7 @@ class CasualDataset(BaseDataset):
         data["masks"] = mask.float()
         data["valid_masks"] = valid_mask.float()
 
-        if self.camera_type == "vggt":
+        if self.camera_type == "vggt" or not self.load_tracks:
             data["query_tracks_2d"] = torch.empty(0, 2)
             data["target_ts"] = torch.tensor([index])
             data["target_w2cs"] = self.w2cs[[index]]

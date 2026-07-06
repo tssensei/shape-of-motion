@@ -3,6 +3,7 @@ import os.path as osp
 import shutil
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import numpy as np
@@ -22,6 +23,7 @@ from flow3d.data import (
     iPhoneDataConfig,
     NvidiaDataConfig,
 )
+from flow3d.data.colmap import read_points3D_binary
 from flow3d.data.utils import to_device
 from flow3d.init_utils import (
     init_bg,
@@ -78,7 +80,9 @@ class TrainConfig:
     num_fg: int = 40_000
     num_bg: int = 100_000
     num_motion_bases: int = 10
-    trajectory_type: Literal["som_basis", "dct_center", "modal_activation"] = "som_basis"
+    trajectory_type: Literal[
+        "som_basis", "dct_center", "modal_activation", "static"
+    ] = "som_basis"
     num_dct_bases: int | None = None
     dct_init: Literal["tracks", "zero"] = "tracks"
     modal_manifest: str | None = None
@@ -152,7 +156,10 @@ def main(cfg: TrainConfig):
     train_dataset, train_video_view, val_img_dataset, val_kpt_dataset = (
         get_train_val_datasets(cfg.data, load_val=True)
     )
-    guru.info(f"Stage 2 dynamic dataset has {train_dataset.num_frames} frames")
+    if cfg.trajectory_type == "static":
+        guru.info(f"Static sweep dataset has {train_dataset.num_frames} frames")
+    else:
+        guru.info(f"Stage 2 dynamic dataset has {train_dataset.num_frames} frames")
     stage1_dataset = None
     if stage1_data_cfg is not None:
         stage1_dataset, _, _, _ = get_train_val_datasets(
@@ -351,7 +358,9 @@ def initialize_and_checkpoint_model(
 
 
     camera_poses = (
-        None if cfg.trajectory_type == "modal_activation" else init_trainable_poses(w2cs)
+        None
+        if cfg.trajectory_type in ("modal_activation", "static")
+        else init_trainable_poses(w2cs)
     )
     modal = None
     modal_phi_real = None
@@ -557,6 +566,7 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
             data, "modal_max_local_frames_per_view", None
         ),
         "load_depths": getattr(data, "load_depths", None),
+        "load_tracks": getattr(data, "load_tracks", None),
     }
     stage1_metadata = {
         "data_dir": cfg.modal_stage1_data_dir,
@@ -672,13 +682,28 @@ def init_model_from_tracks(
     num_fg: int,
     num_bg: int,
     num_motion_bases: int,
-    trajectory_type: Literal["som_basis", "dct_center", "modal_activation"],
+    trajectory_type: Literal["som_basis", "dct_center", "modal_activation", "static"],
     num_dct_bases: int | None,
     dct_init: Literal["tracks", "zero"],
     modal_carrier_points: str | None,
     vis: bool = False,
     port: int | None = None,
 ):
+    if trajectory_type == "static":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        fg_params, bg_params = init_static_gaussians_from_colmap(
+            train_dataset,
+            num_fg,
+            num_bg,
+            device,
+        )
+        motion_bases = init_identity_motion_bases(
+            train_dataset.num_frames,
+            device,
+            fg_params.params["means"].dtype,
+        ).to(device)
+        return fg_params, motion_bases, bg_params, None, 0
+
     if trajectory_type == "modal_activation":
         if modal_carrier_points is None:
             raise ValueError("trajectory_type='modal_activation' requires modal_carrier_points")
@@ -762,6 +787,149 @@ def init_model_from_tracks(
     return fg_params, motion_bases, bg_params, tracks_3d, cano_t
 
 
+def init_static_gaussians_from_colmap(
+    train_dataset,
+    num_fg: int,
+    num_bg: int,
+    device: torch.device,
+) -> tuple[GaussianParams, GaussianParams | None]:
+    if getattr(train_dataset, "camera_type", None) != "colmap":
+        raise ValueError("trajectory_type='static' currently requires data.camera_type='colmap'")
+    data_dir = getattr(train_dataset, "data_dir", None)
+    if data_dir is None:
+        raise ValueError("COLMAP static initialization requires dataset.data_dir")
+    colmap_dir = Path(data_dir) / "colmap" / "sparse" / "0"
+    points_path = colmap_dir / "points3D.bin"
+    if not points_path.exists():
+        raise FileNotFoundError(points_path)
+
+    points3d = read_points3D_binary(points_path)
+    if not points3d:
+        raise ValueError(f"No COLMAP sparse points found in {points_path}")
+    points = np.stack([p.xyz for p in points3d.values()]).astype(np.float32)
+    colors = np.stack([p.rgb for p in points3d.values()]).astype(np.float32) / 255.0
+    points = _transform_colmap_points_to_dataset_world(train_dataset, points)
+    fg_mask, bg_mask = _classify_static_colmap_points(train_dataset, points)
+
+    fg_points, fg_colors = _sample_colmap_points(
+        points[fg_mask],
+        colors[fg_mask],
+        num_fg,
+        "foreground",
+    )
+    fg_params = init_fg_from_point_cloud(
+        torch.from_numpy(fg_points).to(device),
+        torch.from_numpy(fg_colors).to(device),
+    ).to(device)
+
+    bg_params = None
+    if num_bg > 0:
+        bg_points, bg_colors = _sample_colmap_points(
+            points[bg_mask],
+            colors[bg_mask],
+            num_bg,
+            "background",
+        )
+        bg_params = init_fg_from_point_cloud(
+            torch.from_numpy(bg_points).to(device),
+            torch.from_numpy(bg_colors).to(device),
+        ).to(device)
+
+    guru.info(
+        "Initialized static COLMAP Gaussians: "
+        f"fg={fg_params.num_gaussians}, "
+        f"bg={0 if bg_params is None else bg_params.num_gaussians}"
+    )
+    return fg_params, bg_params
+
+
+def _transform_colmap_points_to_dataset_world(train_dataset, points: np.ndarray) -> np.ndarray:
+    scene_norm = getattr(train_dataset, "scene_norm_dict", None)
+    if scene_norm is None:
+        raise ValueError("COLMAP static initialization requires dataset.scene_norm_dict")
+    transform = scene_norm["transfm"].detach().cpu().numpy().astype(np.float32)
+    scale = float(scene_norm["scale"])
+    if scale <= 0:
+        raise ValueError(f"scene_norm scale must be positive, got {scale}")
+    points_h = np.concatenate(
+        [points.astype(np.float32), np.ones((points.shape[0], 1), dtype=np.float32)],
+        axis=1,
+    )
+    return (points_h @ transform.T)[:, :3] / scale
+
+
+def _classify_static_colmap_points(train_dataset, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    num_points = points.shape[0]
+    mask_dir = getattr(train_dataset, "mask_dir", None)
+    if mask_dir is None or not os.path.isdir(mask_dir):
+        guru.warning("No mask directory found for static COLMAP init; using all points as foreground")
+        return np.ones(num_points, dtype=bool), np.zeros(num_points, dtype=bool)
+
+    Ks = train_dataset.get_Ks().detach().cpu().numpy().astype(np.float32)
+    w2cs = train_dataset.get_w2cs().detach().cpu().numpy().astype(np.float32)
+    fg_counts = np.zeros(num_points, dtype=np.int32)
+    bg_counts = np.zeros(num_points, dtype=np.int32)
+    chunk = 16384
+    for view_idx in range(train_dataset.num_frames):
+        mask = train_dataset.get_mask(view_idx).detach().cpu().numpy()
+        height, width = mask.shape
+        K = Ks[view_idx]
+        w2c = w2cs[view_idx]
+        R = w2c[:3, :3]
+        t = w2c[:3, 3]
+        for start in range(0, num_points, chunk):
+            end = min(start + chunk, num_points)
+            cam = points[start:end] @ R.T + t[None]
+            z = cam[:, 2]
+            pix_h = cam @ K.T
+            valid_z = z > 1e-6
+            u = pix_h[:, 0] / np.clip(pix_h[:, 2], 1e-6, None)
+            v = pix_h[:, 1] / np.clip(pix_h[:, 2], 1e-6, None)
+            ui = np.rint(u).astype(np.int64)
+            vi = np.rint(v).astype(np.int64)
+            valid = (
+                valid_z
+                & (ui >= 0)
+                & (ui < width)
+                & (vi >= 0)
+                & (vi < height)
+            )
+            if not valid.any():
+                continue
+            vals = mask[vi[valid], ui[valid]]
+            local_indices = np.nonzero(valid)[0] + start
+            fg_counts[local_indices[vals > 0]] += 1
+            bg_counts[local_indices[vals < 0]] += 1
+
+    observed = (fg_counts + bg_counts) > 0
+    fg_mask = (fg_counts >= bg_counts) & observed
+    fg_mask |= ~observed
+    bg_mask = (bg_counts > fg_counts) & observed
+    guru.info(
+        "COLMAP point mask classification: "
+        f"fg={int(fg_mask.sum())}, bg={int(bg_mask.sum())}, "
+        f"unobserved={int((~observed).sum())}"
+    )
+    return fg_mask, bg_mask
+
+
+def _sample_colmap_points(
+    points: np.ndarray,
+    colors: np.ndarray,
+    max_count: int,
+    label: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if max_count <= 0:
+        raise ValueError(f"{label} Gaussian count must be positive")
+    if points.shape[0] < 2:
+        raise ValueError(f"Need at least 2 {label} COLMAP points, got {points.shape[0]}")
+    if points.shape[0] > max_count:
+        sel = np.random.choice(points.shape[0], max_count, replace=False)
+        points = points[sel]
+        colors = colors[sel]
+    return points.astype(np.float32), colors.astype(np.float32)
+
+
 def _make_modal_stage1_data_config(
     cfg: TrainConfig,
 ) -> DavisDataConfig | CustomDataConfig | None:
@@ -837,6 +1005,36 @@ def _inject_vggt_static_view_config(cfg: TrainConfig):
         raise ValueError("--modal-refresh-transport-reg must be positive")
     if cfg.modal_refresh_diagnostic_frames < 0:
         raise ValueError("--modal-refresh-diagnostic-frames must be non-negative")
+    if cfg.trajectory_type == "static":
+        if cfg.modal_manifest is not None or cfg.modal_frame_map is not None:
+            raise ValueError("static trajectory does not use modal training inputs")
+        if not isinstance(cfg.data, (CustomDataConfig, DavisDataConfig)):
+            raise ValueError("static trajectory requires custom or davis data")
+        if cfg.data.camera_type != "colmap":
+            raise ValueError("static trajectory requires data.camera_type='colmap'")
+        if not cfg.data.load_from_cache:
+            raise ValueError(
+                "static COLMAP sweep training requires --data.load-from-cache "
+                "with an aligned scene_norm_dict.pth"
+            )
+        cache_scene_norm = os.path.join(
+            cfg.data.data_dir,
+            "flow3d_preprocessed",
+            cfg.data.res,
+            "scene_norm_dict.pth",
+        )
+        if not os.path.exists(cache_scene_norm):
+            raise FileNotFoundError(cache_scene_norm)
+        depth_weight = (
+            cfg.loss.w_depth_reg
+            + cfg.loss.w_depth_grad
+            + cfg.loss.w_depth_const
+        )
+        cfg.data = replace(
+            cfg.data,
+            load_tracks=False,
+            load_depths=depth_weight > 0,
+        )
     if (
         cfg.modal_train_view_id is not None
         or cfg.modal_max_local_frames_per_view is not None

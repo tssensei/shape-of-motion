@@ -43,6 +43,11 @@ class Renderer:
                 model.modal_frame_local_indices,
                 tuple(camera.label for camera in viewer_cameras),
             )
+            modal_freqs_hz = ()
+            if model.has_modal_field:
+                modal_freqs_hz = tuple(
+                    float(x) for x in model.modal_freqs_hz.detach().cpu().numpy()
+                )
             server = get_server(port=port)
             self.viewer = DynamicViewer(
                 server,
@@ -54,6 +59,7 @@ class Renderer:
                 orbit_center=orbit_center,
                 camera_frustum_scale=frustum_scale,
                 playback_groups=playback_groups,
+                modal_freqs_hz=modal_freqs_hz,
             )
 
         self.tracks_3d = self.model.compute_poses_fg(
@@ -135,9 +141,31 @@ class Renderer:
         )
         t = self.viewer.current_timestep()
         self.model.training = False
-        img = self.model.render(t, w2c[None], K[None], img_wh)["img"][0]
+        means = None
+        quats = None
+        render_t = t
+        modal_oscillator = self.viewer.current_modal_oscillator()
+        if modal_oscillator is not None:
+            q_np, motion_scale = modal_oscillator
+            base_means, base_quats = self.model.compute_poses_all(None)
+            means = base_means[:, 0].clone()
+            quats = base_quats[:, 0]
+            q = torch.from_numpy(q_np).to(self.device)
+            fg_offsets = self.model.compute_synthetic_modal_offsets(q, motion_scale)
+            means[: self.model.num_fg_gaussians] += fg_offsets
+            render_t = None
+        img = self.model.render(
+            render_t,
+            w2c[None],
+            K[None],
+            img_wh,
+            means=means,
+            quats=quats,
+        )["img"][0]
         render_track_checkbox = getattr(self.viewer, "_render_track_checkbox", None)
         render_tracks = bool(render_track_checkbox.value) if render_track_checkbox is not None else False
+        if modal_oscillator is not None:
+            render_tracks = False
         if not render_tracks:
             img = (img.cpu().numpy() * 255.0).astype(np.uint8)
         else:

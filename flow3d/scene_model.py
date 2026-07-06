@@ -15,6 +15,14 @@ from flow3d.params import (
     build_dct_basis,
 )
 
+TRAJECTORY_TYPE_TO_ID = {
+    "som_basis": 0,
+    "dct_center": 1,
+    "modal_activation": 2,
+    "static": 3,
+}
+TRAJECTORY_ID_TO_TYPE = {value: key for key, value in TRAJECTORY_TYPE_TO_ID.items()}
+
 
 class SceneModel(nn.Module):
     def __init__(
@@ -45,12 +53,17 @@ class SceneModel(nn.Module):
         modal_consistency_group_count: int = 0,
         modal_consistency_target_view_index: int = -1,
         modal_consistency_fps: float = 0.0,
+        modal_synthetic_enabled: bool | Tensor = False,
     ):
         super().__init__()
-        if trajectory_type not in ("som_basis", "dct_center", "modal_activation"):
+        if trajectory_type not in TRAJECTORY_TYPE_TO_ID:
             raise ValueError(f"Unknown trajectory type: {trajectory_type}")
         self.num_frames = motion_bases.num_frames
         self.trajectory_type = trajectory_type
+        self.register_buffer(
+            "trajectory_type_id",
+            torch.tensor(TRAJECTORY_TYPE_TO_ID[trajectory_type], dtype=torch.long),
+        )
         self.fg = fg_params
         self.motion_bases = motion_bases
         self.modal = modal
@@ -110,6 +123,12 @@ class SceneModel(nn.Module):
                 )
             if modal_phi_imag is None:
                 modal_phi_imag = torch.empty_like(modal_phi_real)
+            if modal_phi_real.shape != modal_phi_imag.shape:
+                raise ValueError("modal phi real/imag tensors must have matching shapes")
+            if modal_phi_real.ndim != 3 or modal_phi_real.shape[-1] != 3:
+                raise ValueError("modal phi tensors must have shape (K, G, 3)")
+            if modal_phi_real.shape[1] != self.num_fg_gaussians:
+                raise ValueError("modal phi Gaussian dimension does not match foreground")
 
         if modal_freqs_hz is None:
             modal_freqs_hz = torch.empty(
@@ -132,6 +151,12 @@ class SceneModel(nn.Module):
         self.register_buffer("modal_phi_real", modal_phi_real)
         self.register_buffer("modal_phi_imag", modal_phi_imag)
         self.register_buffer("modal_freqs_hz", modal_freqs_hz)
+        if isinstance(modal_synthetic_enabled, Tensor):
+            modal_synthetic_enabled = bool(modal_synthetic_enabled.item())
+        self.register_buffer(
+            "modal_synthetic_enabled",
+            torch.tensor(bool(modal_synthetic_enabled), dtype=torch.bool),
+        )
         self.register_buffer("modal_frame_view_indices", modal_frame_view_indices.long())
         self.register_buffer("modal_frame_local_indices", modal_frame_local_indices.long())
         self.register_buffer("modal_smooth_triplets", modal_smooth_triplets.long())
@@ -220,6 +245,10 @@ class SceneModel(nn.Module):
     @property
     def has_modal(self) -> bool:
         return self.modal is not None
+
+    @property
+    def has_modal_field(self) -> bool:
+        return self.modal_phi_real.numel() > 0 and self.modal_phi_imag.numel() > 0
 
     @property
     def has_modal_consistency(self) -> bool:
@@ -352,6 +381,33 @@ class SceneModel(nn.Module):
         imag = activations[..., 1]
         return torch.einsum("bk,kgc->gbc", real, phi_real) - torch.einsum(
             "bk,kgc->gbc", imag, phi_imag
+        )
+
+    def compute_synthetic_modal_offsets(
+        self,
+        q: torch.Tensor,
+        motion_scale: float | torch.Tensor = 1.0,
+        inds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.has_modal_field:
+            raise RuntimeError("synthetic modal playback requires modal phi fields")
+        if q.ndim != 1 or q.shape[0] != self.modal_phi_real.shape[0]:
+            raise ValueError(
+                f"q must have shape ({self.modal_phi_real.shape[0]},), got {tuple(q.shape)}"
+            )
+        phi_real = self.modal_phi_real
+        phi_imag = self.modal_phi_imag
+        if inds is not None:
+            phi_real = phi_real[:, inds]
+            phi_imag = phi_imag[:, inds]
+        q = q.to(device=phi_real.device)
+        q_real = q.real.to(dtype=phi_real.dtype)
+        q_imag = q.imag.to(dtype=phi_real.dtype)
+        offsets = torch.einsum("k,kgc->gc", q_real, phi_real) - torch.einsum(
+            "k,kgc->gc", q_imag, phi_imag
+        )
+        return offsets * torch.as_tensor(
+            motion_scale, device=offsets.device, dtype=offsets.dtype
         )
 
     def compute_activation_smoothness_loss(self) -> torch.Tensor:
@@ -498,7 +554,10 @@ class SceneModel(nn.Module):
             means = means[inds]
             quats = quats[inds]
         if ts is not None:
-            if self.trajectory_type == "dct_center":
+            if self.trajectory_type == "static":
+                means = means[:, None].expand(-1, ts.shape[0], -1)
+                quats = quats[:, None].expand(-1, ts.shape[0], -1)
+            elif self.trajectory_type == "dct_center":
                 means = means[:, None] + self.compute_dct_offsets(ts, inds)
                 quats = quats[:, None].expand(-1, ts.shape[0], -1)
             elif self.trajectory_type == "modal_activation":
@@ -583,12 +642,18 @@ class SceneModel(nn.Module):
                 state_dict, prefix=f"{prefix}camera_poses.params."
             )
 
-        if f"{prefix}modal.params.activations" in state_dict:
-            trajectory_type = "modal_activation"
-        elif f"{prefix}fg.params.traj_coefs" in state_dict:
-            trajectory_type = "dct_center"
+        if f"{prefix}trajectory_type_id" in state_dict:
+            trajectory_type_id = int(state_dict[f"{prefix}trajectory_type_id"].item())
+            if trajectory_type_id not in TRAJECTORY_ID_TO_TYPE:
+                raise ValueError(f"Unknown trajectory type id: {trajectory_type_id}")
+            trajectory_type = TRAJECTORY_ID_TO_TYPE[trajectory_type_id]
         else:
-            trajectory_type = "som_basis"
+            if f"{prefix}modal.params.activations" in state_dict:
+                trajectory_type = "modal_activation"
+            elif f"{prefix}fg.params.traj_coefs" in state_dict:
+                trajectory_type = "dct_center"
+            else:
+                trajectory_type = "som_basis"
         cano_t = None
         if f"{prefix}cano_t" in state_dict:
             cano_t_tensor = state_dict[f"{prefix}cano_t"]
@@ -612,13 +677,15 @@ class SceneModel(nn.Module):
         modal_consistency_group_count = 0
         modal_consistency_target_view_index = -1
         modal_consistency_fps = 0.0
+        if f"{prefix}modal_phi_real" in state_dict:
+            modal_phi_real = state_dict[f"{prefix}modal_phi_real"]
+            modal_phi_imag = state_dict[f"{prefix}modal_phi_imag"]
+            modal_freqs_hz = state_dict[f"{prefix}modal_freqs_hz"]
+
         if trajectory_type == "modal_activation":
             modal = ModalActivations.init_from_state_dict(
                 state_dict, prefix=f"{prefix}modal.params."
             )
-            modal_phi_real = state_dict[f"{prefix}modal_phi_real"]
-            modal_phi_imag = state_dict[f"{prefix}modal_phi_imag"]
-            modal_freqs_hz = state_dict[f"{prefix}modal_freqs_hz"]
             modal_frame_view_indices = state_dict[f"{prefix}modal_frame_view_indices"]
             modal_frame_local_indices = state_dict[f"{prefix}modal_frame_local_indices"]
             modal_smooth_triplets = state_dict[f"{prefix}modal_smooth_triplets"]
@@ -644,6 +711,10 @@ class SceneModel(nn.Module):
                 modal_consistency_fps = float(
                     state_dict[f"{prefix}modal_consistency_fps"].item()
                 )
+        modal_synthetic_enabled = state_dict.get(
+            f"{prefix}modal_synthetic_enabled",
+            torch.tensor(False),
+        )
 
         return SceneModel(
             Ks, 
@@ -671,6 +742,7 @@ class SceneModel(nn.Module):
             modal_consistency_group_count=modal_consistency_group_count,
             modal_consistency_target_view_index=modal_consistency_target_view_index,
             modal_consistency_fps=modal_consistency_fps,
+            modal_synthetic_enabled=modal_synthetic_enabled,
         )
 
     def render(
