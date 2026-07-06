@@ -88,6 +88,7 @@ class DynamicViewer(Viewer):
         playback_groups: tuple[ViewerPlaybackGroup, ...] = (),
         modal_freqs_hz: tuple[float, ...] = (),
         gaussian_center_count: int = 0,
+        modal_anchor_count: int = 0,
     ):
         self.num_frames = num_frames
         self.work_dir = Path(work_dir)
@@ -97,7 +98,9 @@ class DynamicViewer(Viewer):
         self.playback_groups = tuple(playback_groups)
         self.modal_freqs_hz = tuple(float(freq) for freq in modal_freqs_hz)
         self.gaussian_center_count = int(gaussian_center_count)
+        self.modal_anchor_count = int(modal_anchor_count)
         self._gaussian_center_handle = None
+        self._modal_anchor_handle = None
         for group in self.playback_groups:
             if len(group.global_timestamps) == 0:
                 raise ValueError(f"Playback group {group.label!r} has no frames")
@@ -159,7 +162,7 @@ class DynamicViewer(Viewer):
         self._render_track_checkbox = server.gui.add_checkbox("Render tracks", False)
         self._render_track_checkbox.on_update(self.rerender)
         self._define_modal_playback_guis()
-        self._define_gaussian_center_guis()
+        self._define_debug_point_guis()
         self._define_camera_guis()
 
         tabs = server.gui.add_tab_group()
@@ -261,59 +264,111 @@ class DynamicViewer(Viewer):
             "modes": tuple(modes),
         }
 
-    def _define_gaussian_center_guis(self) -> None:
-        self._gaussian_center_handles = None
-        if self.gaussian_center_count <= 0:
+    def _define_debug_point_guis(self) -> None:
+        self._debug_point_handles = None
+        if self.gaussian_center_count <= 0 and self.modal_anchor_count <= 0:
             return
-        max_count = max(int(self.gaussian_center_count), 1)
-        step = max(max_count // 200, 1)
-        with self.server.gui.add_folder("Gaussian centers"):
-            show = self.server.gui.add_checkbox("Show moving centers", False)
+        max_gaussian_count = max(int(self.gaussian_center_count), 1)
+        gaussian_step = max(max_gaussian_count // 200, 1)
+        max_anchor_count = max(int(self.modal_anchor_count), 1)
+        anchor_step = max(max_anchor_count // 200, 1)
+        with self.server.gui.add_folder("Debug points"):
+            hide_render = self.server.gui.add_checkbox("Hide Gaussian render", False)
+            show_centers = self.server.gui.add_checkbox("Show Gaussian centers", False)
             fg_only = self.server.gui.add_checkbox("Foreground only", True)
-            count = self.server.gui.add_slider(
-                "Visible count",
+            center_count = self.server.gui.add_slider(
+                "Center visible count",
                 min=0,
-                max=max_count,
-                step=step,
-                initial_value=min(2000, max_count),
+                max=max_gaussian_count,
+                step=gaussian_step,
+                initial_value=min(2000, max_gaussian_count),
             )
-            point_size = self.server.gui.add_slider(
-                "Point size",
-                min=0.001,
-                max=0.05,
-                step=0.001,
-                initial_value=0.01,
+            center_point_size = self.server.gui.add_slider(
+                "Center point size",
+                min=0.0002,
+                max=0.008,
+                step=0.0001,
+                initial_value=0.002,
             )
-        self._gaussian_center_handles = {
-            "show": show,
+            show_anchors = None
+            anchor_count = None
+            anchor_point_size = None
+            if self.modal_anchor_count > 0:
+                show_anchors = self.server.gui.add_checkbox("Show modal anchors", False)
+                anchor_count = self.server.gui.add_slider(
+                    "Anchor visible count",
+                    min=0,
+                    max=max_anchor_count,
+                    step=anchor_step,
+                    initial_value=min(5000, max_anchor_count),
+                )
+                anchor_point_size = self.server.gui.add_slider(
+                    "Anchor point size",
+                    min=0.0002,
+                    max=0.008,
+                    step=0.0001,
+                    initial_value=0.002,
+                )
+        self._debug_point_handles = {
+            "hide_render": hide_render,
+            "show_centers": show_centers,
             "fg_only": fg_only,
-            "count": count,
-            "point_size": point_size,
+            "center_count": center_count,
+            "center_point_size": center_point_size,
+            "show_anchors": show_anchors,
+            "anchor_count": anchor_count,
+            "anchor_point_size": anchor_point_size,
         }
 
         def _on_update(event) -> None:
-            if not bool(show.value):
+            if not bool(show_centers.value):
                 self._remove_gaussian_center_cloud()
+            if show_anchors is not None and not bool(show_anchors.value):
+                self._remove_modal_anchor_cloud()
             self.rerender(event)
 
-        show.on_update(_on_update)
+        hide_render.on_update(_on_update)
+        show_centers.on_update(_on_update)
         fg_only.on_update(_on_update)
-        count.on_update(_on_update)
-        point_size.on_update(_on_update)
+        center_count.on_update(_on_update)
+        center_point_size.on_update(_on_update)
+        if show_anchors is not None:
+            show_anchors.on_update(_on_update)
+        if anchor_count is not None:
+            anchor_count.on_update(_on_update)
+        if anchor_point_size is not None:
+            anchor_point_size.on_update(_on_update)
 
     def _remove_gaussian_center_cloud(self) -> None:
         if self._gaussian_center_handle is not None:
             self._gaussian_center_handle.remove()
             self._gaussian_center_handle = None
 
+    def _remove_modal_anchor_cloud(self) -> None:
+        if self._modal_anchor_handle is not None:
+            self._modal_anchor_handle.remove()
+            self._modal_anchor_handle = None
+
+    def hide_gaussian_render(self) -> bool:
+        handles = getattr(self, "_debug_point_handles", None)
+        return handles is not None and bool(handles["hide_render"].value)
+
     def wants_gaussian_centers(self) -> bool:
-        handles = getattr(self, "_gaussian_center_handles", None)
-        return handles is not None and bool(handles["show"].value)
+        handles = getattr(self, "_debug_point_handles", None)
+        return handles is not None and bool(handles["show_centers"].value)
+
+    def wants_modal_anchors(self) -> bool:
+        handles = getattr(self, "_debug_point_handles", None)
+        return (
+            handles is not None
+            and handles["show_anchors"] is not None
+            and bool(handles["show_anchors"].value)
+        )
 
     def update_gaussian_centers(self, points: np.ndarray, fg_count: int) -> None:
         if not self.wants_gaussian_centers():
             return
-        handles = self._gaussian_center_handles
+        handles = self._debug_point_handles
         assert handles is not None
 
         points = np.asarray(points, dtype=np.float32)
@@ -328,7 +383,9 @@ class DynamicViewer(Viewer):
         else:
             selectable = np.arange(points.shape[0], dtype=np.int64)
 
-        visible_count = min(max(int(handles["count"].value), 0), selectable.shape[0])
+        visible_count = min(
+            max(int(handles["center_count"].value), 0), selectable.shape[0]
+        )
         self._remove_gaussian_center_cloud()
         if visible_count == 0:
             return
@@ -342,7 +399,33 @@ class DynamicViewer(Viewer):
             "/debug/gaussian_centers",
             points=points[selected],
             colors=colors,
-            point_size=float(handles["point_size"].value),
+            point_size=float(handles["center_point_size"].value),
+        )
+
+    def update_modal_anchors(self, points: np.ndarray) -> None:
+        if not self.wants_modal_anchors():
+            return
+        handles = self._debug_point_handles
+        assert handles is not None
+        assert handles["anchor_count"] is not None
+        assert handles["anchor_point_size"] is not None
+
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"Modal anchors must have shape (N,3), got {points.shape}")
+
+        visible_count = min(max(int(handles["anchor_count"].value), 0), points.shape[0])
+        self._remove_modal_anchor_cloud()
+        if visible_count == 0:
+            return
+
+        selected = np.arange(visible_count, dtype=np.int64)
+        colors = np.full((visible_count, 3), [0.05, 0.55, 1.0], dtype=np.float32)
+        self._modal_anchor_handle = self.server.scene.add_point_cloud(
+            "/debug/modal_anchors",
+            points=points[selected],
+            colors=colors,
+            point_size=float(handles["anchor_point_size"].value),
         )
 
     def current_modal_oscillator(self) -> tuple[np.ndarray, float] | None:

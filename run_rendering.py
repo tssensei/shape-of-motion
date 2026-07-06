@@ -1,6 +1,8 @@
+import json
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import tyro
@@ -19,6 +21,7 @@ class RenderConfig:
     port: int = 8890
     ckpt_path: str | None = None
     vggt_view_config: tuple[str, ...] = ()
+    modal_anchor_manifest: str | None = None
 
 
 def main(cfg: RenderConfig):
@@ -34,6 +37,13 @@ def main(cfg: RenderConfig):
     vggt_view_configs = cfg.vggt_view_config or tuple(
         train_cfg.get("vggt_view_configs") or ()
     )
+    modal_anchor_manifest = cfg.modal_anchor_manifest
+    if modal_anchor_manifest is None:
+        binding_diag_path = Path(ckpt_path).with_suffix(".modal_binding.json")
+        if binding_diag_path.exists():
+            with binding_diag_path.open("r", encoding="utf-8") as f:
+                binding_diag = json.load(f)
+            modal_anchor_manifest = binding_diag.get("modal_manifest")
 
     renderer = Renderer.init_from_checkpoint(
         ckpt_path,
@@ -42,6 +52,7 @@ def main(cfg: RenderConfig):
         work_dir=cfg.work_dir,
         port=cfg.port,
         vggt_view_configs=vggt_view_configs,
+        modal_anchor_manifest=modal_anchor_manifest,
     )
 
     guru.info(f"Starting rendering from {renderer.global_step=}")

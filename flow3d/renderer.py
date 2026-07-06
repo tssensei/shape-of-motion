@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from loguru import logger as guru
 from nerfview import CameraState
 
+from flow3d.modal_utils import load_modal_modes
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import draw_tracks_2d_th, get_server
 from flow3d.vis.viewer import (
@@ -23,6 +24,7 @@ class Renderer:
         work_dir: str,
         port: int | None = None,
         vggt_view_configs: tuple[str, ...] = (),
+        modal_anchor_manifest: str | None = None,
     ):
         self.device = device
 
@@ -32,6 +34,12 @@ class Renderer:
         self.work_dir = work_dir
         self.global_step = 0
         self.epoch = 0
+        (
+            self.modal_anchor_points,
+            self.modal_anchor_phi_real,
+            self.modal_anchor_phi_imag,
+            modal_anchor_freqs_hz,
+        ) = self._load_modal_anchor_data(modal_anchor_manifest)
 
         self.viewer = None
         if port is not None:
@@ -48,6 +56,8 @@ class Renderer:
                 modal_freqs_hz = tuple(
                     float(x) for x in model.modal_freqs_hz.detach().cpu().numpy()
                 )
+            elif modal_anchor_freqs_hz:
+                modal_freqs_hz = modal_anchor_freqs_hz
             server = get_server(port=port)
             self.viewer = DynamicViewer(
                 server,
@@ -61,6 +71,11 @@ class Renderer:
                 playback_groups=playback_groups,
                 modal_freqs_hz=modal_freqs_hz,
                 gaussian_center_count=model.num_gaussians,
+                modal_anchor_count=(
+                    0
+                    if self.modal_anchor_points is None
+                    else int(self.modal_anchor_points.shape[0])
+                ),
             )
 
         self.tracks_3d = self.model.compute_poses_fg(
@@ -125,6 +140,64 @@ class Renderer:
             )
         return tuple(viewer_cameras)
 
+    def _load_modal_anchor_data(
+        self, modal_anchor_manifest: str | None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, tuple[float, ...]]:
+        if modal_anchor_manifest is None:
+            return None, None, None, ()
+
+        modes = load_modal_modes(modal_anchor_manifest)
+        points = modes[0].points_world.astype(np.float32)
+        for mode in modes[1:]:
+            if mode.points_world.shape != points.shape or not np.allclose(
+                mode.points_world, points, rtol=1e-4, atol=1e-5
+            ):
+                raise ValueError(
+                    f"{modal_anchor_manifest} contains modes with different anchor points"
+                )
+        if self.model.has_modal_field and len(modes) != self.model.modal_phi_real.shape[0]:
+            raise ValueError(
+                f"{modal_anchor_manifest} has {len(modes)} modes but checkpoint has "
+                f"{self.model.modal_phi_real.shape[0]} modal fields"
+            )
+
+        phi = np.stack([mode.phi for mode in modes], axis=0).astype(np.complex64)
+        points_th = torch.as_tensor(points, device=self.device, dtype=torch.float32)
+        phi_real = torch.as_tensor(phi.real, device=self.device, dtype=torch.float32)
+        phi_imag = torch.as_tensor(phi.imag, device=self.device, dtype=torch.float32)
+        freqs_hz = tuple(float(mode.freq_hz) for mode in modes)
+        guru.info(
+            f"Loaded {points.shape[0]} modal anchor points from {modal_anchor_manifest}"
+        )
+        return points_th, phi_real, phi_imag, freqs_hz
+
+    def _current_modal_anchor_points(
+        self, modal_oscillator: tuple[np.ndarray, float] | None
+    ) -> torch.Tensor | None:
+        if self.modal_anchor_points is None:
+            return None
+        points = self.modal_anchor_points
+        if modal_oscillator is None:
+            return points
+
+        assert self.modal_anchor_phi_real is not None
+        assert self.modal_anchor_phi_imag is not None
+        q_np, motion_scale = modal_oscillator
+        if q_np.shape[0] != self.modal_anchor_phi_real.shape[0]:
+            raise ValueError(
+                f"Modal oscillator has {q_np.shape[0]} modes but anchors have "
+                f"{self.modal_anchor_phi_real.shape[0]}"
+            )
+        q = torch.from_numpy(q_np).to(self.device)
+        q_real = q.real.to(dtype=self.modal_anchor_phi_real.dtype)
+        q_imag = q.imag.to(dtype=self.modal_anchor_phi_imag.dtype)
+        offsets = torch.einsum("k,knc->nc", q_real, self.modal_anchor_phi_real) - torch.einsum(
+            "k,knc->nc", q_imag, self.modal_anchor_phi_imag
+        )
+        return points + offsets * torch.as_tensor(
+            motion_scale, device=points.device, dtype=points.dtype
+        )
+
     @torch.inference_mode()
     def render_fn(self, camera_state: CameraState, img_wh: tuple[int, int]):
         if self.viewer is None:
@@ -146,7 +219,7 @@ class Renderer:
         quats = None
         render_t = t
         modal_oscillator = self.viewer.current_modal_oscillator()
-        if modal_oscillator is not None:
+        if modal_oscillator is not None and self.model.has_modal_field:
             q_np, motion_scale = modal_oscillator
             base_means, base_quats = self.model.compute_poses_all(None)
             means = base_means[:, 0].clone()
@@ -166,6 +239,12 @@ class Renderer:
                 center_means.detach().cpu().numpy(),
                 self.model.num_fg_gaussians,
             )
+        if self.viewer.wants_modal_anchors():
+            anchor_points = self._current_modal_anchor_points(modal_oscillator)
+            if anchor_points is not None:
+                self.viewer.update_modal_anchors(anchor_points.detach().cpu().numpy())
+        if self.viewer.hide_gaussian_render():
+            return np.full((H, W, 3), 255, dtype=np.uint8)
         img = self.model.render(
             render_t,
             w2c[None],
