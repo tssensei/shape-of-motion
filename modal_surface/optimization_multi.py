@@ -295,12 +295,10 @@ def _build_modal_rigid_edges(
     points: np.ndarray,
     active: np.ndarray,
     point_view_masks: np.ndarray,
-    phi_seed: np.ndarray,
     modal_rigid_k: int,
     modal_rigid_auto_radius_scale: float,
     modal_rigid_min_shared_views: int,
-    modal_rigid_motion_cos_min: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     if modal_rigid_k <= 0:
         raise ValueError("modal_rigid_k must be positive.")
     if modal_rigid_auto_radius_scale <= 0:
@@ -315,9 +313,7 @@ def _build_modal_rigid_edges(
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.float64),
-            np.zeros((0, 3), dtype=np.float64),
             np.zeros((points.shape[0],), dtype=np.int32),
-            np.zeros((0,), dtype=np.float64),
             0.0,
         )
 
@@ -335,9 +331,7 @@ def _build_modal_rigid_edges(
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.float64),
-            np.zeros((0, 3), dtype=np.float64),
             np.zeros((points.shape[0],), dtype=np.int32),
-            np.zeros((0,), dtype=np.float64),
             0.0,
         )
     radius = float(np.median(finite_neighbor_distances) * float(modal_rigid_auto_radius_scale))
@@ -352,9 +346,7 @@ def _build_modal_rigid_edges(
                 valid.append(int(neighbor_row))
         neighbor_sets.append(set(valid))
 
-    edge_data: dict[tuple[int, int], tuple[float, np.ndarray, float]] = {}
-    phi64 = phi_seed.astype(np.complex128)
-    phi_norm = np.linalg.norm(phi64, axis=1).astype(np.float64)
+    edge_data: dict[tuple[int, int], float] = {}
     for row, point_idx in enumerate(active_indices.tolist()):
         for dist, neighbor_row in zip(distances[row, 1:], neighbor_rows[row, 1:]):
             if not np.isfinite(dist) or dist <= 0 or dist > radius:
@@ -369,43 +361,28 @@ def _build_modal_rigid_edges(
                 shared = int(np.logical_and(point_view_masks[point_idx], point_view_masks[neighbor_idx]).sum())
                 if shared < int(modal_rigid_min_shared_views):
                     continue
-            denom = float(phi_norm[point_idx] * phi_norm[neighbor_idx]) + 1e-12
-            motion_cos = float(np.real(np.vdot(phi64[point_idx], phi64[neighbor_idx])) / denom)
-            if motion_cos < float(modal_rigid_motion_cos_min):
-                continue
-            edge = points[point_idx].astype(np.float64) - points[neighbor_idx].astype(np.float64)
-            edge_norm = float(np.linalg.norm(edge))
-            if edge_norm <= 1e-12:
-                continue
             a, b = sorted((int(point_idx), int(neighbor_idx)))
             if (a, b) in edge_data:
                 continue
-            direction = edge / edge_norm
-            if a != int(point_idx):
-                direction = -direction
-            edge_data[(a, b)] = (1.0 / max(float(dist), 1e-6), direction.astype(np.float64), motion_cos)
+            edge_data[(a, b)] = 1.0 / max(float(dist), 1e-6)
 
     if not edge_data:
         return (
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.float64),
-            np.zeros((0, 3), dtype=np.float64),
             np.zeros((points.shape[0],), dtype=np.int32),
-            np.zeros((0,), dtype=np.float64),
             radius,
         )
 
     sorted_pairs = sorted(edge_data)
     edges = np.asarray(sorted_pairs, dtype=np.int64)
-    weights = np.asarray([edge_data[pair][0] for pair in sorted_pairs], dtype=np.float64)
+    weights = np.asarray([edge_data[pair] for pair in sorted_pairs], dtype=np.float64)
     weights = weights / max(float(np.median(weights)), 1e-12)
-    directions = np.asarray([edge_data[pair][1] for pair in sorted_pairs], dtype=np.float64)
-    motion_cos = np.asarray([edge_data[pair][2] for pair in sorted_pairs], dtype=np.float64)
     degree = np.zeros((points.shape[0],), dtype=np.int32)
     np.add.at(degree, edges[:, 0], 1)
     np.add.at(degree, edges[:, 1], 1)
-    return edges[:, 0], edges[:, 1], weights, directions, degree, motion_cos, radius
+    return edges[:, 0], edges[:, 1], weights, degree, radius
 
 
 def _solve_phi_modal_rigid(
@@ -422,7 +399,6 @@ def _solve_phi_modal_rigid(
     modal_rigid_edge_a: np.ndarray,
     modal_rigid_edge_b: np.ndarray,
     modal_rigid_edge_weights: np.ndarray,
-    modal_rigid_edge_dirs: np.ndarray,
 ) -> np.ndarray:
     if modal_rigid_lambda <= 0:
         raise ValueError("_solve_phi_modal_rigid requires positive modal_rigid_lambda.")
@@ -441,7 +417,7 @@ def _solve_phi_modal_rigid(
     keep_obs = active[obs_point_index]
     obs_rows = np.where(keep_obs)[0]
     data_rows = obs_rows.size * 2
-    edge_rows = modal_rigid_edge_a.size
+    edge_rows = modal_rigid_edge_a.size * 3
     ridge_rows = active_indices.size * 3
     total_rows = data_rows + edge_rows + ridge_rows
     total_cols = active_indices.size * 3
@@ -470,23 +446,32 @@ def _solve_phi_modal_rigid(
 
     edge_start = data_rows
     rigid_weight = np.sqrt(float(modal_rigid_lambda) * np.maximum(modal_rigid_edge_weights, 0.0))
-    edge_rows_idx = edge_start + np.arange(modal_rigid_edge_a.size, dtype=np.int64)
     edge_local_a = active_to_col[modal_rigid_edge_a]
     edge_local_b = active_to_col[modal_rigid_edge_b]
-    row_idx.append(np.repeat(edge_rows_idx, 6))
+    edge_rows_idx = (edge_start + np.arange(edge_rows, dtype=np.int64)).reshape(modal_rigid_edge_a.size, 3)
+    row_idx.append(np.repeat(edge_rows_idx.reshape(-1), 2))
     col_idx.append(
         np.column_stack(
             [
                 edge_local_a * 3,
-                edge_local_a * 3 + 1,
-                edge_local_a * 3 + 2,
                 edge_local_b * 3,
+                edge_local_a * 3 + 1,
                 edge_local_b * 3 + 1,
+                edge_local_a * 3 + 2,
                 edge_local_b * 3 + 2,
             ]
         ).reshape(-1)
     )
-    rigid_vals = rigid_weight[:, None] * np.column_stack([modal_rigid_edge_dirs, -modal_rigid_edge_dirs])
+    rigid_vals = np.column_stack(
+        [
+            rigid_weight,
+            -rigid_weight,
+            rigid_weight,
+            -rigid_weight,
+            rigid_weight,
+            -rigid_weight,
+        ]
+    )
     values.append(rigid_vals.reshape(-1).astype(np.complex128))
 
     ridge_start = data_rows + edge_rows
@@ -513,7 +498,6 @@ def _modal_rigid_residual(
     phi: np.ndarray,
     edge_a: np.ndarray,
     edge_b: np.ndarray,
-    edge_dirs: np.ndarray,
     active: np.ndarray,
 ) -> np.ndarray:
     residual = np.zeros((phi.shape[0],), dtype=np.float32)
@@ -521,15 +505,170 @@ def _modal_rigid_residual(
     if edge_a.size == 0:
         residual[~active] = np.inf
         return residual
-    diff = phi[edge_a].astype(np.complex128) - phi[edge_b].astype(np.complex128)
-    stretch = np.abs(np.sum(edge_dirs.astype(np.float64) * diff, axis=1)).astype(np.float64)
-    np.add.at(residual, edge_a, stretch)
-    np.add.at(residual, edge_b, stretch)
+    diff = np.linalg.norm(phi[edge_a] - phi[edge_b], axis=1).astype(np.float64)
+    np.add.at(residual, edge_a, diff)
+    np.add.at(residual, edge_b, diff)
     np.add.at(counts, edge_a, 1.0)
     np.add.at(counts, edge_b, 1.0)
     residual = (residual.astype(np.float64) / np.maximum(counts, 1.0)).astype(np.float32)
     residual[~active] = np.inf
     return residual
+
+
+def _propagate_modal_motion_to_unobserved(
+    points: np.ndarray,
+    phi: np.ndarray,
+    obs_count_per_point: np.ndarray,
+    active: np.ndarray,
+    modal_fill_k: int,
+    modal_fill_auto_radius_scale: float,
+    modal_fill_anchor_min_observations: int,
+    modal_fill_ridge_mu: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    if modal_fill_k <= 0:
+        raise ValueError("modal_fill_k must be positive.")
+    if modal_fill_auto_radius_scale <= 0:
+        raise ValueError("modal_fill_auto_radius_scale must be positive.")
+    if modal_fill_anchor_min_observations <= 0:
+        raise ValueError("modal_fill_anchor_min_observations must be positive.")
+    if modal_fill_ridge_mu < 0:
+        raise ValueError("modal_fill_ridge_mu must be non-negative.")
+
+    sp, spla, cKDTree = _require_scipy_for_graph_smoothing()
+    filled_phi = phi.copy()
+    fill_degree = np.zeros((points.shape[0],), dtype=np.int32)
+    target_mask = active & (obs_count_per_point < int(modal_fill_anchor_min_observations))
+    anchor_mask = active & (obs_count_per_point >= int(modal_fill_anchor_min_observations))
+    connected_to_anchor = np.zeros((points.shape[0],), dtype=bool)
+    if not np.any(target_mask):
+        return filled_phi, target_mask, connected_to_anchor, fill_degree, 0.0
+    if not np.any(anchor_mask):
+        raise ValueError("Modal fill has target points but no anchor points; lower --modal-fill-anchor-min-observations.")
+
+    active_indices = np.where(active)[0]
+    if active_indices.size < 2:
+        raise ValueError("Modal fill requires at least two active points.")
+    k = min(int(modal_fill_k) + 1, int(active_indices.size))
+    tree = cKDTree(points[active_indices].astype(np.float64))
+    distances, neighbor_rows = tree.query(points[active_indices].astype(np.float64), k=k)
+    if k == 1:
+        distances = distances[:, None]
+        neighbor_rows = neighbor_rows[:, None]
+
+    neighbor_distances = distances[:, 1:] if distances.shape[1] > 1 else distances
+    finite_neighbor_distances = neighbor_distances[np.isfinite(neighbor_distances) & (neighbor_distances > 0)]
+    if finite_neighbor_distances.size == 0:
+        raise ValueError("Modal fill could not find finite neighbor distances.")
+    radius = float(np.median(finite_neighbor_distances) * float(modal_fill_auto_radius_scale))
+    if radius <= 0:
+        raise ValueError("modal fill auto radius is non-positive.")
+
+    target_to_col = np.full((points.shape[0],), -1, dtype=np.int64)
+    target_indices = np.where(target_mask)[0]
+    target_to_col[target_indices] = np.arange(target_indices.size, dtype=np.int64)
+
+    edge_data: dict[tuple[int, int], float] = {}
+    for row, point_idx in enumerate(active_indices.tolist()):
+        for dist, neighbor_row in zip(distances[row, 1:], neighbor_rows[row, 1:]):
+            if not np.isfinite(dist) or dist <= 0 or dist > radius:
+                continue
+            neighbor_idx = int(active_indices[int(neighbor_row)])
+            if point_idx == neighbor_idx:
+                continue
+            if not (target_mask[point_idx] or target_mask[neighbor_idx]):
+                continue
+            a, b = sorted((int(point_idx), int(neighbor_idx)))
+            edge_data[(a, b)] = min(float(dist), edge_data.get((a, b), float(dist)))
+
+    if not edge_data:
+        raise ValueError(
+            "Modal fill produced no propagation edges; increase --modal-fill-auto-radius-scale "
+            "or --modal-fill-k."
+        )
+
+    sorted_edges = sorted(edge_data)
+    edges = np.asarray(sorted_edges, dtype=np.int64)
+    distances_arr = np.asarray([edge_data[pair] for pair in sorted_edges], dtype=np.float64)
+    weights = 1.0 / np.maximum(distances_arr, 1e-6)
+    weights = weights / max(float(np.median(weights)), 1e-12)
+    np.add.at(fill_degree, edges[:, 0], 1)
+    np.add.at(fill_degree, edges[:, 1], 1)
+
+    adjacency: list[list[int]] = [[] for _ in range(points.shape[0])]
+    for a, b in edges.tolist():
+        adjacency[a].append(b)
+        adjacency[b].append(a)
+    queue = [int(i) for i in np.where(anchor_mask & (fill_degree > 0))[0]]
+    for idx in queue:
+        connected_to_anchor[idx] = True
+    cursor = 0
+    while cursor < len(queue):
+        node = queue[cursor]
+        cursor += 1
+        for neighbor in adjacency[node]:
+            if not active[neighbor] or connected_to_anchor[neighbor]:
+                continue
+            connected_to_anchor[neighbor] = True
+            queue.append(neighbor)
+
+    edge_rows = []
+    edge_cols = []
+    edge_vals = []
+    rhs_base = np.zeros((edges.shape[0] + target_indices.size,), dtype=np.float64)
+    row_count = 0
+    for edge_idx, (a, b) in enumerate(edges.tolist()):
+        weight = float(np.sqrt(weights[edge_idx]))
+        a_is_target = target_mask[a]
+        b_is_target = target_mask[b]
+        if a_is_target and b_is_target:
+            edge_rows.extend([row_count, row_count])
+            edge_cols.extend([int(target_to_col[a]), int(target_to_col[b])])
+            edge_vals.extend([weight, -weight])
+        elif a_is_target:
+            edge_rows.append(row_count)
+            edge_cols.append(int(target_to_col[a]))
+            edge_vals.append(weight)
+            rhs_base[row_count] = weight
+        elif b_is_target:
+            edge_rows.append(row_count)
+            edge_cols.append(int(target_to_col[b]))
+            edge_vals.append(weight)
+            rhs_base[row_count] = weight
+        row_count += 1
+
+    if modal_fill_ridge_mu > 0:
+        ridge_weight = float(np.sqrt(modal_fill_ridge_mu))
+        for local_idx in range(target_indices.size):
+            edge_rows.append(row_count)
+            edge_cols.append(local_idx)
+            edge_vals.append(ridge_weight)
+            row_count += 1
+
+    if row_count == 0:
+        raise ValueError("Modal fill produced an empty sparse system.")
+    matrix = sp.coo_matrix(
+        (
+            np.asarray(edge_vals, dtype=np.complex128),
+            (np.asarray(edge_rows, dtype=np.int64), np.asarray(edge_cols, dtype=np.int64)),
+        ),
+        shape=(row_count, target_indices.size),
+        dtype=np.complex128,
+    ).tocsr()
+
+    solution = np.zeros((target_indices.size, 3), dtype=np.complex128)
+    for comp in range(3):
+        rhs = np.zeros((row_count,), dtype=np.complex128)
+        rhs[: edges.shape[0]] = rhs_base[: edges.shape[0]].astype(np.complex128)
+        for edge_idx, (a, b) in enumerate(edges.tolist()):
+            weight_rhs = rhs_base[edge_idx]
+            if weight_rhs == 0:
+                continue
+            anchor_idx = b if target_mask[a] else a
+            rhs[edge_idx] = weight_rhs * np.complex128(phi[anchor_idx, comp])
+        solution[:, comp] = spla.lsmr(matrix, rhs, atol=1e-6, btol=1e-6)[0]
+
+    filled_phi[target_indices] = solution.astype(np.complex64)
+    return filled_phi, target_mask, connected_to_anchor, fill_degree, radius
 
 
 def _predict_observations(obs_J: np.ndarray, obs_point_index: np.ndarray, obs_view_index: np.ndarray, phi: np.ndarray, alphas: np.ndarray) -> np.ndarray:
@@ -743,9 +882,12 @@ def optimize_multi_view(
     modal_rigid_lambda: float = 0.0,
     modal_rigid_k: int = 8,
     modal_rigid_auto_radius_scale: float = 2.0,
-    modal_rigid_min_shared_views: int = 1,
-    modal_rigid_motion_cos_min: float = 0.3,
-    modal_rigid_bootstrap_iterations: int = 3,
+    modal_rigid_min_shared_views: int = 0,
+    modal_fill_unobserved: bool = False,
+    modal_fill_k: int = 4,
+    modal_fill_auto_radius_scale: float = 1.0,
+    modal_fill_anchor_min_observations: int = 1,
+    modal_fill_ridge_mu: float = 1e-6,
     obs_count_weight_1: float = 0.25,
     obs_count_weight_2: float = 0.75,
     obs_count_weight_3plus: float = 1.0,
@@ -777,10 +919,14 @@ def optimize_multi_view(
         raise ValueError("modal_rigid_auto_radius_scale must be positive.")
     if modal_rigid_min_shared_views < 0:
         raise ValueError("modal_rigid_min_shared_views must be non-negative.")
-    if not (-1.0 <= modal_rigid_motion_cos_min <= 1.0):
-        raise ValueError("modal_rigid_motion_cos_min must be in [-1, 1].")
-    if modal_rigid_bootstrap_iterations <= 0:
-        raise ValueError("modal_rigid_bootstrap_iterations must be positive.")
+    if modal_fill_k <= 0:
+        raise ValueError("modal_fill_k must be positive.")
+    if modal_fill_auto_radius_scale <= 0:
+        raise ValueError("modal_fill_auto_radius_scale must be positive.")
+    if modal_fill_anchor_min_observations <= 0:
+        raise ValueError("modal_fill_anchor_min_observations must be positive.")
+    if modal_fill_ridge_mu < 0:
+        raise ValueError("modal_fill_ridge_mu must be non-negative.")
     if graph_smooth_lambda > 0 and single_view_smooth_lambda > 0:
         raise ValueError("Use either graph smoothing or single-view smoothing, not both.")
     if modal_rigid_lambda > 0 and graph_smooth_lambda > 0:
@@ -852,44 +998,37 @@ def optimize_multi_view(
     modal_rigid_residual = np.zeros((points.shape[0],), dtype=np.float32)
     modal_rigid_edge_count = 0
     modal_rigid_auto_radius = 0.0
-    modal_rigid_motion_cos_p50 = 0.0
-    modal_rigid_motion_cos_p90 = 0.0
     modal_rigid_edge_a = np.zeros((0,), dtype=np.int64)
     modal_rigid_edge_b = np.zeros((0,), dtype=np.int64)
     modal_rigid_edge_weights = np.zeros((0,), dtype=np.float64)
-    modal_rigid_edge_dirs = np.zeros((0, 3), dtype=np.float64)
+    modal_fill_target_mask = np.zeros((points.shape[0],), dtype=bool)
+    modal_fill_connected_to_anchor = np.zeros((points.shape[0],), dtype=bool)
+    modal_fill_degree = np.zeros((points.shape[0],), dtype=np.int32)
+    modal_fill_auto_radius = 0.0
 
     if modal_rigid_lambda > 0:
-        for _ in range(int(modal_rigid_bootstrap_iterations)):
-            phi = _solve_phi_points(obs_y, obs_J, obs_confidence, obs_view_index, obs_by_point, active, alphas, ridge_mu)
-            alphas = _solve_alphas(obs_y, obs_J, obs_point_index, obs_view_index, obs_confidence, active, phi, num_views)
         point_view_masks = _point_view_masks(points.shape[0], obs_point_index, obs_view_index, num_views)
         (
             modal_rigid_edge_a,
             modal_rigid_edge_b,
             modal_rigid_edge_weights,
-            modal_rigid_edge_dirs,
             modal_rigid_degree,
-            modal_rigid_motion_cos,
             modal_rigid_auto_radius,
         ) = _build_modal_rigid_edges(
             points,
             active,
             point_view_masks,
-            phi,
             modal_rigid_k,
             modal_rigid_auto_radius_scale,
             modal_rigid_min_shared_views,
-            modal_rigid_motion_cos_min,
         )
         if modal_rigid_edge_a.size == 0:
             raise ValueError(
-                "Modal rigidity produced no valid edges; lower --modal-rigid-motion-cos-min, "
-                "increase --modal-rigid-auto-radius-scale, or run with --modal-rigid-lambda 0."
+                "Modal rigidity produced no valid local consensus edges; increase "
+                "--modal-rigid-auto-radius-scale, increase --modal-rigid-k, lower "
+                "--modal-rigid-min-shared-views, or run with --modal-rigid-lambda 0."
             )
         modal_rigid_edge_count = int(modal_rigid_edge_a.size)
-        modal_rigid_motion_cos_p50 = float(np.percentile(modal_rigid_motion_cos, 50))
-        modal_rigid_motion_cos_p90 = float(np.percentile(modal_rigid_motion_cos, 90))
 
     for it in range(iterations):
         if int(active.sum()) < 3:
@@ -934,11 +1073,10 @@ def optimize_multi_view(
                 modal_rigid_edge_a,
                 modal_rigid_edge_b,
                 modal_rigid_edge_weights,
-                modal_rigid_edge_dirs,
             )
             graph_smooth_residual = np.zeros((points.shape[0],), dtype=np.float32)
             graph_smooth_residual[~active] = np.inf
-            modal_rigid_residual = _modal_rigid_residual(phi, modal_rigid_edge_a, modal_rigid_edge_b, modal_rigid_edge_dirs, active)
+            modal_rigid_residual = _modal_rigid_residual(phi, modal_rigid_edge_a, modal_rigid_edge_b, active)
             alpha_confidence = obs_confidence
             iteration_regularizer_residual = modal_rigid_residual
         else:
@@ -990,6 +1128,27 @@ def optimize_multi_view(
             single_view_smooth_lambda,
             single_view_smooth_k,
             single_view_anchor_min_observations,
+        )
+        pred_y = _predict_observations(obs_J, obs_point_index, obs_view_index, phi, alphas)
+        obs_residual = _obs_residual(obs_y, pred_y)
+        point_residual = _point_residuals(points.shape[0], obs_point_index, obs_residual, active)
+
+    if modal_fill_unobserved:
+        (
+            phi,
+            modal_fill_target_mask,
+            modal_fill_connected_to_anchor,
+            modal_fill_degree,
+            modal_fill_auto_radius,
+        ) = _propagate_modal_motion_to_unobserved(
+            points,
+            phi,
+            obs_count_per_point,
+            active,
+            modal_fill_k,
+            modal_fill_auto_radius_scale,
+            modal_fill_anchor_min_observations,
+            modal_fill_ridge_mu,
         )
         pred_y = _predict_observations(obs_J, obs_point_index, obs_view_index, phi, alphas)
         obs_residual = _obs_residual(obs_y, pred_y)
@@ -1054,14 +1213,29 @@ def optimize_multi_view(
         modal_rigid_k=np.array(modal_rigid_k, dtype=np.int32),
         modal_rigid_auto_radius_scale=np.array(modal_rigid_auto_radius_scale, dtype=np.float32),
         modal_rigid_min_shared_views=np.array(modal_rigid_min_shared_views, dtype=np.int32),
-        modal_rigid_motion_cos_min=np.array(modal_rigid_motion_cos_min, dtype=np.float32),
-        modal_rigid_bootstrap_iterations=np.array(modal_rigid_bootstrap_iterations, dtype=np.int32),
         modal_rigid_edge_count=np.array(modal_rigid_edge_count, dtype=np.int64),
         modal_rigid_degree=modal_rigid_degree[active_indices].astype(np.int32),
         modal_rigid_residual=modal_rigid_residual[active_indices].astype(np.float32),
         modal_rigid_auto_radius=np.array(modal_rigid_auto_radius, dtype=np.float32),
-        modal_rigid_motion_cos_p50=np.array(modal_rigid_motion_cos_p50, dtype=np.float32),
-        modal_rigid_motion_cos_p90=np.array(modal_rigid_motion_cos_p90, dtype=np.float32),
+        modal_fill_enabled=np.array(bool(modal_fill_unobserved)),
+        modal_fill_k=np.array(modal_fill_k, dtype=np.int32),
+        modal_fill_auto_radius_scale=np.array(modal_fill_auto_radius_scale, dtype=np.float32),
+        modal_fill_anchor_min_observations=np.array(modal_fill_anchor_min_observations, dtype=np.int32),
+        modal_fill_ridge_mu=np.array(modal_fill_ridge_mu, dtype=np.float32),
+        modal_fill_auto_radius=np.array(modal_fill_auto_radius, dtype=np.float32),
+        modal_fill_target_mask=modal_fill_target_mask[active_indices].astype(bool),
+        modal_fill_connected_to_anchor=modal_fill_connected_to_anchor[active_indices].astype(bool),
+        modal_fill_degree=modal_fill_degree[active_indices].astype(np.int32),
+        modal_fill_anchor_count=np.array(
+            int((active & (obs_count_per_point >= int(modal_fill_anchor_min_observations))).sum()) if modal_fill_unobserved else 0,
+            dtype=np.int64,
+        ),
+        modal_fill_target_count=np.array(
+            int((active & (obs_count_per_point < int(modal_fill_anchor_min_observations))).sum()) if modal_fill_unobserved else 0,
+            dtype=np.int64,
+        ),
+        modal_fill_filled_count=np.array(int((modal_fill_target_mask & modal_fill_connected_to_anchor).sum()) if modal_fill_unobserved else 0, dtype=np.int64),
+        modal_fill_unfilled_count=np.array(int((modal_fill_target_mask & ~modal_fill_connected_to_anchor).sum()) if modal_fill_unobserved else 0, dtype=np.int64),
         obs_count_weight_1=np.array(obs_count_weight_1, dtype=np.float32),
         obs_count_weight_2=np.array(obs_count_weight_2, dtype=np.float32),
         obs_count_weight_3plus=np.array(obs_count_weight_3plus, dtype=np.float32),

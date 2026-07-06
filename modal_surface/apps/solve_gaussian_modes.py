@@ -40,7 +40,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pixel-candidate-k", type=int, default=4, help="Number of nearby projected Gaussians supervised by each sampled pixel.")
     parser.add_argument("--pixel-search-radius", type=int, default=6, help="Search radius in pixels for pixel-candidates sampling.")
     parser.add_argument("--pixel-weight-sigma", type=float, default=3.0, help="Gaussian pixel-distance weighting sigma for pixel-candidates observations.")
-    parser.add_argument("--pixel-min-mode-amp-percentile", type=float, default=50.0, help="Discard sampled modal pixels below this foreground amplitude percentile.")
+    parser.add_argument("--pixel-min-mode-amp-percentile", type=float, default=0.0, help="Discard sampled modal pixels below this foreground amplitude percentile.")
     parser.add_argument("--pixel-max-samples-per-view", type=int, default=20000, help="Maximum sampled modal pixels per view before candidate expansion.")
     parser.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
     parser.add_argument("--zbuffer-radius", type=int, default=5, help="Local robust z-buffer window radius in pixels.")
@@ -77,12 +77,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--graph-smooth-k", type=int, default=8, help="Number of nearest neighbors used to build the graph.")
     parser.add_argument("--graph-auto-radius-scale", type=float, default=2.5, help="Multiplier on median kth-neighbor distance for graph edge pruning.")
     parser.add_argument("--graph-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a graph edge.")
-    parser.add_argument("--modal-rigid-lambda", type=float, default=0.0, help="Edge-stretch modal rigidity weight.")
-    parser.add_argument("--modal-rigid-k", type=int, default=8, help="Nearest-neighbor count used for modal rigidity candidate edges.")
-    parser.add_argument("--modal-rigid-auto-radius-scale", type=float, default=2.0, help="Multiplier on median kth-neighbor distance for modal rigidity edge pruning.")
-    parser.add_argument("--modal-rigid-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a modal rigidity edge.")
-    parser.add_argument("--modal-rigid-motion-cos-min", type=float, default=0.3, help="Minimum initial modal motion cosine similarity required for a modal rigidity edge.")
-    parser.add_argument("--modal-rigid-bootstrap-iterations", type=int, default=3, help="No-rigidity ALS iterations used to initialize modal rigidity edge compatibility.")
+    parser.add_argument("--modal-rigid-lambda", type=float, default=0.0, help="Local full-vector modal consensus weight.")
+    parser.add_argument("--modal-rigid-k", type=int, default=8, help="Nearest-neighbor count used for local modal consensus edges.")
+    parser.add_argument("--modal-rigid-auto-radius-scale", type=float, default=2.0, help="Multiplier on median kth-neighbor distance for local modal consensus edge pruning.")
+    parser.add_argument("--modal-rigid-min-shared-views", type=int, default=0, help="Minimum shared observed views required for a local modal consensus edge.")
+    parser.add_argument("--modal-fill-unobserved", action="store_true", help="Propagate solved modal motion from observed Gaussians to unobserved Gaussians.")
+    parser.add_argument("--modal-fill-k", type=int, default=4, help="Nearest-neighbor count used for modal motion propagation.")
+    parser.add_argument("--modal-fill-auto-radius-scale", type=float, default=1.0, help="Multiplier on median neighbor distance for modal motion propagation edges.")
+    parser.add_argument("--modal-fill-anchor-min-observations", type=int, default=1, help="Minimum observation count for Gaussians used as modal propagation anchors.")
+    parser.add_argument("--modal-fill-ridge-mu", type=float, default=1e-6, help="Ridge regularization for propagated modal motion.")
     parser.add_argument("--obs-count-weight-1", type=float, default=0.25, help="Data weight multiplier for points observed by one view.")
     parser.add_argument("--obs-count-weight-2", type=float, default=0.75, help="Data weight multiplier for points observed by two views.")
     parser.add_argument("--obs-count-weight-3plus", type=float, default=1.0, help="Data weight multiplier for points observed by three or more views.")
@@ -148,8 +151,26 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
                 "modal_rigid_degree_max": int(modal_rigid_degree.max()) if modal_rigid_degree.size else 0,
                 "modal_rigid_residual_median": _json_float(np.median(modal_rigid_residual)),
                 "modal_rigid_residual_p90": _json_float(np.percentile(modal_rigid_residual, 90)),
-                "modal_rigid_motion_cos_p50": _json_float(np.asarray(latent["modal_rigid_motion_cos_p50"]).item()),
-                "modal_rigid_motion_cos_p90": _json_float(np.asarray(latent["modal_rigid_motion_cos_p90"]).item()),
+            }
+        )
+    if "modal_fill_enabled" in latent.files and bool(np.asarray(latent["modal_fill_enabled"]).item()):
+        modal_fill_degree = latent["modal_fill_degree"].astype(np.int32)
+        modal_fill_target_mask = latent["modal_fill_target_mask"].astype(bool)
+        modal_fill_connected = latent["modal_fill_connected_to_anchor"].astype(bool)
+        target_degree = modal_fill_degree[modal_fill_target_mask]
+        stats.update(
+            {
+                "modal_fill_anchor_count": int(np.asarray(latent["modal_fill_anchor_count"]).item()),
+                "modal_fill_target_count": int(np.asarray(latent["modal_fill_target_count"]).item()),
+                "modal_fill_filled_count": int(np.asarray(latent["modal_fill_filled_count"]).item()),
+                "modal_fill_unfilled_count": int(np.asarray(latent["modal_fill_unfilled_count"]).item()),
+                "modal_fill_auto_radius": _json_float(np.asarray(latent["modal_fill_auto_radius"]).item()),
+                "modal_fill_degree_p50": _json_float(np.percentile(target_degree, 50)) if target_degree.size else 0.0,
+                "modal_fill_degree_p90": _json_float(np.percentile(target_degree, 90)) if target_degree.size else 0.0,
+                "modal_fill_degree_max": int(target_degree.max()) if target_degree.size else 0,
+                "modal_fill_connected_fraction": _json_float(
+                    float((modal_fill_target_mask & modal_fill_connected).sum()) / max(int(modal_fill_target_mask.sum()), 1)
+                ),
             }
         )
     return stats
@@ -268,8 +289,11 @@ def run(args: argparse.Namespace) -> None:
             modal_rigid_k=args.modal_rigid_k,
             modal_rigid_auto_radius_scale=args.modal_rigid_auto_radius_scale,
             modal_rigid_min_shared_views=args.modal_rigid_min_shared_views,
-            modal_rigid_motion_cos_min=args.modal_rigid_motion_cos_min,
-            modal_rigid_bootstrap_iterations=args.modal_rigid_bootstrap_iterations,
+            modal_fill_unobserved=args.modal_fill_unobserved,
+            modal_fill_k=args.modal_fill_k,
+            modal_fill_auto_radius_scale=args.modal_fill_auto_radius_scale,
+            modal_fill_anchor_min_observations=args.modal_fill_anchor_min_observations,
+            modal_fill_ridge_mu=args.modal_fill_ridge_mu,
             obs_count_weight_1=args.obs_count_weight_1,
             obs_count_weight_2=args.obs_count_weight_2,
             obs_count_weight_3plus=args.obs_count_weight_3plus,
@@ -281,8 +305,18 @@ def run(args: argparse.Namespace) -> None:
                 f"edges={latent_stats['modal_rigid_edge_count']}, "
                 f"degree p50/p90/max={latent_stats['modal_rigid_degree_p50']:.0f}/"
                 f"{latent_stats['modal_rigid_degree_p90']:.0f}/{latent_stats['modal_rigid_degree_max']}, "
-                f"motion_cos p50/p90={latent_stats['modal_rigid_motion_cos_p50']:.3g}/"
-                f"{latent_stats['modal_rigid_motion_cos_p90']:.3g}"
+                f"residual median/p90={latent_stats['modal_rigid_residual_median']:.3g}/"
+                f"{latent_stats['modal_rigid_residual_p90']:.3g}"
+            )
+        if bool(args.modal_fill_unobserved):
+            print(
+                "Modal fill: "
+                f"anchors={latent_stats['modal_fill_anchor_count']}, "
+                f"targets={latent_stats['modal_fill_target_count']}, "
+                f"filled={latent_stats['modal_fill_filled_count']}, "
+                f"unfilled={latent_stats['modal_fill_unfilled_count']}, "
+                f"degree p50/p90/max={latent_stats['modal_fill_degree_p50']:.0f}/"
+                f"{latent_stats['modal_fill_degree_p90']:.0f}/{latent_stats['modal_fill_degree_max']}"
             )
         freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
         modes.append(
@@ -349,8 +383,11 @@ def run(args: argparse.Namespace) -> None:
             "modal_rigid_k": int(args.modal_rigid_k),
             "modal_rigid_auto_radius_scale": float(args.modal_rigid_auto_radius_scale),
             "modal_rigid_min_shared_views": int(args.modal_rigid_min_shared_views),
-            "modal_rigid_motion_cos_min": float(args.modal_rigid_motion_cos_min),
-            "modal_rigid_bootstrap_iterations": int(args.modal_rigid_bootstrap_iterations),
+            "modal_fill_unobserved": bool(args.modal_fill_unobserved),
+            "modal_fill_k": int(args.modal_fill_k),
+            "modal_fill_auto_radius_scale": float(args.modal_fill_auto_radius_scale),
+            "modal_fill_anchor_min_observations": int(args.modal_fill_anchor_min_observations),
+            "modal_fill_ridge_mu": float(args.modal_fill_ridge_mu),
             "obs_count_weight_1": float(args.obs_count_weight_1),
             "obs_count_weight_2": float(args.obs_count_weight_2),
             "obs_count_weight_3plus": float(args.obs_count_weight_3plus),
