@@ -18,6 +18,7 @@ class RenderConfig:
     work_dir: str
     port: int = 8890
     ckpt_path: str | None = None
+    vggt_view_config: tuple[str, ...] = ()
 
 
 def main(cfg: RenderConfig):
@@ -30,13 +31,17 @@ def main(cfg: RenderConfig):
     with open(train_cfg_path, "r") as file:
         train_cfg = yaml.load(file, Loader=yaml.FullLoader)
 
+    vggt_view_configs = cfg.vggt_view_config or tuple(
+        train_cfg.get("vggt_view_configs") or ()
+    )
+
     renderer = Renderer.init_from_checkpoint(
         ckpt_path,
         device,
         use_2dgs=train_cfg["use_2dgs"],
         work_dir=cfg.work_dir,
         port=cfg.port,
-        vggt_view_configs=tuple(train_cfg.get("vggt_view_configs") or ()),
+        vggt_view_configs=vggt_view_configs,
     )
 
     guru.info(f"Starting rendering from {renderer.global_step=}")

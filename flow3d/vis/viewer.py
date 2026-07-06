@@ -217,9 +217,9 @@ class DynamicViewer(Viewer):
             motion_scale = self.server.gui.add_slider(
                 "Motion scale",
                 min=0.0,
-                max=10.0,
-                step=0.01,
-                initial_value=1.0,
+                max=1.0,
+                step=0.001,
+                initial_value=0.1,
             )
             modes = []
             for mode_idx, freq_hz in enumerate(self.modal_freqs_hz):
@@ -305,6 +305,12 @@ class DynamicViewer(Viewer):
             event.client.camera.fov = camera.fov
         self.rerender(event)
 
+    def _reset_client_orbit_center(self, event) -> None:
+        if self.orbit_center is None or event.client is None:
+            return
+        event.client.camera.look_at = self.orbit_center
+        self.rerender(event)
+
     def _define_camera_guis(self) -> None:
         if len(self.viewer_cameras) == 0:
             return
@@ -321,6 +327,8 @@ class DynamicViewer(Viewer):
         self._camera_folder = self.server.gui.add_folder("VGGT Cameras")
         with self._camera_folder:
             show_cameras = self.server.gui.add_checkbox("Show cameras", True)
+            reset_orbit = self.server.gui.add_button("Reset orbit center")
+            reset_orbit.on_click(self._reset_client_orbit_center)
             for i, camera in enumerate(self.viewer_cameras):
                 wxyz, position = self._camera_pose_fields(camera)
                 camera_handles[camera.label] = self.server.scene.add_camera_frustum(
