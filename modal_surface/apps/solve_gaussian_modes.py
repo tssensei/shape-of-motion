@@ -77,6 +77,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--graph-smooth-k", type=int, default=8, help="Number of nearest neighbors used to build the graph.")
     parser.add_argument("--graph-auto-radius-scale", type=float, default=2.5, help="Multiplier on median kth-neighbor distance for graph edge pruning.")
     parser.add_argument("--graph-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a graph edge.")
+    parser.add_argument("--modal-rigid-lambda", type=float, default=0.0, help="Edge-stretch modal rigidity weight.")
+    parser.add_argument("--modal-rigid-k", type=int, default=8, help="Nearest-neighbor count used for modal rigidity candidate edges.")
+    parser.add_argument("--modal-rigid-auto-radius-scale", type=float, default=2.0, help="Multiplier on median kth-neighbor distance for modal rigidity edge pruning.")
+    parser.add_argument("--modal-rigid-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a modal rigidity edge.")
+    parser.add_argument("--modal-rigid-motion-cos-min", type=float, default=0.3, help="Minimum initial modal motion cosine similarity required for a modal rigidity edge.")
+    parser.add_argument("--modal-rigid-bootstrap-iterations", type=int, default=3, help="No-rigidity ALS iterations used to initialize modal rigidity edge compatibility.")
     parser.add_argument("--obs-count-weight-1", type=float, default=0.25, help="Data weight multiplier for points observed by one view.")
     parser.add_argument("--obs-count-weight-2", type=float, default=0.75, help="Data weight multiplier for points observed by two views.")
     parser.add_argument("--obs-count-weight-3plus", type=float, default=1.0, help="Data weight multiplier for points observed by three or more views.")
@@ -131,6 +137,21 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
             else "gaussian-center",
         }
     )
+    if "modal_rigid_edge_count" in latent.files:
+        modal_rigid_degree = latent["modal_rigid_degree"].astype(np.int32)
+        modal_rigid_residual = latent["modal_rigid_residual"].astype(np.float32)
+        stats.update(
+            {
+                "modal_rigid_edge_count": int(np.asarray(latent["modal_rigid_edge_count"]).item()),
+                "modal_rigid_degree_p50": _json_float(np.percentile(modal_rigid_degree, 50)),
+                "modal_rigid_degree_p90": _json_float(np.percentile(modal_rigid_degree, 90)),
+                "modal_rigid_degree_max": int(modal_rigid_degree.max()) if modal_rigid_degree.size else 0,
+                "modal_rigid_residual_median": _json_float(np.median(modal_rigid_residual)),
+                "modal_rigid_residual_p90": _json_float(np.percentile(modal_rigid_residual, 90)),
+                "modal_rigid_motion_cos_p50": _json_float(np.asarray(latent["modal_rigid_motion_cos_p50"]).item()),
+                "modal_rigid_motion_cos_p90": _json_float(np.asarray(latent["modal_rigid_motion_cos_p90"]).item()),
+            }
+        )
     return stats
 
 
@@ -243,10 +264,26 @@ def run(args: argparse.Namespace) -> None:
             graph_smooth_k=args.graph_smooth_k,
             graph_auto_radius_scale=args.graph_auto_radius_scale,
             graph_min_shared_views=args.graph_min_shared_views,
+            modal_rigid_lambda=args.modal_rigid_lambda,
+            modal_rigid_k=args.modal_rigid_k,
+            modal_rigid_auto_radius_scale=args.modal_rigid_auto_radius_scale,
+            modal_rigid_min_shared_views=args.modal_rigid_min_shared_views,
+            modal_rigid_motion_cos_min=args.modal_rigid_motion_cos_min,
+            modal_rigid_bootstrap_iterations=args.modal_rigid_bootstrap_iterations,
             obs_count_weight_1=args.obs_count_weight_1,
             obs_count_weight_2=args.obs_count_weight_2,
             obs_count_weight_3plus=args.obs_count_weight_3plus,
         )
+        latent_stats = _gaussian_latent_stats(latent_path, obs_path, fg_means.shape[0])
+        if float(args.modal_rigid_lambda) > 0:
+            print(
+                "Modal rigidity: "
+                f"edges={latent_stats['modal_rigid_edge_count']}, "
+                f"degree p50/p90/max={latent_stats['modal_rigid_degree_p50']:.0f}/"
+                f"{latent_stats['modal_rigid_degree_p90']:.0f}/{latent_stats['modal_rigid_degree_max']}, "
+                f"motion_cos p50/p90={latent_stats['modal_rigid_motion_cos_p50']:.3g}/"
+                f"{latent_stats['modal_rigid_motion_cos_p90']:.3g}"
+            )
         freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
         modes.append(
             {
@@ -259,7 +296,7 @@ def run(args: argparse.Namespace) -> None:
                 "vis_dir": _rel(mode_vis_dir, out_dir),
                 "alpha_by_view": _alpha_by_view_diagnostics(latent_path),
                 "view_frequency_reliability": _view_frequency_reliability(obs_path),
-                "stats": _gaussian_latent_stats(latent_path, obs_path, fg_means.shape[0]),
+                "stats": latent_stats,
             }
         )
 
@@ -308,6 +345,12 @@ def run(args: argparse.Namespace) -> None:
             "graph_smooth_k": int(args.graph_smooth_k),
             "graph_auto_radius_scale": float(args.graph_auto_radius_scale),
             "graph_min_shared_views": int(args.graph_min_shared_views),
+            "modal_rigid_lambda": float(args.modal_rigid_lambda),
+            "modal_rigid_k": int(args.modal_rigid_k),
+            "modal_rigid_auto_radius_scale": float(args.modal_rigid_auto_radius_scale),
+            "modal_rigid_min_shared_views": int(args.modal_rigid_min_shared_views),
+            "modal_rigid_motion_cos_min": float(args.modal_rigid_motion_cos_min),
+            "modal_rigid_bootstrap_iterations": int(args.modal_rigid_bootstrap_iterations),
             "obs_count_weight_1": float(args.obs_count_weight_1),
             "obs_count_weight_2": float(args.obs_count_weight_2),
             "obs_count_weight_3plus": float(args.obs_count_weight_3plus),

@@ -291,6 +291,247 @@ def _graph_smooth_residual(
     return residual
 
 
+def _build_modal_rigid_edges(
+    points: np.ndarray,
+    active: np.ndarray,
+    point_view_masks: np.ndarray,
+    phi_seed: np.ndarray,
+    modal_rigid_k: int,
+    modal_rigid_auto_radius_scale: float,
+    modal_rigid_min_shared_views: int,
+    modal_rigid_motion_cos_min: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    if modal_rigid_k <= 0:
+        raise ValueError("modal_rigid_k must be positive.")
+    if modal_rigid_auto_radius_scale <= 0:
+        raise ValueError("modal_rigid_auto_radius_scale must be positive.")
+    if modal_rigid_min_shared_views < 0:
+        raise ValueError("modal_rigid_min_shared_views must be non-negative.")
+
+    _, _, cKDTree = _require_scipy_for_graph_smoothing()
+    active_indices = np.where(active)[0]
+    if active_indices.size < 2:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((points.shape[0],), dtype=np.int32),
+            np.zeros((0,), dtype=np.float64),
+            0.0,
+        )
+
+    k = min(int(modal_rigid_k) + 1, int(active_indices.size))
+    tree = cKDTree(points[active_indices].astype(np.float64))
+    distances, neighbor_rows = tree.query(points[active_indices].astype(np.float64), k=k)
+    if k == 1:
+        distances = distances[:, None]
+        neighbor_rows = neighbor_rows[:, None]
+
+    neighbor_distances = distances[:, 1:] if distances.shape[1] > 1 else distances
+    finite_neighbor_distances = neighbor_distances[np.isfinite(neighbor_distances) & (neighbor_distances > 0)]
+    if finite_neighbor_distances.size == 0:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((points.shape[0],), dtype=np.int32),
+            np.zeros((0,), dtype=np.float64),
+            0.0,
+        )
+    radius = float(np.median(finite_neighbor_distances) * float(modal_rigid_auto_radius_scale))
+    if radius <= 0:
+        raise ValueError("modal rigidity auto radius is non-positive.")
+
+    neighbor_sets: list[set[int]] = []
+    for row in range(active_indices.size):
+        valid = []
+        for dist, neighbor_row in zip(distances[row, 1:], neighbor_rows[row, 1:]):
+            if np.isfinite(dist) and dist > 0:
+                valid.append(int(neighbor_row))
+        neighbor_sets.append(set(valid))
+
+    edge_data: dict[tuple[int, int], tuple[float, np.ndarray, float]] = {}
+    phi64 = phi_seed.astype(np.complex128)
+    phi_norm = np.linalg.norm(phi64, axis=1).astype(np.float64)
+    for row, point_idx in enumerate(active_indices.tolist()):
+        for dist, neighbor_row in zip(distances[row, 1:], neighbor_rows[row, 1:]):
+            if not np.isfinite(dist) or dist <= 0 or dist > radius:
+                continue
+            neighbor_row = int(neighbor_row)
+            if row not in neighbor_sets[neighbor_row]:
+                continue
+            neighbor_idx = int(active_indices[neighbor_row])
+            if point_idx == neighbor_idx:
+                continue
+            if modal_rigid_min_shared_views > 0:
+                shared = int(np.logical_and(point_view_masks[point_idx], point_view_masks[neighbor_idx]).sum())
+                if shared < int(modal_rigid_min_shared_views):
+                    continue
+            denom = float(phi_norm[point_idx] * phi_norm[neighbor_idx]) + 1e-12
+            motion_cos = float(np.real(np.vdot(phi64[point_idx], phi64[neighbor_idx])) / denom)
+            if motion_cos < float(modal_rigid_motion_cos_min):
+                continue
+            edge = points[point_idx].astype(np.float64) - points[neighbor_idx].astype(np.float64)
+            edge_norm = float(np.linalg.norm(edge))
+            if edge_norm <= 1e-12:
+                continue
+            a, b = sorted((int(point_idx), int(neighbor_idx)))
+            if (a, b) in edge_data:
+                continue
+            direction = edge / edge_norm
+            if a != int(point_idx):
+                direction = -direction
+            edge_data[(a, b)] = (1.0 / max(float(dist), 1e-6), direction.astype(np.float64), motion_cos)
+
+    if not edge_data:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((points.shape[0],), dtype=np.int32),
+            np.zeros((0,), dtype=np.float64),
+            radius,
+        )
+
+    sorted_pairs = sorted(edge_data)
+    edges = np.asarray(sorted_pairs, dtype=np.int64)
+    weights = np.asarray([edge_data[pair][0] for pair in sorted_pairs], dtype=np.float64)
+    weights = weights / max(float(np.median(weights)), 1e-12)
+    directions = np.asarray([edge_data[pair][1] for pair in sorted_pairs], dtype=np.float64)
+    motion_cos = np.asarray([edge_data[pair][2] for pair in sorted_pairs], dtype=np.float64)
+    degree = np.zeros((points.shape[0],), dtype=np.int32)
+    np.add.at(degree, edges[:, 0], 1)
+    np.add.at(degree, edges[:, 1], 1)
+    return edges[:, 0], edges[:, 1], weights, directions, degree, motion_cos, radius
+
+
+def _solve_phi_modal_rigid(
+    points: np.ndarray,
+    obs_y: np.ndarray,
+    obs_J: np.ndarray,
+    obs_confidence: np.ndarray,
+    obs_point_index: np.ndarray,
+    obs_view_index: np.ndarray,
+    active: np.ndarray,
+    alphas: np.ndarray,
+    ridge_mu: float,
+    modal_rigid_lambda: float,
+    modal_rigid_edge_a: np.ndarray,
+    modal_rigid_edge_b: np.ndarray,
+    modal_rigid_edge_weights: np.ndarray,
+    modal_rigid_edge_dirs: np.ndarray,
+) -> np.ndarray:
+    if modal_rigid_lambda <= 0:
+        raise ValueError("_solve_phi_modal_rigid requires positive modal_rigid_lambda.")
+    sp, spla, _ = _require_scipy_for_graph_smoothing()
+    active_indices = np.where(active)[0]
+    if active_indices.size < 3:
+        raise ValueError("Too few active points for modal rigidity.")
+    if modal_rigid_edge_a.size == 0:
+        raise ValueError("Modal rigidity produced no valid edges; relax modal-rigid parameters or run with --modal-rigid-lambda 0.")
+
+    active_to_col = np.full((points.shape[0],), -1, dtype=np.int64)
+    active_to_col[active_indices] = np.arange(active_indices.size, dtype=np.int64)
+    if np.any(active_to_col[modal_rigid_edge_a] < 0) or np.any(active_to_col[modal_rigid_edge_b] < 0):
+        raise ValueError("Modal rigidity edges reference inactive points.")
+
+    keep_obs = active[obs_point_index]
+    obs_rows = np.where(keep_obs)[0]
+    data_rows = obs_rows.size * 2
+    edge_rows = modal_rigid_edge_a.size
+    ridge_rows = active_indices.size * 3
+    total_rows = data_rows + edge_rows + ridge_rows
+    total_cols = active_indices.size * 3
+
+    row_idx: list[np.ndarray] = []
+    col_idx: list[np.ndarray] = []
+    values: list[np.ndarray] = []
+    rhs = np.zeros((total_rows,), dtype=np.complex128)
+
+    data_base = np.arange(data_rows, dtype=np.int64).reshape(obs_rows.size, 2)
+    data_weights = np.sqrt(np.maximum(obs_confidence[obs_rows].astype(np.float64), 0.0))
+    alpha_rows = alphas[obs_view_index[obs_rows]].astype(np.complex128)
+    point_cols = active_to_col[obs_point_index[obs_rows]]
+    for comp in range(2):
+        rows = np.repeat(data_base[:, comp], 3)
+        cols = np.repeat(point_cols * 3, 3) + np.tile(np.arange(3, dtype=np.int64), obs_rows.size)
+        vals = (
+            data_weights[:, None]
+            * alpha_rows[:, None]
+            * obs_J[obs_rows, comp, :].astype(np.complex128)
+        ).reshape(-1)
+        row_idx.append(rows)
+        col_idx.append(cols)
+        values.append(vals)
+        rhs[data_base[:, comp]] = data_weights * obs_y[obs_rows, comp].astype(np.complex128)
+
+    edge_start = data_rows
+    rigid_weight = np.sqrt(float(modal_rigid_lambda) * np.maximum(modal_rigid_edge_weights, 0.0))
+    edge_rows_idx = edge_start + np.arange(modal_rigid_edge_a.size, dtype=np.int64)
+    edge_local_a = active_to_col[modal_rigid_edge_a]
+    edge_local_b = active_to_col[modal_rigid_edge_b]
+    row_idx.append(np.repeat(edge_rows_idx, 6))
+    col_idx.append(
+        np.column_stack(
+            [
+                edge_local_a * 3,
+                edge_local_a * 3 + 1,
+                edge_local_a * 3 + 2,
+                edge_local_b * 3,
+                edge_local_b * 3 + 1,
+                edge_local_b * 3 + 2,
+            ]
+        ).reshape(-1)
+    )
+    rigid_vals = rigid_weight[:, None] * np.column_stack([modal_rigid_edge_dirs, -modal_rigid_edge_dirs])
+    values.append(rigid_vals.reshape(-1).astype(np.complex128))
+
+    ridge_start = data_rows + edge_rows
+    if ridge_mu > 0:
+        ridge_weight = np.sqrt(float(ridge_mu))
+        cols = np.arange(ridge_rows, dtype=np.int64)
+        rows = ridge_start + cols
+        row_idx.append(rows)
+        col_idx.append(cols)
+        values.append(np.full((ridge_rows,), ridge_weight, dtype=np.complex128))
+
+    matrix = sp.coo_matrix(
+        (np.concatenate(values), (np.concatenate(row_idx), np.concatenate(col_idx))),
+        shape=(total_rows, total_cols),
+        dtype=np.complex128,
+    ).tocsr()
+    solution = spla.lsmr(matrix, rhs, atol=1e-6, btol=1e-6)[0]
+    phi = np.zeros((points.shape[0], 3), dtype=np.complex64)
+    phi[active_indices] = solution.reshape(active_indices.size, 3).astype(np.complex64)
+    return phi
+
+
+def _modal_rigid_residual(
+    phi: np.ndarray,
+    edge_a: np.ndarray,
+    edge_b: np.ndarray,
+    edge_dirs: np.ndarray,
+    active: np.ndarray,
+) -> np.ndarray:
+    residual = np.zeros((phi.shape[0],), dtype=np.float32)
+    counts = np.zeros((phi.shape[0],), dtype=np.float64)
+    if edge_a.size == 0:
+        residual[~active] = np.inf
+        return residual
+    diff = phi[edge_a].astype(np.complex128) - phi[edge_b].astype(np.complex128)
+    stretch = np.abs(np.sum(edge_dirs.astype(np.float64) * diff, axis=1)).astype(np.float64)
+    np.add.at(residual, edge_a, stretch)
+    np.add.at(residual, edge_b, stretch)
+    np.add.at(counts, edge_a, 1.0)
+    np.add.at(counts, edge_b, 1.0)
+    residual = (residual.astype(np.float64) / np.maximum(counts, 1.0)).astype(np.float32)
+    residual[~active] = np.inf
+    return residual
+
+
 def _predict_observations(obs_J: np.ndarray, obs_point_index: np.ndarray, obs_view_index: np.ndarray, phi: np.ndarray, alphas: np.ndarray) -> np.ndarray:
     projected = np.einsum("oij,oj->oi", obs_J.astype(np.float32), phi[obs_point_index].astype(np.complex64))
     return (alphas[obs_view_index][:, None] * projected).astype(np.complex64)
@@ -499,6 +740,12 @@ def optimize_multi_view(
     graph_smooth_k: int = 8,
     graph_auto_radius_scale: float = 2.5,
     graph_min_shared_views: int = 1,
+    modal_rigid_lambda: float = 0.0,
+    modal_rigid_k: int = 8,
+    modal_rigid_auto_radius_scale: float = 2.0,
+    modal_rigid_min_shared_views: int = 1,
+    modal_rigid_motion_cos_min: float = 0.3,
+    modal_rigid_bootstrap_iterations: int = 3,
     obs_count_weight_1: float = 0.25,
     obs_count_weight_2: float = 0.75,
     obs_count_weight_3plus: float = 1.0,
@@ -522,8 +769,26 @@ def optimize_multi_view(
         raise ValueError("graph_auto_radius_scale must be positive.")
     if graph_min_shared_views < 0:
         raise ValueError("graph_min_shared_views must be non-negative.")
+    if modal_rigid_lambda < 0:
+        raise ValueError("modal_rigid_lambda must be non-negative.")
+    if modal_rigid_k <= 0:
+        raise ValueError("modal_rigid_k must be positive.")
+    if modal_rigid_auto_radius_scale <= 0:
+        raise ValueError("modal_rigid_auto_radius_scale must be positive.")
+    if modal_rigid_min_shared_views < 0:
+        raise ValueError("modal_rigid_min_shared_views must be non-negative.")
+    if not (-1.0 <= modal_rigid_motion_cos_min <= 1.0):
+        raise ValueError("modal_rigid_motion_cos_min must be in [-1, 1].")
+    if modal_rigid_bootstrap_iterations <= 0:
+        raise ValueError("modal_rigid_bootstrap_iterations must be positive.")
     if graph_smooth_lambda > 0 and single_view_smooth_lambda > 0:
         raise ValueError("Use either graph smoothing or single-view smoothing, not both.")
+    if modal_rigid_lambda > 0 and graph_smooth_lambda > 0:
+        raise ValueError("Use either graph smoothing or modal rigidity, not both.")
+    if modal_rigid_lambda > 0 and single_view_smooth_lambda > 0:
+        raise ValueError("Use modal rigidity without single-view smoothing in this v1 solver.")
+    if modal_rigid_lambda > 0 and outlier_frac > 0:
+        raise ValueError("modal rigidity uses a fixed edge set and requires outlier_frac=0.")
 
     data = np.load(str(observations_path), allow_pickle=False)
     points = data["points_world"].astype(np.float32)
@@ -583,6 +848,48 @@ def optimize_multi_view(
     obs_count_weight_per_point = np.ones((points.shape[0],), dtype=np.float32)
     graph_edge_count = 0
     graph_auto_radius = 0.0
+    modal_rigid_degree = np.zeros((points.shape[0],), dtype=np.int32)
+    modal_rigid_residual = np.zeros((points.shape[0],), dtype=np.float32)
+    modal_rigid_edge_count = 0
+    modal_rigid_auto_radius = 0.0
+    modal_rigid_motion_cos_p50 = 0.0
+    modal_rigid_motion_cos_p90 = 0.0
+    modal_rigid_edge_a = np.zeros((0,), dtype=np.int64)
+    modal_rigid_edge_b = np.zeros((0,), dtype=np.int64)
+    modal_rigid_edge_weights = np.zeros((0,), dtype=np.float64)
+    modal_rigid_edge_dirs = np.zeros((0, 3), dtype=np.float64)
+
+    if modal_rigid_lambda > 0:
+        for _ in range(int(modal_rigid_bootstrap_iterations)):
+            phi = _solve_phi_points(obs_y, obs_J, obs_confidence, obs_view_index, obs_by_point, active, alphas, ridge_mu)
+            alphas = _solve_alphas(obs_y, obs_J, obs_point_index, obs_view_index, obs_confidence, active, phi, num_views)
+        point_view_masks = _point_view_masks(points.shape[0], obs_point_index, obs_view_index, num_views)
+        (
+            modal_rigid_edge_a,
+            modal_rigid_edge_b,
+            modal_rigid_edge_weights,
+            modal_rigid_edge_dirs,
+            modal_rigid_degree,
+            modal_rigid_motion_cos,
+            modal_rigid_auto_radius,
+        ) = _build_modal_rigid_edges(
+            points,
+            active,
+            point_view_masks,
+            phi,
+            modal_rigid_k,
+            modal_rigid_auto_radius_scale,
+            modal_rigid_min_shared_views,
+            modal_rigid_motion_cos_min,
+        )
+        if modal_rigid_edge_a.size == 0:
+            raise ValueError(
+                "Modal rigidity produced no valid edges; lower --modal-rigid-motion-cos-min, "
+                "increase --modal-rigid-auto-radius-scale, or run with --modal-rigid-lambda 0."
+            )
+        modal_rigid_edge_count = int(modal_rigid_edge_a.size)
+        modal_rigid_motion_cos_p50 = float(np.percentile(modal_rigid_motion_cos, 50))
+        modal_rigid_motion_cos_p90 = float(np.percentile(modal_rigid_motion_cos, 90))
 
     for it in range(iterations):
         if int(active.sum()) < 3:
@@ -611,17 +918,41 @@ def optimize_multi_view(
             graph_edge_count = int(graph_edge_a.size)
             graph_smooth_residual = _graph_smooth_residual(phi, graph_edge_a, graph_edge_b, active)
             alpha_confidence = obs_confidence * obs_count_weight_per_point[obs_point_index]
+            iteration_regularizer_residual = graph_smooth_residual
+        elif modal_rigid_lambda > 0:
+            phi = _solve_phi_modal_rigid(
+                points,
+                obs_y,
+                obs_J,
+                obs_confidence,
+                obs_point_index,
+                obs_view_index,
+                active,
+                alphas,
+                ridge_mu,
+                modal_rigid_lambda,
+                modal_rigid_edge_a,
+                modal_rigid_edge_b,
+                modal_rigid_edge_weights,
+                modal_rigid_edge_dirs,
+            )
+            graph_smooth_residual = np.zeros((points.shape[0],), dtype=np.float32)
+            graph_smooth_residual[~active] = np.inf
+            modal_rigid_residual = _modal_rigid_residual(phi, modal_rigid_edge_a, modal_rigid_edge_b, modal_rigid_edge_dirs, active)
+            alpha_confidence = obs_confidence
+            iteration_regularizer_residual = modal_rigid_residual
         else:
             phi = _solve_phi_points(obs_y, obs_J, obs_confidence, obs_view_index, obs_by_point, active, alphas, ridge_mu)
             graph_smooth_residual = np.zeros((points.shape[0],), dtype=np.float32)
             graph_smooth_residual[~active] = np.inf
             alpha_confidence = obs_confidence
+            iteration_regularizer_residual = graph_smooth_residual
         alphas = _solve_alphas(obs_y, obs_J, obs_point_index, obs_view_index, alpha_confidence, active, phi, num_views)
         pred_y = _predict_observations(obs_J, obs_point_index, obs_view_index, phi, alphas)
         obs_residual = _obs_residual(obs_y, pred_y)
         point_residual = _point_residuals(points.shape[0], obs_point_index, obs_residual, active)
         active_residual = point_residual[active]
-        active_graph_residual = graph_smooth_residual[active]
+        active_graph_residual = iteration_regularizer_residual[active]
         history.append(
             [
                 float(it),
@@ -719,6 +1050,18 @@ def optimize_multi_view(
         graph_smooth_k=np.array(graph_smooth_k, dtype=np.int32),
         graph_auto_radius_scale=np.array(graph_auto_radius_scale, dtype=np.float32),
         graph_min_shared_views=np.array(graph_min_shared_views, dtype=np.int32),
+        modal_rigid_lambda=np.array(modal_rigid_lambda, dtype=np.float32),
+        modal_rigid_k=np.array(modal_rigid_k, dtype=np.int32),
+        modal_rigid_auto_radius_scale=np.array(modal_rigid_auto_radius_scale, dtype=np.float32),
+        modal_rigid_min_shared_views=np.array(modal_rigid_min_shared_views, dtype=np.int32),
+        modal_rigid_motion_cos_min=np.array(modal_rigid_motion_cos_min, dtype=np.float32),
+        modal_rigid_bootstrap_iterations=np.array(modal_rigid_bootstrap_iterations, dtype=np.int32),
+        modal_rigid_edge_count=np.array(modal_rigid_edge_count, dtype=np.int64),
+        modal_rigid_degree=modal_rigid_degree[active_indices].astype(np.int32),
+        modal_rigid_residual=modal_rigid_residual[active_indices].astype(np.float32),
+        modal_rigid_auto_radius=np.array(modal_rigid_auto_radius, dtype=np.float32),
+        modal_rigid_motion_cos_p50=np.array(modal_rigid_motion_cos_p50, dtype=np.float32),
+        modal_rigid_motion_cos_p90=np.array(modal_rigid_motion_cos_p90, dtype=np.float32),
         obs_count_weight_1=np.array(obs_count_weight_1, dtype=np.float32),
         obs_count_weight_2=np.array(obs_count_weight_2, dtype=np.float32),
         obs_count_weight_3plus=np.array(obs_count_weight_3plus, dtype=np.float32),
