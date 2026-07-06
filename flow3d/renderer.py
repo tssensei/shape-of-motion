@@ -60,6 +60,7 @@ class Renderer:
                 camera_frustum_scale=frustum_scale,
                 playback_groups=playback_groups,
                 modal_freqs_hz=modal_freqs_hz,
+                gaussian_center_count=model.num_gaussians,
             )
 
         self.tracks_3d = self.model.compute_poses_fg(
@@ -154,6 +155,17 @@ class Renderer:
             fg_offsets = self.model.compute_synthetic_modal_offsets(q, motion_scale)
             means[: self.model.num_fg_gaussians] += fg_offsets
             render_t = None
+        if self.viewer.wants_gaussian_centers():
+            center_means = means
+            if center_means is None:
+                center_ts = (
+                    torch.tensor([t], device=self.device) if t is not None else None
+                )
+                center_means = self.model.compute_poses_all(center_ts)[0][:, 0]
+            self.viewer.update_gaussian_centers(
+                center_means.detach().cpu().numpy(),
+                self.model.num_fg_gaussians,
+            )
         img = self.model.render(
             render_t,
             w2c[None],

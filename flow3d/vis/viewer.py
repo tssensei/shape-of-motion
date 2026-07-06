@@ -87,6 +87,7 @@ class DynamicViewer(Viewer):
         camera_frustum_scale: float = 1.0,
         playback_groups: tuple[ViewerPlaybackGroup, ...] = (),
         modal_freqs_hz: tuple[float, ...] = (),
+        gaussian_center_count: int = 0,
     ):
         self.num_frames = num_frames
         self.work_dir = Path(work_dir)
@@ -95,6 +96,8 @@ class DynamicViewer(Viewer):
         self.camera_frustum_scale = float(camera_frustum_scale)
         self.playback_groups = tuple(playback_groups)
         self.modal_freqs_hz = tuple(float(freq) for freq in modal_freqs_hz)
+        self.gaussian_center_count = int(gaussian_center_count)
+        self._gaussian_center_handle = None
         for group in self.playback_groups:
             if len(group.global_timestamps) == 0:
                 raise ValueError(f"Playback group {group.label!r} has no frames")
@@ -156,6 +159,7 @@ class DynamicViewer(Viewer):
         self._render_track_checkbox = server.gui.add_checkbox("Render tracks", False)
         self._render_track_checkbox.on_update(self.rerender)
         self._define_modal_playback_guis()
+        self._define_gaussian_center_guis()
         self._define_camera_guis()
 
         tabs = server.gui.add_tab_group()
@@ -256,6 +260,90 @@ class DynamicViewer(Viewer):
             "motion_scale": motion_scale,
             "modes": tuple(modes),
         }
+
+    def _define_gaussian_center_guis(self) -> None:
+        self._gaussian_center_handles = None
+        if self.gaussian_center_count <= 0:
+            return
+        max_count = max(int(self.gaussian_center_count), 1)
+        step = max(max_count // 200, 1)
+        with self.server.gui.add_folder("Gaussian centers"):
+            show = self.server.gui.add_checkbox("Show moving centers", False)
+            fg_only = self.server.gui.add_checkbox("Foreground only", True)
+            count = self.server.gui.add_slider(
+                "Visible count",
+                min=0,
+                max=max_count,
+                step=step,
+                initial_value=min(2000, max_count),
+            )
+            point_size = self.server.gui.add_slider(
+                "Point size",
+                min=0.001,
+                max=0.05,
+                step=0.001,
+                initial_value=0.01,
+            )
+        self._gaussian_center_handles = {
+            "show": show,
+            "fg_only": fg_only,
+            "count": count,
+            "point_size": point_size,
+        }
+
+        def _on_update(event) -> None:
+            if not bool(show.value):
+                self._remove_gaussian_center_cloud()
+            self.rerender(event)
+
+        show.on_update(_on_update)
+        fg_only.on_update(_on_update)
+        count.on_update(_on_update)
+        point_size.on_update(_on_update)
+
+    def _remove_gaussian_center_cloud(self) -> None:
+        if self._gaussian_center_handle is not None:
+            self._gaussian_center_handle.remove()
+            self._gaussian_center_handle = None
+
+    def wants_gaussian_centers(self) -> bool:
+        handles = getattr(self, "_gaussian_center_handles", None)
+        return handles is not None and bool(handles["show"].value)
+
+    def update_gaussian_centers(self, points: np.ndarray, fg_count: int) -> None:
+        if not self.wants_gaussian_centers():
+            return
+        handles = self._gaussian_center_handles
+        assert handles is not None
+
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(
+                f"Gaussian centers must have shape (N,3), got {points.shape}"
+            )
+
+        fg_count = min(max(int(fg_count), 0), points.shape[0])
+        if bool(handles["fg_only"].value):
+            selectable = np.arange(fg_count, dtype=np.int64)
+        else:
+            selectable = np.arange(points.shape[0], dtype=np.int64)
+
+        visible_count = min(max(int(handles["count"].value), 0), selectable.shape[0])
+        self._remove_gaussian_center_cloud()
+        if visible_count == 0:
+            return
+
+        selected = selectable[:visible_count]
+        colors = np.empty((visible_count, 3), dtype=np.float32)
+        fg_mask = selected < fg_count
+        colors[fg_mask] = np.asarray([0.05, 0.85, 0.20], dtype=np.float32)
+        colors[~fg_mask] = np.asarray([0.55, 0.55, 0.55], dtype=np.float32)
+        self._gaussian_center_handle = self.server.scene.add_point_cloud(
+            "/debug/gaussian_centers",
+            points=points[selected],
+            colors=colors,
+            point_size=float(handles["point_size"].value),
+        )
 
     def current_modal_oscillator(self) -> tuple[np.ndarray, float] | None:
         handles = getattr(self, "_modal_playback_handles", None)
