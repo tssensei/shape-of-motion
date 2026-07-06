@@ -95,7 +95,7 @@ def main() -> None:
     if "modal.params.activations" in model_state:
         raise ValueError("Refusing to bind synthetic modal fields to a learned activation checkpoint")
     for key in ("modal_phi_real", "modal_phi_imag", "modal_freqs_hz"):
-        if key in model_state:
+        if key in model_state and model_state[key].numel() > 0:
             raise ValueError(f"{args.input_ckpt} already contains {key}; use an unbound checkpoint")
     if "fg.params.means" not in model_state:
         raise ValueError(f"{args.input_ckpt} is missing fg.params.means")
