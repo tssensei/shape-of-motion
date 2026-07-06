@@ -6,7 +6,11 @@ from nerfview import CameraState
 
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import draw_tracks_2d_th, get_server
-from flow3d.vis.viewer import DynamicViewer, ViewerCamera
+from flow3d.vis.viewer import (
+    DynamicViewer,
+    ViewerCamera,
+    build_modal_playback_groups,
+)
 from modal_surface.io import load_view_config
 
 
@@ -34,6 +38,11 @@ class Renderer:
             orbit_center = self._gaussian_orbit_center()
             frustum_scale = 0.08 * self._gaussian_scene_scale(orbit_center)
             viewer_cameras = self._load_viewer_cameras(vggt_view_configs)
+            playback_groups = build_modal_playback_groups(
+                model.modal_frame_view_indices,
+                model.modal_frame_local_indices,
+                tuple(camera.label for camera in viewer_cameras),
+            )
             server = get_server(port=port)
             self.viewer = DynamicViewer(
                 server,
@@ -44,6 +53,7 @@ class Renderer:
                 viewer_cameras=viewer_cameras,
                 orbit_center=orbit_center,
                 camera_frustum_scale=frustum_scale,
+                playback_groups=playback_groups,
             )
 
         self.tracks_3d = self.model.compute_poses_fg(
@@ -123,10 +133,7 @@ class Renderer:
         w2c = torch.linalg.inv(
             torch.from_numpy(camera_state.c2w.astype(np.float32)).to(self.device)
         )
-        playback_guis = getattr(self.viewer, "_playback_guis", None)
-        canonical_checkbox = getattr(self.viewer, "_canonical_checkbox", None)
-        canonical = bool(canonical_checkbox.value) if canonical_checkbox is not None else False
-        t = int(playback_guis[0].value) if playback_guis is not None and not canonical else None
+        t = self.viewer.current_timestep()
         self.model.training = False
         img = self.model.render(t, w2c[None], K[None], img_wh)["img"][0]
         render_track_checkbox = getattr(self.viewer, "_render_track_checkbox", None)

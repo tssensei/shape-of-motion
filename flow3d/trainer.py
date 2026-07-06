@@ -27,7 +27,7 @@ from flow3d.modal_utils import (
 )
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import get_server
-from flow3d.vis.viewer import DynamicViewer
+from flow3d.vis.viewer import DynamicViewer, build_modal_playback_groups
 from flow3d.normal_utils import depth_to_normal
 
 class Trainer:
@@ -143,8 +143,17 @@ class Trainer:
         self.viewer = None
         if port is not None:
             server = get_server(port=port)
+            playback_groups = build_modal_playback_groups(
+                model.modal_frame_view_indices,
+                model.modal_frame_local_indices,
+            )
             self.viewer = DynamicViewer(
-                server, self.render_fn, model.num_frames, work_dir, mode="training"
+                server,
+                self.render_fn,
+                model.num_frames,
+                work_dir,
+                mode="training",
+                playback_groups=playback_groups,
             )
 
         # metrics
@@ -354,11 +363,7 @@ class Trainer:
         )
         t = 0
         if self.viewer is not None:
-            t = (
-                int(self.viewer._playback_guis[0].value)
-                if not self.viewer._canonical_checkbox.value
-                else None
-            )
+            t = self.viewer.current_timestep()
         self.model.training = False
         img = self.model.render(t, w2c[None], K[None], img_wh)["img"][0]
         return (img.cpu().numpy() * 255.0).astype(np.uint8)

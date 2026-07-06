@@ -106,6 +106,7 @@ class TrainConfig:
     modal_stage2_lr_fg_scales: float | None = None
     modal_stage2_lr_fg_quats: float | None = None
     modal_train_view_id: str | None = None
+    modal_max_local_frames_per_view: int | None = None
     modal_consistency_target_view_id: str | None = None
     modal_consistency_fps: float = 0.0
     modal_consistency_view_configs: tuple[str, ...] = ()
@@ -478,6 +479,9 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "depth_type": getattr(data, "depth_type", None),
         "camera_type": getattr(data, "camera_type", None),
         "modal_train_view_id": getattr(data, "modal_train_view_id", None),
+        "modal_max_local_frames_per_view": getattr(
+            data, "modal_max_local_frames_per_view", None
+        ),
         "load_depths": getattr(data, "load_depths", None),
     }
     stage1_metadata = {
@@ -496,6 +500,7 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_frame_map": cfg.modal_frame_map,
         "modal_carrier_points": cfg.modal_carrier_points,
         "modal_train_view_id": cfg.modal_train_view_id,
+        "modal_max_local_frames_per_view": cfg.modal_max_local_frames_per_view,
         "vggt_view_configs": cfg.vggt_view_configs,
         "modal_knn": cfg.modal_knn,
         "modal_interp_power": cfg.modal_interp_power,
@@ -724,18 +729,27 @@ def _make_modal_stage1_data_config(
         vggt_view_configs=cfg.vggt_view_configs,
         modal_frame_map=cfg.modal_stage1_frame_map,
         modal_train_view_id=None,
+        modal_max_local_frames_per_view=None,
         load_depths=False,
     )
 
 
 def _inject_vggt_static_view_config(cfg: TrainConfig):
-    if cfg.modal_train_view_id is not None:
+    if (
+        cfg.modal_train_view_id is not None
+        or cfg.modal_max_local_frames_per_view is not None
+    ):
         if cfg.trajectory_type != "modal_activation":
-            raise ValueError("--modal-train-view-id requires modal_activation")
+            raise ValueError("modal frame filtering requires modal_activation")
         if not isinstance(cfg.data, (CustomDataConfig, DavisDataConfig)):
-            raise ValueError("--modal-train-view-id requires custom or davis data")
+            raise ValueError("modal frame filtering requires custom or davis data")
         if cfg.data.camera_type != "vggt":
-            raise ValueError("--modal-train-view-id requires data.camera_type='vggt'")
+            raise ValueError("modal frame filtering requires data.camera_type='vggt'")
+        if (
+            cfg.modal_max_local_frames_per_view is not None
+            and cfg.modal_max_local_frames_per_view <= 0
+        ):
+            raise ValueError("--modal-max-local-frames-per-view must be positive")
     if cfg.trajectory_type != "modal_activation":
         return
     if not isinstance(cfg.data, (CustomDataConfig, DavisDataConfig)):
@@ -751,6 +765,7 @@ def _inject_vggt_static_view_config(cfg: TrainConfig):
         vggt_view_configs=cfg.vggt_view_configs,
         modal_frame_map=cfg.modal_frame_map,
         modal_train_view_id=cfg.modal_train_view_id,
+        modal_max_local_frames_per_view=cfg.modal_max_local_frames_per_view,
     )
 
 

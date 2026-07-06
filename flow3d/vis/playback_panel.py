@@ -1,5 +1,6 @@
 import threading
 import time
+from typing import Callable
 
 import viser
 
@@ -11,11 +12,17 @@ def add_gui_playback_group(
     max_fps: float = 60.0,
     fps_step: float = 0.1,
     initial_fps: float = 10.0,
+    num_frames_getter: Callable[[], int] | None = None,
 ):
+    def _num_frames() -> int:
+        if num_frames_getter is None:
+            return num_frames
+        return max(1, int(num_frames_getter()))
+
     gui_timestep = server.gui.add_slider(
         "Timestep",
         min=0,
-        max=num_frames - 1,
+        max=_num_frames() - 1,
         step=1,
         initial_value=0,
         disabled=True,
@@ -32,11 +39,11 @@ def add_gui_playback_group(
     # Frame step buttons.
     @gui_next_frame.on_click
     def _(_) -> None:
-        gui_timestep.value = (gui_timestep.value + 1) % num_frames
+        gui_timestep.value = (gui_timestep.value + 1) % _num_frames()
 
     @gui_prev_frame.on_click
     def _(_) -> None:
-        gui_timestep.value = (gui_timestep.value - 1) % num_frames
+        gui_timestep.value = (gui_timestep.value - 1) % _num_frames()
 
     # Disable frame controls when we're playing.
     def _toggle_gui_playing(_):
@@ -53,7 +60,7 @@ def add_gui_playback_group(
     def _update_timestep():
         while True:
             if gui_playing_pause.visible:
-                gui_timestep.value = (gui_timestep.value + 1) % num_frames
+                gui_timestep.value = (gui_timestep.value + 1) % _num_frames()
             time.sleep(1 / gui_framerate.value)
 
     threading.Thread(target=_update_timestep, daemon=True).start()

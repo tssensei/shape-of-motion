@@ -59,6 +59,7 @@ class DavisDataConfig:
     vggt_view_configs: tyro.conf.Suppress[tuple[str, ...]] = ()
     modal_frame_map: tyro.conf.Suppress[str | None] = None
     modal_train_view_id: tyro.conf.Suppress[str | None] = None
+    modal_max_local_frames_per_view: tyro.conf.Suppress[int | None] = None
     load_depths: tyro.conf.Suppress[bool] = True
 
 
@@ -88,6 +89,7 @@ class CustomDataConfig:
     vggt_view_configs: tyro.conf.Suppress[tuple[str, ...]] = ()
     modal_frame_map: tyro.conf.Suppress[str | None] = None
     modal_train_view_id: tyro.conf.Suppress[str | None] = None
+    modal_max_local_frames_per_view: tyro.conf.Suppress[int | None] = None
     load_depths: tyro.conf.Suppress[bool] = True
 
 
@@ -118,6 +120,7 @@ class CasualDataset(BaseDataset):
         vggt_view_configs: tuple[str, ...] = (),
         modal_frame_map: str | None = None,
         modal_train_view_id: str | None = None,
+        modal_max_local_frames_per_view: int | None = None,
         load_depths: bool = True,
         **_,
     ):
@@ -143,13 +146,21 @@ class CasualDataset(BaseDataset):
         self.cache_dir = f"{data_dir}/flow3d_preprocessed/{res}"
         frame_names = [os.path.splitext(p)[0] for p in sorted(os.listdir(self.img_dir))]
 
-        if modal_train_view_id is not None:
+        if modal_train_view_id is not None or modal_max_local_frames_per_view is not None:
             if camera_type != "vggt":
-                raise ValueError("modal_train_view_id requires camera_type='vggt'")
+                raise ValueError("modal frame filtering requires camera_type='vggt'")
             if modal_frame_map is None:
-                raise ValueError("modal_train_view_id requires modal_frame_map")
+                raise ValueError("modal frame filtering requires modal_frame_map")
+            if (
+                modal_max_local_frames_per_view is not None
+                and modal_max_local_frames_per_view <= 0
+            ):
+                raise ValueError("modal_max_local_frames_per_view must be positive")
             with open(modal_frame_map, "r", encoding="utf-8") as f:
                 frame_map = json.load(f)
+            view_ids = frame_map.get("views")
+            if not isinstance(view_ids, list) or not view_ids:
+                raise ValueError(f"{modal_frame_map} must contain non-empty views list")
             records = frame_map.get("frames")
             if not isinstance(records, list):
                 raise ValueError(f"{modal_frame_map} must contain a frames list")
@@ -172,18 +183,37 @@ class CasualDataset(BaseDataset):
                     f"{modal_frame_map} is missing {len(missing)} image frames, "
                     f"first missing: {preview}"
                 )
-            frame_names = [
-                name
-                for name in frame_names
-                if frame_to_record[name].get("view_id") == modal_train_view_id
-            ]
+            selected_frame_names = []
+            selected_counts: dict[str, int] = {}
+            for name in frame_names:
+                record = frame_to_record[name]
+                view_id = record.get("view_id")
+                if view_id not in view_ids:
+                    raise ValueError(
+                        f"Frame record {name} uses unknown view_id={view_id!r}"
+                    )
+                if modal_train_view_id is not None and view_id != modal_train_view_id:
+                    continue
+                if modal_max_local_frames_per_view is not None:
+                    if "local_index" not in record:
+                        raise ValueError(f"Frame record {name} is missing local_index")
+                    if int(record["local_index"]) >= modal_max_local_frames_per_view:
+                        continue
+                selected_frame_names.append(name)
+                selected_counts[view_id] = selected_counts.get(view_id, 0) + 1
+            frame_names = selected_frame_names
             if not frame_names:
                 raise ValueError(
-                    f"No training frames found for modal_train_view_id={modal_train_view_id!r}"
+                    "No training frames left after modal frame filtering"
                 )
             guru.info(
-                f"Filtered modal training frames to view_id={modal_train_view_id!r}: "
-                f"{len(frame_names)} frames"
+                "Filtered modal training frames: "
+                + ", ".join(
+                    f"{view_id}={selected_counts.get(view_id, 0)}"
+                    for view_id in view_ids
+                    if modal_train_view_id is None or view_id == modal_train_view_id
+                )
+                + f", total={len(frame_names)}"
             )
 
         if end == -1:
