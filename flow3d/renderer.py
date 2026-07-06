@@ -6,7 +6,8 @@ from nerfview import CameraState
 
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import draw_tracks_2d_th, get_server
-from flow3d.vis.viewer import DynamicViewer
+from flow3d.vis.viewer import DynamicViewer, ViewerCamera
+from modal_surface.io import load_view_config
 
 
 class Renderer:
@@ -17,6 +18,7 @@ class Renderer:
         # Logging.
         work_dir: str,
         port: int | None = None,
+        vggt_view_configs: tuple[str, ...] = (),
     ):
         self.device = device
 
@@ -29,9 +31,19 @@ class Renderer:
 
         self.viewer = None
         if port is not None:
+            orbit_center = self._gaussian_orbit_center()
+            frustum_scale = 0.08 * self._gaussian_scene_scale(orbit_center)
+            viewer_cameras = self._load_viewer_cameras(vggt_view_configs)
             server = get_server(port=port)
             self.viewer = DynamicViewer(
-                server, self.render_fn, model.num_frames, work_dir, mode="rendering"
+                server,
+                self.render_fn,
+                model.num_frames,
+                work_dir,
+                mode="rendering",
+                viewer_cameras=viewer_cameras,
+                orbit_center=orbit_center,
+                camera_frustum_scale=frustum_scale,
             )
 
         self.tracks_3d = self.model.compute_poses_fg(
@@ -55,6 +67,46 @@ class Renderer:
         renderer.global_step = ckpt.get("global_step", 0)
         renderer.epoch = ckpt.get("epoch", 0)
         return renderer
+
+    @torch.inference_mode()
+    def _gaussian_orbit_center(self) -> np.ndarray:
+        means = self.model.compute_poses_all(None)[0][:, 0]
+        finite = torch.isfinite(means).all(dim=-1)
+        if not bool(finite.any()):
+            return np.zeros(3, dtype=np.float32)
+        center = torch.median(means[finite], dim=0).values
+        return center.detach().cpu().numpy().astype(np.float32)
+
+    @torch.inference_mode()
+    def _gaussian_scene_scale(self, center: np.ndarray) -> float:
+        means = self.model.compute_poses_all(None)[0][:, 0]
+        finite = torch.isfinite(means).all(dim=-1)
+        if not bool(finite.any()):
+            return 1.0
+        center_th = torch.as_tensor(center, device=means.device, dtype=means.dtype)
+        dists = torch.linalg.norm(means[finite] - center_th, dim=-1)
+        if dists.numel() == 0:
+            return 1.0
+        scale = float(torch.quantile(dists, 0.9).detach().cpu().item())
+        return max(scale, 1.0e-3)
+
+    @staticmethod
+    def _load_viewer_cameras(vggt_view_configs: tuple[str, ...]) -> tuple[ViewerCamera, ...]:
+        viewer_cameras = []
+        for path in vggt_view_configs:
+            view_cfg = load_view_config(path)
+            c2w = np.linalg.inv(view_cfg.world_to_camera)
+            fov = float(2.0 * np.arctan(0.5 * view_cfg.image_height / view_cfg.K[1, 1]))
+            aspect = float(view_cfg.image_width) / float(view_cfg.image_height)
+            viewer_cameras.append(
+                ViewerCamera(
+                    label=view_cfg.view_id,
+                    c2w=c2w.astype(np.float64),
+                    fov=fov,
+                    aspect=aspect,
+                )
+            )
+        return tuple(viewer_cameras)
 
     @torch.inference_mode()
     def render_fn(self, camera_state: CameraState, img_wh: tuple[int, int]):

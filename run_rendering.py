@@ -35,6 +35,7 @@ def main(cfg: RenderConfig):
         use_2dgs=train_cfg["use_2dgs"],
         work_dir=cfg.work_dir,
         port=cfg.port,
+        vggt_view_configs=tuple(train_cfg.get("vggt_view_configs") or ()),
     )
 
     guru.info(f"Starting rendering from {renderer.global_step=}")
