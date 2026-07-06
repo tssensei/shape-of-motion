@@ -105,6 +105,9 @@ class TrainConfig:
     modal_stage2_train_bg_quats: bool = False
     modal_stage2_lr_fg_scales: float | None = None
     modal_stage2_lr_fg_quats: float | None = None
+    modal_refresh_every_epochs: int = 0
+    modal_refresh_transport_reg: float = 1e-4
+    modal_refresh_diagnostic_frames: int = 8
     modal_train_view_id: str | None = None
     modal_max_local_frames_per_view: int | None = None
     modal_consistency_target_view_id: str | None = None
@@ -194,6 +197,9 @@ def main(cfg: TrainConfig):
         modal_stage2_train_bg_quats=cfg.modal_stage2_train_bg_quats,
         modal_stage2_lr_fg_scales=cfg.modal_stage2_lr_fg_scales,
         modal_stage2_lr_fg_quats=cfg.modal_stage2_lr_fg_quats,
+        modal_refresh_every_epochs=cfg.modal_refresh_every_epochs,
+        modal_refresh_transport_reg=cfg.modal_refresh_transport_reg,
+        modal_refresh_diagnostic_frames=cfg.modal_refresh_diagnostic_frames,
         modal_manifest=cfg.modal_manifest,
         modal_knn=cfg.modal_knn,
         modal_interp_power=cfg.modal_interp_power,
@@ -522,6 +528,9 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_stage2_train_bg_quats": cfg.modal_stage2_train_bg_quats,
         "modal_stage2_lr_fg_scales": cfg.modal_stage2_lr_fg_scales,
         "modal_stage2_lr_fg_quats": cfg.modal_stage2_lr_fg_quats,
+        "modal_refresh_every_epochs": cfg.modal_refresh_every_epochs,
+        "modal_refresh_transport_reg": cfg.modal_refresh_transport_reg,
+        "modal_refresh_diagnostic_frames": cfg.modal_refresh_diagnostic_frames,
         "modal_consistency_target_view_id": cfg.modal_consistency_target_view_id,
         "modal_consistency_fps": cfg.modal_consistency_fps,
         "modal_consistency_view_configs": cfg.modal_consistency_view_configs,
@@ -735,6 +744,12 @@ def _make_modal_stage1_data_config(
 
 
 def _inject_vggt_static_view_config(cfg: TrainConfig):
+    if cfg.modal_refresh_every_epochs < 0:
+        raise ValueError("--modal-refresh-every-epochs must be non-negative")
+    if cfg.modal_refresh_transport_reg <= 0:
+        raise ValueError("--modal-refresh-transport-reg must be positive")
+    if cfg.modal_refresh_diagnostic_frames < 0:
+        raise ValueError("--modal-refresh-diagnostic-frames must be non-negative")
     if (
         cfg.modal_train_view_id is not None
         or cfg.modal_max_local_frames_per_view is not None
