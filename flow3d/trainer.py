@@ -472,7 +472,7 @@ class Trainer:
         path: str, device: torch.device, use_2dgs, *args, **kwargs
     ) -> tuple["Trainer", int]:
         guru.info(f"Loading checkpoint from {path}")
-        ckpt = torch.load(path)
+        ckpt = torch.load(path, weights_only=False)
         state_dict = ckpt["model"]
         model = SceneModel.init_from_state_dict(state_dict)
         model = model.to(device)

@@ -495,7 +495,7 @@ def _load_stage1_gaussians_from_checkpoint(
 ) -> tuple[GaussianParams, GaussianParams | None]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Stage 1 init checkpoint does not exist: {path}")
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     state_dict = ckpt.get("model")
     if not isinstance(state_dict, dict):
         raise ValueError(f"Stage 1 init checkpoint has no model state: {path}")
@@ -646,7 +646,7 @@ def _validate_checkpoint_policy(
             "Use a new work_dir or pass --resume."
         )
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     actual_metadata = ckpt.get("init_metadata")
     if actual_metadata is None:
         raise ValueError(
