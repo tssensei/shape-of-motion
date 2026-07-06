@@ -485,6 +485,296 @@ def _append_view_observations(
     return added, z_reference
 
 
+def _write_point_observation_graph(
+    points_world_all: np.ndarray,
+    configs: Sequence[ViewConfig],
+    modals: Sequence[dict[str, np.ndarray]],
+    view_freqs_hz: np.ndarray,
+    reference_freq_hz: float,
+    reliability: dict[str, np.ndarray],
+    out_path: str | Path,
+    mode_index: int,
+    mask_erode_iters: int,
+    zbuffer_radius: int,
+    front_percentile: float,
+    zbuffer_tau: float,
+    min_zbuffer_samples: int,
+    min_observations: int,
+    view_frequency_weighting: str,
+    snr_band_hz: float,
+    snr_exclude_hz: float,
+    snr_good: float,
+    view_weight_min: float,
+    depth_weighting: str,
+    depth_weight_power: float,
+    depth_weight_min: float,
+    depth_weight_reference_percentile: float,
+    pair_weight_specs: Sequence[str] | None,
+    source_view_config_paths: Sequence[str | Path],
+    source_modal_npz_paths: Sequence[str | Path],
+    preserve_all_points: bool = False,
+    optional_point_fields: dict[str, np.ndarray] | None = None,
+    extra_metadata: dict[str, np.ndarray] | None = None,
+) -> Path:
+    points_world_all = np.asarray(points_world_all, dtype=np.float32)
+    if points_world_all.ndim != 2 or points_world_all.shape[1] != 3:
+        raise ValueError(f"points_world must have shape (N,3), got {points_world_all.shape}.")
+
+    view_frequency_weights = reliability["weights"]
+    obs_point_indices: list[int] = []
+    obs_view_indices: list[int] = []
+    obs_pixels: list[list[float]] = []
+    obs_y: list[list[complex]] = []
+    obs_j: list[np.ndarray] = []
+    obs_confidence: list[float] = []
+    obs_depth_weight: list[float] = []
+    obs_camera_z: list[float] = []
+    observations_per_view: list[int] = []
+    view_depth_reference_z: list[float] = []
+    for view_index, (cfg, modal) in enumerate(zip(configs, modals)):
+        count, z_reference = _append_view_observations(
+            points_world_all,
+            view_index,
+            cfg,
+            modal,
+            mode_index,
+            mask_erode_iters,
+            zbuffer_radius,
+            front_percentile,
+            zbuffer_tau,
+            min_zbuffer_samples,
+            obs_point_indices,
+            obs_view_indices,
+            obs_pixels,
+            obs_y,
+            obs_j,
+            obs_confidence,
+            obs_depth_weight,
+            obs_camera_z,
+            float(view_frequency_weights[view_index]),
+            depth_weighting,
+            depth_weight_power,
+            depth_weight_min,
+            depth_weight_reference_percentile,
+        )
+        observations_per_view.append(count)
+        view_depth_reference_z.append(z_reference)
+
+    obs_point_arr = np.asarray(obs_point_indices, dtype=np.int64)
+    obs_view_arr = np.asarray(obs_view_indices, dtype=np.int32)
+    if obs_point_arr.size == 0:
+        raise ValueError("No observations survived point z-buffer and mask checks.")
+    counts = np.bincount(obs_point_arr, minlength=points_world_all.shape[0])
+    pair_weight_per_point, normalized_pair_weight_specs = _pair_weight_per_point(
+        points_world_all.shape[0],
+        obs_point_arr,
+        obs_view_arr,
+        counts,
+        pair_weight_specs,
+        configs,
+    )
+    obs_pair_weight = pair_weight_per_point[obs_point_arr].astype(np.float32)
+    obs_confidence_arr = np.asarray(obs_confidence, dtype=np.float32) * obs_pair_weight
+    observation_keep_points = counts >= int(min_observations)
+    if not np.any(observation_keep_points):
+        raise ValueError("No points satisfy min_observations.")
+    used_counts = counts.copy()
+    used_counts[~observation_keep_points] = 0
+
+    if preserve_all_points:
+        active_old_indices = np.arange(points_world_all.shape[0], dtype=np.int64)
+        old_to_new = active_old_indices.copy()
+    else:
+        active_old_indices = np.where(observation_keep_points)[0]
+        old_to_new = np.full(points_world_all.shape[0], -1, dtype=np.int64)
+        old_to_new[active_old_indices] = np.arange(active_old_indices.size, dtype=np.int64)
+    keep_obs = observation_keep_points[obs_point_arr]
+
+    optional_point_fields = dict(optional_point_fields or {})
+    point_fields_out: dict[str, np.ndarray] = {}
+    for key, value in optional_point_fields.items():
+        value = np.asarray(value)
+        if value.shape[:1] != (points_world_all.shape[0],):
+            raise ValueError(
+                f"Optional point field {key} must have first dimension "
+                f"{points_world_all.shape[0]}, got {value.shape}."
+            )
+        point_fields_out[key] = value[active_old_indices]
+
+    metadata = dict(extra_metadata or {})
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out,
+        points_world=points_world_all[active_old_indices].astype(np.float32),
+        obs_point_index=old_to_new[obs_point_arr[keep_obs]].astype(np.int32),
+        obs_view_index=obs_view_arr[keep_obs].astype(np.int32),
+        obs_pixels_xy=np.asarray(obs_pixels, dtype=np.float32)[keep_obs],
+        obs_y=np.asarray(obs_y, dtype=np.complex64)[keep_obs],
+        obs_J=np.asarray(obs_j, dtype=np.float32)[keep_obs],
+        obs_confidence=obs_confidence_arr[keep_obs],
+        obs_depth_weight=np.asarray(obs_depth_weight, dtype=np.float32)[keep_obs],
+        obs_pair_weight=obs_pair_weight[keep_obs],
+        obs_camera_z=np.asarray(obs_camera_z, dtype=np.float32)[keep_obs],
+        obs_count_per_point=used_counts[active_old_indices].astype(np.int32),
+        pair_weight_per_point=pair_weight_per_point[active_old_indices],
+        pair_weight_specs=normalized_pair_weight_specs,
+        view_ids=np.asarray([cfg.view_id for cfg in configs]),
+        view_image_width=np.asarray([cfg.image_width for cfg in configs], dtype=np.int32),
+        view_image_height=np.asarray([cfg.image_height for cfg in configs], dtype=np.int32),
+        view_freqs_hz=view_freqs_hz.astype(np.float32),
+        view_frequency_weighting=np.array(str(view_frequency_weighting)),
+        view_frequency_weights=view_frequency_weights.astype(np.float32),
+        view_frequency_snr=reliability["snr"].astype(np.float32),
+        view_frequency_signal=reliability["signal"].astype(np.float32),
+        view_frequency_noise=reliability["noise"].astype(np.float32),
+        view_frequency_bin_hz=reliability["bin_hz"].astype(np.float32),
+        view_depth_reference_z=np.asarray(view_depth_reference_z, dtype=np.float32),
+        depth_weighting=np.array(str(depth_weighting)),
+        depth_weight_power=np.array(depth_weight_power, dtype=np.float32),
+        depth_weight_min=np.array(depth_weight_min, dtype=np.float32),
+        depth_weight_reference_percentile=np.array(depth_weight_reference_percentile, dtype=np.float32),
+        snr_band_hz=np.array(snr_band_hz, dtype=np.float32),
+        snr_exclude_hz=np.array(snr_exclude_hz, dtype=np.float32),
+        snr_good=np.array(snr_good, dtype=np.float32),
+        view_weight_min=np.array(view_weight_min, dtype=np.float32),
+        freq_hz=np.array(reference_freq_hz, dtype=np.float32),
+        mode_index=np.array(mode_index, dtype=np.int32),
+        min_observations=np.array(min_observations, dtype=np.int32),
+        zbuffer_radius=np.array(zbuffer_radius, dtype=np.int32),
+        front_percentile=np.array(front_percentile, dtype=np.float32),
+        zbuffer_tau=np.array(zbuffer_tau, dtype=np.float32),
+        min_zbuffer_samples=np.array(min_zbuffer_samples, dtype=np.int32),
+        mask_erode_iters=np.array(mask_erode_iters, dtype=np.int32),
+        candidate_point_count=np.array(points_world_all.shape[0], dtype=np.int32),
+        preserved_all_points=np.array(bool(preserve_all_points)),
+        observations_per_view=np.asarray(observations_per_view, dtype=np.int32),
+        source_view_configs=np.asarray([str(path) for path in source_view_config_paths]),
+        source_modal_npzs=np.asarray([str(path) for path in source_modal_npz_paths]),
+        **point_fields_out,
+        **metadata,
+    )
+    return out
+
+
+def _validate_observation_graph_args(
+    min_observations: int,
+    zbuffer_radius: int,
+    front_percentile: float,
+    zbuffer_tau: float,
+    min_zbuffer_samples: int,
+    depth_weighting: str,
+    depth_weight_power: float,
+    depth_weight_min: float,
+    depth_weight_reference_percentile: float,
+) -> None:
+    if min_observations < 1:
+        raise ValueError("min_observations must be at least 1.")
+    if zbuffer_radius < 0:
+        raise ValueError("zbuffer_radius must be non-negative.")
+    if not (0.0 <= front_percentile <= 100.0):
+        raise ValueError("front_percentile must be in [0, 100].")
+    if zbuffer_tau <= 0:
+        raise ValueError("zbuffer_tau must be positive.")
+    if min_zbuffer_samples < 1:
+        raise ValueError("min_zbuffer_samples must be at least 1.")
+    if depth_weighting not in {"none", "inverse-z"}:
+        raise ValueError("depth_weighting must be 'none' or 'inverse-z'.")
+    if depth_weight_power <= 0:
+        raise ValueError("depth_weight_power must be positive.")
+    if not (0.0 <= depth_weight_min <= 1.0):
+        raise ValueError("depth_weight_min must be in [0, 1].")
+    if not (0.0 <= depth_weight_reference_percentile <= 100.0):
+        raise ValueError("depth_weight_reference_percentile must be in [0, 100].")
+
+
+def build_points_observation_graph(
+    points_world: np.ndarray,
+    view_config_paths: Sequence[str | Path],
+    modal_npz_paths: Sequence[str | Path],
+    out_path: str | Path,
+    mode_index: int = 0,
+    mask_erode_iters: int = 1,
+    zbuffer_radius: int = 5,
+    front_percentile: float = 10.0,
+    zbuffer_tau: float = 0.05,
+    min_zbuffer_samples: int = 5,
+    min_observations: int = 1,
+    freq_tolerance_hz: float = 0.1,
+    view_frequency_weighting: str = "none",
+    snr_band_hz: float = 0.3,
+    snr_exclude_hz: float = 0.08,
+    snr_good: float = 3.0,
+    view_weight_min: float = 0.05,
+    depth_weighting: str = "none",
+    depth_weight_power: float = 2.0,
+    depth_weight_min: float = 0.02,
+    depth_weight_reference_percentile: float = 50.0,
+    pair_weight_specs: Sequence[str] | None = None,
+    preserve_all_points: bool = False,
+    optional_point_fields: dict[str, np.ndarray] | None = None,
+    extra_metadata: dict[str, np.ndarray] | None = None,
+) -> Path:
+    """Build an N-view observation graph for an arbitrary fixed 3D point set."""
+    _validate_observation_graph_args(
+        min_observations,
+        zbuffer_radius,
+        front_percentile,
+        zbuffer_tau,
+        min_zbuffer_samples,
+        depth_weighting,
+        depth_weight_power,
+        depth_weight_min,
+        depth_weight_reference_percentile,
+    )
+    configs, modals, view_freqs_hz, reference_freq_hz = _load_view_inputs(
+        view_config_paths,
+        modal_npz_paths,
+        mode_index,
+        freq_tolerance_hz,
+    )
+    reliability = _view_frequency_reliability(
+        modals,
+        view_freqs_hz,
+        view_frequency_weighting,
+        snr_band_hz,
+        snr_exclude_hz,
+        snr_good,
+        view_weight_min,
+    )
+    return _write_point_observation_graph(
+        points_world,
+        configs,
+        modals,
+        view_freqs_hz,
+        reference_freq_hz,
+        reliability,
+        out_path,
+        mode_index,
+        mask_erode_iters,
+        zbuffer_radius,
+        front_percentile,
+        zbuffer_tau,
+        min_zbuffer_samples,
+        min_observations,
+        view_frequency_weighting,
+        snr_band_hz,
+        snr_exclude_hz,
+        snr_good,
+        view_weight_min,
+        depth_weighting,
+        depth_weight_power,
+        depth_weight_min,
+        depth_weight_reference_percentile,
+        pair_weight_specs,
+        view_config_paths,
+        modal_npz_paths,
+        preserve_all_points=preserve_all_points,
+        optional_point_fields=optional_point_fields,
+        extra_metadata=extra_metadata,
+    )
+
+
 def build_carrier_observation_graph(
     carrier_points_path: str | Path,
     view_config_paths: Sequence[str | Path],

@@ -103,6 +103,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_solve.add_argument("--obs-count-weight-2", type=float, default=0.75, help="Data weight multiplier for points observed by two views.")
     p_solve.add_argument("--obs-count-weight-3plus", type=float, default=1.0, help="Data weight multiplier for points observed by three or more views.")
 
+    p_solve_gaussian = sub.add_parser(
+        "solve-gaussian-modes",
+        help="Batch solve modal fields directly on foreground 3DGS Gaussian centers.",
+    )
+    from modal_surface.apps import solve_gaussian_modes
+
+    solve_gaussian_modes.add_arguments(p_solve_gaussian)
+
     return parser
 
 
@@ -123,6 +131,11 @@ def main(argv: list[str] | None = None) -> None:
         from modal_surface.apps import solve_carrier_modes
 
         solve_carrier_modes.run(args)
+        return
+    if args.command == "solve-gaussian-modes":
+        from modal_surface.apps import solve_gaussian_modes
+
+        solve_gaussian_modes.run(args)
         return
     raise SystemExit(f"Unknown command: {args.command}")
 

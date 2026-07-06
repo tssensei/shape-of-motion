@@ -674,6 +674,14 @@ def optimize_multi_view(
         if colors.shape != (points.shape[0], 3):
             raise ValueError("colors must have shape (N,3) and match points_world length.")
         optional_point_fields["colors"] = colors[active_indices].astype(np.uint8)
+    if "gaussian_indices" in data.files:
+        gaussian_indices = data["gaussian_indices"]
+        if gaussian_indices.shape != (points.shape[0],):
+            raise ValueError("gaussian_indices must have shape (N,) and match points_world length.")
+        optional_point_fields["gaussian_indices"] = gaussian_indices[active_indices].astype(np.int32)
+    for scalar_key in ("point_type", "source_checkpoint"):
+        if scalar_key in data.files:
+            optional_point_fields[scalar_key] = data[scalar_key]
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
