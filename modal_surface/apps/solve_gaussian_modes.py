@@ -44,6 +44,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pixel-max-samples-per-view", type=int, default=20000, help="Maximum sampled modal pixels per view before candidate expansion.")
     parser.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
     parser.add_argument("--zbuffer-radius", type=int, default=5, help="Local robust z-buffer window radius in pixels.")
+    parser.add_argument("--zbuffer-mode", choices=["hard", "soft"], default="hard", help="Hard z-buffer filtering or soft z-buffer confidence weighting.")
+    parser.add_argument("--zbuffer-soft-sigma", type=float, default=0.10, help="Normalized depth sigma used by --zbuffer-mode soft.")
+    parser.add_argument("--zbuffer-soft-min-weight", type=float, default=0.05, help="Minimum z-buffer weight retained by --zbuffer-mode soft.")
     parser.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
     parser.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
     parser.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local point depths for visibility.")
@@ -193,6 +196,9 @@ def run(args: argparse.Namespace) -> None:
             mode_index=mode_index,
             mask_erode_iters=args.mask_erode_iters,
             zbuffer_radius=args.zbuffer_radius,
+            zbuffer_mode=args.zbuffer_mode,
+            zbuffer_soft_sigma=args.zbuffer_soft_sigma,
+            zbuffer_soft_min_weight=args.zbuffer_soft_min_weight,
             front_percentile=args.front_percentile,
             zbuffer_tau=args.zbuffer_tau,
             min_zbuffer_samples=args.min_zbuffer_samples,
@@ -274,6 +280,9 @@ def run(args: argparse.Namespace) -> None:
             "pixel_min_mode_amp_percentile": float(args.pixel_min_mode_amp_percentile),
             "pixel_max_samples_per_view": int(args.pixel_max_samples_per_view),
             "zbuffer_radius": int(args.zbuffer_radius),
+            "zbuffer_mode": str(args.zbuffer_mode),
+            "zbuffer_soft_sigma": float(args.zbuffer_soft_sigma),
+            "zbuffer_soft_min_weight": float(args.zbuffer_soft_min_weight),
             "front_percentile": float(args.front_percentile),
             "zbuffer_tau": float(args.zbuffer_tau),
             "min_zbuffer_samples": int(args.min_zbuffer_samples),

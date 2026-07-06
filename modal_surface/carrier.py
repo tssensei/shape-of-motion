@@ -266,6 +266,26 @@ def _local_depth_stats(
     return float(z_front), float(z_med)
 
 
+def _zbuffer_weight(
+    z_value: float,
+    z_front: float,
+    z_med: float,
+    zbuffer_tau: float,
+    zbuffer_mode: str,
+    zbuffer_soft_sigma: float,
+    zbuffer_soft_min_weight: float,
+) -> float | None:
+    rel_depth_delta = abs(float(z_value) - float(z_front)) / max(abs(float(z_med)), 1e-6)
+    if zbuffer_mode == "hard":
+        return 1.0 if rel_depth_delta < float(zbuffer_tau) else None
+    if zbuffer_mode != "soft":
+        raise ValueError("zbuffer_mode must be 'hard' or 'soft'.")
+    weight = float(np.exp(-0.5 * (rel_depth_delta / float(zbuffer_soft_sigma)) ** 2))
+    if weight < float(zbuffer_soft_min_weight):
+        return None
+    return weight
+
+
 def _bucket_indices_in_radius(
     buckets: dict[int, np.ndarray],
     x: int,
@@ -439,6 +459,10 @@ def _append_view_observations(
     depth_weight_power: float,
     depth_weight_min: float,
     depth_weight_reference_percentile: float,
+    obs_zbuffer_weight: list[float] | None = None,
+    zbuffer_mode: str = "hard",
+    zbuffer_soft_sigma: float = 0.10,
+    zbuffer_soft_min_weight: float = 0.05,
 ) -> tuple[int, float]:
     expected_shape = (cfg.image_height, cfg.image_width)
     mask = load_mask(cfg.mask_path, expected_shape)
@@ -484,7 +508,16 @@ def _append_view_observations(
         z_front, z_med = stats
         if z_med <= 0:
             continue
-        if abs(float(z[point_idx]) - z_front) / max(abs(z_med), 1e-6) >= zbuffer_tau:
+        z_weight = _zbuffer_weight(
+            float(z[point_idx]),
+            z_front,
+            z_med,
+            zbuffer_tau,
+            zbuffer_mode,
+            zbuffer_soft_sigma,
+            zbuffer_soft_min_weight,
+        )
+        if z_weight is None:
             continue
 
         sample_xy = pixels_xy[point_idx : point_idx + 1]
@@ -502,9 +535,11 @@ def _append_view_observations(
             depth_weight_power,
             depth_weight_min,
         )
-        obs_confidence.append(float(view_confidence) * depth_weight)
+        obs_confidence.append(float(view_confidence) * depth_weight * float(z_weight))
         obs_depth_weight.append(depth_weight)
         obs_camera_z.append(float(z[point_idx]))
+        if obs_zbuffer_weight is not None:
+            obs_zbuffer_weight.append(float(z_weight))
         added += 1
     return added, z_reference
 
@@ -540,6 +575,10 @@ def _append_view_pixel_candidate_observations(
     pixel_weight_sigma: float,
     pixel_min_mode_amp_percentile: float,
     pixel_max_samples_per_view: int,
+    obs_zbuffer_weight: list[float],
+    zbuffer_mode: str,
+    zbuffer_soft_sigma: float,
+    zbuffer_soft_min_weight: float,
 ) -> tuple[int, float]:
     expected_shape = (cfg.image_height, cfg.image_width)
     mask = load_mask(cfg.mask_path, expected_shape)
@@ -621,17 +660,33 @@ def _append_view_pixel_candidate_observations(
         projected = pixels_xy[nearby]
         delta = projected - np.asarray([[float(x), float(y)]], dtype=np.float32)
         dist = np.linalg.norm(delta, axis=1).astype(np.float32)
-        front = np.abs(z[nearby].astype(np.float32) - float(z_front)) / max(abs(float(z_med)), 1e-6) < float(zbuffer_tau)
+        z_weights = np.asarray(
+            [
+                _zbuffer_weight(
+                    float(z[int(point_idx)]),
+                    z_front,
+                    z_med,
+                    zbuffer_tau,
+                    zbuffer_mode,
+                    zbuffer_soft_sigma,
+                    zbuffer_soft_min_weight,
+                )
+                for point_idx in nearby.tolist()
+            ],
+            dtype=object,
+        )
+        front = np.asarray([weight is not None for weight in z_weights.tolist()], dtype=bool)
         within = dist <= float(pixel_search_radius)
         valid = front & within & np.isfinite(dist)
         if not np.any(valid):
             continue
         nearby = nearby[valid]
         dist = dist[valid]
+        z_weights = z_weights[valid].astype(np.float32)
         order = np.argsort(dist)[: int(pixel_candidate_k)]
         y_u = complex(mode_u[int(y), int(x)])
         y_v = complex(mode_v[int(y), int(x)])
-        for point_idx, distance in zip(nearby[order].tolist(), dist[order].tolist()):
+        for point_idx, distance, z_weight in zip(nearby[order].tolist(), dist[order].tolist(), z_weights[order].tolist()):
             obs_point_indices.append(int(point_idx))
             obs_view_indices.append(view_index)
             obs_pixels.append([float(x), float(y)])
@@ -645,10 +700,11 @@ def _append_view_pixel_candidate_observations(
                 depth_weight_min,
             )
             distance_weight = float(np.exp(-(float(distance) ** 2) / max(2.0 * sigma2, 1e-12)))
-            obs_confidence.append(float(view_confidence) * depth_weight * distance_weight)
+            obs_confidence.append(float(view_confidence) * depth_weight * distance_weight * float(z_weight))
             obs_depth_weight.append(depth_weight)
             obs_camera_z.append(float(z[int(point_idx)]))
             obs_candidate_distance_px.append(float(distance))
+            obs_zbuffer_weight.append(float(z_weight))
             added += 1
     return added, z_reference
 
@@ -690,12 +746,17 @@ def _write_point_observation_graph(
     pixel_weight_sigma: float = 3.0,
     pixel_min_mode_amp_percentile: float = 50.0,
     pixel_max_samples_per_view: int = 20000,
+    zbuffer_mode: str = "hard",
+    zbuffer_soft_sigma: float = 0.10,
+    zbuffer_soft_min_weight: float = 0.05,
 ) -> Path:
     points_world_all = np.asarray(points_world_all, dtype=np.float32)
     if points_world_all.ndim != 2 or points_world_all.shape[1] != 3:
         raise ValueError(f"points_world must have shape (N,3), got {points_world_all.shape}.")
     if observation_sampling not in {"gaussian-center", "pixel-candidates"}:
         raise ValueError("observation_sampling must be 'gaussian-center' or 'pixel-candidates'.")
+    if zbuffer_mode not in {"hard", "soft"}:
+        raise ValueError("zbuffer_mode must be 'hard' or 'soft'.")
 
     view_frequency_weights = reliability["weights"]
     obs_point_indices: list[int] = []
@@ -707,6 +768,7 @@ def _write_point_observation_graph(
     obs_depth_weight: list[float] = []
     obs_camera_z: list[float] = []
     obs_candidate_distance_px: list[float] = []
+    obs_zbuffer_weight: list[float] = []
     observations_per_view: list[int] = []
     view_depth_reference_z: list[float] = []
     for view_index, (cfg, modal) in enumerate(zip(configs, modals)):
@@ -735,6 +797,10 @@ def _write_point_observation_graph(
                 depth_weight_power,
                 depth_weight_min,
                 depth_weight_reference_percentile,
+                obs_zbuffer_weight,
+                zbuffer_mode,
+                zbuffer_soft_sigma,
+                zbuffer_soft_min_weight,
             )
         else:
             count, z_reference = _append_view_pixel_candidate_observations(
@@ -768,6 +834,10 @@ def _write_point_observation_graph(
                 pixel_weight_sigma,
                 pixel_min_mode_amp_percentile,
                 pixel_max_samples_per_view,
+                obs_zbuffer_weight,
+                zbuffer_mode,
+                zbuffer_soft_sigma,
+                zbuffer_soft_min_weight,
             )
         observations_per_view.append(count)
         view_depth_reference_z.append(z_reference)
@@ -809,6 +879,9 @@ def _write_point_observation_graph(
         if len(obs_candidate_distance_px) != obs_point_arr.shape[0]:
             raise ValueError("Internal error: candidate distance count does not match observations.")
         obs_fields_out["obs_candidate_distance_px"] = np.asarray(obs_candidate_distance_px, dtype=np.float32)[keep_obs]
+    if len(obs_zbuffer_weight) != obs_point_arr.shape[0]:
+        raise ValueError("Internal error: z-buffer weight count does not match observations.")
+    obs_fields_out["obs_zbuffer_weight"] = np.asarray(obs_zbuffer_weight, dtype=np.float32)[keep_obs]
 
     optional_point_fields = dict(optional_point_fields or {})
     point_fields_out: dict[str, np.ndarray] = {}
@@ -863,6 +936,9 @@ def _write_point_observation_graph(
         mode_index=np.array(mode_index, dtype=np.int32),
         min_observations=np.array(min_observations, dtype=np.int32),
         zbuffer_radius=np.array(zbuffer_radius, dtype=np.int32),
+        zbuffer_mode=np.array(str(zbuffer_mode)),
+        zbuffer_soft_sigma=np.array(zbuffer_soft_sigma, dtype=np.float32),
+        zbuffer_soft_min_weight=np.array(zbuffer_soft_min_weight, dtype=np.float32),
         front_percentile=np.array(front_percentile, dtype=np.float32),
         zbuffer_tau=np.array(zbuffer_tau, dtype=np.float32),
         min_zbuffer_samples=np.array(min_zbuffer_samples, dtype=np.int32),
@@ -896,6 +972,9 @@ def _validate_observation_graph_args(
     depth_weight_power: float,
     depth_weight_min: float,
     depth_weight_reference_percentile: float,
+    zbuffer_mode: str = "hard",
+    zbuffer_soft_sigma: float = 0.10,
+    zbuffer_soft_min_weight: float = 0.05,
 ) -> None:
     if min_observations < 1:
         raise ValueError("min_observations must be at least 1.")
@@ -905,6 +984,12 @@ def _validate_observation_graph_args(
         raise ValueError("front_percentile must be in [0, 100].")
     if zbuffer_tau <= 0:
         raise ValueError("zbuffer_tau must be positive.")
+    if zbuffer_mode not in {"hard", "soft"}:
+        raise ValueError("zbuffer_mode must be 'hard' or 'soft'.")
+    if zbuffer_soft_sigma <= 0:
+        raise ValueError("zbuffer_soft_sigma must be positive.")
+    if not (0.0 <= zbuffer_soft_min_weight <= 1.0):
+        raise ValueError("zbuffer_soft_min_weight must be in [0, 1].")
     if min_zbuffer_samples < 1:
         raise ValueError("min_zbuffer_samples must be at least 1.")
     if depth_weighting not in {"none", "inverse-z"}:
@@ -972,6 +1057,9 @@ def build_points_observation_graph(
     pixel_weight_sigma: float = 3.0,
     pixel_min_mode_amp_percentile: float = 50.0,
     pixel_max_samples_per_view: int = 20000,
+    zbuffer_mode: str = "hard",
+    zbuffer_soft_sigma: float = 0.10,
+    zbuffer_soft_min_weight: float = 0.05,
 ) -> Path:
     """Build an N-view observation graph for an arbitrary fixed 3D point set."""
     _validate_observation_graph_args(
@@ -984,6 +1072,9 @@ def build_points_observation_graph(
         depth_weight_power,
         depth_weight_min,
         depth_weight_reference_percentile,
+        zbuffer_mode,
+        zbuffer_soft_sigma,
+        zbuffer_soft_min_weight,
     )
     if observation_sampling not in {"gaussian-center", "pixel-candidates"}:
         raise ValueError("observation_sampling must be 'gaussian-center' or 'pixel-candidates'.")
@@ -1048,6 +1139,9 @@ def build_points_observation_graph(
         pixel_weight_sigma=pixel_weight_sigma,
         pixel_min_mode_amp_percentile=pixel_min_mode_amp_percentile,
         pixel_max_samples_per_view=pixel_max_samples_per_view,
+        zbuffer_mode=zbuffer_mode,
+        zbuffer_soft_sigma=zbuffer_soft_sigma,
+        zbuffer_soft_min_weight=zbuffer_soft_min_weight,
     )
 
 
