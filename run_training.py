@@ -23,7 +23,7 @@ from flow3d.data import (
     iPhoneDataConfig,
     NvidiaDataConfig,
 )
-from flow3d.data.colmap import read_points3D_binary
+from flow3d.data.colmap import read_points3d_binary
 from flow3d.data.utils import to_device
 from flow3d.init_utils import (
     init_bg,
@@ -803,7 +803,7 @@ def init_static_gaussians_from_colmap(
     if not points_path.exists():
         raise FileNotFoundError(points_path)
 
-    points3d = read_points3D_binary(points_path)
+    points3d = read_points3d_binary(points_path)
     if not points3d:
         raise ValueError(f"No COLMAP sparse points found in {points_path}")
     points = np.stack([p.xyz for p in points3d.values()]).astype(np.float32)
