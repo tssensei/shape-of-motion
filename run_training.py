@@ -40,7 +40,7 @@ from flow3d.modal_utils import (
     load_modal_modes,
     resolve_required_modal_paths,
 )
-from flow3d.params import CameraScales, ModalActivations
+from flow3d.params import CameraScales, GaussianParams, ModalActivations
 from flow3d.scene_model import SceneModel
 from flow3d.tensor_dataclass import StaticObservations, TrackObservations
 from flow3d.trainer import Trainer
@@ -93,6 +93,7 @@ class TrainConfig:
     modal_stage1_data_dir: str | None = None
     modal_stage1_frame_map: str | None = None
     modal_stage1_epochs: int = 0
+    modal_stage1_init_ckpt: str | None = None
     modal_stage2_train_base_means: bool = True
     modal_stage2_train_colors: bool = True
     modal_stage2_train_opacities: bool = True
@@ -135,9 +136,13 @@ def main(cfg: TrainConfig):
     _inject_vggt_static_view_config(cfg)
     stage1_data_cfg = _make_modal_stage1_data_config(cfg)
     effective_modal_warmup_epochs = (
-        cfg.modal_stage1_epochs
-        if stage1_data_cfg is not None
-        else cfg.modal_warmup_epochs
+        0
+        if cfg.modal_stage1_init_ckpt is not None
+        else (
+            cfg.modal_stage1_epochs
+            if stage1_data_cfg is not None
+            else cfg.modal_warmup_epochs
+        )
     )
     ckpt_path = f"{cfg.work_dir}/checkpoints/last.ckpt"
     init_metadata = _make_init_metadata(cfg)
@@ -275,6 +280,13 @@ def main(cfg: TrainConfig):
             loss = trainer.train_step(batch)
             pbar.set_description(f"{stage_name} Loss: {loss:.6f}")
 
+        if (
+            stage1_loader is not None
+            and stage_name == "stage1"
+            and epoch == cfg.modal_stage1_epochs - 1
+        ):
+            trainer.save_checkpoint(f"{cfg.work_dir}/checkpoints/stage1.ckpt")
+
         if validator is not None:
             if (epoch > 0 and epoch % cfg.validate_every == 0) or (
                 epoch == cfg.num_epochs - 1
@@ -300,18 +312,33 @@ def initialize_and_checkpoint_model(
         guru.info(f"model checkpoint exists at {ckpt_path}")
         return
 
-    fg_params, motion_bases, bg_params, tracks_3d, cano_t = init_model_from_tracks(
-        train_dataset,
-        cfg.num_fg,
-        cfg.num_bg,
-        cfg.num_motion_bases,
-        cfg.trajectory_type,
-        cfg.num_dct_bases,
-        cfg.dct_init,
-        cfg.modal_carrier_points,
-        vis=vis,
-        port=port,
-    )
+    if cfg.modal_stage1_init_ckpt is not None:
+        if cfg.trajectory_type != "modal_activation":
+            raise ValueError("--modal-stage1-init-ckpt requires modal_activation")
+        fg_params, bg_params = _load_stage1_gaussians_from_checkpoint(
+            cfg.modal_stage1_init_ckpt,
+            device,
+        )
+        motion_bases = init_identity_motion_bases(
+            train_dataset.num_frames,
+            device,
+            fg_params.params["means"].dtype,
+        ).to(device)
+        tracks_3d = None
+        cano_t = 0
+    else:
+        fg_params, motion_bases, bg_params, tracks_3d, cano_t = init_model_from_tracks(
+            train_dataset,
+            cfg.num_fg,
+            cfg.num_bg,
+            cfg.num_motion_bases,
+            cfg.trajectory_type,
+            cfg.num_dct_bases,
+            cfg.dct_init,
+            cfg.modal_carrier_points,
+            vis=vis,
+            port=port,
+        )
     # run initial optimization
     Ks = train_dataset.get_Ks().to(device)
     w2cs = train_dataset.get_w2cs().to(device)
@@ -462,6 +489,47 @@ def initialize_and_checkpoint_model(
     )
 
 
+def _load_stage1_gaussians_from_checkpoint(
+    path: str,
+    device: torch.device,
+) -> tuple[GaussianParams, GaussianParams | None]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Stage 1 init checkpoint does not exist: {path}")
+    ckpt = torch.load(path, map_location=device)
+    state_dict = ckpt.get("model")
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Stage 1 init checkpoint has no model state: {path}")
+    try:
+        fg_params = GaussianParams.init_from_state_dict(
+            state_dict,
+            prefix="fg.params.",
+        ).to(device)
+    except AssertionError as exc:
+        raise ValueError(
+            f"Stage 1 init checkpoint cannot restore foreground Gaussians: {path}"
+        ) from exc
+
+    bg_params = None
+    if any(key.startswith("bg.params.") for key in state_dict):
+        try:
+            bg_params = GaussianParams.init_from_state_dict(
+                state_dict,
+                prefix="bg.params.",
+            ).to(device)
+        except AssertionError as exc:
+            raise ValueError(
+                f"Stage 1 init checkpoint cannot restore background Gaussians: {path}"
+            ) from exc
+
+    num_bg = 0 if bg_params is None else bg_params.num_gaussians
+    guru.info(
+        "Loaded Stage 1 Gaussian init from "
+        f"{path}: fg={fg_params.num_gaussians}, bg={num_bg}, "
+        f"source_epoch={ckpt.get('epoch')}, source_step={ckpt.get('global_step')}"
+    )
+    return fg_params, bg_params
+
+
 def _metadata_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_metadata_value(v) for v in value]
@@ -494,6 +562,8 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "data_dir": cfg.modal_stage1_data_dir,
         "frame_map": cfg.modal_stage1_frame_map,
         "epochs": cfg.modal_stage1_epochs,
+        "init_ckpt": cfg.modal_stage1_init_ckpt,
+        "reuse": cfg.modal_stage1_init_ckpt is not None,
     }
     metadata = {
         "trajectory_type": cfg.trajectory_type,
@@ -514,6 +584,8 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_warmup_epochs": cfg.modal_warmup_epochs,
         "modal_train_base_means": cfg.modal_train_base_means,
         "modal_stage1": stage1_metadata,
+        "modal_stage1_init_ckpt": cfg.modal_stage1_init_ckpt,
+        "modal_stage1_reuse": cfg.modal_stage1_init_ckpt is not None,
         "modal_stage2_train_base_means": (
             cfg.modal_stage2_train_base_means or cfg.modal_train_base_means
         ),
@@ -693,13 +765,28 @@ def init_model_from_tracks(
 def _make_modal_stage1_data_config(
     cfg: TrainConfig,
 ) -> DavisDataConfig | CustomDataConfig | None:
+    has_stage1_init = cfg.modal_stage1_init_ckpt is not None
     has_stage1_data = (
         cfg.modal_stage1_data_dir is not None
         or cfg.modal_stage1_frame_map is not None
     )
     if cfg.trajectory_type != "modal_activation":
-        if has_stage1_data or cfg.modal_stage1_epochs != 0:
+        if has_stage1_init or has_stage1_data or cfg.modal_stage1_epochs != 0:
             raise ValueError("modal stage1 options require modal_activation")
+        return None
+    if has_stage1_init:
+        if has_stage1_data:
+            raise ValueError(
+                "--modal-stage1-init-ckpt cannot be combined with "
+                "--modal-stage1-data-dir or --modal-stage1-frame-map"
+            )
+        if not os.path.exists(cfg.modal_stage1_init_ckpt):
+            raise FileNotFoundError(
+                f"Stage 1 init checkpoint does not exist: {cfg.modal_stage1_init_ckpt}"
+            )
+        guru.info(
+            "--modal-stage1-init-ckpt is set; skipping Stage 1 dataset and epochs"
+        )
         return None
     if not has_stage1_data:
         if cfg.modal_stage1_epochs != 0:
