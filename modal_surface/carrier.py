@@ -348,16 +348,17 @@ def _validate_gaussian_contribution_inputs(
     rendered_depths: Sequence[np.ndarray] | None,
     rendered_accs: Sequence[np.ndarray] | None,
     configs: Sequence[ViewConfig],
+    require_rendered: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
     if gaussian_scales is None:
-        raise ValueError("pixel-candidates requires gaussian_scales.")
+        raise ValueError("Contribution-based Gaussian sampling requires gaussian_scales.")
     if gaussian_quats is None:
-        raise ValueError("pixel-candidates requires gaussian_quats.")
+        raise ValueError("Contribution-based Gaussian sampling requires gaussian_quats.")
     if gaussian_opacities is None:
-        raise ValueError("pixel-candidates requires gaussian_opacities.")
-    if rendered_depths is None:
+        raise ValueError("Contribution-based Gaussian sampling requires gaussian_opacities.")
+    if require_rendered and rendered_depths is None:
         raise ValueError("pixel-candidates requires rendered_depths.")
-    if rendered_accs is None:
+    if require_rendered and rendered_accs is None:
         raise ValueError("pixel-candidates requires rendered_accs.")
 
     scales = np.asarray(gaussian_scales, dtype=np.float32)
@@ -373,21 +374,24 @@ def _validate_gaussian_contribution_inputs(
         raise ValueError("gaussian_scales must be finite and positive.")
     if not np.all(np.isfinite(opacities)) or np.any(opacities < 0):
         raise ValueError("gaussian_opacities must be finite and non-negative.")
-    if len(rendered_depths) != len(configs) or len(rendered_accs) != len(configs):
-        raise ValueError("rendered_depths/rendered_accs must have one array per view.")
 
     depth_arrays: list[np.ndarray] = []
     acc_arrays: list[np.ndarray] = []
-    for cfg, depth, acc in zip(configs, rendered_depths, rendered_accs):
-        expected_shape = (cfg.image_height, cfg.image_width)
-        depth_arr = np.asarray(depth, dtype=np.float32)
-        acc_arr = np.asarray(acc, dtype=np.float32)
-        if depth_arr.shape != expected_shape:
-            raise ValueError(f"Rendered depth for {cfg.view_id} must have shape {expected_shape}, got {depth_arr.shape}.")
-        if acc_arr.shape != expected_shape:
-            raise ValueError(f"Rendered alpha for {cfg.view_id} must have shape {expected_shape}, got {acc_arr.shape}.")
-        depth_arrays.append(depth_arr)
-        acc_arrays.append(acc_arr)
+    if rendered_depths is not None or rendered_accs is not None:
+        if rendered_depths is None or rendered_accs is None:
+            raise ValueError("rendered_depths and rendered_accs must either both be supplied or both be omitted.")
+        if len(rendered_depths) != len(configs) or len(rendered_accs) != len(configs):
+            raise ValueError("rendered_depths/rendered_accs must have one array per view.")
+        for cfg, depth, acc in zip(configs, rendered_depths, rendered_accs):
+            expected_shape = (cfg.image_height, cfg.image_width)
+            depth_arr = np.asarray(depth, dtype=np.float32)
+            acc_arr = np.asarray(acc, dtype=np.float32)
+            if depth_arr.shape != expected_shape:
+                raise ValueError(f"Rendered depth for {cfg.view_id} must have shape {expected_shape}, got {depth_arr.shape}.")
+            if acc_arr.shape != expected_shape:
+                raise ValueError(f"Rendered alpha for {cfg.view_id} must have shape {expected_shape}, got {acc_arr.shape}.")
+            depth_arrays.append(depth_arr)
+            acc_arrays.append(acc_arr)
     return scales, quats, opacities, depth_arrays, acc_arrays
 
 
@@ -413,6 +417,7 @@ def _append_view_contribution_observations(
     obs_camera_z: list[float],
     obs_contribution_weight: list[float],
     obs_contribution_score: list[float],
+    obs_contribution_sum: list[float],
     obs_surface_pixels: list[list[float]],
     obs_surface_camera_z: list[float],
     view_confidence: float,
@@ -542,10 +547,174 @@ def _append_view_contribution_observations(
             obs_camera_z.append(candidate_z)
             obs_contribution_weight.append(float(contribution_weight))
             obs_contribution_score.append(float(score))
+            obs_contribution_sum.append(denom)
             obs_surface_pixels.append([float(surface_pixels[row, 0]), float(surface_pixels[row, 1])])
             obs_surface_camera_z.append(float(depth))
             obs_zbuffer_weight.append(1.0)
             added += 1
+    return added, z_reference
+
+
+def _projected_covariances_2d(
+    jacobians: np.ndarray,
+    gaussian_scales: np.ndarray,
+    gaussian_rotmats: np.ndarray,
+    cov_eps_px: float,
+) -> np.ndarray:
+    scales2 = gaussian_scales.astype(np.float64) ** 2
+    rotmats = gaussian_rotmats.astype(np.float64)
+    cov3d = np.einsum("nai,ni,nbi->nab", rotmats, scales2, rotmats)
+    tmp = np.einsum("nij,njk->nik", jacobians.astype(np.float64), cov3d)
+    cov2d = np.einsum("nij,nkj->nik", tmp, jacobians.astype(np.float64))
+    eps = float(cov_eps_px)
+    cov2d[:, 0, 0] += eps
+    cov2d[:, 1, 1] += eps
+    return cov2d
+
+
+def _append_view_gaussian_contribution_observations(
+    points_world: np.ndarray,
+    gaussian_scales: np.ndarray,
+    gaussian_rotmats: np.ndarray,
+    gaussian_opacities: np.ndarray,
+    view_index: int,
+    cfg: ViewConfig,
+    modal: dict[str, np.ndarray],
+    mode_index: int,
+    mask_erode_iters: int,
+    gaussian_contribution_radius: int,
+    gaussian_contribution_min_share: float,
+    gaussian_contribution_min_score: float,
+    gaussian_contribution_cov_eps_px: float,
+    obs_point_indices: list[int],
+    obs_view_indices: list[int],
+    obs_pixels: list[list[float]],
+    obs_y: list[list[complex]],
+    obs_j: list[np.ndarray],
+    obs_confidence: list[float],
+    obs_depth_weight: list[float],
+    obs_camera_z: list[float],
+    obs_contribution_weight: list[float],
+    obs_contribution_score: list[float],
+    obs_contribution_sum: list[float],
+    view_confidence: float,
+    depth_weighting: str,
+    depth_weight_power: float,
+    depth_weight_min: float,
+    depth_weight_reference_percentile: float,
+    obs_zbuffer_weight: list[float],
+) -> tuple[int, float]:
+    expected_shape = (cfg.image_height, cfg.image_width)
+    mask = load_mask(cfg.mask_path, expected_shape)
+    valid_mask = erode_mask(mask, mask_erode_iters)
+
+    pixels_xy, z = project_points(points_world, cfg.K, cfg.world_to_camera)
+    candidate, rounded_x, rounded_y = _candidate_mask(
+        pixels_xy,
+        z,
+        valid_mask,
+        cfg.image_width,
+        cfg.image_height,
+        margin=max(1, int(gaussian_contribution_radius) + 1),
+    )
+    candidate_indices = np.where(candidate)[0]
+    if candidate_indices.size == 0:
+        return 0, float("nan")
+    z_reference = float(np.percentile(z[candidate_indices], depth_weight_reference_percentile))
+
+    buckets = _build_pixel_buckets(candidate_indices, rounded_x, rounded_y, cfg.image_width)
+    jacobians = projection_jacobian(points_world[candidate_indices], cfg.K, cfg.world_to_camera)
+    candidate_row = np.full(points_world.shape[0], -1, dtype=np.int64)
+    candidate_row[candidate_indices] = np.arange(candidate_indices.size, dtype=np.int64)
+    cov2d = _projected_covariances_2d(
+        jacobians,
+        gaussian_scales[candidate_indices],
+        gaussian_rotmats[candidate_indices],
+        gaussian_contribution_cov_eps_px,
+    )
+
+    mode_u = modal["mode_u"][mode_index].astype(np.complex64)
+    mode_v = modal["mode_v"][mode_index].astype(np.complex64)
+    min_share = float(gaussian_contribution_min_share)
+    min_score = float(gaussian_contribution_min_score)
+    added = 0
+    for point_idx in candidate_indices.tolist():
+        x = int(rounded_x[point_idx])
+        y = int(rounded_y[point_idx])
+        nearby = _bucket_indices_in_radius(
+            buckets,
+            x,
+            y,
+            cfg.image_width,
+            cfg.image_height,
+            int(gaussian_contribution_radius),
+        )
+        if nearby.size == 0:
+            continue
+
+        rows = candidate_row[nearby]
+        valid_rows = rows >= 0
+        if not np.any(valid_rows):
+            continue
+        nearby = nearby[valid_rows]
+        rows = rows[valid_rows]
+
+        delta = pixels_xy[point_idx][None, :].astype(np.float64) - pixels_xy[nearby].astype(np.float64)
+        a = cov2d[rows, 0, 0]
+        b = cov2d[rows, 0, 1]
+        c = cov2d[rows, 1, 1]
+        det = a * c - b * b
+        valid_det = np.isfinite(det) & (det > 0)
+        if not np.any(valid_det):
+            continue
+        dx = delta[:, 0]
+        dy = delta[:, 1]
+        quad = np.full((nearby.shape[0],), np.inf, dtype=np.float64)
+        quad[valid_det] = (
+            c[valid_det] * dx[valid_det] * dx[valid_det]
+            - 2.0 * b[valid_det] * dx[valid_det] * dy[valid_det]
+            + a[valid_det] * dy[valid_det] * dy[valid_det]
+        ) / det[valid_det]
+        scores = gaussian_opacities[nearby].astype(np.float64) * np.exp(-0.5 * quad)
+        valid_scores = np.isfinite(scores) & (scores >= min_score)
+        if not np.any(valid_scores):
+            continue
+        current = np.where(nearby == point_idx)[0]
+        if current.size == 0:
+            continue
+        current_score = float(scores[int(current[0])])
+        if not np.isfinite(current_score) or current_score < min_score:
+            continue
+        contribution_sum = float(np.sum(scores[valid_scores]))
+        if contribution_sum <= 0.0 or not np.isfinite(contribution_sum):
+            continue
+        contribution_share = current_score / contribution_sum
+        if contribution_share < min_share:
+            continue
+
+        sample_xy = pixels_xy[point_idx : point_idx + 1]
+        y_u = bilinear_sample(mode_u, sample_xy)[0]
+        y_v = bilinear_sample(mode_v, sample_xy)[0]
+        depth_weight = _depth_weight(
+            float(z[point_idx]),
+            z_reference,
+            depth_weighting,
+            depth_weight_power,
+            depth_weight_min,
+        )
+        obs_point_indices.append(point_idx)
+        obs_view_indices.append(view_index)
+        obs_pixels.append([float(pixels_xy[point_idx, 0]), float(pixels_xy[point_idx, 1])])
+        obs_y.append([complex(y_u), complex(y_v)])
+        obs_j.append(jacobians[int(candidate_row[point_idx])].astype(np.float32))
+        obs_confidence.append(float(view_confidence) * depth_weight * float(contribution_share))
+        obs_depth_weight.append(depth_weight)
+        obs_camera_z.append(float(z[point_idx]))
+        obs_contribution_weight.append(float(contribution_share))
+        obs_contribution_score.append(current_score)
+        obs_contribution_sum.append(contribution_sum)
+        obs_zbuffer_weight.append(1.0)
+        added += 1
     return added, z_reference
 
 
@@ -821,6 +990,10 @@ def _write_point_observation_graph(
     pixel_min_contribution: float = 1e-12,
     pixel_min_mode_amp_percentile: float = 0.0,
     pixel_max_samples_per_view: int = 20000,
+    gaussian_contribution_radius: int = 8,
+    gaussian_contribution_min_share: float = 1e-4,
+    gaussian_contribution_min_score: float = 1e-12,
+    gaussian_contribution_cov_eps_px: float = 0.25,
     zbuffer_mode: str = "hard",
     zbuffer_soft_sigma: float = 0.10,
     zbuffer_soft_min_weight: float = 0.05,
@@ -833,13 +1006,14 @@ def _write_point_observation_graph(
     points_world_all = np.asarray(points_world_all, dtype=np.float32)
     if points_world_all.ndim != 2 or points_world_all.shape[1] != 3:
         raise ValueError(f"points_world must have shape (N,3), got {points_world_all.shape}.")
-    if observation_sampling not in {"gaussian-center", "pixel-candidates"}:
-        raise ValueError("observation_sampling must be 'gaussian-center' or 'pixel-candidates'.")
+    contribution_modes = {"pixel-candidates", "gaussian-center-contribution"}
+    if observation_sampling not in ({"gaussian-center"} | contribution_modes):
+        raise ValueError("observation_sampling must be 'gaussian-center', 'pixel-candidates', or 'gaussian-center-contribution'.")
     if zbuffer_mode not in {"hard", "soft"}:
         raise ValueError("zbuffer_mode must be 'hard' or 'soft'.")
     contribution_inputs = None
     contribution_rotmats = None
-    if observation_sampling == "pixel-candidates":
+    if observation_sampling in contribution_modes:
         contribution_inputs = _validate_gaussian_contribution_inputs(
             points_world_all,
             gaussian_scales,
@@ -848,14 +1022,25 @@ def _write_point_observation_graph(
             rendered_depths,
             rendered_accs,
             configs,
+            require_rendered=observation_sampling == "pixel-candidates",
         )
         contribution_rotmats = _quat_wxyz_to_rotmat(contribution_inputs[1])
+    if observation_sampling == "pixel-candidates":
         if pixel_preselect_k < 1:
             raise ValueError("pixel_preselect_k must be at least 1.")
         if not (0.0 <= pixel_render_acc_min <= 1.0):
             raise ValueError("pixel_render_acc_min must be in [0, 1].")
         if pixel_min_contribution < 0:
             raise ValueError("pixel_min_contribution must be non-negative.")
+    if observation_sampling == "gaussian-center-contribution":
+        if gaussian_contribution_radius < 0:
+            raise ValueError("gaussian_contribution_radius must be non-negative.")
+        if not (0.0 <= gaussian_contribution_min_share <= 1.0):
+            raise ValueError("gaussian_contribution_min_share must be in [0, 1].")
+        if gaussian_contribution_min_score < 0:
+            raise ValueError("gaussian_contribution_min_score must be non-negative.")
+        if gaussian_contribution_cov_eps_px <= 0:
+            raise ValueError("gaussian_contribution_cov_eps_px must be positive.")
 
     view_frequency_weights = reliability["weights"]
     obs_point_indices: list[int] = []
@@ -868,6 +1053,7 @@ def _write_point_observation_graph(
     obs_camera_z: list[float] = []
     obs_contribution_weight: list[float] = []
     obs_contribution_score: list[float] = []
+    obs_contribution_sum: list[float] = []
     obs_surface_pixels: list[list[float]] = []
     obs_surface_camera_z: list[float] = []
     obs_zbuffer_weight: list[float] = []
@@ -904,7 +1090,7 @@ def _write_point_observation_graph(
                 zbuffer_soft_sigma,
                 zbuffer_soft_min_weight,
             )
-        else:
+        elif observation_sampling == "pixel-candidates":
             assert contribution_inputs is not None
             assert contribution_rotmats is not None
             contribution_scales, _, contribution_opacities, contribution_depths, contribution_accs = contribution_inputs
@@ -930,6 +1116,7 @@ def _write_point_observation_graph(
                 obs_camera_z,
                 obs_contribution_weight,
                 obs_contribution_score,
+                obs_contribution_sum,
                 obs_surface_pixels,
                 obs_surface_camera_z,
                 float(view_frequency_weights[view_index]),
@@ -944,6 +1131,42 @@ def _write_point_observation_graph(
                 pixel_max_samples_per_view,
                 pixel_render_acc_min,
                 pixel_min_contribution,
+                obs_zbuffer_weight,
+            )
+        else:
+            assert contribution_inputs is not None
+            assert contribution_rotmats is not None
+            contribution_scales, _, contribution_opacities, _, _ = contribution_inputs
+            count, z_reference = _append_view_gaussian_contribution_observations(
+                points_world_all,
+                contribution_scales,
+                contribution_rotmats,
+                contribution_opacities,
+                view_index,
+                cfg,
+                modal,
+                mode_index,
+                mask_erode_iters,
+                gaussian_contribution_radius,
+                gaussian_contribution_min_share,
+                gaussian_contribution_min_score,
+                gaussian_contribution_cov_eps_px,
+                obs_point_indices,
+                obs_view_indices,
+                obs_pixels,
+                obs_y,
+                obs_j,
+                obs_confidence,
+                obs_depth_weight,
+                obs_camera_z,
+                obs_contribution_weight,
+                obs_contribution_score,
+                obs_contribution_sum,
+                float(view_frequency_weights[view_index]),
+                depth_weighting,
+                depth_weight_power,
+                depth_weight_min,
+                depth_weight_reference_percentile,
                 obs_zbuffer_weight,
             )
         observations_per_view.append(count)
@@ -982,17 +1205,24 @@ def _write_point_observation_graph(
         old_to_new[active_old_indices] = np.arange(active_old_indices.size, dtype=np.int64)
     keep_obs = observation_keep_points[obs_point_arr]
     obs_fields_out: dict[str, np.ndarray] = {}
-    if observation_sampling == "pixel-candidates":
+    if observation_sampling in contribution_modes:
         for key, values in (
             ("obs_contribution_weight", obs_contribution_weight),
             ("obs_contribution_score", obs_contribution_score),
-            ("obs_surface_pixels_xy", obs_surface_pixels),
-            ("obs_surface_camera_z", obs_surface_camera_z),
+            ("obs_contribution_sum", obs_contribution_sum),
         ):
             if len(values) != obs_point_arr.shape[0]:
                 raise ValueError(f"Internal error: {key} count does not match observations.")
         obs_fields_out["obs_contribution_weight"] = np.asarray(obs_contribution_weight, dtype=np.float32)[keep_obs]
         obs_fields_out["obs_contribution_score"] = np.asarray(obs_contribution_score, dtype=np.float32)[keep_obs]
+        obs_fields_out["obs_contribution_sum"] = np.asarray(obs_contribution_sum, dtype=np.float32)[keep_obs]
+    if observation_sampling == "pixel-candidates":
+        for key, values in (
+            ("obs_surface_pixels_xy", obs_surface_pixels),
+            ("obs_surface_camera_z", obs_surface_camera_z),
+        ):
+            if len(values) != obs_point_arr.shape[0]:
+                raise ValueError(f"Internal error: {key} count does not match observations.")
         obs_fields_out["obs_surface_pixels_xy"] = np.asarray(obs_surface_pixels, dtype=np.float32)[keep_obs]
         obs_fields_out["obs_surface_camera_z"] = np.asarray(obs_surface_camera_z, dtype=np.float32)[keep_obs]
     if len(obs_zbuffer_weight) != obs_point_arr.shape[0]:
@@ -1069,8 +1299,15 @@ def _write_point_observation_graph(
         pixel_min_contribution=np.array(pixel_min_contribution, dtype=np.float32),
         pixel_min_mode_amp_percentile=np.array(pixel_min_mode_amp_percentile, dtype=np.float32),
         pixel_max_samples_per_view=np.array(pixel_max_samples_per_view, dtype=np.int32),
+        gaussian_contribution_radius=np.array(gaussian_contribution_radius, dtype=np.int32),
+        gaussian_contribution_min_share=np.array(gaussian_contribution_min_share, dtype=np.float32),
+        gaussian_contribution_min_score=np.array(gaussian_contribution_min_score, dtype=np.float32),
+        gaussian_contribution_cov_eps_px=np.array(gaussian_contribution_cov_eps_px, dtype=np.float32),
         pixel_candidate_method=np.array(
             "rendered_depth_gaussian_contribution" if observation_sampling == "pixel-candidates" else ""
+        ),
+        gaussian_candidate_method=np.array(
+            "projected_gaussian_contribution_share" if observation_sampling == "gaussian-center-contribution" else ""
         ),
         observations_per_view=np.asarray(observations_per_view, dtype=np.int32),
         source_view_configs=np.asarray([str(path) for path in source_view_config_paths]),
@@ -1147,6 +1384,22 @@ def _validate_pixel_candidate_args(
         raise ValueError("pixel_max_samples_per_view must be at least 1.")
 
 
+def _validate_gaussian_contribution_args(
+    gaussian_contribution_radius: int,
+    gaussian_contribution_min_share: float,
+    gaussian_contribution_min_score: float,
+    gaussian_contribution_cov_eps_px: float,
+) -> None:
+    if gaussian_contribution_radius < 0:
+        raise ValueError("gaussian_contribution_radius must be non-negative.")
+    if not (0.0 <= gaussian_contribution_min_share <= 1.0):
+        raise ValueError("gaussian_contribution_min_share must be in [0, 1].")
+    if gaussian_contribution_min_score < 0:
+        raise ValueError("gaussian_contribution_min_score must be non-negative.")
+    if gaussian_contribution_cov_eps_px <= 0:
+        raise ValueError("gaussian_contribution_cov_eps_px must be positive.")
+
+
 def build_points_observation_graph(
     points_world: np.ndarray,
     view_config_paths: Sequence[str | Path],
@@ -1181,6 +1434,10 @@ def build_points_observation_graph(
     pixel_min_contribution: float = 1e-12,
     pixel_min_mode_amp_percentile: float = 0.0,
     pixel_max_samples_per_view: int = 20000,
+    gaussian_contribution_radius: int = 8,
+    gaussian_contribution_min_share: float = 1e-4,
+    gaussian_contribution_min_score: float = 1e-12,
+    gaussian_contribution_cov_eps_px: float = 0.25,
     zbuffer_mode: str = "hard",
     zbuffer_soft_sigma: float = 0.10,
     zbuffer_soft_min_weight: float = 0.05,
@@ -1205,8 +1462,8 @@ def build_points_observation_graph(
         zbuffer_soft_sigma,
         zbuffer_soft_min_weight,
     )
-    if observation_sampling not in {"gaussian-center", "pixel-candidates"}:
-        raise ValueError("observation_sampling must be 'gaussian-center' or 'pixel-candidates'.")
+    if observation_sampling not in {"gaussian-center", "pixel-candidates", "gaussian-center-contribution"}:
+        raise ValueError("observation_sampling must be 'gaussian-center', 'pixel-candidates', or 'gaussian-center-contribution'.")
     if observation_sampling == "pixel-candidates":
         _validate_pixel_candidate_args(
             pixel_sample_stride,
@@ -1216,6 +1473,13 @@ def build_points_observation_graph(
             pixel_min_contribution,
             pixel_min_mode_amp_percentile,
             pixel_max_samples_per_view,
+        )
+    if observation_sampling == "gaussian-center-contribution":
+        _validate_gaussian_contribution_args(
+            gaussian_contribution_radius,
+            gaussian_contribution_min_share,
+            gaussian_contribution_min_score,
+            gaussian_contribution_cov_eps_px,
         )
     configs, modals, view_freqs_hz, reference_freq_hz = _load_view_inputs(
         view_config_paths,
@@ -1270,6 +1534,10 @@ def build_points_observation_graph(
         pixel_min_contribution=pixel_min_contribution,
         pixel_min_mode_amp_percentile=pixel_min_mode_amp_percentile,
         pixel_max_samples_per_view=pixel_max_samples_per_view,
+        gaussian_contribution_radius=gaussian_contribution_radius,
+        gaussian_contribution_min_share=gaussian_contribution_min_share,
+        gaussian_contribution_min_score=gaussian_contribution_min_score,
+        gaussian_contribution_cov_eps_px=gaussian_contribution_cov_eps_px,
         zbuffer_mode=zbuffer_mode,
         zbuffer_soft_sigma=zbuffer_soft_sigma,
         zbuffer_soft_min_weight=zbuffer_soft_min_weight,

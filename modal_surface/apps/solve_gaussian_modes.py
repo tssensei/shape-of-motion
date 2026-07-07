@@ -34,7 +34,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode-indices", default="all", help="Comma-separated zero-based mode indices, or 'all'.")
     parser.add_argument(
         "--observation-sampling",
-        choices=["gaussian-center", "pixel-candidates"],
+        choices=["gaussian-center", "pixel-candidates", "gaussian-center-contribution"],
         default="gaussian-center",
         help="Observation graph sampling mode.",
     )
@@ -45,6 +45,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pixel-min-contribution", type=float, default=1e-12, help="Minimum unnormalized Gaussian contribution retained for a sampled modal pixel.")
     parser.add_argument("--pixel-min-mode-amp-percentile", type=float, default=0.0, help="Discard sampled modal pixels below this foreground amplitude percentile.")
     parser.add_argument("--pixel-max-samples-per-view", type=int, default=20000, help="Maximum sampled modal pixels per view before candidate expansion.")
+    parser.add_argument("--gaussian-contribution-radius", type=int, default=8, help="Pixel radius used to estimate projected Gaussian contribution share.")
+    parser.add_argument("--gaussian-contribution-min-share", type=float, default=1e-4, help="Minimum normalized contribution share for gaussian-center-contribution observations.")
+    parser.add_argument("--gaussian-contribution-min-score", type=float, default=1e-12, help="Minimum unnormalized projected Gaussian contribution score.")
+    parser.add_argument("--gaussian-contribution-cov-eps-px", type=float, default=0.25, help="2D covariance diagonal epsilon in pixels for projected Gaussian contribution.")
     parser.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
     parser.add_argument("--zbuffer-radius", type=int, default=5, help="Local robust z-buffer window radius in pixels.")
     parser.add_argument("--zbuffer-mode", choices=["hard", "soft"], default="hard", help="Hard z-buffer filtering or soft z-buffer confidence weighting.")
@@ -117,6 +121,7 @@ def _load_fg_means_from_checkpoint(path: str) -> np.ndarray:
 def _load_fg_contribution_inputs_from_checkpoint(
     path: str,
     view_config_paths: list[str],
+    render_views: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
     ckpt_path = Path(path)
     if not ckpt_path.exists():
@@ -146,31 +151,32 @@ def _load_fg_contribution_inputs_from_checkpoint(
 
     rendered_depths: list[np.ndarray] = []
     rendered_accs: list[np.ndarray] = []
-    with torch.no_grad():
-        for cfg_path in view_config_paths:
-            cfg = load_view_config(cfg_path)
-            w2c = torch.from_numpy(cfg.world_to_camera).to(device=device, dtype=torch.float32)[None]
-            K = torch.from_numpy(cfg.K).to(device=device, dtype=torch.float32)[None]
-            rendered = model.render(
-                None,
-                w2c,
-                K,
-                (cfg.image_width, cfg.image_height),
-                return_depth=True,
-                return_mask=False,
-                fg_only=True,
-            )
-            depth = rendered["depth"][0, ..., 0].detach().cpu().float().numpy().astype(np.float32)
-            acc_tensor = rendered["acc"][0]
-            if acc_tensor.ndim == 3:
-                acc_tensor = acc_tensor[..., 0]
-            acc = acc_tensor.detach().cpu().float().numpy().astype(np.float32)
-            if depth.shape != (cfg.image_height, cfg.image_width):
-                raise ValueError(f"Rendered depth for {cfg.view_id} has unexpected shape {depth.shape}.")
-            if acc.shape != (cfg.image_height, cfg.image_width):
-                raise ValueError(f"Rendered alpha for {cfg.view_id} has unexpected shape {acc.shape}.")
-            rendered_depths.append(depth)
-            rendered_accs.append(acc)
+    if render_views:
+        with torch.no_grad():
+            for cfg_path in view_config_paths:
+                cfg = load_view_config(cfg_path)
+                w2c = torch.from_numpy(cfg.world_to_camera).to(device=device, dtype=torch.float32)[None]
+                K = torch.from_numpy(cfg.K).to(device=device, dtype=torch.float32)[None]
+                rendered = model.render(
+                    None,
+                    w2c,
+                    K,
+                    (cfg.image_width, cfg.image_height),
+                    return_depth=True,
+                    return_mask=False,
+                    fg_only=True,
+                )
+                depth = rendered["depth"][0, ..., 0].detach().cpu().float().numpy().astype(np.float32)
+                acc_tensor = rendered["acc"][0]
+                if acc_tensor.ndim == 3:
+                    acc_tensor = acc_tensor[..., 0]
+                acc = acc_tensor.detach().cpu().float().numpy().astype(np.float32)
+                if depth.shape != (cfg.image_height, cfg.image_width):
+                    raise ValueError(f"Rendered depth for {cfg.view_id} has unexpected shape {depth.shape}.")
+                if acc.shape != (cfg.image_height, cfg.image_width):
+                    raise ValueError(f"Rendered alpha for {cfg.view_id} has unexpected shape {acc.shape}.")
+                rendered_depths.append(depth)
+                rendered_accs.append(acc)
     return fg_means, fg_scales, fg_quats, fg_opacities, rendered_depths, rendered_accs
 
 
@@ -205,9 +211,12 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
     )
     if "pixel_candidate_method" in observations.files:
         stats["pixel_candidate_method"] = str(np.asarray(observations["pixel_candidate_method"]).item())
+    if "gaussian_candidate_method" in observations.files:
+        stats["gaussian_candidate_method"] = str(np.asarray(observations["gaussian_candidate_method"]).item())
     if "obs_contribution_weight" in observations.files:
         contribution_weight = observations["obs_contribution_weight"].astype(np.float32)
         contribution_score = observations["obs_contribution_score"].astype(np.float32)
+        contribution_sum = observations["obs_contribution_sum"].astype(np.float32)
         stats.update(
             {
                 "contribution_weight_p50": _json_float(np.percentile(contribution_weight, 50)),
@@ -216,6 +225,9 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
                 "contribution_score_p50": _json_float(np.percentile(contribution_score, 50)),
                 "contribution_score_p90": _json_float(np.percentile(contribution_score, 90)),
                 "contribution_score_max": _json_float(contribution_score.max()),
+                "contribution_sum_p50": _json_float(np.percentile(contribution_sum, 50)),
+                "contribution_sum_p90": _json_float(np.percentile(contribution_sum, 90)),
+                "contribution_sum_max": _json_float(contribution_sum.max()),
             }
         )
     if "modal_rigid_edge_count" in latent.files:
@@ -288,7 +300,7 @@ def run(args: argparse.Namespace) -> None:
     if float(args.outlier_frac) != 0.0:
         raise ValueError("solve-gaussian-modes preserves foreground Gaussian order and requires --outlier-frac 0.0")
 
-    if args.observation_sampling == "pixel-candidates":
+    if args.observation_sampling in {"pixel-candidates", "gaussian-center-contribution"}:
         (
             fg_means,
             fg_scales,
@@ -296,7 +308,14 @@ def run(args: argparse.Namespace) -> None:
             fg_opacities,
             rendered_depths,
             rendered_accs,
-        ) = _load_fg_contribution_inputs_from_checkpoint(args.input_ckpt, view_configs)
+        ) = _load_fg_contribution_inputs_from_checkpoint(
+            args.input_ckpt,
+            view_configs,
+            render_views=args.observation_sampling == "pixel-candidates",
+        )
+        if args.observation_sampling == "gaussian-center-contribution":
+            rendered_depths = None
+            rendered_accs = None
     else:
         fg_means = _load_fg_means_from_checkpoint(args.input_ckpt)
         fg_scales = None
@@ -363,6 +382,10 @@ def run(args: argparse.Namespace) -> None:
             pixel_min_contribution=args.pixel_min_contribution,
             pixel_min_mode_amp_percentile=args.pixel_min_mode_amp_percentile,
             pixel_max_samples_per_view=args.pixel_max_samples_per_view,
+            gaussian_contribution_radius=args.gaussian_contribution_radius,
+            gaussian_contribution_min_share=args.gaussian_contribution_min_share,
+            gaussian_contribution_min_score=args.gaussian_contribution_min_score,
+            gaussian_contribution_cov_eps_px=args.gaussian_contribution_cov_eps_px,
             gaussian_scales=fg_scales,
             gaussian_quats=fg_quats,
             gaussian_opacities=fg_opacities,
@@ -450,6 +473,10 @@ def run(args: argparse.Namespace) -> None:
             "pixel_min_contribution": float(args.pixel_min_contribution),
             "pixel_min_mode_amp_percentile": float(args.pixel_min_mode_amp_percentile),
             "pixel_max_samples_per_view": int(args.pixel_max_samples_per_view),
+            "gaussian_contribution_radius": int(args.gaussian_contribution_radius),
+            "gaussian_contribution_min_share": float(args.gaussian_contribution_min_share),
+            "gaussian_contribution_min_score": float(args.gaussian_contribution_min_score),
+            "gaussian_contribution_cov_eps_px": float(args.gaussian_contribution_cov_eps_px),
             "zbuffer_radius": int(args.zbuffer_radius),
             "zbuffer_mode": str(args.zbuffer_mode),
             "zbuffer_soft_sigma": float(args.zbuffer_soft_sigma),
