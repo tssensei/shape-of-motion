@@ -40,6 +40,8 @@ def _load_checkpoint(path: Path) -> tuple[dict, dict, torch.Tensor]:
     for key in ("modal_phi_real", "modal_phi_imag", "modal_freqs_hz"):
         if key in state and state[key].numel() > 0:
             raise ValueError(f"{path} already contains {key}; use an unbound checkpoint")
+    if "modal_obs_count_per_point" in state and state["modal_obs_count_per_point"].numel() > 0:
+        raise ValueError(f"{path} already contains modal_obs_count_per_point; use an unbound checkpoint")
     if "fg.params.means" not in state:
         raise ValueError(f"{path} is missing fg.params.means")
     fg_means = state["fg.params.means"].detach().cpu().float()
@@ -93,6 +95,8 @@ def main() -> None:
     num_fg = int(fg_points.shape[0])
     phi_real: list[np.ndarray] = []
     phi_imag: list[np.ndarray] = []
+    obs_counts: list[np.ndarray] = []
+    missing_obs_count_modes: list[str] = []
     freqs_hz: list[float] = []
     mode_stats: list[dict] = []
     max_position_abs_delta = 0.0
@@ -139,6 +143,15 @@ def main() -> None:
         freqs_hz.append(float(np.asarray(latent["freq_hz"]).item()))
 
         obs_count = latent["obs_count_per_point"].astype(np.int32) if "obs_count_per_point" in latent.files else None
+        if obs_count is not None:
+            if obs_count.shape != (num_fg,):
+                raise ValueError(
+                    f"{latent_path} obs_count_per_point shape {obs_count.shape} "
+                    f"does not match foreground {(num_fg,)}"
+                )
+            obs_counts.append(obs_count)
+        else:
+            missing_obs_count_modes.append(str(latent_path))
         residual = latent["point_residual"].astype(np.float32) if "point_residual" in latent.files else None
         stats = {
             "mode_index": int(mode_entry.get("mode_index", len(mode_stats))),
@@ -167,6 +180,13 @@ def main() -> None:
     state["modal_phi_real"] = torch.from_numpy(np.stack(phi_real, axis=0)).float()
     state["modal_phi_imag"] = torch.from_numpy(np.stack(phi_imag, axis=0)).float()
     state["modal_freqs_hz"] = torch.tensor(freqs_hz, dtype=torch.float32)
+    if obs_counts:
+        if missing_obs_count_modes:
+            raise ValueError(
+                "Modal obs_count_per_point must be present for every mode or no modes; "
+                f"missing: {missing_obs_count_modes}"
+            )
+        state["modal_obs_count_per_point"] = torch.from_numpy(np.stack(obs_counts, axis=0)).long()
     state["modal_synthetic_enabled"] = torch.tensor(True)
 
     args.output_ckpt.parent.mkdir(parents=True, exist_ok=True)
@@ -180,6 +200,7 @@ def main() -> None:
         "source_checkpoint_in_manifest": manifest.get("source_checkpoint"),
         "num_modes": len(phi_real),
         "num_fg_gaussians": num_fg,
+        "has_modal_obs_count_per_point": bool(obs_counts),
         "max_position_abs_delta": max_position_abs_delta,
         "position_atol": float(args.position_atol),
         "freqs_hz": freqs_hz,

@@ -41,6 +41,7 @@ class SceneModel(nn.Module):
         modal_phi_real: Tensor | None = None,
         modal_phi_imag: Tensor | None = None,
         modal_freqs_hz: Tensor | None = None,
+        modal_obs_count_per_point: Tensor | None = None,
         modal_frame_view_indices: Tensor | None = None,
         modal_frame_local_indices: Tensor | None = None,
         modal_smooth_triplets: Tensor | None = None,
@@ -145,6 +146,22 @@ class SceneModel(nn.Module):
                 device=self.fg.params["means"].device,
                 dtype=self.fg.params["means"].dtype,
             )
+        if modal_obs_count_per_point is None:
+            modal_obs_count_per_point = torch.empty(
+                modal_phi_real.shape[0],
+                self.num_fg_gaussians,
+                device=self.fg.params["means"].device,
+                dtype=torch.long,
+            )
+        if modal_obs_count_per_point.shape != (
+            modal_phi_real.shape[0],
+            self.num_fg_gaussians,
+        ):
+            raise ValueError(
+                "modal obs_count_per_point must have shape "
+                f"({modal_phi_real.shape[0]}, {self.num_fg_gaussians}), "
+                f"got {tuple(modal_obs_count_per_point.shape)}"
+            )
         if modal_frame_view_indices is None:
             modal_frame_view_indices = torch.full(
                 (self.num_frames,), -1, device=self.fg.params["means"].device
@@ -160,6 +177,7 @@ class SceneModel(nn.Module):
         self.register_buffer("modal_phi_real", modal_phi_real)
         self.register_buffer("modal_phi_imag", modal_phi_imag)
         self.register_buffer("modal_freqs_hz", modal_freqs_hz)
+        self.register_buffer("modal_obs_count_per_point", modal_obs_count_per_point.long())
         if isinstance(modal_synthetic_enabled, Tensor):
             modal_synthetic_enabled = bool(modal_synthetic_enabled.item())
         self.register_buffer(
@@ -258,6 +276,10 @@ class SceneModel(nn.Module):
     @property
     def has_modal_field(self) -> bool:
         return self.modal_phi_real.numel() > 0 and self.modal_phi_imag.numel() > 0
+
+    @property
+    def has_modal_obs_count(self) -> bool:
+        return self.modal_obs_count_per_point.numel() > 0
 
     @property
     def has_modal_consistency(self) -> bool:
@@ -536,20 +558,29 @@ class SceneModel(nn.Module):
 
     @torch.no_grad()
     def densify_modal_fields(self, should_split: torch.Tensor, should_dup: torch.Tensor):
-        if not self.has_modal:
+        if not self.has_modal_field:
             return
         for name in ("modal_phi_real", "modal_phi_imag"):
             x = getattr(self, name)
             x_dup = x[:, should_dup]
             x_split = x[:, should_split].repeat(1, 2, 1)
             setattr(self, name, torch.cat([x[:, ~should_split], x_dup, x_split], dim=1))
+        if self.has_modal_obs_count:
+            x = self.modal_obs_count_per_point
+            x_dup = x[:, should_dup]
+            x_split = x[:, should_split].repeat(1, 2)
+            self.modal_obs_count_per_point = torch.cat(
+                [x[:, ~should_split], x_dup, x_split], dim=1
+            )
 
     @torch.no_grad()
     def cull_modal_fields(self, should_cull: torch.Tensor):
-        if not self.has_modal:
+        if not self.has_modal_field:
             return
         self.modal_phi_real = self.modal_phi_real[:, ~should_cull]
         self.modal_phi_imag = self.modal_phi_imag[:, ~should_cull]
+        if self.has_modal_obs_count:
+            self.modal_obs_count_per_point = self.modal_obs_count_per_point[:, ~should_cull]
 
     def compute_poses_fg(
         self, ts: torch.Tensor | None, inds: torch.Tensor | None = None
@@ -674,6 +705,7 @@ class SceneModel(nn.Module):
         modal_phi_real = None
         modal_phi_imag = None
         modal_freqs_hz = None
+        modal_obs_count_per_point = None
         modal_frame_view_indices = None
         modal_frame_local_indices = None
         modal_smooth_triplets = None
@@ -690,6 +722,8 @@ class SceneModel(nn.Module):
             modal_phi_real = state_dict[f"{prefix}modal_phi_real"]
             modal_phi_imag = state_dict[f"{prefix}modal_phi_imag"]
             modal_freqs_hz = state_dict[f"{prefix}modal_freqs_hz"]
+            if f"{prefix}modal_obs_count_per_point" in state_dict:
+                modal_obs_count_per_point = state_dict[f"{prefix}modal_obs_count_per_point"]
 
         if trajectory_type == "modal_activation":
             modal = ModalActivations.init_from_state_dict(
@@ -739,6 +773,7 @@ class SceneModel(nn.Module):
             modal_phi_real=modal_phi_real,
             modal_phi_imag=modal_phi_imag,
             modal_freqs_hz=modal_freqs_hz,
+            modal_obs_count_per_point=modal_obs_count_per_point,
             modal_frame_view_indices=modal_frame_view_indices,
             modal_frame_local_indices=modal_frame_local_indices,
             modal_smooth_triplets=modal_smooth_triplets,

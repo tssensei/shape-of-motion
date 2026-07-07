@@ -87,6 +87,7 @@ class DynamicViewer(Viewer):
         camera_frustum_scale: float = 1.0,
         playback_groups: tuple[ViewerPlaybackGroup, ...] = (),
         modal_freqs_hz: tuple[float, ...] = (),
+        has_modal_obs_count: bool = False,
         gaussian_center_count: int = 0,
         modal_anchor_count: int = 0,
     ):
@@ -97,6 +98,7 @@ class DynamicViewer(Viewer):
         self.camera_frustum_scale = float(camera_frustum_scale)
         self.playback_groups = tuple(playback_groups)
         self.modal_freqs_hz = tuple(float(freq) for freq in modal_freqs_hz)
+        self.has_modal_obs_count = bool(has_modal_obs_count)
         self.gaussian_center_count = int(gaussian_center_count)
         self.modal_anchor_count = int(modal_anchor_count)
         self._gaussian_center_handle = None
@@ -162,6 +164,7 @@ class DynamicViewer(Viewer):
         self._render_track_checkbox = server.gui.add_checkbox("Render tracks", False)
         self._render_track_checkbox.on_update(self.rerender)
         self._define_modal_playback_guis()
+        self._define_gaussian_color_guis()
         self._define_debug_point_guis()
         self._define_camera_guis()
 
@@ -264,6 +267,33 @@ class DynamicViewer(Viewer):
             "modes": tuple(modes),
         }
 
+    def _define_gaussian_color_guis(self) -> None:
+        self._gaussian_color_handles = None
+        if not self.modal_freqs_hz:
+            return
+        options = ["rgb", "modal amplitude", "modal phase"]
+        if self.has_modal_obs_count:
+            options.append("obs count")
+        with self.server.gui.add_folder("Gaussian color"):
+            color_mode = self.server.gui.add_dropdown(
+                "Render color mode",
+                options=tuple(options),
+                initial_value="rgb",
+            )
+            mode_index = self.server.gui.add_slider(
+                "Color mode index",
+                min=0,
+                max=max(len(self.modal_freqs_hz) - 1, 0),
+                step=1,
+                initial_value=0,
+            )
+        self._gaussian_color_handles = {
+            "color_mode": color_mode,
+            "mode_index": mode_index,
+        }
+        color_mode.on_update(self.rerender)
+        mode_index.on_update(self.rerender)
+
     def _define_debug_point_guis(self) -> None:
         self._debug_point_handles = None
         if self.gaussian_center_count <= 0 and self.modal_anchor_count <= 0:
@@ -364,6 +394,12 @@ class DynamicViewer(Viewer):
             and handles["show_anchors"] is not None
             and bool(handles["show_anchors"].value)
         )
+
+    def current_gaussian_color_mode(self) -> tuple[str, int]:
+        handles = getattr(self, "_gaussian_color_handles", None)
+        if handles is None:
+            return "rgb", 0
+        return str(handles["color_mode"].value), int(handles["mode_index"].value)
 
     def update_gaussian_centers(self, points: np.ndarray, fg_count: int) -> None:
         if not self.wants_gaussian_centers():

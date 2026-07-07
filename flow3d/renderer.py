@@ -70,6 +70,7 @@ class Renderer:
                 camera_frustum_scale=frustum_scale,
                 playback_groups=playback_groups,
                 modal_freqs_hz=modal_freqs_hz,
+                has_modal_obs_count=model.has_modal_obs_count,
                 gaussian_center_count=model.num_gaussians,
                 modal_anchor_count=(
                     0
@@ -198,6 +199,122 @@ class Renderer:
             motion_scale, device=points.device, dtype=points.dtype
         )
 
+    @staticmethod
+    def _hsv_to_rgb(hue: torch.Tensor, saturation: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        hue = torch.remainder(hue, 1.0)
+        h6 = hue * 6.0
+        sector = torch.floor(h6).long()
+        frac = h6 - sector.to(dtype=hue.dtype)
+        p = value * (1.0 - saturation)
+        q = value * (1.0 - saturation * frac)
+        t = value * (1.0 - saturation * (1.0 - frac))
+        sector = torch.remainder(sector, 6)
+
+        rgb = torch.empty(hue.shape + (3,), device=hue.device, dtype=hue.dtype)
+        rgb0 = torch.stack([value, t, p], dim=-1)
+        rgb1 = torch.stack([q, value, p], dim=-1)
+        rgb2 = torch.stack([p, value, t], dim=-1)
+        rgb3 = torch.stack([p, q, value], dim=-1)
+        rgb4 = torch.stack([t, p, value], dim=-1)
+        rgb5 = torch.stack([value, p, q], dim=-1)
+        for idx, candidate in enumerate((rgb0, rgb1, rgb2, rgb3, rgb4, rgb5)):
+            rgb = torch.where((sector == idx)[..., None], candidate, rgb)
+        return rgb
+
+    def _modal_amplitude_colors(self, mode_index: int) -> torch.Tensor:
+        phi_real = self.model.modal_phi_real[mode_index]
+        phi_imag = self.model.modal_phi_imag[mode_index]
+        amp = torch.sqrt((phi_real.square() + phi_imag.square()).sum(dim=-1))
+        finite_amp = amp[torch.isfinite(amp)]
+        if finite_amp.numel() == 0:
+            norm = torch.zeros_like(amp)
+        else:
+            hi = torch.quantile(finite_amp, 0.98).clamp_min(1.0e-8)
+            norm = (amp / hi).clamp(0.0, 1.0)
+        return torch.stack(
+            [
+                norm,
+                0.15 + 0.85 * norm,
+                1.0 - norm,
+            ],
+            dim=-1,
+        )
+
+    def _modal_phase_colors(self, mode_index: int) -> torch.Tensor:
+        phi_real = self.model.modal_phi_real[mode_index]
+        phi_imag = self.model.modal_phi_imag[mode_index]
+        comp_amp = torch.sqrt(phi_real.square() + phi_imag.square())
+        component = comp_amp.argmax(dim=-1, keepdim=True)
+        real = torch.gather(phi_real, 1, component).squeeze(1)
+        imag = torch.gather(phi_imag, 1, component).squeeze(1)
+        amp = torch.sqrt((phi_real.square() + phi_imag.square()).sum(dim=-1))
+        finite_amp = amp[torch.isfinite(amp)]
+        if finite_amp.numel() == 0:
+            value = torch.zeros_like(amp)
+        else:
+            hi = torch.quantile(finite_amp, 0.98).clamp_min(1.0e-8)
+            value = (amp / hi).clamp(0.0, 1.0)
+        phase = torch.atan2(imag, real)
+        hue = (phase + torch.pi) / (2.0 * torch.pi)
+        saturation = torch.ones_like(value)
+        return self._hsv_to_rgb(hue, saturation, value)
+
+    def _modal_obs_count_colors(self, mode_index: int) -> torch.Tensor:
+        obs_count = self.model.modal_obs_count_per_point[mode_index]
+        colors = torch.full(
+            (obs_count.shape[0], 3),
+            0.15,
+            device=obs_count.device,
+            dtype=self.model.modal_phi_real.dtype,
+        )
+        colors[obs_count <= 1] = torch.tensor(
+            [1.0, 0.43, 0.16], device=colors.device, dtype=colors.dtype
+        )
+        colors[obs_count == 2] = torch.tensor(
+            [0.27, 0.55, 1.0], device=colors.device, dtype=colors.dtype
+        )
+        colors[obs_count >= 3] = torch.tensor(
+            [0.27, 0.82, 0.47], device=colors.device, dtype=colors.dtype
+        )
+        colors[obs_count < 0] = torch.tensor(
+            [0.5, 0.5, 0.5], device=colors.device, dtype=colors.dtype
+        )
+        return colors
+
+    def _current_gaussian_color_override(self) -> torch.Tensor | None:
+        if self.viewer is None or not self.model.has_modal_field:
+            return None
+        color_mode, mode_index = self.viewer.current_gaussian_color_mode()
+        if color_mode == "rgb":
+            return None
+        if mode_index < 0 or mode_index >= self.model.modal_phi_real.shape[0]:
+            raise ValueError(
+                f"Gaussian color mode index {mode_index} is outside "
+                f"[0, {self.model.modal_phi_real.shape[0]})"
+            )
+
+        if color_mode == "modal amplitude":
+            fg_colors = self._modal_amplitude_colors(mode_index)
+        elif color_mode == "modal phase":
+            fg_colors = self._modal_phase_colors(mode_index)
+        elif color_mode == "obs count":
+            if not self.model.has_modal_obs_count:
+                raise ValueError("Checkpoint does not contain modal obs_count_per_point")
+            fg_colors = self._modal_obs_count_colors(mode_index)
+        else:
+            raise ValueError(f"Unknown Gaussian render color mode: {color_mode}")
+
+        if not self.model.has_bg:
+            return fg_colors
+        colors = torch.full(
+            (self.model.num_gaussians, 3),
+            0.5,
+            device=fg_colors.device,
+            dtype=fg_colors.dtype,
+        )
+        colors[: self.model.num_fg_gaussians] = fg_colors
+        return colors
+
     @torch.inference_mode()
     def render_fn(self, camera_state: CameraState, img_wh: tuple[int, int]):
         if self.viewer is None:
@@ -245,6 +362,7 @@ class Renderer:
                 self.viewer.update_modal_anchors(anchor_points.detach().cpu().numpy())
         if self.viewer.hide_gaussian_render():
             return np.full((H, W, 3), 255, dtype=np.uint8)
+        colors_override = self._current_gaussian_color_override()
         img = self.model.render(
             render_t,
             w2c[None],
@@ -252,6 +370,7 @@ class Renderer:
             img_wh,
             means=means,
             quats=quats,
+            colors_override=colors_override,
         )["img"][0]
         render_track_checkbox = getattr(self.viewer, "_render_track_checkbox", None)
         render_tracks = bool(render_track_checkbox.value) if render_track_checkbox is not None else False

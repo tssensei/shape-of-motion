@@ -935,6 +935,8 @@ def optimize_multi_view(
         raise ValueError("Use modal rigidity without single-view smoothing in this v1 solver.")
     if modal_rigid_lambda > 0 and outlier_frac > 0:
         raise ValueError("modal rigidity uses a fixed edge set and requires outlier_frac=0.")
+    if modal_fill_unobserved and modal_rigid_lambda > 0:
+        raise ValueError("Use modal fill with --modal-rigid-lambda 0 so anchors are solved directly from observations.")
 
     data = np.load(str(observations_path), allow_pickle=False)
     points = data["points_world"].astype(np.float32)
@@ -1002,6 +1004,7 @@ def optimize_multi_view(
     modal_rigid_edge_b = np.zeros((0,), dtype=np.int64)
     modal_rigid_edge_weights = np.zeros((0,), dtype=np.float64)
     modal_fill_target_mask = np.zeros((points.shape[0],), dtype=bool)
+    modal_fill_anchor_mask = np.zeros((points.shape[0],), dtype=bool)
     modal_fill_connected_to_anchor = np.zeros((points.shape[0],), dtype=bool)
     modal_fill_degree = np.zeros((points.shape[0],), dtype=np.int32)
     modal_fill_auto_radius = 0.0
@@ -1134,6 +1137,7 @@ def optimize_multi_view(
         point_residual = _point_residuals(points.shape[0], obs_point_index, obs_residual, active)
 
     if modal_fill_unobserved:
+        modal_fill_anchor_mask = active & (obs_count_per_point >= int(modal_fill_anchor_min_observations))
         (
             phi,
             modal_fill_target_mask,
@@ -1223,6 +1227,7 @@ def optimize_multi_view(
         modal_fill_anchor_min_observations=np.array(modal_fill_anchor_min_observations, dtype=np.int32),
         modal_fill_ridge_mu=np.array(modal_fill_ridge_mu, dtype=np.float32),
         modal_fill_auto_radius=np.array(modal_fill_auto_radius, dtype=np.float32),
+        modal_fill_anchor_mask=modal_fill_anchor_mask[active_indices].astype(bool),
         modal_fill_target_mask=modal_fill_target_mask[active_indices].astype(bool),
         modal_fill_connected_to_anchor=modal_fill_connected_to_anchor[active_indices].astype(bool),
         modal_fill_degree=modal_fill_degree[active_indices].astype(np.int32),
