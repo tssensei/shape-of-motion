@@ -46,7 +46,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pixel-min-mode-amp-percentile", type=float, default=0.0, help="Discard sampled modal pixels below this foreground amplitude percentile.")
     parser.add_argument("--pixel-max-samples-per-view", type=int, default=20000, help="Maximum sampled modal pixels per view before candidate expansion.")
     parser.add_argument("--gaussian-contribution-radius", type=int, default=8, help="Pixel radius used to estimate projected Gaussian contribution share.")
-    parser.add_argument("--gaussian-contribution-min-share", type=float, default=1e-4, help="Minimum normalized contribution share for gaussian-center-contribution observations.")
+    parser.add_argument("--gaussian-contribution-min-share", type=float, default=1e-4, help="For gaussian-center-contribution, keep observations whose share reaches this ratio of the point's max-view share.")
     parser.add_argument("--gaussian-contribution-min-score", type=float, default=1e-12, help="Minimum unnormalized projected Gaussian contribution score.")
     parser.add_argument("--gaussian-contribution-cov-eps-px", type=float, default=0.25, help="2D covariance diagonal epsilon in pixels for projected Gaussian contribution.")
     parser.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")

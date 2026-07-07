@@ -635,7 +635,6 @@ def _append_view_gaussian_contribution_observations(
 
     mode_u = modal["mode_u"][mode_index].astype(np.complex64)
     mode_v = modal["mode_v"][mode_index].astype(np.complex64)
-    min_share = float(gaussian_contribution_min_share)
     min_score = float(gaussian_contribution_min_score)
     added = 0
     for point_idx in candidate_indices.tolist():
@@ -689,8 +688,6 @@ def _append_view_gaussian_contribution_observations(
         if contribution_sum <= 0.0 or not np.isfinite(contribution_sum):
             continue
         contribution_share = current_score / contribution_sum
-        if contribution_share < min_share:
-            continue
 
         sample_xy = pixels_xy[point_idx : point_idx + 1]
         y_u = bilinear_sample(mode_u, sample_xy)[0]
@@ -1176,6 +1173,43 @@ def _write_point_observation_graph(
     obs_view_arr = np.asarray(obs_view_indices, dtype=np.int32)
     if obs_point_arr.size == 0:
         raise ValueError("No observations survived point z-buffer and mask checks.")
+
+    gaussian_contribution_max_share_per_point: np.ndarray | None = None
+    gaussian_contribution_contrast_keep: np.ndarray | None = None
+    if observation_sampling == "gaussian-center-contribution":
+        if len(obs_contribution_weight) != obs_point_arr.shape[0]:
+            raise ValueError("Internal error: contribution weight count does not match observations.")
+        contribution_weight_arr = np.asarray(obs_contribution_weight, dtype=np.float32)
+        gaussian_contribution_max_share_per_point = np.zeros(points_world_all.shape[0], dtype=np.float32)
+        np.maximum.at(gaussian_contribution_max_share_per_point, obs_point_arr, contribution_weight_arr)
+        contrast_ratio = float(gaussian_contribution_min_share)
+        gaussian_contribution_contrast_keep = contribution_weight_arr >= (
+            contrast_ratio * gaussian_contribution_max_share_per_point[obs_point_arr]
+        )
+        if not np.any(gaussian_contribution_contrast_keep):
+            raise ValueError(
+                "No gaussian-center-contribution observations survived relative contrast gating. "
+                "Lower --gaussian-contribution-min-share or use 0 to disable it."
+            )
+        if not np.all(gaussian_contribution_contrast_keep):
+            keep_indices = np.flatnonzero(gaussian_contribution_contrast_keep)
+            obs_point_arr = obs_point_arr[keep_indices]
+            obs_view_arr = obs_view_arr[keep_indices]
+            obs_point_indices = obs_point_arr.tolist()
+            obs_view_indices = obs_view_arr.tolist()
+            obs_pixels = [obs_pixels[int(i)] for i in keep_indices]
+            obs_y = [obs_y[int(i)] for i in keep_indices]
+            obs_j = [obs_j[int(i)] for i in keep_indices]
+            obs_confidence = [obs_confidence[int(i)] for i in keep_indices]
+            obs_depth_weight = [obs_depth_weight[int(i)] for i in keep_indices]
+            obs_camera_z = [obs_camera_z[int(i)] for i in keep_indices]
+            obs_contribution_weight = [obs_contribution_weight[int(i)] for i in keep_indices]
+            obs_contribution_score = [obs_contribution_score[int(i)] for i in keep_indices]
+            obs_contribution_sum = [obs_contribution_sum[int(i)] for i in keep_indices]
+            obs_zbuffer_weight = [obs_zbuffer_weight[int(i)] for i in keep_indices]
+            observations_per_view = np.bincount(obs_view_arr, minlength=len(configs)).astype(np.int32).tolist()
+        gaussian_contribution_contrast_keep = np.ones(obs_point_arr.shape[0], dtype=bool)
+
     sample_counts = np.bincount(obs_point_arr, minlength=points_world_all.shape[0])
     point_view_mask = np.zeros((points_world_all.shape[0], len(configs)), dtype=bool)
     point_view_mask[obs_point_arr, obs_view_arr] = True
@@ -1216,6 +1250,10 @@ def _write_point_observation_graph(
         obs_fields_out["obs_contribution_weight"] = np.asarray(obs_contribution_weight, dtype=np.float32)[keep_obs]
         obs_fields_out["obs_contribution_score"] = np.asarray(obs_contribution_score, dtype=np.float32)[keep_obs]
         obs_fields_out["obs_contribution_sum"] = np.asarray(obs_contribution_sum, dtype=np.float32)[keep_obs]
+        if observation_sampling == "gaussian-center-contribution":
+            if gaussian_contribution_contrast_keep is None:
+                raise ValueError("Internal error: gaussian contribution contrast keep mask was not computed.")
+            obs_fields_out["gaussian_contribution_contrast_keep"] = gaussian_contribution_contrast_keep[keep_obs]
     if observation_sampling == "pixel-candidates":
         for key, values in (
             ("obs_surface_pixels_xy", obs_surface_pixels),
@@ -1239,6 +1277,10 @@ def _write_point_observation_graph(
                 f"{points_world_all.shape[0]}, got {value.shape}."
             )
         point_fields_out[key] = value[active_old_indices]
+    if gaussian_contribution_max_share_per_point is not None:
+        point_fields_out["gaussian_contribution_max_share_per_point"] = gaussian_contribution_max_share_per_point[
+            active_old_indices
+        ]
 
     metadata = dict(extra_metadata or {})
     out = Path(out_path)
