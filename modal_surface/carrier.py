@@ -22,7 +22,7 @@ from typing import Sequence
 
 import numpy as np
 
-from modal_surface.geometry import bilinear_sample, erode_mask, in_image_with_margin, project_points, projection_jacobian
+from modal_surface.geometry import bilinear_sample, erode_mask, in_image_with_margin, project_points, projection_jacobian, unproject_pixels
 from modal_surface.io import ViewConfig, ensure_modal_shape, load_mask, load_modal_npz, load_view_config
 
 
@@ -310,6 +310,245 @@ def _bucket_indices_in_radius(
     return parts[0] if len(parts) == 1 else np.concatenate(parts)
 
 
+def _require_scipy_kdtree():
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError as exc:
+        raise ImportError("pixel-candidates contribution sampling requires scipy.spatial.cKDTree.") from exc
+    return cKDTree
+
+
+def _quat_wxyz_to_rotmat(quats: np.ndarray) -> np.ndarray:
+    quats = np.asarray(quats, dtype=np.float64)
+    if quats.ndim != 2 or quats.shape[1] != 4:
+        raise ValueError(f"gaussian_quats must have shape (N,4), got {quats.shape}.")
+    norms = np.linalg.norm(quats, axis=1, keepdims=True)
+    if np.any(norms <= 0) or not np.all(np.isfinite(norms)):
+        raise ValueError("gaussian_quats contains invalid zero or non-finite entries.")
+    q = quats / norms
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    mats = np.empty((q.shape[0], 3, 3), dtype=np.float64)
+    mats[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
+    mats[:, 0, 1] = 2.0 * (x * y - w * z)
+    mats[:, 0, 2] = 2.0 * (x * z + w * y)
+    mats[:, 1, 0] = 2.0 * (x * y + w * z)
+    mats[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
+    mats[:, 1, 2] = 2.0 * (y * z - w * x)
+    mats[:, 2, 0] = 2.0 * (x * z - w * y)
+    mats[:, 2, 1] = 2.0 * (y * z + w * x)
+    mats[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
+    return mats
+
+
+def _validate_gaussian_contribution_inputs(
+    points_world: np.ndarray,
+    gaussian_scales: np.ndarray | None,
+    gaussian_quats: np.ndarray | None,
+    gaussian_opacities: np.ndarray | None,
+    rendered_depths: Sequence[np.ndarray] | None,
+    rendered_accs: Sequence[np.ndarray] | None,
+    configs: Sequence[ViewConfig],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
+    if gaussian_scales is None:
+        raise ValueError("pixel-candidates requires gaussian_scales.")
+    if gaussian_quats is None:
+        raise ValueError("pixel-candidates requires gaussian_quats.")
+    if gaussian_opacities is None:
+        raise ValueError("pixel-candidates requires gaussian_opacities.")
+    if rendered_depths is None:
+        raise ValueError("pixel-candidates requires rendered_depths.")
+    if rendered_accs is None:
+        raise ValueError("pixel-candidates requires rendered_accs.")
+
+    scales = np.asarray(gaussian_scales, dtype=np.float32)
+    quats = np.asarray(gaussian_quats, dtype=np.float32)
+    opacities = np.asarray(gaussian_opacities, dtype=np.float32).reshape(-1)
+    if scales.shape != points_world.shape:
+        raise ValueError(f"gaussian_scales must have shape {points_world.shape}, got {scales.shape}.")
+    if quats.shape != (points_world.shape[0], 4):
+        raise ValueError(f"gaussian_quats must have shape ({points_world.shape[0]},4), got {quats.shape}.")
+    if opacities.shape != (points_world.shape[0],):
+        raise ValueError(f"gaussian_opacities must have shape ({points_world.shape[0]},), got {opacities.shape}.")
+    if not np.all(np.isfinite(scales)) or np.any(scales <= 0):
+        raise ValueError("gaussian_scales must be finite and positive.")
+    if not np.all(np.isfinite(opacities)) or np.any(opacities < 0):
+        raise ValueError("gaussian_opacities must be finite and non-negative.")
+    if len(rendered_depths) != len(configs) or len(rendered_accs) != len(configs):
+        raise ValueError("rendered_depths/rendered_accs must have one array per view.")
+
+    depth_arrays: list[np.ndarray] = []
+    acc_arrays: list[np.ndarray] = []
+    for cfg, depth, acc in zip(configs, rendered_depths, rendered_accs):
+        expected_shape = (cfg.image_height, cfg.image_width)
+        depth_arr = np.asarray(depth, dtype=np.float32)
+        acc_arr = np.asarray(acc, dtype=np.float32)
+        if depth_arr.shape != expected_shape:
+            raise ValueError(f"Rendered depth for {cfg.view_id} must have shape {expected_shape}, got {depth_arr.shape}.")
+        if acc_arr.shape != expected_shape:
+            raise ValueError(f"Rendered alpha for {cfg.view_id} must have shape {expected_shape}, got {acc_arr.shape}.")
+        depth_arrays.append(depth_arr)
+        acc_arrays.append(acc_arr)
+    return scales, quats, opacities, depth_arrays, acc_arrays
+
+
+def _append_view_contribution_observations(
+    points_world: np.ndarray,
+    gaussian_scales: np.ndarray,
+    gaussian_rotmats: np.ndarray,
+    gaussian_opacities: np.ndarray,
+    rendered_depth: np.ndarray,
+    rendered_acc: np.ndarray,
+    view_index: int,
+    cfg: ViewConfig,
+    modal: dict[str, np.ndarray],
+    mode_index: int,
+    mask_erode_iters: int,
+    obs_point_indices: list[int],
+    obs_view_indices: list[int],
+    obs_pixels: list[list[float]],
+    obs_y: list[list[complex]],
+    obs_j: list[np.ndarray],
+    obs_confidence: list[float],
+    obs_depth_weight: list[float],
+    obs_camera_z: list[float],
+    obs_contribution_weight: list[float],
+    obs_contribution_score: list[float],
+    obs_surface_pixels: list[list[float]],
+    obs_surface_camera_z: list[float],
+    view_confidence: float,
+    depth_weighting: str,
+    depth_weight_power: float,
+    depth_weight_min: float,
+    depth_weight_reference_percentile: float,
+    pixel_sample_stride: int,
+    pixel_candidate_k: int,
+    pixel_preselect_k: int,
+    pixel_min_mode_amp_percentile: float,
+    pixel_max_samples_per_view: int,
+    pixel_render_acc_min: float,
+    pixel_min_contribution: float,
+    obs_zbuffer_weight: list[float],
+) -> tuple[int, float]:
+    expected_shape = (cfg.image_height, cfg.image_width)
+    mask = load_mask(cfg.mask_path, expected_shape)
+    valid_mask = erode_mask(mask, mask_erode_iters)
+
+    valid_depth = np.isfinite(rendered_depth) & (rendered_depth > 0)
+    valid_acc = np.isfinite(rendered_acc) & (rendered_acc >= float(pixel_render_acc_min))
+    visible_mask = valid_mask & valid_depth & valid_acc
+    if not np.any(visible_mask):
+        return 0, float("nan")
+
+    mode_u = modal["mode_u"][mode_index].astype(np.complex64)
+    mode_v = modal["mode_v"][mode_index].astype(np.complex64)
+    mode_amp = np.sqrt(np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32)
+    valid_amp = mode_amp[visible_mask]
+    if valid_amp.size == 0:
+        return 0, float("nan")
+    amp_threshold = float(np.percentile(valid_amp, pixel_min_mode_amp_percentile))
+
+    ys = np.arange(1, cfg.image_height - 1, int(pixel_sample_stride), dtype=np.int32)
+    xs = np.arange(1, cfg.image_width - 1, int(pixel_sample_stride), dtype=np.int32)
+    if ys.size == 0 or xs.size == 0:
+        return 0, float("nan")
+    yy, xx = np.meshgrid(ys, xs, indexing="ij")
+    flat_x = xx.reshape(-1)
+    flat_y = yy.reshape(-1)
+    keep = visible_mask[flat_y, flat_x] & (mode_amp[flat_y, flat_x] >= amp_threshold)
+    flat_x = flat_x[keep]
+    flat_y = flat_y[keep]
+    if flat_x.size == 0:
+        return 0, float("nan")
+    if flat_x.size > int(pixel_max_samples_per_view):
+        selected = np.linspace(0, flat_x.size - 1, int(pixel_max_samples_per_view)).astype(np.int64)
+        flat_x = flat_x[selected]
+        flat_y = flat_y[selected]
+
+    depths = rendered_depth[flat_y, flat_x].astype(np.float32)
+    surface_pixels = np.stack([flat_x.astype(np.float32), flat_y.astype(np.float32)], axis=1)
+    surface_points = unproject_pixels(surface_pixels, depths, cfg.K, cfg.world_to_camera)
+    finite_surface = np.all(np.isfinite(surface_points), axis=1) & np.isfinite(depths) & (depths > 0)
+    if not np.any(finite_surface):
+        return 0, float("nan")
+    flat_x = flat_x[finite_surface]
+    flat_y = flat_y[finite_surface]
+    depths = depths[finite_surface]
+    surface_pixels = surface_pixels[finite_surface]
+    surface_points = surface_points[finite_surface]
+
+    z_reference = float(np.percentile(depths, depth_weight_reference_percentile))
+    cKDTree = _require_scipy_kdtree()
+    preselect_k = min(int(pixel_preselect_k), points_world.shape[0])
+    tree = cKDTree(points_world.astype(np.float64))
+    _, candidate_rows = tree.query(surface_points.astype(np.float64), k=preselect_k)
+    if preselect_k == 1:
+        candidate_rows = candidate_rows[:, None]
+
+    _, point_camera_z = project_points(points_world, cfg.K, cfg.world_to_camera)
+    added = 0
+    min_contribution = float(pixel_min_contribution)
+    scale_eps = np.float32(1e-8)
+    for row, (x, y, depth, surface_point, candidates) in enumerate(
+        zip(flat_x.tolist(), flat_y.tolist(), depths.tolist(), surface_points, candidate_rows)
+    ):
+        candidate_indices = np.asarray(candidates, dtype=np.int64)
+        candidate_indices = candidate_indices[(candidate_indices >= 0) & (candidate_indices < points_world.shape[0])]
+        if candidate_indices.size == 0:
+            continue
+
+        delta = surface_point[None, :].astype(np.float64) - points_world[candidate_indices].astype(np.float64)
+        local = np.einsum("nij,nj->ni", np.swapaxes(gaussian_rotmats[candidate_indices], 1, 2), delta)
+        scaled = local / np.maximum(gaussian_scales[candidate_indices].astype(np.float64), float(scale_eps))
+        mahalanobis2 = np.sum(scaled * scaled, axis=1)
+        scores = gaussian_opacities[candidate_indices].astype(np.float64) * np.exp(-0.5 * mahalanobis2)
+        valid = np.isfinite(scores) & (scores >= min_contribution)
+        if not np.any(valid):
+            continue
+        candidate_indices = candidate_indices[valid]
+        scores = scores[valid]
+        order = np.argsort(scores)[::-1][: int(pixel_candidate_k)]
+        candidate_indices = candidate_indices[order]
+        scores = scores[order]
+        positive_z = np.isfinite(point_camera_z[candidate_indices]) & (point_camera_z[candidate_indices] > 0)
+        if not np.any(positive_z):
+            continue
+        candidate_indices = candidate_indices[positive_z]
+        scores = scores[positive_z]
+        denom = float(np.sum(scores))
+        if denom <= 0 or not np.isfinite(denom):
+            continue
+        weights = (scores / denom).astype(np.float32)
+        jacobians = projection_jacobian(points_world[candidate_indices], cfg.K, cfg.world_to_camera)
+        y_u = complex(mode_u[int(y), int(x)])
+        y_v = complex(mode_v[int(y), int(x)])
+        for row_idx, (point_idx, score, contribution_weight) in enumerate(
+            zip(candidate_indices.tolist(), scores.tolist(), weights.tolist())
+        ):
+            candidate_z = float(point_camera_z[int(point_idx)])
+            depth_weight = _depth_weight(
+                candidate_z,
+                z_reference,
+                depth_weighting,
+                depth_weight_power,
+                depth_weight_min,
+            )
+            obs_point_indices.append(int(point_idx))
+            obs_view_indices.append(view_index)
+            obs_pixels.append([float(x), float(y)])
+            obs_y.append([y_u, y_v])
+            obs_j.append(jacobians[row_idx].astype(np.float32))
+            obs_confidence.append(float(view_confidence) * depth_weight * float(contribution_weight))
+            obs_depth_weight.append(depth_weight)
+            obs_camera_z.append(candidate_z)
+            obs_contribution_weight.append(float(contribution_weight))
+            obs_contribution_score.append(float(score))
+            obs_surface_pixels.append([float(surface_pixels[row, 0]), float(surface_pixels[row, 1])])
+            obs_surface_camera_z.append(float(depth))
+            obs_zbuffer_weight.append(1.0)
+            added += 1
+    return added, z_reference
+
+
 def _depth_weight(
     z_value: float,
     z_reference: float,
@@ -544,171 +783,6 @@ def _append_view_observations(
     return added, z_reference
 
 
-def _append_view_pixel_candidate_observations(
-    points_world: np.ndarray,
-    view_index: int,
-    cfg: ViewConfig,
-    modal: dict[str, np.ndarray],
-    mode_index: int,
-    mask_erode_iters: int,
-    zbuffer_radius: int,
-    front_percentile: float,
-    zbuffer_tau: float,
-    min_zbuffer_samples: int,
-    obs_point_indices: list[int],
-    obs_view_indices: list[int],
-    obs_pixels: list[list[float]],
-    obs_y: list[list[complex]],
-    obs_j: list[np.ndarray],
-    obs_confidence: list[float],
-    obs_depth_weight: list[float],
-    obs_camera_z: list[float],
-    obs_candidate_distance_px: list[float],
-    view_confidence: float,
-    depth_weighting: str,
-    depth_weight_power: float,
-    depth_weight_min: float,
-    depth_weight_reference_percentile: float,
-    pixel_sample_stride: int,
-    pixel_candidate_k: int,
-    pixel_search_radius: int,
-    pixel_weight_sigma: float,
-    pixel_min_mode_amp_percentile: float,
-    pixel_max_samples_per_view: int,
-    obs_zbuffer_weight: list[float],
-    zbuffer_mode: str,
-    zbuffer_soft_sigma: float,
-    zbuffer_soft_min_weight: float,
-) -> tuple[int, float]:
-    expected_shape = (cfg.image_height, cfg.image_width)
-    mask = load_mask(cfg.mask_path, expected_shape)
-    valid_mask = erode_mask(mask, mask_erode_iters)
-
-    pixels_xy, z = project_points(points_world, cfg.K, cfg.world_to_camera)
-    candidate, rounded_x, rounded_y = _candidate_mask(
-        pixels_xy,
-        z,
-        valid_mask,
-        cfg.image_width,
-        cfg.image_height,
-        margin=max(1, zbuffer_radius + 1),
-    )
-    candidate_indices = np.where(candidate)[0]
-    if candidate_indices.size == 0:
-        return 0, float("nan")
-    z_reference = float(np.percentile(z[candidate_indices], depth_weight_reference_percentile))
-
-    buckets = _build_pixel_buckets(candidate_indices, rounded_x, rounded_y, cfg.image_width)
-    jacobians = projection_jacobian(points_world[candidate_indices], cfg.K, cfg.world_to_camera)
-    candidate_to_row = {int(point_idx): row for row, point_idx in enumerate(candidate_indices.tolist())}
-
-    mode_u = modal["mode_u"][mode_index].astype(np.complex64)
-    mode_v = modal["mode_v"][mode_index].astype(np.complex64)
-    mode_amp = np.sqrt(np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32)
-    valid_amp = mode_amp[valid_mask]
-    if valid_amp.size == 0:
-        return 0, z_reference
-    amp_threshold = float(np.percentile(valid_amp, pixel_min_mode_amp_percentile))
-
-    ys = np.arange(1, cfg.image_height - 1, int(pixel_sample_stride), dtype=np.int32)
-    xs = np.arange(1, cfg.image_width - 1, int(pixel_sample_stride), dtype=np.int32)
-    if ys.size == 0 or xs.size == 0:
-        return 0, z_reference
-    yy, xx = np.meshgrid(ys, xs, indexing="ij")
-    flat_x = xx.reshape(-1)
-    flat_y = yy.reshape(-1)
-    keep = valid_mask[flat_y, flat_x] & (mode_amp[flat_y, flat_x] >= amp_threshold)
-    flat_x = flat_x[keep]
-    flat_y = flat_y[keep]
-    if flat_x.size == 0:
-        return 0, z_reference
-    if flat_x.size > int(pixel_max_samples_per_view):
-        selected = np.linspace(0, flat_x.size - 1, int(pixel_max_samples_per_view)).astype(np.int64)
-        flat_x = flat_x[selected]
-        flat_y = flat_y[selected]
-
-    added = 0
-    sigma2 = float(pixel_weight_sigma) ** 2
-    for x, y in zip(flat_x.tolist(), flat_y.tolist()):
-        stats = _local_depth_stats(
-            buckets,
-            z,
-            int(x),
-            int(y),
-            cfg.image_width,
-            cfg.image_height,
-            zbuffer_radius,
-            front_percentile,
-            min_zbuffer_samples,
-        )
-        if stats is None:
-            continue
-        z_front, z_med = stats
-        if z_med <= 0:
-            continue
-
-        nearby = _bucket_indices_in_radius(
-            buckets,
-            int(x),
-            int(y),
-            cfg.image_width,
-            cfg.image_height,
-            int(pixel_search_radius),
-        )
-        if nearby.size == 0:
-            continue
-        projected = pixels_xy[nearby]
-        delta = projected - np.asarray([[float(x), float(y)]], dtype=np.float32)
-        dist = np.linalg.norm(delta, axis=1).astype(np.float32)
-        z_weights = np.asarray(
-            [
-                _zbuffer_weight(
-                    float(z[int(point_idx)]),
-                    z_front,
-                    z_med,
-                    zbuffer_tau,
-                    zbuffer_mode,
-                    zbuffer_soft_sigma,
-                    zbuffer_soft_min_weight,
-                )
-                for point_idx in nearby.tolist()
-            ],
-            dtype=object,
-        )
-        front = np.asarray([weight is not None for weight in z_weights.tolist()], dtype=bool)
-        within = dist <= float(pixel_search_radius)
-        valid = front & within & np.isfinite(dist)
-        if not np.any(valid):
-            continue
-        nearby = nearby[valid]
-        dist = dist[valid]
-        z_weights = z_weights[valid].astype(np.float32)
-        order = np.argsort(dist)[: int(pixel_candidate_k)]
-        y_u = complex(mode_u[int(y), int(x)])
-        y_v = complex(mode_v[int(y), int(x)])
-        for point_idx, distance, z_weight in zip(nearby[order].tolist(), dist[order].tolist(), z_weights[order].tolist()):
-            obs_point_indices.append(int(point_idx))
-            obs_view_indices.append(view_index)
-            obs_pixels.append([float(x), float(y)])
-            obs_y.append([y_u, y_v])
-            obs_j.append(jacobians[candidate_to_row[int(point_idx)]].astype(np.float32))
-            depth_weight = _depth_weight(
-                float(z[int(point_idx)]),
-                z_reference,
-                depth_weighting,
-                depth_weight_power,
-                depth_weight_min,
-            )
-            distance_weight = float(np.exp(-(float(distance) ** 2) / max(2.0 * sigma2, 1e-12)))
-            obs_confidence.append(float(view_confidence) * depth_weight * distance_weight * float(z_weight))
-            obs_depth_weight.append(depth_weight)
-            obs_camera_z.append(float(z[int(point_idx)]))
-            obs_candidate_distance_px.append(float(distance))
-            obs_zbuffer_weight.append(float(z_weight))
-            added += 1
-    return added, z_reference
-
-
 def _write_point_observation_graph(
     points_world_all: np.ndarray,
     configs: Sequence[ViewConfig],
@@ -742,13 +816,19 @@ def _write_point_observation_graph(
     observation_sampling: str = "gaussian-center",
     pixel_sample_stride: int = 4,
     pixel_candidate_k: int = 4,
-    pixel_search_radius: int = 6,
-    pixel_weight_sigma: float = 3.0,
+    pixel_preselect_k: int = 32,
+    pixel_render_acc_min: float = 0.05,
+    pixel_min_contribution: float = 1e-12,
     pixel_min_mode_amp_percentile: float = 0.0,
     pixel_max_samples_per_view: int = 20000,
     zbuffer_mode: str = "hard",
     zbuffer_soft_sigma: float = 0.10,
     zbuffer_soft_min_weight: float = 0.05,
+    gaussian_scales: np.ndarray | None = None,
+    gaussian_quats: np.ndarray | None = None,
+    gaussian_opacities: np.ndarray | None = None,
+    rendered_depths: Sequence[np.ndarray] | None = None,
+    rendered_accs: Sequence[np.ndarray] | None = None,
 ) -> Path:
     points_world_all = np.asarray(points_world_all, dtype=np.float32)
     if points_world_all.ndim != 2 or points_world_all.shape[1] != 3:
@@ -757,6 +837,25 @@ def _write_point_observation_graph(
         raise ValueError("observation_sampling must be 'gaussian-center' or 'pixel-candidates'.")
     if zbuffer_mode not in {"hard", "soft"}:
         raise ValueError("zbuffer_mode must be 'hard' or 'soft'.")
+    contribution_inputs = None
+    contribution_rotmats = None
+    if observation_sampling == "pixel-candidates":
+        contribution_inputs = _validate_gaussian_contribution_inputs(
+            points_world_all,
+            gaussian_scales,
+            gaussian_quats,
+            gaussian_opacities,
+            rendered_depths,
+            rendered_accs,
+            configs,
+        )
+        contribution_rotmats = _quat_wxyz_to_rotmat(contribution_inputs[1])
+        if pixel_preselect_k < 1:
+            raise ValueError("pixel_preselect_k must be at least 1.")
+        if not (0.0 <= pixel_render_acc_min <= 1.0):
+            raise ValueError("pixel_render_acc_min must be in [0, 1].")
+        if pixel_min_contribution < 0:
+            raise ValueError("pixel_min_contribution must be non-negative.")
 
     view_frequency_weights = reliability["weights"]
     obs_point_indices: list[int] = []
@@ -767,7 +866,10 @@ def _write_point_observation_graph(
     obs_confidence: list[float] = []
     obs_depth_weight: list[float] = []
     obs_camera_z: list[float] = []
-    obs_candidate_distance_px: list[float] = []
+    obs_contribution_weight: list[float] = []
+    obs_contribution_score: list[float] = []
+    obs_surface_pixels: list[list[float]] = []
+    obs_surface_camera_z: list[float] = []
     obs_zbuffer_weight: list[float] = []
     observations_per_view: list[int] = []
     view_depth_reference_z: list[float] = []
@@ -803,17 +905,21 @@ def _write_point_observation_graph(
                 zbuffer_soft_min_weight,
             )
         else:
-            count, z_reference = _append_view_pixel_candidate_observations(
+            assert contribution_inputs is not None
+            assert contribution_rotmats is not None
+            contribution_scales, _, contribution_opacities, contribution_depths, contribution_accs = contribution_inputs
+            count, z_reference = _append_view_contribution_observations(
                 points_world_all,
+                contribution_scales,
+                contribution_rotmats,
+                contribution_opacities,
+                contribution_depths[view_index],
+                contribution_accs[view_index],
                 view_index,
                 cfg,
                 modal,
                 mode_index,
                 mask_erode_iters,
-                zbuffer_radius,
-                front_percentile,
-                zbuffer_tau,
-                min_zbuffer_samples,
                 obs_point_indices,
                 obs_view_indices,
                 obs_pixels,
@@ -822,7 +928,10 @@ def _write_point_observation_graph(
                 obs_confidence,
                 obs_depth_weight,
                 obs_camera_z,
-                obs_candidate_distance_px,
+                obs_contribution_weight,
+                obs_contribution_score,
+                obs_surface_pixels,
+                obs_surface_camera_z,
                 float(view_frequency_weights[view_index]),
                 depth_weighting,
                 depth_weight_power,
@@ -830,14 +939,12 @@ def _write_point_observation_graph(
                 depth_weight_reference_percentile,
                 pixel_sample_stride,
                 pixel_candidate_k,
-                pixel_search_radius,
-                pixel_weight_sigma,
+                pixel_preselect_k,
                 pixel_min_mode_amp_percentile,
                 pixel_max_samples_per_view,
+                pixel_render_acc_min,
+                pixel_min_contribution,
                 obs_zbuffer_weight,
-                zbuffer_mode,
-                zbuffer_soft_sigma,
-                zbuffer_soft_min_weight,
             )
         observations_per_view.append(count)
         view_depth_reference_z.append(z_reference)
@@ -876,9 +983,18 @@ def _write_point_observation_graph(
     keep_obs = observation_keep_points[obs_point_arr]
     obs_fields_out: dict[str, np.ndarray] = {}
     if observation_sampling == "pixel-candidates":
-        if len(obs_candidate_distance_px) != obs_point_arr.shape[0]:
-            raise ValueError("Internal error: candidate distance count does not match observations.")
-        obs_fields_out["obs_candidate_distance_px"] = np.asarray(obs_candidate_distance_px, dtype=np.float32)[keep_obs]
+        for key, values in (
+            ("obs_contribution_weight", obs_contribution_weight),
+            ("obs_contribution_score", obs_contribution_score),
+            ("obs_surface_pixels_xy", obs_surface_pixels),
+            ("obs_surface_camera_z", obs_surface_camera_z),
+        ):
+            if len(values) != obs_point_arr.shape[0]:
+                raise ValueError(f"Internal error: {key} count does not match observations.")
+        obs_fields_out["obs_contribution_weight"] = np.asarray(obs_contribution_weight, dtype=np.float32)[keep_obs]
+        obs_fields_out["obs_contribution_score"] = np.asarray(obs_contribution_score, dtype=np.float32)[keep_obs]
+        obs_fields_out["obs_surface_pixels_xy"] = np.asarray(obs_surface_pixels, dtype=np.float32)[keep_obs]
+        obs_fields_out["obs_surface_camera_z"] = np.asarray(obs_surface_camera_z, dtype=np.float32)[keep_obs]
     if len(obs_zbuffer_weight) != obs_point_arr.shape[0]:
         raise ValueError("Internal error: z-buffer weight count does not match observations.")
     obs_fields_out["obs_zbuffer_weight"] = np.asarray(obs_zbuffer_weight, dtype=np.float32)[keep_obs]
@@ -948,10 +1064,14 @@ def _write_point_observation_graph(
         observation_sampling=np.array(str(observation_sampling)),
         pixel_sample_stride=np.array(pixel_sample_stride, dtype=np.int32),
         pixel_candidate_k=np.array(pixel_candidate_k, dtype=np.int32),
-        pixel_search_radius=np.array(pixel_search_radius, dtype=np.int32),
-        pixel_weight_sigma=np.array(pixel_weight_sigma, dtype=np.float32),
+        pixel_preselect_k=np.array(pixel_preselect_k, dtype=np.int32),
+        pixel_render_acc_min=np.array(pixel_render_acc_min, dtype=np.float32),
+        pixel_min_contribution=np.array(pixel_min_contribution, dtype=np.float32),
         pixel_min_mode_amp_percentile=np.array(pixel_min_mode_amp_percentile, dtype=np.float32),
         pixel_max_samples_per_view=np.array(pixel_max_samples_per_view, dtype=np.int32),
+        pixel_candidate_method=np.array(
+            "rendered_depth_gaussian_contribution" if observation_sampling == "pixel-candidates" else ""
+        ),
         observations_per_view=np.asarray(observations_per_view, dtype=np.int32),
         source_view_configs=np.asarray([str(path) for path in source_view_config_paths]),
         source_modal_npzs=np.asarray([str(path) for path in source_modal_npz_paths]),
@@ -1005,8 +1125,9 @@ def _validate_observation_graph_args(
 def _validate_pixel_candidate_args(
     pixel_sample_stride: int,
     pixel_candidate_k: int,
-    pixel_search_radius: int,
-    pixel_weight_sigma: float,
+    pixel_preselect_k: int,
+    pixel_render_acc_min: float,
+    pixel_min_contribution: float,
     pixel_min_mode_amp_percentile: float,
     pixel_max_samples_per_view: int,
 ) -> None:
@@ -1014,10 +1135,12 @@ def _validate_pixel_candidate_args(
         raise ValueError("pixel_sample_stride must be at least 1.")
     if pixel_candidate_k < 1:
         raise ValueError("pixel_candidate_k must be at least 1.")
-    if pixel_search_radius < 1:
-        raise ValueError("pixel_search_radius must be at least 1.")
-    if pixel_weight_sigma <= 0:
-        raise ValueError("pixel_weight_sigma must be positive.")
+    if pixel_preselect_k < pixel_candidate_k:
+        raise ValueError("pixel_preselect_k must be at least pixel_candidate_k.")
+    if not (0.0 <= pixel_render_acc_min <= 1.0):
+        raise ValueError("pixel_render_acc_min must be in [0, 1].")
+    if pixel_min_contribution < 0:
+        raise ValueError("pixel_min_contribution must be non-negative.")
     if not (0.0 <= pixel_min_mode_amp_percentile <= 100.0):
         raise ValueError("pixel_min_mode_amp_percentile must be in [0, 100].")
     if pixel_max_samples_per_view < 1:
@@ -1053,13 +1176,19 @@ def build_points_observation_graph(
     observation_sampling: str = "gaussian-center",
     pixel_sample_stride: int = 4,
     pixel_candidate_k: int = 4,
-    pixel_search_radius: int = 6,
-    pixel_weight_sigma: float = 3.0,
+    pixel_preselect_k: int = 32,
+    pixel_render_acc_min: float = 0.05,
+    pixel_min_contribution: float = 1e-12,
     pixel_min_mode_amp_percentile: float = 0.0,
     pixel_max_samples_per_view: int = 20000,
     zbuffer_mode: str = "hard",
     zbuffer_soft_sigma: float = 0.10,
     zbuffer_soft_min_weight: float = 0.05,
+    gaussian_scales: np.ndarray | None = None,
+    gaussian_quats: np.ndarray | None = None,
+    gaussian_opacities: np.ndarray | None = None,
+    rendered_depths: Sequence[np.ndarray] | None = None,
+    rendered_accs: Sequence[np.ndarray] | None = None,
 ) -> Path:
     """Build an N-view observation graph for an arbitrary fixed 3D point set."""
     _validate_observation_graph_args(
@@ -1082,8 +1211,9 @@ def build_points_observation_graph(
         _validate_pixel_candidate_args(
             pixel_sample_stride,
             pixel_candidate_k,
-            pixel_search_radius,
-            pixel_weight_sigma,
+            pixel_preselect_k,
+            pixel_render_acc_min,
+            pixel_min_contribution,
             pixel_min_mode_amp_percentile,
             pixel_max_samples_per_view,
         )
@@ -1135,13 +1265,19 @@ def build_points_observation_graph(
         observation_sampling=observation_sampling,
         pixel_sample_stride=pixel_sample_stride,
         pixel_candidate_k=pixel_candidate_k,
-        pixel_search_radius=pixel_search_radius,
-        pixel_weight_sigma=pixel_weight_sigma,
+        pixel_preselect_k=pixel_preselect_k,
+        pixel_render_acc_min=pixel_render_acc_min,
+        pixel_min_contribution=pixel_min_contribution,
         pixel_min_mode_amp_percentile=pixel_min_mode_amp_percentile,
         pixel_max_samples_per_view=pixel_max_samples_per_view,
         zbuffer_mode=zbuffer_mode,
         zbuffer_soft_sigma=zbuffer_soft_sigma,
         zbuffer_soft_min_weight=zbuffer_soft_min_weight,
+        gaussian_scales=gaussian_scales,
+        gaussian_quats=gaussian_quats,
+        gaussian_opacities=gaussian_opacities,
+        rendered_depths=rendered_depths,
+        rendered_accs=rendered_accs,
     )
 
 

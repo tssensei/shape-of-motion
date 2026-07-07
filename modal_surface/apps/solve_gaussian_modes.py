@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from modal_surface.carrier import build_points_observation_graph
+from modal_surface.io import load_view_config
 from modal_surface.optimization_multi import optimize_multi_view
 from modal_surface.apps.solve_carrier_modes import (
     _alpha_by_view_diagnostics,
@@ -22,6 +23,7 @@ from modal_surface.apps.solve_carrier_modes import (
     _rel,
     _view_frequency_reliability,
 )
+from flow3d.scene_model import SceneModel
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -37,9 +39,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Observation graph sampling mode.",
     )
     parser.add_argument("--pixel-sample-stride", type=int, default=4, help="Pixel grid stride for pixel-candidates sampling.")
-    parser.add_argument("--pixel-candidate-k", type=int, default=4, help="Number of nearby projected Gaussians supervised by each sampled pixel.")
-    parser.add_argument("--pixel-search-radius", type=int, default=6, help="Search radius in pixels for pixel-candidates sampling.")
-    parser.add_argument("--pixel-weight-sigma", type=float, default=3.0, help="Gaussian pixel-distance weighting sigma for pixel-candidates observations.")
+    parser.add_argument("--pixel-candidate-k", type=int, default=4, help="Number of top contribution Gaussians supervised by each sampled pixel.")
+    parser.add_argument("--pixel-preselect-k", type=int, default=32, help="Number of 3D nearest Gaussians scored before top-k contribution selection.")
+    parser.add_argument("--pixel-render-acc-min", type=float, default=0.05, help="Minimum rendered foreground alpha for sampled modal pixels.")
+    parser.add_argument("--pixel-min-contribution", type=float, default=1e-12, help="Minimum unnormalized Gaussian contribution retained for a sampled modal pixel.")
     parser.add_argument("--pixel-min-mode-amp-percentile", type=float, default=0.0, help="Discard sampled modal pixels below this foreground amplitude percentile.")
     parser.add_argument("--pixel-max-samples-per-view", type=int, default=20000, help="Maximum sampled modal pixels per view before candidate expansion.")
     parser.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
@@ -111,6 +114,66 @@ def _load_fg_means_from_checkpoint(path: str) -> np.ndarray:
     return means
 
 
+def _load_fg_contribution_inputs_from_checkpoint(
+    path: str,
+    view_config_paths: list[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
+    ckpt_path = Path(path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("model")
+    if not isinstance(state, dict):
+        raise ValueError(f"{path} does not contain a model state")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SceneModel.init_from_state_dict(state).to(device)
+    model.eval()
+    fg_means = model.fg.params["means"].detach().cpu().float().numpy().astype(np.float32)
+    fg_scales = model.fg.get_scales().detach().cpu().float().numpy().astype(np.float32)
+    fg_quats = model.fg.get_quats().detach().cpu().float().numpy().astype(np.float32)
+    fg_opacities = model.fg.get_opacities().detach().cpu().float().numpy().reshape(-1).astype(np.float32)
+    if fg_means.ndim != 2 or fg_means.shape[1] != 3:
+        raise ValueError(f"fg.params.means must have shape (N,3), got {fg_means.shape}")
+    if fg_scales.shape != fg_means.shape:
+        raise ValueError(f"activated foreground scales must have shape {fg_means.shape}, got {fg_scales.shape}")
+    if fg_quats.shape != (fg_means.shape[0], 4):
+        raise ValueError(f"activated foreground quats must have shape ({fg_means.shape[0]},4), got {fg_quats.shape}")
+    if fg_opacities.shape != (fg_means.shape[0],):
+        raise ValueError(f"activated foreground opacities must have shape ({fg_means.shape[0]},), got {fg_opacities.shape}")
+    if not np.all(np.isfinite(fg_means)):
+        raise ValueError(f"{path} contains non-finite foreground Gaussian centers")
+
+    rendered_depths: list[np.ndarray] = []
+    rendered_accs: list[np.ndarray] = []
+    with torch.no_grad():
+        for cfg_path in view_config_paths:
+            cfg = load_view_config(cfg_path)
+            w2c = torch.from_numpy(cfg.world_to_camera).to(device=device, dtype=torch.float32)[None]
+            K = torch.from_numpy(cfg.K).to(device=device, dtype=torch.float32)[None]
+            rendered = model.render(
+                None,
+                w2c,
+                K,
+                (cfg.image_width, cfg.image_height),
+                return_depth=True,
+                return_mask=False,
+                fg_only=True,
+            )
+            depth = rendered["depth"][0, ..., 0].detach().cpu().float().numpy().astype(np.float32)
+            acc_tensor = rendered["acc"][0]
+            if acc_tensor.ndim == 3:
+                acc_tensor = acc_tensor[..., 0]
+            acc = acc_tensor.detach().cpu().float().numpy().astype(np.float32)
+            if depth.shape != (cfg.image_height, cfg.image_width):
+                raise ValueError(f"Rendered depth for {cfg.view_id} has unexpected shape {depth.shape}.")
+            if acc.shape != (cfg.image_height, cfg.image_width):
+                raise ValueError(f"Rendered alpha for {cfg.view_id} has unexpected shape {acc.shape}.")
+            rendered_depths.append(depth)
+            rendered_accs.append(acc)
+    return fg_means, fg_scales, fg_quats, fg_opacities, rendered_depths, rendered_accs
+
+
 def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: int) -> dict[str, Any]:
     stats = _latent_stats(latent_path, observation_path)
     latent = np.load(str(latent_path), allow_pickle=False)
@@ -140,6 +203,21 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
             else "gaussian-center",
         }
     )
+    if "pixel_candidate_method" in observations.files:
+        stats["pixel_candidate_method"] = str(np.asarray(observations["pixel_candidate_method"]).item())
+    if "obs_contribution_weight" in observations.files:
+        contribution_weight = observations["obs_contribution_weight"].astype(np.float32)
+        contribution_score = observations["obs_contribution_score"].astype(np.float32)
+        stats.update(
+            {
+                "contribution_weight_p50": _json_float(np.percentile(contribution_weight, 50)),
+                "contribution_weight_p90": _json_float(np.percentile(contribution_weight, 90)),
+                "contribution_weight_max": _json_float(contribution_weight.max()),
+                "contribution_score_p50": _json_float(np.percentile(contribution_score, 50)),
+                "contribution_score_p90": _json_float(np.percentile(contribution_score, 90)),
+                "contribution_score_max": _json_float(contribution_score.max()),
+            }
+        )
     if "modal_rigid_edge_count" in latent.files:
         modal_rigid_degree = latent["modal_rigid_degree"].astype(np.int32)
         modal_rigid_residual = latent["modal_rigid_residual"].astype(np.float32)
@@ -210,7 +288,22 @@ def run(args: argparse.Namespace) -> None:
     if float(args.outlier_frac) != 0.0:
         raise ValueError("solve-gaussian-modes preserves foreground Gaussian order and requires --outlier-frac 0.0")
 
-    fg_means = _load_fg_means_from_checkpoint(args.input_ckpt)
+    if args.observation_sampling == "pixel-candidates":
+        (
+            fg_means,
+            fg_scales,
+            fg_quats,
+            fg_opacities,
+            rendered_depths,
+            rendered_accs,
+        ) = _load_fg_contribution_inputs_from_checkpoint(args.input_ckpt, view_configs)
+    else:
+        fg_means = _load_fg_means_from_checkpoint(args.input_ckpt)
+        fg_scales = None
+        fg_quats = None
+        fg_opacities = None
+        rendered_depths = None
+        rendered_accs = None
     gaussian_indices = np.arange(fg_means.shape[0], dtype=np.int32)
     freqs_per_view = _load_modal_freqs(modal_npzs)
     mode_indices = _parse_mode_indices(args.mode_indices, int(freqs_per_view[0].shape[0]))
@@ -265,10 +358,16 @@ def run(args: argparse.Namespace) -> None:
             observation_sampling=args.observation_sampling,
             pixel_sample_stride=args.pixel_sample_stride,
             pixel_candidate_k=args.pixel_candidate_k,
-            pixel_search_radius=args.pixel_search_radius,
-            pixel_weight_sigma=args.pixel_weight_sigma,
+            pixel_preselect_k=args.pixel_preselect_k,
+            pixel_render_acc_min=args.pixel_render_acc_min,
+            pixel_min_contribution=args.pixel_min_contribution,
             pixel_min_mode_amp_percentile=args.pixel_min_mode_amp_percentile,
             pixel_max_samples_per_view=args.pixel_max_samples_per_view,
+            gaussian_scales=fg_scales,
+            gaussian_quats=fg_quats,
+            gaussian_opacities=fg_opacities,
+            rendered_depths=rendered_depths,
+            rendered_accs=rendered_accs,
         )
         _print_observation_sanity(obs_path, fg_means.shape[0])
         optimize_multi_view(
@@ -346,8 +445,9 @@ def run(args: argparse.Namespace) -> None:
             "observation_sampling": str(args.observation_sampling),
             "pixel_sample_stride": int(args.pixel_sample_stride),
             "pixel_candidate_k": int(args.pixel_candidate_k),
-            "pixel_search_radius": int(args.pixel_search_radius),
-            "pixel_weight_sigma": float(args.pixel_weight_sigma),
+            "pixel_preselect_k": int(args.pixel_preselect_k),
+            "pixel_render_acc_min": float(args.pixel_render_acc_min),
+            "pixel_min_contribution": float(args.pixel_min_contribution),
             "pixel_min_mode_amp_percentile": float(args.pixel_min_mode_amp_percentile),
             "pixel_max_samples_per_view": int(args.pixel_max_samples_per_view),
             "zbuffer_radius": int(args.zbuffer_radius),
