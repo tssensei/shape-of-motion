@@ -271,17 +271,30 @@ class DynamicViewer(Viewer):
         self._gaussian_color_handles = None
         if not self.modal_freqs_hz:
             return
-        options = ["rgb", "modal amplitude", "modal phase"]
+        options = ["rgb", "modal phase"]
         if self.has_modal_obs_count:
             options.append("obs count")
+        phase_component_options = []
+        for mode_index, freq_hz in enumerate(self.modal_freqs_hz):
+            phase_component_options.append(
+                f"Mode {mode_index} {freq_hz:.3f} Hz projected u"
+            )
+            phase_component_options.append(
+                f"Mode {mode_index} {freq_hz:.3f} Hz projected v"
+            )
         with self.server.gui.add_folder("Gaussian color"):
             color_mode = self.server.gui.add_dropdown(
                 "Render color mode",
                 options=tuple(options),
                 initial_value="rgb",
             )
+            phase_component = self.server.gui.add_dropdown(
+                "Phase component",
+                options=tuple(phase_component_options),
+                initial_value=phase_component_options[0],
+            )
             mode_index = self.server.gui.add_slider(
-                "Color mode index",
+                "Obs count mode index",
                 min=0,
                 max=max(len(self.modal_freqs_hz) - 1, 0),
                 step=1,
@@ -289,9 +302,12 @@ class DynamicViewer(Viewer):
             )
         self._gaussian_color_handles = {
             "color_mode": color_mode,
+            "phase_component": phase_component,
+            "phase_component_options": tuple(phase_component_options),
             "mode_index": mode_index,
         }
         color_mode.on_update(self.rerender)
+        phase_component.on_update(self.rerender)
         mode_index.on_update(self.rerender)
 
     def _define_debug_point_guis(self) -> None:
@@ -400,6 +416,17 @@ class DynamicViewer(Viewer):
         if handles is None:
             return "rgb", 0
         return str(handles["color_mode"].value), int(handles["mode_index"].value)
+
+    def current_gaussian_phase_component(self) -> tuple[int, int]:
+        handles = getattr(self, "_gaussian_color_handles", None)
+        if handles is None:
+            return 0, 0
+        options = handles["phase_component_options"]
+        selected = str(handles["phase_component"].value)
+        if selected not in options:
+            raise ValueError(f"Unknown Gaussian phase component: {selected}")
+        flat_index = options.index(selected)
+        return flat_index // 2, flat_index % 2
 
     def update_gaussian_centers(self, points: np.ndarray, fg_count: int) -> None:
         if not self.wants_gaussian_centers():

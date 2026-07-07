@@ -221,40 +221,59 @@ class Renderer:
             rgb = torch.where((sector == idx)[..., None], candidate, rgb)
         return rgb
 
-    def _modal_amplitude_colors(self, mode_index: int) -> torch.Tensor:
-        phi_real = self.model.modal_phi_real[mode_index]
-        phi_imag = self.model.modal_phi_imag[mode_index]
-        amp = torch.sqrt((phi_real.square() + phi_imag.square()).sum(dim=-1))
-        finite_amp = amp[torch.isfinite(amp)]
-        if finite_amp.numel() == 0:
-            norm = torch.zeros_like(amp)
-        else:
-            hi = torch.quantile(finite_amp, 0.98).clamp_min(1.0e-8)
-            norm = (amp / hi).clamp(0.0, 1.0)
-        return torch.stack(
-            [
-                norm,
-                0.15 + 0.85 * norm,
-                1.0 - norm,
-            ],
-            dim=-1,
+    def _modal_phase_colors(
+        self,
+        mode_index: int,
+        component_index: int,
+        w2c: torch.Tensor,
+        K: torch.Tensor,
+    ) -> torch.Tensor:
+        if component_index not in (0, 1):
+            raise ValueError(
+                f"Projected phase component must be 0 for u or 1 for v, got {component_index}"
+            )
+        means = self.model.fg.params["means"]
+        R = w2c[:3, :3]
+        t = w2c[:3, 3]
+        points_cam = means @ R.T + t[None]
+        x = points_cam[:, 0]
+        y = points_cam[:, 1]
+        z = points_cam[:, 2]
+        eps = torch.as_tensor(1.0e-6, device=z.device, dtype=z.dtype)
+        z_safe = torch.where(
+            z.abs() < eps,
+            torch.where(z >= 0, eps, -eps),
+            z,
         )
-
-    def _modal_phase_colors(self, mode_index: int) -> torch.Tensor:
+        fx = K[0, 0]
+        fy = K[1, 1]
+        J_cam = torch.zeros(
+            (means.shape[0], 2, 3),
+            device=means.device,
+            dtype=means.dtype,
+        )
+        J_cam[:, 0, 0] = fx / z_safe
+        J_cam[:, 0, 2] = -fx * x / (z_safe * z_safe)
+        J_cam[:, 1, 1] = fy / z_safe
+        J_cam[:, 1, 2] = -fy * y / (z_safe * z_safe)
+        J = torch.einsum("nij,jk->nik", J_cam, R.to(dtype=means.dtype))
         phi_real = self.model.modal_phi_real[mode_index]
         phi_imag = self.model.modal_phi_imag[mode_index]
-        comp_amp = torch.sqrt(phi_real.square() + phi_imag.square())
-        component = comp_amp.argmax(dim=-1, keepdim=True)
-        real = torch.gather(phi_real, 1, component).squeeze(1)
-        imag = torch.gather(phi_imag, 1, component).squeeze(1)
-        amp = torch.sqrt((phi_real.square() + phi_imag.square()).sum(dim=-1))
-        finite_amp = amp[torch.isfinite(amp)]
+        projected_real = torch.einsum("nij,nj->ni", J, phi_real)
+        projected_imag = torch.einsum("nij,nj->ni", J, phi_imag)
+        real = projected_real[:, component_index]
+        imag = projected_imag[:, component_index]
+        amp = torch.sqrt(real.square() + imag.square())
+        phase = torch.atan2(imag, real)
+        finite = torch.isfinite(amp) & torch.isfinite(phase)
+        finite_amp = amp[finite]
         if finite_amp.numel() == 0:
             value = torch.zeros_like(amp)
         else:
-            hi = torch.quantile(finite_amp, 0.98).clamp_min(1.0e-8)
-            value = (amp / hi).clamp(0.0, 1.0)
-        phase = torch.atan2(imag, real)
+            hi = torch.quantile(finite_amp, 0.95).clamp_min(1.0e-8)
+            value = torch.zeros_like(amp)
+            value[finite] = (amp[finite] / hi).clamp(0.0, 1.0)
+        phase = torch.where(torch.isfinite(phase), phase, torch.zeros_like(phase))
         hue = (phase + torch.pi) / (2.0 * torch.pi)
         saturation = torch.ones_like(value)
         return self._hsv_to_rgb(hue, saturation, value)
@@ -281,7 +300,9 @@ class Renderer:
         )
         return colors
 
-    def _current_gaussian_color_override(self) -> torch.Tensor | None:
+    def _current_gaussian_color_override(
+        self, w2c: torch.Tensor, K: torch.Tensor
+    ) -> torch.Tensor | None:
         if self.viewer is None or not self.model.has_modal_field:
             return None
         color_mode, mode_index = self.viewer.current_gaussian_color_mode()
@@ -291,12 +312,23 @@ class Renderer:
             raise ValueError(
                 f"Gaussian color mode index {mode_index} is outside "
                 f"[0, {self.model.modal_phi_real.shape[0]})"
-            )
+        )
 
-        if color_mode == "modal amplitude":
-            fg_colors = self._modal_amplitude_colors(mode_index)
-        elif color_mode == "modal phase":
-            fg_colors = self._modal_phase_colors(mode_index)
+        if color_mode == "modal phase":
+            phase_mode_index, component_index = (
+                self.viewer.current_gaussian_phase_component()
+            )
+            if phase_mode_index < 0 or phase_mode_index >= self.model.modal_phi_real.shape[0]:
+                raise ValueError(
+                    f"Gaussian phase mode index {phase_mode_index} is outside "
+                    f"[0, {self.model.modal_phi_real.shape[0]})"
+                )
+            fg_colors = self._modal_phase_colors(
+                phase_mode_index,
+                component_index,
+                w2c,
+                K,
+            )
         elif color_mode == "obs count":
             if not self.model.has_modal_obs_count:
                 raise ValueError("Checkpoint does not contain modal obs_count_per_point")
@@ -362,7 +394,7 @@ class Renderer:
                 self.viewer.update_modal_anchors(anchor_points.detach().cpu().numpy())
         if self.viewer.hide_gaussian_render():
             return np.full((H, W, 3), 255, dtype=np.uint8)
-        colors_override = self._current_gaussian_color_override()
+        colors_override = self._current_gaussian_color_override(w2c, K)
         img = self.model.render(
             render_t,
             w2c[None],
