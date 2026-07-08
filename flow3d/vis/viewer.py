@@ -432,7 +432,9 @@ class DynamicViewer(Viewer):
         flat_index = options.index(selected)
         return flat_index // 2, flat_index % 2
 
-    def update_gaussian_centers(self, points: np.ndarray, fg_count: int) -> None:
+    def update_gaussian_centers(
+        self, points: np.ndarray, fg_count: int, update_key
+    ) -> None:
         if not self.wants_gaussian_centers():
             return
         handles = self._debug_point_handles
@@ -459,13 +461,17 @@ class DynamicViewer(Viewer):
 
         selected = selectable[:visible_count]
         point_size = float(handles["center_point_size"].value)
-        cache_key = (visible_count, bool(handles["fg_only"].value), fg_count)
+        cache_key = (
+            visible_count,
+            bool(handles["fg_only"].value),
+            fg_count,
+            point_size,
+            update_key,
+        )
         if (
             self._gaussian_center_handle is not None
             and self._gaussian_center_cache_key == cache_key
         ):
-            self._gaussian_center_handle.points = points[selected]
-            self._gaussian_center_handle.point_size = point_size
             return
 
         self._remove_gaussian_center_cloud()
@@ -481,7 +487,7 @@ class DynamicViewer(Viewer):
         )
         self._gaussian_center_cache_key = cache_key
 
-    def update_modal_anchors(self, points: np.ndarray) -> None:
+    def update_modal_anchors(self, points: np.ndarray, update_key) -> None:
         if not self.wants_modal_anchors():
             return
         handles = self._debug_point_handles
@@ -500,13 +506,11 @@ class DynamicViewer(Viewer):
 
         selected = np.arange(visible_count, dtype=np.int64)
         point_size = float(handles["anchor_point_size"].value)
-        cache_key = (visible_count,)
+        cache_key = (visible_count, point_size, update_key)
         if (
             self._modal_anchor_handle is not None
             and self._modal_anchor_cache_key == cache_key
         ):
-            self._modal_anchor_handle.points = points[selected]
-            self._modal_anchor_handle.point_size = point_size
             return
 
         self._remove_modal_anchor_cloud()

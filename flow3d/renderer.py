@@ -368,6 +368,7 @@ class Renderer:
         quats = None
         render_t = t
         modal_oscillator = self.viewer.current_modal_oscillator()
+        debug_points_update_key = ("canonical",) if t is None else ("frame", int(t))
         if modal_oscillator is not None and self.model.has_modal_field:
             q_np, motion_scale = modal_oscillator
             base_means, base_quats = self.model.compute_poses_all(None)
@@ -377,6 +378,17 @@ class Renderer:
             fg_offsets = self.model.compute_synthetic_modal_offsets(q, motion_scale)
             means[: self.model.num_fg_gaussians] += fg_offsets
             render_t = None
+            q_key = tuple(
+                np.round(
+                    np.stack([q_np.real, q_np.imag], axis=-1).reshape(-1),
+                    6,
+                ).tolist()
+            )
+            debug_points_update_key = (
+                "oscillator",
+                round(float(motion_scale), 6),
+                q_key,
+            )
         if self.viewer.wants_gaussian_centers():
             center_means = means
             if center_means is None:
@@ -387,11 +399,15 @@ class Renderer:
             self.viewer.update_gaussian_centers(
                 center_means.detach().cpu().numpy(),
                 self.model.num_fg_gaussians,
+                debug_points_update_key,
             )
         if self.viewer.wants_modal_anchors():
             anchor_points = self._current_modal_anchor_points(modal_oscillator)
             if anchor_points is not None:
-                self.viewer.update_modal_anchors(anchor_points.detach().cpu().numpy())
+                self.viewer.update_modal_anchors(
+                    anchor_points.detach().cpu().numpy(),
+                    debug_points_update_key,
+                )
         if self.viewer.hide_gaussian_render():
             return np.full((H, W, 3), 255, dtype=np.uint8)
         colors_override = self._current_gaussian_color_override(w2c, K)
