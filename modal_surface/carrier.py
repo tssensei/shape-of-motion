@@ -77,8 +77,8 @@ def _load_view_inputs(
 ) -> tuple[list[ViewConfig], list[dict[str, np.ndarray]], np.ndarray, float]:
     if len(view_config_paths) != len(modal_npz_paths):
         raise ValueError("--view-config and --modal-npz must be supplied the same number of times.")
-    if len(view_config_paths) < 2:
-        raise ValueError("At least two views are required.")
+    if len(view_config_paths) < 1:
+        raise ValueError("At least one view is required.")
     if mode_index < 0:
         raise ValueError("mode_index must be non-negative.")
     if freq_tolerance_hz < 0:
