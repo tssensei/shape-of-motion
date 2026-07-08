@@ -229,7 +229,7 @@ class DynamicViewer(Viewer):
                 min=0.0,
                 max=1.0,
                 step=0.001,
-                initial_value=0.1,
+                initial_value=0.04,
             )
             modes = []
             for mode_idx, freq_hz in enumerate(self.modal_freqs_hz):
