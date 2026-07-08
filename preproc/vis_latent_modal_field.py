@@ -463,7 +463,8 @@ def obs_count_colors(obs_count: np.ndarray) -> np.ndarray:
     """Diagnostic colors: one-view red, two-view blue, three-plus green."""
     counts = np.asarray(obs_count, dtype=np.int32)
     colors = np.zeros((counts.shape[0], 3), dtype=np.uint8)
-    colors[counts <= 1] = np.asarray([255, 110, 40], dtype=np.uint8)
+    colors[counts == 0] = np.asarray([35, 35, 35], dtype=np.uint8)
+    colors[counts == 1] = np.asarray([255, 110, 40], dtype=np.uint8)
     colors[counts == 2] = np.asarray([70, 140, 255], dtype=np.uint8)
     colors[counts >= 3] = np.asarray([70, 210, 120], dtype=np.uint8)
     return colors
