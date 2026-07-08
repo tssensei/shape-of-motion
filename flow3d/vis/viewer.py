@@ -103,6 +103,8 @@ class DynamicViewer(Viewer):
         self.modal_anchor_count = int(modal_anchor_count)
         self._gaussian_center_handle = None
         self._modal_anchor_handle = None
+        self._gaussian_center_cache_key = None
+        self._modal_anchor_cache_key = None
         for group in self.playback_groups:
             if len(group.global_timestamps) == 0:
                 raise ValueError(f"Playback group {group.label!r} has no frames")
@@ -389,11 +391,13 @@ class DynamicViewer(Viewer):
         if self._gaussian_center_handle is not None:
             self._gaussian_center_handle.remove()
             self._gaussian_center_handle = None
+        self._gaussian_center_cache_key = None
 
     def _remove_modal_anchor_cloud(self) -> None:
         if self._modal_anchor_handle is not None:
             self._modal_anchor_handle.remove()
             self._modal_anchor_handle = None
+        self._modal_anchor_cache_key = None
 
     def hide_gaussian_render(self) -> bool:
         handles = getattr(self, "_debug_point_handles", None)
@@ -449,11 +453,22 @@ class DynamicViewer(Viewer):
         visible_count = min(
             max(int(handles["center_count"].value), 0), selectable.shape[0]
         )
-        self._remove_gaussian_center_cloud()
         if visible_count == 0:
+            self._remove_gaussian_center_cloud()
             return
 
         selected = selectable[:visible_count]
+        point_size = float(handles["center_point_size"].value)
+        cache_key = (visible_count, bool(handles["fg_only"].value), fg_count)
+        if (
+            self._gaussian_center_handle is not None
+            and self._gaussian_center_cache_key == cache_key
+        ):
+            self._gaussian_center_handle.points = points[selected]
+            self._gaussian_center_handle.point_size = point_size
+            return
+
+        self._remove_gaussian_center_cloud()
         colors = np.empty((visible_count, 3), dtype=np.float32)
         fg_mask = selected < fg_count
         colors[fg_mask] = np.asarray([0.05, 0.85, 0.20], dtype=np.float32)
@@ -462,8 +477,9 @@ class DynamicViewer(Viewer):
             "/debug/gaussian_centers",
             points=points[selected],
             colors=colors,
-            point_size=float(handles["center_point_size"].value),
+            point_size=point_size,
         )
+        self._gaussian_center_cache_key = cache_key
 
     def update_modal_anchors(self, points: np.ndarray) -> None:
         if not self.wants_modal_anchors():
@@ -478,18 +494,30 @@ class DynamicViewer(Viewer):
             raise ValueError(f"Modal anchors must have shape (N,3), got {points.shape}")
 
         visible_count = min(max(int(handles["anchor_count"].value), 0), points.shape[0])
-        self._remove_modal_anchor_cloud()
         if visible_count == 0:
+            self._remove_modal_anchor_cloud()
             return
 
         selected = np.arange(visible_count, dtype=np.int64)
+        point_size = float(handles["anchor_point_size"].value)
+        cache_key = (visible_count,)
+        if (
+            self._modal_anchor_handle is not None
+            and self._modal_anchor_cache_key == cache_key
+        ):
+            self._modal_anchor_handle.points = points[selected]
+            self._modal_anchor_handle.point_size = point_size
+            return
+
+        self._remove_modal_anchor_cloud()
         colors = np.full((visible_count, 3), [0.05, 0.55, 1.0], dtype=np.float32)
         self._modal_anchor_handle = self.server.scene.add_point_cloud(
             "/debug/modal_anchors",
             points=points[selected],
             colors=colors,
-            point_size=float(handles["anchor_point_size"].value),
+            point_size=point_size,
         )
+        self._modal_anchor_cache_key = cache_key
 
     def current_modal_oscillator(self) -> tuple[np.ndarray, float] | None:
         handles = getattr(self, "_modal_playback_handles", None)
