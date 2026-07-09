@@ -236,6 +236,12 @@ def _write_manifest(path: Path, modes: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _tint_colors(colors: np.ndarray, tint: np.ndarray, strength: float = 0.35) -> np.ndarray:
+    base = colors.astype(np.float32)
+    tinted = (1.0 - float(strength)) * base + float(strength) * tint.astype(np.float32)[None, :]
+    return np.clip(tinted, 0.0, 255.0).astype(np.uint8)
+
+
 def _write_viewer_inputs(
     out_dir: Path,
     points: np.ndarray,
@@ -449,6 +455,40 @@ def main() -> None:
         modal_fill_unobserved=False,
     )
     solved = _load_npz_dict(solved_path)
+    overlay_points = np.concatenate([points, points], axis=0).astype(np.float32)
+    overlay_phi = np.concatenate([phi_gt, solved["phi"].astype(np.complex64)], axis=0).astype(np.complex64)
+    overlay_colors = np.concatenate(
+        [
+            _tint_colors(colors, np.array([40, 220, 120], dtype=np.uint8)),
+            _tint_colors(colors, np.array([240, 80, 220], dtype=np.uint8)),
+        ],
+        axis=0,
+    )
+    overlay_obs_count = np.concatenate(
+        [
+            observations["obs_count_per_point"].astype(np.int32),
+            observations["obs_count_per_point"].astype(np.int32),
+        ],
+        axis=0,
+    )
+    overlay_path = _write_npz(
+        out_dir / "latents" / "gt_vs_solved_overlay.npz",
+        points_world=overlay_points,
+        phi=overlay_phi,
+        colors=overlay_colors,
+        freq_hz=np.array(float(args.freq_hz), dtype=np.float32),
+        mode_index=np.array(0, dtype=np.int32),
+        obs_count_per_point=overlay_obs_count,
+        obs_sample_count_per_point=overlay_obs_count.copy(),
+        point_group=np.concatenate(
+            [
+                np.zeros(points.shape[0], dtype=np.int32),
+                np.ones(points.shape[0], dtype=np.int32),
+            ],
+            axis=0,
+        ),
+        point_group_names=np.array(["GT", "Solved"]),
+    )
     _write_diagnostics(
         out_dir / "diagnostics.json",
         observations,
@@ -462,6 +502,7 @@ def main() -> None:
     gt_manifest = out_dir / "manifests" / "gt" / "modal_modes_manifest.json"
     solved_manifest = out_dir / "manifests" / "solved" / "modal_modes_manifest.json"
     compare_manifest = out_dir / "manifests" / "compare" / "modal_modes_manifest.json"
+    overlay_manifest = out_dir / "manifests" / "overlay" / "modal_modes_manifest.json"
     _write_manifest(
         gt_manifest,
         [
@@ -501,6 +542,17 @@ def main() -> None:
             },
         ],
     )
+    _write_manifest(
+        overlay_manifest,
+        [
+            {
+                "mode_index": 0,
+                "freq_hz": float(args.freq_hz),
+                "label": "GT vs Solved overlay",
+                "latent_path": _rel(overlay_path, overlay_manifest.parent),
+            }
+        ],
+    )
 
     visibility = observations["point_view_mask"].astype(bool)
     view1_only = int((visibility[:, 0] & ~visibility[:, 1]).sum())
@@ -515,6 +567,7 @@ def main() -> None:
     print(f"Observation graph: {obs_path}")
     print(f"GT manifest: {gt_manifest}")
     print(f"Solved manifest: {solved_manifest}")
+    print(f"Overlay manifest: {overlay_manifest}")
     print(f"Diagnostics: {out_dir / 'diagnostics.json'}")
 
 
