@@ -1,0 +1,193 @@
+{
+  "num_points": 20000,
+  "num_observations": 14304,
+  "image_width": 1280,
+  "image_height": 720,
+  "visibility_margin": 0.03,
+  "visibility_counts": {
+    "view1_only": 4199,
+    "view2_only": 4207,
+    "overlap": 2949,
+    "observed_all": 11355,
+    "unobserved": 8645
+  },
+  "true_alphas": [
+    [
+      1.0,
+      0.0
+    ],
+    [
+      0.6967067122459412,
+      0.7173560857772827
+    ]
+  ],
+  "solved_alphas": [
+    [
+      1.0,
+      0.0
+    ],
+    [
+      1.0,
+      8.379510973988147e-10
+    ]
+  ],
+  "residual_stats": null,
+  "groups": {
+    "view1_only": {
+      "name": "view1_only",
+      "count": 4199,
+      "angular_error_deg": {
+        "count": 4199,
+        "mean": 32.957550048828125,
+        "median": 32.76906204223633,
+        "p90": 39.836585998535156,
+        "max": 41.87453079223633
+      },
+      "phase_rad": {
+        "count": 4199,
+        "mean": 0.0,
+        "median": 0.0,
+        "p90": 0.0,
+        "max": 0.0
+      },
+      "mean_recovered_real_motion": [
+        0.7011769413948059,
+        -0.44088998436927795,
+        -0.0001169829920399934
+      ],
+      "mean_recovered_abs_motion": 0.8360869288444519,
+      "point_residual": {
+        "count": 4199,
+        "mean": 4.483798875298817e-06,
+        "median": 2.384185791015625e-07,
+        "p90": 1.52587890625e-05,
+        "max": 3.053247564821504e-05
+      }
+    },
+    "view2_only": {
+      "name": "view2_only",
+      "count": 4207,
+      "angular_error_deg": {
+        "count": 4207,
+        "mean": 32.95520782470703,
+        "median": 32.77783966064453,
+        "p90": 39.82810974121094,
+        "max": 41.90392303466797
+      },
+      "phase_rad": {
+        "count": 4207,
+        "mean": 0.8000000715255737,
+        "median": 0.800000011920929,
+        "p90": 0.8000000715255737,
+        "max": 0.8000001311302185
+      },
+      "mean_recovered_real_motion": [
+        0.4885389804840088,
+        0.3071465790271759,
+        -5.760303247370757e-05
+      ],
+      "mean_recovered_abs_motion": 0.8361052870750427,
+      "point_residual": {
+        "count": 4207,
+        "mean": 4.792334493686212e-06,
+        "median": 1.9073486328125e-06,
+        "p90": 1.528856228105724e-05,
+        "max": 2.174711880797986e-05
+      }
+    },
+    "overlap": {
+      "name": "overlap",
+      "count": 2949,
+      "angular_error_deg": {
+        "count": 2949,
+        "mean": 9.047420501708984,
+        "median": 8.89427375793457,
+        "p90": 10.137198448181152,
+        "max": 11.201470375061035
+      },
+      "phase_rad": {
+        "count": 2949,
+        "mean": 0.40001675486564636,
+        "median": 0.4000025987625122,
+        "p90": 0.46294689178466797,
+        "max": 0.4927787184715271
+      },
+      "mean_recovered_real_motion": [
+        0.848348081111908,
+        -0.13204479217529297,
+        2.9165306841605343e-05
+      ],
+      "mean_recovered_abs_motion": 0.9854229092597961,
+      "point_residual": {
+        "count": 2949,
+        "mean": 6.561483132827561e-06,
+        "median": 5.722045443690149e-06,
+        "p90": 1.2157010132796131e-05,
+        "max": 1.8833559806807898e-05
+      }
+    },
+    "observed_all": {
+      "name": "observed_all",
+      "count": 11355,
+      "angular_error_deg": {
+        "count": 11355,
+        "mean": 26.746997833251953,
+        "median": 29.874509811401367,
+        "p90": 39.187644958496094,
+        "max": 41.90392303466797
+      },
+      "phase_rad": {
+        "count": 11355,
+        "mean": 0.4002862274646759,
+        "median": 0.4001694321632385,
+        "p90": 0.800000011920929,
+        "max": 0.8000001311302185
+      },
+      "mean_recovered_real_motion": [
+        0.660617470741272,
+        -0.0835338681936264,
+        -5.7060737162828445e-05
+      ],
+      "mean_recovered_abs_motion": 0.8748776912689209,
+      "point_residual": {
+        "count": 11355,
+        "mean": 5.137705102242762e-06,
+        "median": 1.9073486328125e-06,
+        "p90": 1.526065170764923e-05,
+        "max": 3.053247564821504e-05
+      }
+    },
+    "unobserved": {
+      "name": "unobserved",
+      "count": 8645,
+      "angular_error_deg": {
+        "count": 8645,
+        "mean": 90.0,
+        "median": 90.0,
+        "p90": 90.0,
+        "max": 90.0
+      },
+      "phase_rad": {
+        "count": 8645,
+        "mean": 0.0,
+        "median": 0.0,
+        "p90": 0.0,
+        "max": 0.0
+      },
+      "mean_recovered_real_motion": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "mean_recovered_abs_motion": 0.0,
+      "point_residual": {
+        "count": 8645,
+        "mean": 0.0,
+        "median": 0.0,
+        "p90": 0.0,
+        "max": 0.0
+      }
+    }
+  },
+  "view1_only_vs_view2_only_mean_direction_angle_deg": 64.31884440213189
+}
