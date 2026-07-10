@@ -70,8 +70,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--depth-weight-power", type=float, default=2.0, help="Power used by inverse-z depth weighting.")
     parser.add_argument("--depth-weight-min", type=float, default=0.02, help="Minimum inverse-z depth weight.")
     parser.add_argument("--depth-weight-reference-percentile", type=float, default=50.0, help="Per-view candidate-depth percentile used as inverse-z reference.")
-    parser.add_argument("--pair-weight", action="append", default=None, help="Weight for points observed by exactly two views, formatted as viewA,viewB,weight. Repeat per pair.")
-    parser.add_argument("--min-observations", type=int, default=1, help="Minimum observed views whose observations are used for solving.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
     add_solver_arguments(
         parser,
@@ -345,7 +343,6 @@ def run(args: argparse.Namespace) -> None:
             front_percentile=args.front_percentile,
             zbuffer_tau=args.zbuffer_tau,
             min_zbuffer_samples=args.min_zbuffer_samples,
-            min_observations=args.min_observations,
             freq_tolerance_hz=args.freq_tolerance_hz,
             view_frequency_weighting=args.view_frequency_weighting,
             snr_band_hz=args.snr_band_hz,
@@ -356,7 +353,6 @@ def run(args: argparse.Namespace) -> None:
             depth_weight_power=args.depth_weight_power,
             depth_weight_min=args.depth_weight_min,
             depth_weight_reference_percentile=args.depth_weight_reference_percentile,
-            pair_weight_specs=args.pair_weight,
             preserve_all_points=True,
             optional_point_fields={"gaussian_indices": gaussian_indices},
             extra_metadata={
@@ -462,8 +458,6 @@ def run(args: argparse.Namespace) -> None:
             "depth_weight_power": float(args.depth_weight_power),
             "depth_weight_min": float(args.depth_weight_min),
             "depth_weight_reference_percentile": float(args.depth_weight_reference_percentile),
-            "pair_weight": list(args.pair_weight or []),
-            "min_observations": int(args.min_observations),
             "freq_tolerance_hz": float(args.freq_tolerance_hz),
             "iterations": int(args.iterations),
             "ridge_mu": float(args.ridge_mu),

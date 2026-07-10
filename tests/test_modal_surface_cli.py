@@ -51,7 +51,6 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 "modal_surface.apps.match_carrier_views",
                 {
                     "mode_index": 3,
-                    "min_observations": 1,
                     "view_config": ["view.json"],
                 },
             ),
@@ -126,6 +125,29 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 self.assertIs(args._runner, app.run)
                 for name, value in expected.items():
                     self.assertEqual(getattr(args, name), value)
+
+    def test_observation_filter_controls_are_not_registered(self) -> None:
+        cli = importlib.import_module("modal_surface.cli")
+        parser = cli.build_arg_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+
+        for command in (
+            "match-carrier-views",
+            "solve-carrier-modes",
+            "solve-gaussian-modes",
+        ):
+            with self.subTest(command=command):
+                option_strings = {
+                    option
+                    for action in subparsers.choices[command]._actions
+                    for option in action.option_strings
+                }
+                self.assertNotIn("--min-observations", option_strings)
+                self.assertNotIn("--pair-weight", option_strings)
 
     def test_main_dispatches_to_the_attached_app_runner(self) -> None:
         cli = importlib.import_module("modal_surface.cli")

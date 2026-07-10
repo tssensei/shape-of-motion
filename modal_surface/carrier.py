@@ -732,65 +732,6 @@ def _depth_weight(
     return float(np.clip(weight, float(min_weight), 1.0))
 
 
-def _parse_pair_weight_specs(
-    pair_weight_specs: Sequence[str] | None,
-    configs: Sequence[ViewConfig],
-) -> tuple[dict[tuple[int, int], float], np.ndarray]:
-    if not pair_weight_specs:
-        return {}, np.asarray([], dtype=str)
-    view_ids = [cfg.view_id for cfg in configs]
-    if len(set(view_ids)) != len(view_ids):
-        raise ValueError("View ids must be unique when using --pair-weight.")
-    view_to_index = {view_id: idx for idx, view_id in enumerate(view_ids)}
-    pair_weights: dict[tuple[int, int], float] = {}
-    normalized_specs: list[str] = []
-    for raw in pair_weight_specs:
-        parts = [part.strip() for part in str(raw).split(",")]
-        if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2]:
-            raise ValueError(f"--pair-weight must have format viewA,viewB,weight, got: {raw}")
-        view_a, view_b, weight_text = parts
-        if view_a not in view_to_index:
-            raise ValueError(f"Unknown view id in --pair-weight: {view_a}. Known views: {view_ids}")
-        if view_b not in view_to_index:
-            raise ValueError(f"Unknown view id in --pair-weight: {view_b}. Known views: {view_ids}")
-        idx_a = view_to_index[view_a]
-        idx_b = view_to_index[view_b]
-        if idx_a == idx_b:
-            raise ValueError(f"--pair-weight must reference two different views, got: {raw}")
-        weight = float(weight_text)
-        if not np.isfinite(weight) or weight < 0:
-            raise ValueError(f"--pair-weight weight must be finite and non-negative, got: {raw}")
-        key = tuple(sorted((idx_a, idx_b)))
-        if key in pair_weights:
-            raise ValueError(f"Duplicate --pair-weight for pair {view_ids[key[0]]},{view_ids[key[1]]}.")
-        pair_weights[key] = weight
-        normalized_specs.append(f"{view_ids[key[0]]},{view_ids[key[1]]},{weight:g}")
-    return pair_weights, np.asarray(normalized_specs, dtype=str)
-
-
-def _pair_weight_per_point(
-    num_points: int,
-    obs_point_arr: np.ndarray,
-    obs_view_arr: np.ndarray,
-    counts: np.ndarray,
-    pair_weight_specs: Sequence[str] | None,
-    configs: Sequence[ViewConfig],
-) -> tuple[np.ndarray, np.ndarray]:
-    pair_weights, normalized_specs = _parse_pair_weight_specs(pair_weight_specs, configs)
-    out = np.ones((num_points,), dtype=np.float32)
-    if not pair_weights:
-        return out, normalized_specs
-    point_view_mask = np.zeros((num_points, len(configs)), dtype=bool)
-    point_view_mask[obs_point_arr, obs_view_arr] = True
-    for point_idx in np.where(counts == 2)[0].tolist():
-        views = np.where(point_view_mask[point_idx])[0]
-        if views.size != 2:
-            raise ValueError(f"Point {point_idx} has two observations but not two distinct observed views.")
-        key = tuple(sorted((int(views[0]), int(views[1]))))
-        out[point_idx] = float(pair_weights.get(key, 1.0))
-    return out, normalized_specs
-
-
 def _subset_carrier_points(carrier: dict[str, np.ndarray], keep: np.ndarray) -> dict[str, np.ndarray]:
     n = carrier["points_world"].shape[0]
     out: dict[str, np.ndarray] = {}
@@ -963,7 +904,6 @@ def _write_point_observation_graph(
     front_percentile: float,
     zbuffer_tau: float,
     min_zbuffer_samples: int,
-    min_observations: int,
     view_frequency_weighting: str,
     snr_band_hz: float,
     snr_exclude_hz: float,
@@ -973,7 +913,6 @@ def _write_point_observation_graph(
     depth_weight_power: float,
     depth_weight_min: float,
     depth_weight_reference_percentile: float,
-    pair_weight_specs: Sequence[str] | None,
     source_view_config_paths: Sequence[str | Path],
     source_modal_npz_paths: Sequence[str | Path],
     preserve_all_points: bool = False,
@@ -1214,30 +1153,16 @@ def _write_point_observation_graph(
     point_view_mask = np.zeros((points_world_all.shape[0], len(configs)), dtype=bool)
     point_view_mask[obs_point_arr, obs_view_arr] = True
     counts = point_view_mask.sum(axis=1).astype(np.int32)
-    pair_weight_per_point, normalized_pair_weight_specs = _pair_weight_per_point(
-        points_world_all.shape[0],
-        obs_point_arr,
-        obs_view_arr,
-        counts,
-        pair_weight_specs,
-        configs,
-    )
-    obs_pair_weight = pair_weight_per_point[obs_point_arr].astype(np.float32)
-    obs_confidence_arr = np.asarray(obs_confidence, dtype=np.float32) * obs_pair_weight
-    observation_keep_points = counts >= int(min_observations)
-    if not np.any(observation_keep_points):
-        raise ValueError("No points satisfy min_observations.")
-    used_counts = counts.copy()
-    used_counts[~observation_keep_points] = 0
+    observed_points = counts > 0
+    obs_confidence_arr = np.asarray(obs_confidence, dtype=np.float32)
 
     if preserve_all_points:
         active_old_indices = np.arange(points_world_all.shape[0], dtype=np.int64)
         old_to_new = active_old_indices.copy()
     else:
-        active_old_indices = np.where(observation_keep_points)[0]
+        active_old_indices = np.where(observed_points)[0]
         old_to_new = np.full(points_world_all.shape[0], -1, dtype=np.int64)
         old_to_new[active_old_indices] = np.arange(active_old_indices.size, dtype=np.int64)
-    keep_obs = observation_keep_points[obs_point_arr]
     obs_fields_out: dict[str, np.ndarray] = {}
     if observation_sampling in contribution_modes:
         for key, values in (
@@ -1247,13 +1172,13 @@ def _write_point_observation_graph(
         ):
             if len(values) != obs_point_arr.shape[0]:
                 raise ValueError(f"Internal error: {key} count does not match observations.")
-        obs_fields_out["obs_contribution_weight"] = np.asarray(obs_contribution_weight, dtype=np.float32)[keep_obs]
-        obs_fields_out["obs_contribution_score"] = np.asarray(obs_contribution_score, dtype=np.float32)[keep_obs]
-        obs_fields_out["obs_contribution_sum"] = np.asarray(obs_contribution_sum, dtype=np.float32)[keep_obs]
+        obs_fields_out["obs_contribution_weight"] = np.asarray(obs_contribution_weight, dtype=np.float32)
+        obs_fields_out["obs_contribution_score"] = np.asarray(obs_contribution_score, dtype=np.float32)
+        obs_fields_out["obs_contribution_sum"] = np.asarray(obs_contribution_sum, dtype=np.float32)
         if observation_sampling == "gaussian-center-contribution":
             if gaussian_contribution_contrast_keep is None:
                 raise ValueError("Internal error: gaussian contribution contrast keep mask was not computed.")
-            obs_fields_out["gaussian_contribution_contrast_keep"] = gaussian_contribution_contrast_keep[keep_obs]
+            obs_fields_out["gaussian_contribution_contrast_keep"] = gaussian_contribution_contrast_keep
     if observation_sampling == "pixel-candidates":
         for key, values in (
             ("obs_surface_pixels_xy", obs_surface_pixels),
@@ -1261,11 +1186,11 @@ def _write_point_observation_graph(
         ):
             if len(values) != obs_point_arr.shape[0]:
                 raise ValueError(f"Internal error: {key} count does not match observations.")
-        obs_fields_out["obs_surface_pixels_xy"] = np.asarray(obs_surface_pixels, dtype=np.float32)[keep_obs]
-        obs_fields_out["obs_surface_camera_z"] = np.asarray(obs_surface_camera_z, dtype=np.float32)[keep_obs]
+        obs_fields_out["obs_surface_pixels_xy"] = np.asarray(obs_surface_pixels, dtype=np.float32)
+        obs_fields_out["obs_surface_camera_z"] = np.asarray(obs_surface_camera_z, dtype=np.float32)
     if len(obs_zbuffer_weight) != obs_point_arr.shape[0]:
         raise ValueError("Internal error: z-buffer weight count does not match observations.")
-    obs_fields_out["obs_zbuffer_weight"] = np.asarray(obs_zbuffer_weight, dtype=np.float32)[keep_obs]
+    obs_fields_out["obs_zbuffer_weight"] = np.asarray(obs_zbuffer_weight, dtype=np.float32)
 
     optional_point_fields = dict(optional_point_fields or {})
     point_fields_out: dict[str, np.ndarray] = {}
@@ -1288,19 +1213,16 @@ def _write_point_observation_graph(
     np.savez_compressed(
         out,
         points_world=points_world_all[active_old_indices].astype(np.float32),
-        obs_point_index=old_to_new[obs_point_arr[keep_obs]].astype(np.int32),
-        obs_view_index=obs_view_arr[keep_obs].astype(np.int32),
-        obs_pixels_xy=np.asarray(obs_pixels, dtype=np.float32)[keep_obs],
-        obs_y=np.asarray(obs_y, dtype=np.complex64)[keep_obs],
-        obs_J=np.asarray(obs_j, dtype=np.float32)[keep_obs],
-        obs_confidence=obs_confidence_arr[keep_obs],
-        obs_depth_weight=np.asarray(obs_depth_weight, dtype=np.float32)[keep_obs],
-        obs_pair_weight=obs_pair_weight[keep_obs],
-        obs_camera_z=np.asarray(obs_camera_z, dtype=np.float32)[keep_obs],
-        obs_count_per_point=used_counts[active_old_indices].astype(np.int32),
+        obs_point_index=old_to_new[obs_point_arr].astype(np.int32),
+        obs_view_index=obs_view_arr.astype(np.int32),
+        obs_pixels_xy=np.asarray(obs_pixels, dtype=np.float32),
+        obs_y=np.asarray(obs_y, dtype=np.complex64),
+        obs_J=np.asarray(obs_j, dtype=np.float32),
+        obs_confidence=obs_confidence_arr,
+        obs_depth_weight=np.asarray(obs_depth_weight, dtype=np.float32),
+        obs_camera_z=np.asarray(obs_camera_z, dtype=np.float32),
+        obs_count_per_point=counts[active_old_indices].astype(np.int32),
         obs_sample_count_per_point=sample_counts[active_old_indices].astype(np.int32),
-        pair_weight_per_point=pair_weight_per_point[active_old_indices],
-        pair_weight_specs=normalized_pair_weight_specs,
         view_ids=np.asarray([cfg.view_id for cfg in configs]),
         view_image_width=np.asarray([cfg.image_width for cfg in configs], dtype=np.int32),
         view_image_height=np.asarray([cfg.image_height for cfg in configs], dtype=np.int32),
@@ -1322,7 +1244,6 @@ def _write_point_observation_graph(
         view_weight_min=np.array(view_weight_min, dtype=np.float32),
         freq_hz=np.array(reference_freq_hz, dtype=np.float32),
         mode_index=np.array(mode_index, dtype=np.int32),
-        min_observations=np.array(min_observations, dtype=np.int32),
         zbuffer_radius=np.array(zbuffer_radius, dtype=np.int32),
         zbuffer_mode=np.array(str(zbuffer_mode)),
         zbuffer_soft_sigma=np.array(zbuffer_soft_sigma, dtype=np.float32),
@@ -1362,7 +1283,6 @@ def _write_point_observation_graph(
 
 
 def _validate_observation_graph_args(
-    min_observations: int,
     zbuffer_radius: int,
     front_percentile: float,
     zbuffer_tau: float,
@@ -1375,8 +1295,6 @@ def _validate_observation_graph_args(
     zbuffer_soft_sigma: float = 0.10,
     zbuffer_soft_min_weight: float = 0.05,
 ) -> None:
-    if min_observations < 1:
-        raise ValueError("min_observations must be at least 1.")
     if zbuffer_radius < 0:
         raise ValueError("zbuffer_radius must be non-negative.")
     if not (0.0 <= front_percentile <= 100.0):
@@ -1453,7 +1371,6 @@ def build_points_observation_graph(
     front_percentile: float = 10.0,
     zbuffer_tau: float = 0.05,
     min_zbuffer_samples: int = 5,
-    min_observations: int = 1,
     freq_tolerance_hz: float = 0.1,
     view_frequency_weighting: str = "none",
     snr_band_hz: float = 0.3,
@@ -1464,7 +1381,6 @@ def build_points_observation_graph(
     depth_weight_power: float = 2.0,
     depth_weight_min: float = 0.02,
     depth_weight_reference_percentile: float = 50.0,
-    pair_weight_specs: Sequence[str] | None = None,
     preserve_all_points: bool = False,
     optional_point_fields: dict[str, np.ndarray] | None = None,
     extra_metadata: dict[str, np.ndarray] | None = None,
@@ -1491,7 +1407,6 @@ def build_points_observation_graph(
 ) -> Path:
     """Build an N-view observation graph for an arbitrary fixed 3D point set."""
     _validate_observation_graph_args(
-        min_observations,
         zbuffer_radius,
         front_percentile,
         zbuffer_tau,
@@ -1552,7 +1467,6 @@ def build_points_observation_graph(
         front_percentile,
         zbuffer_tau,
         min_zbuffer_samples,
-        min_observations,
         view_frequency_weighting,
         snr_band_hz,
         snr_exclude_hz,
@@ -1562,7 +1476,6 @@ def build_points_observation_graph(
         depth_weight_power,
         depth_weight_min,
         depth_weight_reference_percentile,
-        pair_weight_specs,
         view_config_paths,
         modal_npz_paths,
         preserve_all_points=preserve_all_points,
@@ -1603,7 +1516,6 @@ def build_carrier_observation_graph(
     front_percentile: float = 10.0,
     zbuffer_tau: float = 0.05,
     min_zbuffer_samples: int = 5,
-    min_observations: int = 1,
     freq_tolerance_hz: float = 0.1,
     view_frequency_weighting: str = "none",
     snr_band_hz: float = 0.3,
@@ -1614,11 +1526,8 @@ def build_carrier_observation_graph(
     depth_weight_power: float = 2.0,
     depth_weight_min: float = 0.02,
     depth_weight_reference_percentile: float = 50.0,
-    pair_weight_specs: Sequence[str] | None = None,
 ) -> Path:
     """Build an N-view observation graph using VGGT carrier points."""
-    if min_observations < 1:
-        raise ValueError("min_observations must be at least 1.")
     if zbuffer_radius < 0:
         raise ValueError("zbuffer_radius must be non-negative.")
     if not (0.0 <= front_percentile <= 100.0):
@@ -1705,24 +1614,12 @@ def build_carrier_observation_graph(
     if obs_point_arr.size == 0:
         raise ValueError("No observations survived carrier z-buffer and mask checks.")
     counts = np.bincount(obs_point_arr, minlength=points_world_all.shape[0])
-    pair_weight_per_point, normalized_pair_weight_specs = _pair_weight_per_point(
-        points_world_all.shape[0],
-        obs_point_arr,
-        obs_view_arr,
-        counts,
-        pair_weight_specs,
-        configs,
-    )
-    obs_pair_weight = pair_weight_per_point[obs_point_arr].astype(np.float32)
-    obs_confidence_arr = np.asarray(obs_confidence, dtype=np.float32) * obs_pair_weight
-    keep_points = counts >= int(min_observations)
-    if not np.any(keep_points):
-        raise ValueError("No carrier points satisfy min_observations.")
+    obs_confidence_arr = np.asarray(obs_confidence, dtype=np.float32)
+    keep_points = counts > 0
 
     old_to_new = np.full(points_world_all.shape[0], -1, dtype=np.int64)
     active_old_indices = np.where(keep_points)[0]
     old_to_new[active_old_indices] = np.arange(active_old_indices.size, dtype=np.int64)
-    keep_obs = keep_points[obs_point_arr]
 
     optional_point_fields = {}
     if "source_view_index" in carrier:
@@ -1743,18 +1640,15 @@ def build_carrier_observation_graph(
         out,
         points_world=points_world_all[active_old_indices].astype(np.float32),
         carrier_point_indices=carrier["original_indices"][active_old_indices].astype(np.int32),
-        obs_point_index=old_to_new[obs_point_arr[keep_obs]].astype(np.int32),
-        obs_view_index=obs_view_arr[keep_obs].astype(np.int32),
-        obs_pixels_xy=np.asarray(obs_pixels, dtype=np.float32)[keep_obs],
-        obs_y=np.asarray(obs_y, dtype=np.complex64)[keep_obs],
-        obs_J=np.asarray(obs_j, dtype=np.float32)[keep_obs],
-        obs_confidence=obs_confidence_arr[keep_obs],
-        obs_depth_weight=np.asarray(obs_depth_weight, dtype=np.float32)[keep_obs],
-        obs_pair_weight=obs_pair_weight[keep_obs],
-        obs_camera_z=np.asarray(obs_camera_z, dtype=np.float32)[keep_obs],
+        obs_point_index=old_to_new[obs_point_arr].astype(np.int32),
+        obs_view_index=obs_view_arr.astype(np.int32),
+        obs_pixels_xy=np.asarray(obs_pixels, dtype=np.float32),
+        obs_y=np.asarray(obs_y, dtype=np.complex64),
+        obs_J=np.asarray(obs_j, dtype=np.float32),
+        obs_confidence=obs_confidence_arr,
+        obs_depth_weight=np.asarray(obs_depth_weight, dtype=np.float32),
+        obs_camera_z=np.asarray(obs_camera_z, dtype=np.float32),
         obs_count_per_point=counts[active_old_indices].astype(np.int32),
-        pair_weight_per_point=pair_weight_per_point[active_old_indices],
-        pair_weight_specs=normalized_pair_weight_specs,
         view_ids=np.asarray([cfg.view_id for cfg in configs]),
         view_image_width=np.asarray([cfg.image_width for cfg in configs], dtype=np.int32),
         view_image_height=np.asarray([cfg.image_height for cfg in configs], dtype=np.int32),
@@ -1776,7 +1670,6 @@ def build_carrier_observation_graph(
         view_weight_min=np.array(view_weight_min, dtype=np.float32),
         freq_hz=np.array(reference_freq_hz, dtype=np.float32),
         mode_index=np.array(mode_index, dtype=np.int32),
-        min_observations=np.array(min_observations, dtype=np.int32),
         zbuffer_radius=np.array(zbuffer_radius, dtype=np.int32),
         front_percentile=np.array(front_percentile, dtype=np.float32),
         zbuffer_tau=np.array(zbuffer_tau, dtype=np.float32),

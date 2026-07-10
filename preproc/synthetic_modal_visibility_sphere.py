@@ -338,6 +338,29 @@ def _stats(values: np.ndarray) -> dict[str, float | int | None]:
     }
 
 
+def _phase_stats(values: np.ndarray) -> dict[str, float | int | None]:
+    values = np.asarray(values, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {"count": 0, "mean": None, "median": None, "p90": None, "max": None}
+
+    resultant = np.mean(np.exp(1j * finite))
+    if abs(resultant) <= 1e-12:
+        return {
+            "count": int(finite.size),
+            "mean": None,
+            "median": None,
+            "p90": None,
+            "max": None,
+        }
+
+    center = float(np.angle(resultant))
+    unwrapped = center + np.angle(np.exp(1j * (finite - center)))
+    stats = _stats(unwrapped)
+    stats["mean"] = center
+    return stats
+
+
 def _group_diagnostics(
     name: str,
     mask: np.ndarray,
@@ -350,7 +373,7 @@ def _group_diagnostics(
             "name": name,
             "count": 0,
             "angular_error_deg": _stats(np.array([], dtype=np.float32)),
-            "phase_rad": _stats(np.array([], dtype=np.float32)),
+            "phase_rad": _phase_stats(np.array([], dtype=np.float32)),
             "mean_recovered_real_motion": None,
             "mean_recovered_abs_motion": None,
             "point_residual": _stats(np.array([], dtype=np.float32)),
@@ -364,7 +387,7 @@ def _group_diagnostics(
         "name": name,
         "count": int(mask.sum()),
         "angular_error_deg": _stats(_angular_error_deg(phi_group, direction)),
-        "phase_rad": _stats(phase),
+        "phase_rad": _phase_stats(phase),
         "mean_recovered_real_motion": np.mean(np.real(phi_group), axis=0).astype(float).tolist(),
         "mean_recovered_abs_motion": float(np.mean(np.linalg.norm(phi_group, axis=1))),
         "point_residual": _stats(point_residual[mask] if point_residual is not None else np.array([], dtype=np.float32)),
