@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "parameters": {
+    "synthetic_test": "visibility_sphere",
+    "alpha_model": "per_view_per_mode",
+    "alpha_reference_view_index": 0
+  },
+  "modes": [
+    {
+      "mode_index": 0,
+      "freq_hz": 1.0,
+      "label": "GT configured motion",
+      "latent_path": "../../latents/gt_motion.npz"
+    }
+  ]
+}

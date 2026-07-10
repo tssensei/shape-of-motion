@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "parameters": {
+    "synthetic_test": "visibility_sphere",
+    "alpha_model": "per_view_per_mode",
+    "alpha_reference_view_index": 0,
+    "solver": "staged",
+    "alpha_solver_model": "phase",
+    "alpha_gain_min": 0.25,
+    "alpha_gain_max": 4.0,
+    "alpha_min_shared_points": 16,
+    "alpha_rank_ratio_min": 0.0001,
+    "alpha_info_ratio_min": 0.0001,
+    "alpha_failure": "exclude",
+    "anchor_svd_ratio_min": 0.01,
+    "anchor_residual_max": 0.1
+  },
+  "modes": [
+    {
+      "mode_index": 0,
+      "freq_hz": 1.0,
+      "label": "GT configured motion",
+      "latent_path": "../../latents/gt_motion.npz"
+    },
+    {
+      "mode_index": 1,
+      "freq_hz": 1.0,
+      "label": "Solved staged",
+      "latent_path": "../../latents/solved_staged.npz"
+    }
+  ]
+}
