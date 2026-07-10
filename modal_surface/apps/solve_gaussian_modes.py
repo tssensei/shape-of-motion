@@ -8,12 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 
-from modal_surface.carrier import build_points_observation_graph
-from modal_surface.io import load_view_config
-from modal_surface.optimization_multi import optimize_multi_view
-from modal_surface.apps.solve_carrier_modes import (
+from modal_surface.apps._shared import (
     _alpha_by_view_diagnostics,
     _freq_slug,
     _json_float,
@@ -23,7 +19,15 @@ from modal_surface.apps.solve_carrier_modes import (
     _rel,
     _view_frequency_reliability,
 )
-from flow3d.scene_model import SceneModel
+from modal_surface.carrier import build_points_observation_graph
+from modal_surface.io import load_view_config
+from modal_surface.optimization_multi import optimize_multi_view
+from modal_surface.solver_cli import (
+    add_solver_arguments,
+    solver_kwargs,
+    staged_solver_manifest_parameters,
+    validate_solver_args,
+)
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -69,36 +73,16 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pair-weight", action="append", default=None, help="Weight for points observed by exactly two views, formatted as viewA,viewB,weight. Repeat per pair.")
     parser.add_argument("--min-observations", type=int, default=1, help="Minimum observed views whose observations are used for solving.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
-    parser.add_argument("--iterations", type=int, default=8, help="Alternating optimization iterations.")
-    parser.add_argument("--ridge-mu", type=float, default=1e-4, help="Per-point ridge regularization.")
-    parser.add_argument("--outlier-frac", type=float, default=0.0, help="Fraction of worst residual points dropped per iteration.")
-    parser.add_argument("--single-view-smooth-lambda", type=float, default=0.0, help="Anchor-prior weight for refining points observed by only one view.")
-    parser.add_argument("--single-view-smooth-k", type=int, default=8, help="Number of reliable anchor neighbors used for single-view refinement.")
-    parser.add_argument(
-        "--single-view-anchor-min-observations",
-        type=int,
-        default=2,
-        help="Minimum observation count for points used as single-view smoothing anchors.",
+    add_solver_arguments(
+        parser,
+        include_modal_rigid=True,
+        include_modal_fill=True,
     )
-    parser.add_argument("--graph-smooth-lambda", type=float, default=0.0, help="Shared graph smoothness weight for all active points.")
-    parser.add_argument("--graph-smooth-k", type=int, default=8, help="Number of nearest neighbors used to build the graph.")
-    parser.add_argument("--graph-auto-radius-scale", type=float, default=2.5, help="Multiplier on median kth-neighbor distance for graph edge pruning.")
-    parser.add_argument("--graph-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a graph edge.")
-    parser.add_argument("--modal-rigid-lambda", type=float, default=0.0, help="Local full-vector modal consensus weight.")
-    parser.add_argument("--modal-rigid-k", type=int, default=8, help="Nearest-neighbor count used for local modal consensus edges.")
-    parser.add_argument("--modal-rigid-auto-radius-scale", type=float, default=2.0, help="Multiplier on median kth-neighbor distance for local modal consensus edge pruning.")
-    parser.add_argument("--modal-rigid-min-shared-views", type=int, default=0, help="Minimum shared observed views required for a local modal consensus edge.")
-    parser.add_argument("--modal-fill-unobserved", action="store_true", help="Propagate solved modal motion from observed Gaussians to unobserved Gaussians.")
-    parser.add_argument("--modal-fill-k", type=int, default=4, help="Nearest-neighbor count used for modal motion propagation.")
-    parser.add_argument("--modal-fill-auto-radius-scale", type=float, default=1.0, help="Multiplier on median neighbor distance for modal motion propagation edges.")
-    parser.add_argument("--modal-fill-anchor-min-observations", type=int, default=1, help="Minimum observation count for Gaussians used as modal propagation anchors.")
-    parser.add_argument("--modal-fill-ridge-mu", type=float, default=1e-6, help="Ridge regularization for propagated modal motion.")
-    parser.add_argument("--obs-count-weight-1", type=float, default=0.25, help="Data weight multiplier for points observed by one view.")
-    parser.add_argument("--obs-count-weight-2", type=float, default=0.75, help="Data weight multiplier for points observed by two views.")
-    parser.add_argument("--obs-count-weight-3plus", type=float, default=1.0, help="Data weight multiplier for points observed by three or more views.")
 
 
 def _load_fg_means_from_checkpoint(path: str) -> np.ndarray:
+    import torch
+
     ckpt_path = Path(path)
     if not ckpt_path.exists():
         raise FileNotFoundError(ckpt_path)
@@ -123,6 +107,10 @@ def _load_fg_contribution_inputs_from_checkpoint(
     view_config_paths: list[str],
     render_views: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
+    import torch
+
+    from flow3d.scene_model import SceneModel
+
     ckpt_path = Path(path)
     if not ckpt_path.exists():
         raise FileNotFoundError(ckpt_path)
@@ -293,6 +281,7 @@ def _print_observation_sanity(obs_path: Path, num_fg: int) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    validate_solver_args(args)
     view_configs = list(args.view_config)
     modal_npzs = list(args.modal_npz)
     if len(view_configs) != len(modal_npzs):
@@ -397,31 +386,10 @@ def run(args: argparse.Namespace) -> None:
             observations_path=obs_path,
             out_path=latent_path,
             vis_dir=mode_vis_dir,
-            iterations=args.iterations,
-            ridge_mu=args.ridge_mu,
-            outlier_frac=args.outlier_frac,
-            single_view_smooth_lambda=args.single_view_smooth_lambda,
-            single_view_smooth_k=args.single_view_smooth_k,
-            single_view_anchor_min_observations=args.single_view_anchor_min_observations,
-            graph_smooth_lambda=args.graph_smooth_lambda,
-            graph_smooth_k=args.graph_smooth_k,
-            graph_auto_radius_scale=args.graph_auto_radius_scale,
-            graph_min_shared_views=args.graph_min_shared_views,
-            modal_rigid_lambda=args.modal_rigid_lambda,
-            modal_rigid_k=args.modal_rigid_k,
-            modal_rigid_auto_radius_scale=args.modal_rigid_auto_radius_scale,
-            modal_rigid_min_shared_views=args.modal_rigid_min_shared_views,
-            modal_fill_unobserved=args.modal_fill_unobserved,
-            modal_fill_k=args.modal_fill_k,
-            modal_fill_auto_radius_scale=args.modal_fill_auto_radius_scale,
-            modal_fill_anchor_min_observations=args.modal_fill_anchor_min_observations,
-            modal_fill_ridge_mu=args.modal_fill_ridge_mu,
-            obs_count_weight_1=args.obs_count_weight_1,
-            obs_count_weight_2=args.obs_count_weight_2,
-            obs_count_weight_3plus=args.obs_count_weight_3plus,
+            **solver_kwargs(args),
         )
         latent_stats = _gaussian_latent_stats(latent_path, obs_path, fg_means.shape[0])
-        if float(args.modal_rigid_lambda) > 0:
+        if args.solver == "legacy-als" and float(args.modal_rigid_lambda) > 0:
             print(
                 "Modal rigidity: "
                 f"edges={latent_stats['modal_rigid_edge_count']}, "
@@ -430,7 +398,7 @@ def run(args: argparse.Namespace) -> None:
                 f"residual median/p90={latent_stats['modal_rigid_residual_median']:.3g}/"
                 f"{latent_stats['modal_rigid_residual_p90']:.3g}"
             )
-        if bool(args.modal_fill_unobserved):
+        if args.solver == "legacy-als" and bool(args.modal_fill_unobserved):
             print(
                 "Modal fill: "
                 f"anchors={latent_stats['modal_fill_anchor_count']}, "
@@ -464,6 +432,7 @@ def run(args: argparse.Namespace) -> None:
         "source_modal_npzs": modal_npzs,
         "mode_indices": mode_indices,
         "parameters": {
+            "legacy_solver_parameters_active": bool(args.solver == "legacy-als"),
             "mask_erode_iters": int(args.mask_erode_iters),
             "observation_sampling": str(args.observation_sampling),
             "pixel_sample_stride": int(args.pixel_sample_stride),
@@ -520,6 +489,7 @@ def run(args: argparse.Namespace) -> None:
             "obs_count_weight_3plus": float(args.obs_count_weight_3plus),
             "alpha_model": "per_view_per_mode",
             "alpha_reference_view_index": 0,
+            **staged_solver_manifest_parameters(args),
         },
         "modes": modes,
     }

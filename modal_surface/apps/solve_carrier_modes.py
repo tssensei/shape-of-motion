@@ -7,10 +7,23 @@ import json
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
+from modal_surface.apps._shared import (
+    _alpha_by_view_diagnostics,
+    _freq_slug,
+    _latent_stats,
+    _load_modal_freqs,
+    _parse_mode_indices,
+    _rel,
+    _view_frequency_reliability,
+)
 from modal_surface.carrier import build_carrier_observation_graph
 from modal_surface.optimization_multi import optimize_multi_view
+from modal_surface.solver_cli import (
+    add_solver_arguments,
+    solver_kwargs,
+    staged_solver_manifest_parameters,
+    validate_solver_args,
+)
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -38,198 +51,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pair-weight", action="append", default=None, help="Weight for points observed by exactly two views, formatted as viewA,viewB,weight. Repeat per pair.")
     parser.add_argument("--min-observations", type=int, default=1, help="Minimum observed views per carrier point.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
-    parser.add_argument("--iterations", type=int, default=8, help="Alternating optimization iterations.")
-    parser.add_argument("--ridge-mu", type=float, default=1e-4, help="Per-point ridge regularization.")
-    parser.add_argument("--outlier-frac", type=float, default=0.0, help="Fraction of worst residual points dropped per iteration.")
-    parser.add_argument("--single-view-smooth-lambda", type=float, default=0.0, help="Anchor-prior weight for refining points observed by only one view.")
-    parser.add_argument("--single-view-smooth-k", type=int, default=8, help="Number of reliable anchor neighbors used for single-view refinement.")
-    parser.add_argument(
-        "--single-view-anchor-min-observations",
-        type=int,
-        default=2,
-        help="Minimum observation count for points used as single-view smoothing anchors.",
-    )
-    parser.add_argument("--graph-smooth-lambda", type=float, default=0.0, help="Shared graph smoothness weight for all active points.")
-    parser.add_argument("--graph-smooth-k", type=int, default=8, help="Number of nearest neighbors used to build the graph.")
-    parser.add_argument("--graph-auto-radius-scale", type=float, default=2.5, help="Multiplier on median kth-neighbor distance for graph edge pruning.")
-    parser.add_argument("--graph-min-shared-views", type=int, default=1, help="Minimum shared observed views required for a graph edge.")
-    parser.add_argument("--obs-count-weight-1", type=float, default=0.25, help="Data weight multiplier for points observed by one view.")
-    parser.add_argument("--obs-count-weight-2", type=float, default=0.75, help="Data weight multiplier for points observed by two views.")
-    parser.add_argument("--obs-count-weight-3plus", type=float, default=1.0, help="Data weight multiplier for points observed by three or more views.")
-
-
-def _load_modal_freqs(paths: list[str]) -> list[np.ndarray]:
-    freqs_per_view: list[np.ndarray] = []
-    for path in paths:
-        z = np.load(str(path), allow_pickle=False)
-        required = ["mode_u", "mode_v", "selected_freqs_hz"]
-        missing = [key for key in required if key not in z.files]
-        if missing:
-            raise ValueError(f"{path} missing required modal arrays: {missing}.")
-        mode_u = z["mode_u"]
-        mode_v = z["mode_v"]
-        freqs = z["selected_freqs_hz"].astype(np.float32).reshape(-1)
-        if mode_u.ndim != 3 or mode_v.ndim != 3 or mode_u.shape != mode_v.shape:
-            raise ValueError(f"{path} must contain mode_u/mode_v with matching shape (K,H,W).")
-        if mode_u.shape[0] != freqs.shape[0]:
-            raise ValueError(f"{path} selected_freqs_hz length does not match mode_u/mode_v.")
-        freqs_per_view.append(freqs)
-    if len({freqs.shape[0] for freqs in freqs_per_view}) != 1:
-        raise ValueError("All modal npz files must contain the same number of selected frequencies.")
-    return freqs_per_view
-
-
-def _parse_mode_indices(raw: str, num_modes: int) -> list[int]:
-    if raw.strip().lower() == "all":
-        return list(range(num_modes))
-    out: list[int] = []
-    for part in raw.split(","):
-        text = part.strip()
-        if not text:
-            continue
-        idx = int(text)
-        if idx < 0 or idx >= num_modes:
-            raise ValueError(f"mode index {idx} is outside [0,{num_modes - 1}].")
-        out.append(idx)
-    if not out:
-        raise ValueError("--mode-indices must contain at least one index, or 'all'.")
-    return out
-
-
-def _freq_slug(freq_hz: float) -> str:
-    text = f"{freq_hz:.6f}".rstrip("0").rstrip(".")
-    return text.replace("-", "m").replace(".", "p")
-
-
-def _rel(path: Path, root: Path) -> str:
-    try:
-        return path.relative_to(root).as_posix()
-    except ValueError:
-        return str(path)
-
-
-def _latent_stats(latent_path: Path, observation_path: Path) -> dict[str, Any]:
-    latent = np.load(str(latent_path), allow_pickle=False)
-    observations = np.load(str(observation_path), allow_pickle=False)
-    obs_residual = latent["obs_residual"].astype(np.float32)
-    point_residual = latent["point_residual"].astype(np.float32)
-    refined_count = None
-    if "single_view_refined_mask" in latent.files:
-        refined_count = int(latent["single_view_refined_mask"].astype(bool).sum())
-    graph_smooth_residual = latent["graph_smooth_residual"].astype(np.float32) if "graph_smooth_residual" in latent.files else None
-    return {
-        "num_points": int(latent["points_world"].shape[0]),
-        "num_observations": int(latent["obs_point_index"].shape[0]),
-        "single_view_refined_count": refined_count,
-        "graph_edge_count": int(np.asarray(latent["graph_edge_count"]).item()) if "graph_edge_count" in latent.files else None,
-        "graph_auto_radius": float(np.asarray(latent["graph_auto_radius"]).item()) if "graph_auto_radius" in latent.files else None,
-        "graph_smooth_residual_median": float(np.median(graph_smooth_residual)) if graph_smooth_residual is not None else None,
-        "graph_smooth_residual_p90": float(np.percentile(graph_smooth_residual, 90)) if graph_smooth_residual is not None else None,
-        "obs_residual_median": float(np.median(obs_residual)),
-        "obs_residual_p90": float(np.percentile(obs_residual, 90)),
-        "point_residual_median": float(np.median(point_residual)),
-        "point_residual_p90": float(np.percentile(point_residual, 90)),
-        "observations_per_view": observations["observations_per_view"].astype(int).tolist(),
-        "source_mask_candidate_count": int(np.asarray(observations["source_mask_candidate_count"]).item())
-        if "source_mask_candidate_count" in observations.files
-        else None,
-        "source_mask_kept_count": int(np.asarray(observations["source_mask_kept_count"]).item())
-        if "source_mask_kept_count" in observations.files
-        else None,
-    }
-
-
-def _json_float(value: float) -> float | None:
-    value = float(value)
-    if not np.isfinite(value):
-        return None
-    return value
-
-
-def _view_frequency_reliability(observation_path: Path) -> dict[str, Any]:
-    observations = np.load(str(observation_path), allow_pickle=False)
-    required = [
-        "view_ids",
-        "view_frequency_weights",
-        "view_frequency_snr",
-        "view_frequency_signal",
-        "view_frequency_noise",
-        "view_frequency_bin_hz",
-    ]
-    missing = [key for key in required if key not in observations.files]
-    if missing:
-        raise ValueError(f"{observation_path} missing view-frequency reliability fields: {missing}.")
-    view_ids = [str(v) for v in observations["view_ids"].tolist()]
-    weights = observations["view_frequency_weights"].astype(float)
-    snr = observations["view_frequency_snr"].astype(float)
-    signal = observations["view_frequency_signal"].astype(float)
-    noise = observations["view_frequency_noise"].astype(float)
-    bin_hz = observations["view_frequency_bin_hz"].astype(float)
-    return {
-        "weighting": str(np.asarray(observations["view_frequency_weighting"]).item()),
-        "snr_band_hz": float(np.asarray(observations["snr_band_hz"]).item()),
-        "snr_exclude_hz": float(np.asarray(observations["snr_exclude_hz"]).item()),
-        "snr_good": float(np.asarray(observations["snr_good"]).item()),
-        "view_weight_min": float(np.asarray(observations["view_weight_min"]).item()),
-        "views": [
-            {
-                "view_id": view_id,
-                "weight": _json_float(weights[idx]),
-                "snr": _json_float(snr[idx]),
-                "signal": _json_float(signal[idx]),
-                "noise": _json_float(noise[idx]),
-                "bin_hz": _json_float(bin_hz[idx]),
-            }
-            for idx, view_id in enumerate(view_ids)
-        ],
-    }
-
-
-def _alpha_by_view_diagnostics(latent_path: Path) -> list[dict[str, Any]]:
-    latent = np.load(str(latent_path), allow_pickle=False)
-    required = [
-        "view_ids",
-        "alphas",
-        "alpha_by_view",
-        "alpha_semantics",
-        "alpha_reference_view_index",
-        "alpha_view_freqs_hz",
-    ]
-    missing = [key for key in required if key not in latent.files]
-    if missing:
-        raise ValueError(f"{latent_path} missing alpha diagnostic fields: {missing}.")
-    semantics = str(np.asarray(latent["alpha_semantics"]).item())
-    if semantics != "per_view_per_mode":
-        raise ValueError(f"{latent_path} has unexpected alpha_semantics={semantics!r}.")
-    reference_view_index = int(np.asarray(latent["alpha_reference_view_index"]).item())
-    if reference_view_index != 0:
-        raise ValueError(f"{latent_path} has unexpected alpha_reference_view_index={reference_view_index}.")
-
-    view_ids = [str(v) for v in latent["view_ids"].tolist()]
-    saved_alphas = latent["alphas"].astype(np.complex64).reshape(-1)
-    alphas = latent["alpha_by_view"].astype(np.complex64).reshape(-1)
-    freqs_hz = latent["alpha_view_freqs_hz"].astype(np.float32).reshape(-1)
-    if saved_alphas.shape != alphas.shape or not np.array_equal(saved_alphas, alphas):
-        raise ValueError(f"{latent_path} alphas and alpha_by_view are inconsistent.")
-    if alphas.shape[0] != len(view_ids):
-        raise ValueError(f"{latent_path} alpha_by_view length does not match view_ids.")
-    if freqs_hz.shape[0] != len(view_ids):
-        raise ValueError(f"{latent_path} alpha_view_freqs_hz length does not match view_ids.")
-    return [
-        {
-            "view_id": view_id,
-            "freq_hz": _json_float(freqs_hz[idx]),
-            "real": _json_float(np.real(alphas[idx])),
-            "imag": _json_float(np.imag(alphas[idx])),
-            "abs": _json_float(np.abs(alphas[idx])),
-            "phase_rad": _json_float(np.angle(alphas[idx])),
-        }
-        for idx, view_id in enumerate(view_ids)
-    ]
+    add_solver_arguments(parser)
 
 
 def run(args: argparse.Namespace) -> None:
     """Solve all requested frequency indices and write a manifest."""
+    validate_solver_args(args)
     view_configs = list(args.view_config)
     modal_npzs = list(args.modal_npz)
     if len(view_configs) != len(modal_npzs):
@@ -282,19 +109,7 @@ def run(args: argparse.Namespace) -> None:
             observations_path=obs_path,
             out_path=latent_path,
             vis_dir=mode_vis_dir,
-            iterations=args.iterations,
-            ridge_mu=args.ridge_mu,
-            outlier_frac=args.outlier_frac,
-            single_view_smooth_lambda=args.single_view_smooth_lambda,
-            single_view_smooth_k=args.single_view_smooth_k,
-            single_view_anchor_min_observations=args.single_view_anchor_min_observations,
-            graph_smooth_lambda=args.graph_smooth_lambda,
-            graph_smooth_k=args.graph_smooth_k,
-            graph_auto_radius_scale=args.graph_auto_radius_scale,
-            graph_min_shared_views=args.graph_min_shared_views,
-            obs_count_weight_1=args.obs_count_weight_1,
-            obs_count_weight_2=args.obs_count_weight_2,
-            obs_count_weight_3plus=args.obs_count_weight_3plus,
+            **solver_kwargs(args),
         )
         freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
         modes.append(
@@ -319,6 +134,7 @@ def run(args: argparse.Namespace) -> None:
         "source_modal_npzs": modal_npzs,
         "mode_indices": mode_indices,
         "parameters": {
+            "legacy_solver_parameters_active": bool(args.solver == "legacy-als"),
             "mask_erode_iters": int(args.mask_erode_iters),
             "source_mask_erode_iters": int(args.source_mask_erode_iters),
             "zbuffer_radius": int(args.zbuffer_radius),
@@ -352,6 +168,7 @@ def run(args: argparse.Namespace) -> None:
             "obs_count_weight_3plus": float(args.obs_count_weight_3plus),
             "alpha_model": "per_view_per_mode",
             "alpha_reference_view_index": 0,
+            **staged_solver_manifest_parameters(args),
         },
         "modes": modes,
     }

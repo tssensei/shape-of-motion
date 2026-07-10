@@ -865,7 +865,7 @@ def _phase_colors(phi: np.ndarray) -> np.ndarray:
     return (255.0 * rgb).astype(np.uint8)
 
 
-def optimize_multi_view(
+def _optimize_multi_view_legacy(
     observations_path: str | Path,
     out_path: str | Path,
     vis_dir: str | Path | None = None,
@@ -1308,3 +1308,149 @@ def optimize_multi_view(
         _write_ply(vis / "pointcloud_phase_u.ply", points[active_indices], _phase_colors(phi[active_indices]))
 
     return out
+
+
+def optimize_multi_view(
+    observations_path: str | Path,
+    out_path: str | Path,
+    vis_dir: str | Path | None = None,
+    iterations: int = 8,
+    ridge_mu: float = 1e-4,
+    outlier_frac: float | None = None,
+    single_view_smooth_lambda: float = 0.0,
+    single_view_smooth_k: int = 8,
+    single_view_anchor_min_observations: int = 2,
+    graph_smooth_lambda: float = 0.0,
+    graph_smooth_k: int = 8,
+    graph_auto_radius_scale: float = 2.5,
+    graph_min_shared_views: int = 1,
+    modal_rigid_lambda: float = 0.0,
+    modal_rigid_k: int = 8,
+    modal_rigid_auto_radius_scale: float = 2.0,
+    modal_rigid_min_shared_views: int = 0,
+    modal_fill_unobserved: bool = False,
+    modal_fill_k: int = 4,
+    modal_fill_auto_radius_scale: float = 1.0,
+    modal_fill_anchor_min_observations: int = 1,
+    modal_fill_ridge_mu: float = 1e-6,
+    obs_count_weight_1: float = 0.25,
+    obs_count_weight_2: float = 0.75,
+    obs_count_weight_3plus: float = 1.0,
+    solver: str = "staged",
+    alpha_model: str = "phase",
+    alpha_gain_min: float = 0.25,
+    alpha_gain_max: float = 4.0,
+    alpha_min_shared_points: int = 16,
+    alpha_rank_ratio_min: float = 1e-4,
+    alpha_info_ratio_min: float = 1e-4,
+    alpha_failure: str = "exclude",
+    anchor_svd_ratio_min: float = 1e-2,
+    anchor_residual_max: float = 0.1,
+) -> Path:
+    """Dispatch to the staged solver (default) or the transitional legacy ALS."""
+    if solver == "staged":
+        legacy_values = {
+            "iterations": (iterations, 8),
+            "ridge_mu": (ridge_mu, 1e-4),
+            "single_view_smooth_lambda": (single_view_smooth_lambda, 0.0),
+            "single_view_smooth_k": (single_view_smooth_k, 8),
+            "single_view_anchor_min_observations": (single_view_anchor_min_observations, 2),
+            "graph_smooth_lambda": (graph_smooth_lambda, 0.0),
+            "graph_smooth_k": (graph_smooth_k, 8),
+            "graph_auto_radius_scale": (graph_auto_radius_scale, 2.5),
+            "graph_min_shared_views": (graph_min_shared_views, 1),
+            "modal_rigid_lambda": (modal_rigid_lambda, 0.0),
+            "modal_rigid_k": (modal_rigid_k, 8),
+            "modal_rigid_auto_radius_scale": (modal_rigid_auto_radius_scale, 2.0),
+            "modal_rigid_min_shared_views": (modal_rigid_min_shared_views, 0),
+            "modal_fill_unobserved": (modal_fill_unobserved, False),
+            "modal_fill_k": (modal_fill_k, 4),
+            "modal_fill_auto_radius_scale": (modal_fill_auto_radius_scale, 1.0),
+            "modal_fill_anchor_min_observations": (modal_fill_anchor_min_observations, 1),
+            "modal_fill_ridge_mu": (modal_fill_ridge_mu, 1e-6),
+            "obs_count_weight_1": (obs_count_weight_1, 0.25),
+            "obs_count_weight_2": (obs_count_weight_2, 0.75),
+            "obs_count_weight_3plus": (obs_count_weight_3plus, 1.0),
+        }
+        incompatible = [
+            name
+            for name, (value, default) in legacy_values.items()
+            if value != default
+        ]
+        if outlier_frac is not None and float(outlier_frac) != 0.0:
+            incompatible.append("outlier_frac")
+        if incompatible:
+            flags = ", ".join(f"--{name.replace('_', '-')}" for name in incompatible)
+            raise ValueError(
+                f"The staged solver does not use non-default legacy ALS controls: {flags}. "
+                "Select solver='legacy-als' to use them."
+            )
+        from modal_surface.optimization_staged import StagedSolverConfig, optimize_multi_view_staged
+
+        config = StagedSolverConfig(
+            alpha_model=alpha_model,
+            alpha_gain_min=alpha_gain_min,
+            alpha_gain_max=alpha_gain_max,
+            alpha_min_shared_points=alpha_min_shared_points,
+            alpha_rank_ratio_min=alpha_rank_ratio_min,
+            alpha_info_ratio_min=alpha_info_ratio_min,
+            alpha_failure=alpha_failure,
+            anchor_svd_ratio_min=anchor_svd_ratio_min,
+            anchor_residual_max=anchor_residual_max,
+        )
+        return optimize_multi_view_staged(
+            observations_path=observations_path,
+            out_path=out_path,
+            vis_dir=vis_dir,
+            config=config,
+        )
+    if solver != "legacy-als":
+        raise ValueError("solver must be 'staged' or 'legacy-als'.")
+    staged_values = {
+        "alpha_model": (alpha_model, "phase"),
+        "alpha_gain_min": (alpha_gain_min, 0.25),
+        "alpha_gain_max": (alpha_gain_max, 4.0),
+        "alpha_min_shared_points": (alpha_min_shared_points, 16),
+        "alpha_rank_ratio_min": (alpha_rank_ratio_min, 1e-4),
+        "alpha_info_ratio_min": (alpha_info_ratio_min, 1e-4),
+        "alpha_failure": (alpha_failure, "exclude"),
+        "anchor_svd_ratio_min": (anchor_svd_ratio_min, 1e-2),
+        "anchor_residual_max": (anchor_residual_max, 0.1),
+    }
+    incompatible = [
+        name for name, (value, default) in staged_values.items() if value != default
+    ]
+    if incompatible:
+        flags = ", ".join(f"--{name.replace('_', '-')}" for name in incompatible)
+        raise ValueError(
+            f"The legacy ALS solver cannot use staged-only controls: {flags}. "
+            "Select solver='staged' to use them."
+        )
+    resolved_outlier_frac = 0.05 if outlier_frac is None else float(outlier_frac)
+    return _optimize_multi_view_legacy(
+        observations_path=observations_path,
+        out_path=out_path,
+        vis_dir=vis_dir,
+        iterations=iterations,
+        ridge_mu=ridge_mu,
+        outlier_frac=resolved_outlier_frac,
+        single_view_smooth_lambda=single_view_smooth_lambda,
+        single_view_smooth_k=single_view_smooth_k,
+        single_view_anchor_min_observations=single_view_anchor_min_observations,
+        graph_smooth_lambda=graph_smooth_lambda,
+        graph_smooth_k=graph_smooth_k,
+        graph_auto_radius_scale=graph_auto_radius_scale,
+        graph_min_shared_views=graph_min_shared_views,
+        modal_rigid_lambda=modal_rigid_lambda,
+        modal_rigid_k=modal_rigid_k,
+        modal_rigid_auto_radius_scale=modal_rigid_auto_radius_scale,
+        modal_rigid_min_shared_views=modal_rigid_min_shared_views,
+        modal_fill_unobserved=modal_fill_unobserved,
+        modal_fill_k=modal_fill_k,
+        modal_fill_auto_radius_scale=modal_fill_auto_radius_scale,
+        modal_fill_anchor_min_observations=modal_fill_anchor_min_observations,
+        modal_fill_ridge_mu=modal_fill_ridge_mu,
+        obs_count_weight_1=obs_count_weight_1,
+        obs_count_weight_2=obs_count_weight_2,
+        obs_count_weight_3plus=obs_count_weight_3plus,
+    )

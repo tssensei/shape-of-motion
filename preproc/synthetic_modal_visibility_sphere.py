@@ -1,8 +1,8 @@
 """Synthetic sphere test for multi-view modal lifting.
 
 This script builds a noise-free observation graph for a textured sphere with a
-known horizontal 3D complex mode. It then calls the existing multi-view ALS
-solver and writes viewer-compatible latent manifests.
+known, configurable 3D complex translation mode. It then calls the selected
+multi-view solver and writes viewer-compatible latent manifests and diagnostics.
 """
 
 from __future__ import annotations
@@ -17,6 +17,12 @@ from typing import Any
 import numpy as np
 
 from modal_surface.optimization_multi import optimize_multi_view
+from modal_surface.solver_cli import (
+    add_staged_solver_arguments,
+    staged_solver_kwargs,
+    staged_solver_manifest_parameters,
+    validate_solver_args,
+)
 
 
 def _world_to_camera_points(points_world: np.ndarray, world_to_camera: np.ndarray) -> np.ndarray:
@@ -126,6 +132,16 @@ def _camera_intrinsics(width: int, height: int, focal: float) -> np.ndarray:
     )
 
 
+def _normalize_direction(direction: np.ndarray) -> np.ndarray:
+    direction = np.asarray(direction, dtype=np.float64)
+    if direction.shape != (3,):
+        raise ValueError(f"motion direction must have shape (3,), got {direction.shape}.")
+    norm = float(np.linalg.norm(direction))
+    if not np.isfinite(norm) or norm <= 1e-12:
+        raise ValueError("motion direction must be finite and non-zero.")
+    return (direction / norm).astype(np.float32)
+
+
 def _visibility_by_normal(points: np.ndarray, centers: np.ndarray, margin: float) -> np.ndarray:
     normals = points / np.maximum(np.linalg.norm(points, axis=1, keepdims=True), 1e-8)
     masks = []
@@ -147,12 +163,18 @@ def _build_observations(
     visibility_margin: float,
     phase_offset_rad: float,
     freq_hz: float,
+    motion_direction: np.ndarray,
 ) -> dict[str, np.ndarray]:
+    motion_direction = _normalize_direction(motion_direction)
     normal_visibility = _visibility_by_normal(points, camera_centers, visibility_margin)
     point_view_mask = np.zeros((points.shape[0], world_to_cameras.shape[0]), dtype=bool)
     alphas = np.array([1.0 + 0.0j, np.exp(1j * phase_offset_rad)], dtype=np.complex64)
-    phi_gt = np.zeros_like(points, dtype=np.complex64)
-    phi_gt[:, 0] = np.complex64(1.0 + 0.0j)
+    phi_gt = np.broadcast_to(motion_direction, points.shape).astype(np.complex64).copy()
+    motion_direction_camera = np.einsum(
+        "vij,j->vi",
+        world_to_cameras[:, :3, :3].astype(np.float64),
+        motion_direction.astype(np.float64),
+    ).astype(np.float32)
 
     obs_point_index: list[int] = []
     obs_view_index: list[int] = []
@@ -204,6 +226,9 @@ def _build_observations(
         "mode_index": np.array(0, dtype=np.int32),
         "colors": colors.astype(np.uint8),
         "phi_gt": phi_gt.astype(np.complex64),
+        "motion_direction_world": motion_direction.astype(np.float32),
+        "motion_direction_camera": motion_direction_camera,
+        "motion_depth_components": motion_direction_camera[:, 2].astype(np.float32),
         "true_alphas": alphas,
         "normal_visibility": normal_visibility.astype(bool),
         "point_view_mask": point_view_mask.astype(bool),
@@ -221,15 +246,22 @@ def _rel(path: Path, base: Path) -> str:
     return os.path.relpath(path, base).replace(os.sep, "/")
 
 
-def _write_manifest(path: Path, modes: list[dict[str, Any]]) -> Path:
+def _write_manifest(
+    path: Path,
+    modes: list[dict[str, Any]],
+    solver_parameters: dict[str, Any] | None = None,
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    parameters: dict[str, Any] = {
+        "synthetic_test": "visibility_sphere",
+        "alpha_model": "per_view_per_mode",
+        "alpha_reference_view_index": 0,
+    }
+    if solver_parameters is not None:
+        parameters.update(solver_parameters)
     payload = {
         "version": 1,
-        "parameters": {
-            "synthetic_test": "visibility_sphere",
-            "alpha_model": "per_view_per_mode",
-            "alpha_reference_view_index": 0,
-        },
+        "parameters": parameters,
         "modes": modes,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -262,11 +294,25 @@ def _write_viewer_inputs(
 
 
 def _angular_error_deg(phi: np.ndarray, direction: np.ndarray) -> np.ndarray:
-    real_phi = np.real(phi).astype(np.float64)
+    complex_phi = np.asarray(phi, dtype=np.complex128)
     direction = np.asarray(direction, dtype=np.float64)
-    denom = np.linalg.norm(real_phi, axis=1) * max(float(np.linalg.norm(direction)), 1e-12)
-    cos = np.sum(real_phi * direction[None, :], axis=1) / np.maximum(denom, 1e-12)
-    return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))).astype(np.float32)
+    direction_norm = float(np.linalg.norm(direction))
+    component = complex_phi @ direction.astype(np.complex128)
+    phase_valid = np.abs(component) > 1e-12
+    aligned_phi = np.full(complex_phi.shape, np.nan, dtype=np.float64)
+    if np.any(phase_valid):
+        phase_alignment = np.exp(-1j * np.angle(component[phase_valid]))
+        aligned_phi[phase_valid] = np.real(
+            complex_phi[phase_valid] * phase_alignment[:, None]
+        )
+    phi_norm = np.linalg.norm(aligned_phi, axis=1)
+    valid = phase_valid & (phi_norm > 1e-12) & (direction_norm > 1e-12)
+    angles = np.full((phi.shape[0],), np.nan, dtype=np.float32)
+    cos = np.sum(aligned_phi[valid] * direction[None, :], axis=1) / (
+        phi_norm[valid] * direction_norm
+    )
+    angles[valid] = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))).astype(np.float32)
+    return angles
 
 
 def _direction_angle_deg(a: np.ndarray, b: np.ndarray) -> float | None:
@@ -311,11 +357,14 @@ def _group_diagnostics(
         }
     phi_group = phi[mask]
     component = phi_group @ direction.astype(np.complex64)
+    phase = np.full((component.shape[0],), np.nan, dtype=np.float32)
+    phase_valid = np.abs(component) > 1e-12
+    phase[phase_valid] = np.angle(component[phase_valid]).astype(np.float32)
     return {
         "name": name,
         "count": int(mask.sum()),
         "angular_error_deg": _stats(_angular_error_deg(phi_group, direction)),
-        "phase_rad": _stats(np.angle(component).astype(np.float32)),
+        "phase_rad": _stats(phase),
         "mean_recovered_real_motion": np.mean(np.real(phi_group), axis=0).astype(float).tolist(),
         "mean_recovered_abs_motion": float(np.mean(np.linalg.norm(phi_group, axis=1))),
         "point_residual": _stats(point_residual[mask] if point_residual is not None else np.array([], dtype=np.float32)),
@@ -330,6 +379,7 @@ def _write_diagnostics(
     image_width: int,
     image_height: int,
     visibility_margin: float,
+    solver: str,
 ) -> None:
     obs_count = observations["obs_count_per_point"].astype(np.int32)
     visibility = observations["point_view_mask"].astype(bool)
@@ -345,7 +395,7 @@ def _write_diagnostics(
         "view2_only": _group_diagnostics("view2_only", view2_only, phi, direction, point_residual),
         "overlap": _group_diagnostics("overlap", overlap, phi, direction, point_residual),
         "observed_all": _group_diagnostics("observed_all", observed_all, phi, direction, point_residual),
-        "unobserved": _group_diagnostics("unobserved", unobserved, phi, direction, point_residual),
+        "unobserved": _group_diagnostics("unobserved", unobserved, phi, direction, None),
     }
     v1_mean = groups["view1_only"]["mean_recovered_real_motion"]
     v2_mean = groups["view2_only"]["mean_recovered_real_motion"]
@@ -353,18 +403,159 @@ def _write_diagnostics(
     if v1_mean is not None and v2_mean is not None:
         mean_angle = _direction_angle_deg(np.asarray(v1_mean, dtype=np.float64), np.asarray(v2_mean, dtype=np.float64))
 
-    pred = solved_latent.get("pred_y")
+    pred = solved_latent.get("obs_pred_y")
     residual_stats = None
     if pred is not None:
-        obs_y = observations["obs_y"]
+        obs_y = solved_latent.get("obs_y", observations["obs_y"])
         residual_stats = _stats(np.sqrt(np.sum(np.abs(obs_y - pred) ** 2, axis=1)).astype(np.float32))
 
+    true_alphas = observations["true_alphas"].astype(np.complex64)
+    solved_alphas = solved_latent["alphas"].astype(np.complex64)
+    alpha_history = solved_latent.get("alpha_history")
+
+    solver_method_array = solved_latent.get("solver_method")
+    solver_method = (
+        str(np.asarray(solver_method_array).item())
+        if solver_method_array is not None
+        else ("legacy-als" if solver == "legacy-als" else "staged-unspecified")
+    )
+
+    alpha_identifiable_array = solved_latent.get("alpha_identifiable_mask")
+    alpha_identifiable = (
+        np.asarray(alpha_identifiable_array, dtype=bool).reshape(-1)
+        if alpha_identifiable_array is not None
+        else None
+    )
+    alpha_report_mask = (
+        alpha_identifiable
+        if alpha_identifiable is not None
+        else np.ones((solved_alphas.shape[0],), dtype=bool)
+    )
+    solved_alpha_pairs = [
+        [float(np.real(alpha)), float(np.imag(alpha))] if alpha_report_mask[index] else None
+        for index, alpha in enumerate(solved_alphas)
+    ]
+    solved_alpha_phases = [
+        float(np.angle(alpha)) if alpha_report_mask[index] else None
+        for index, alpha in enumerate(solved_alphas)
+    ]
+    alpha_phase_error = np.angle(solved_alphas * np.conj(true_alphas)).astype(np.float32)
+    alpha_phase_errors = [
+        float(error) if alpha_report_mask[index] else None
+        for index, error in enumerate(alpha_phase_error)
+    ]
+    alpha_phase_history = None
+    if alpha_history is not None:
+        history_array = np.atleast_2d(np.asarray(alpha_history, dtype=np.complex64))
+        alpha_phase_history = [
+            [
+                float(np.angle(value)) if alpha_report_mask[index] else None
+                for index, value in enumerate(row)
+            ]
+            for row in history_array
+        ]
+    alpha_exclusion_array = solved_latent.get("alpha_exclusion_reason")
+    alpha_exclusion_reason = (
+        np.asarray(alpha_exclusion_array).astype(str).reshape(-1).tolist()
+        if alpha_exclusion_array is not None
+        else None
+    )
+    alpha_phase_std_array = solved_latent.get("alpha_phase_std")
+    alpha_phase_std = None
+    if alpha_phase_std_array is not None:
+        alpha_phase_std_values = np.asarray(alpha_phase_std_array, dtype=np.float64).reshape(-1)
+        alpha_phase_std = [
+            float(value) if np.isfinite(value) else None
+            for value in alpha_phase_std_values.tolist()
+        ]
+    alpha_log_gain_std_array = solved_latent.get("alpha_log_gain_std")
+    alpha_log_gain_std = None
+    if alpha_log_gain_std_array is not None:
+        alpha_log_gain_std_values = np.asarray(alpha_log_gain_std_array, dtype=np.float64).reshape(-1)
+        alpha_log_gain_std = [
+            float(value) if np.isfinite(value) else None
+            for value in alpha_log_gain_std_values.tolist()
+        ]
+    alpha_identifiability = {
+        "available": alpha_identifiable is not None,
+        "identifiable_mask": alpha_identifiable.tolist() if alpha_identifiable is not None else None,
+        "identifiable_count": int(alpha_identifiable.sum()) if alpha_identifiable is not None else None,
+        "exclusion_reason": alpha_exclusion_reason,
+        "phase_std_rad": alpha_phase_std,
+        "log_gain_std": alpha_log_gain_std,
+        "gain_bound_active_mask": (
+            np.asarray(solved_latent["alpha_gain_bound_active_mask"], dtype=bool).tolist()
+            if "alpha_gain_bound_active_mask" in solved_latent
+            else None
+        ),
+        "optimizer_success": (
+            bool(np.asarray(solved_latent["alpha_optimizer_success"]).item())
+            if "alpha_optimizer_success" in solved_latent
+            else None
+        ),
+        "optimizer_status": (
+            int(np.asarray(solved_latent["alpha_optimizer_status"]).item())
+            if "alpha_optimizer_status" in solved_latent
+            else None
+        ),
+        "information_kind": (
+            str(np.asarray(solved_latent["alpha_information_kind"]).item())
+            if "alpha_information_kind" in solved_latent
+            else None
+        ),
+    }
+
+    point_mask_keys = {
+        "anchor": "anchor_mask",
+        "partial_unresolved": "partial_mask",
+        "rejected": "rejected_mask",
+        "unobserved_unresolved": "unobserved_mask",
+        "alpha_unresolved": "alpha_unresolved_mask",
+        "no_usable_observation": "no_usable_observation_mask",
+        "completed": "completion_mask",
+    }
+    point_class_counts: dict[str, int | None] = {}
+    point_classification_available = False
+    for label, key in point_mask_keys.items():
+        mask_array = solved_latent.get(key)
+        if mask_array is None:
+            point_class_counts[label] = None
+            continue
+        point_classification_available = True
+        point_class_counts[label] = int(np.asarray(mask_array, dtype=bool).sum())
+
+    status_counts = None
+    point_status_array = solved_latent.get("point_solution_status")
+    point_status_names_array = solved_latent.get("point_solution_status_names")
+    if point_status_array is not None and point_status_names_array is not None:
+        point_status = np.asarray(point_status_array, dtype=np.int64).reshape(-1)
+        point_status_names = np.asarray(point_status_names_array).astype(str).reshape(-1)
+        status_counts = {
+            str(name): int(np.count_nonzero(point_status == status_index))
+            for status_index, name in enumerate(point_status_names.tolist())
+        }
+    point_classification = {
+        "available": point_classification_available,
+        "counts": point_class_counts,
+        "status_counts": status_counts,
+    }
+
     payload = {
+        "solver": {
+            "selection": str(solver),
+            "method": solver_method,
+        },
         "num_points": int(observations["points_world"].shape[0]),
         "num_observations": int(observations["obs_y"].shape[0]),
         "image_width": int(image_width),
         "image_height": int(image_height),
         "visibility_margin": float(visibility_margin),
+        "motion_direction_world": direction.astype(float).tolist(),
+        "motion_direction_camera": observations["motion_direction_camera"].astype(float).tolist(),
+        "motion_depth_components": observations["motion_depth_components"].astype(float).tolist(),
+        "motion_angle_to_camera_normal_deg": np.degrees(
+            np.arccos(np.clip(np.abs(observations["motion_depth_components"]), 0.0, 1.0))
+        ).astype(float).tolist(),
         "visibility_counts": {
             "view1_only": int(view1_only.sum()),
             "view2_only": int(view2_only.sum()),
@@ -372,8 +563,14 @@ def _write_diagnostics(
             "observed_all": int(observed_all.sum()),
             "unobserved": int(unobserved.sum()),
         },
-        "true_alphas": [[float(np.real(a)), float(np.imag(a))] for a in observations["true_alphas"]],
-        "solved_alphas": [[float(np.real(a)), float(np.imag(a))] for a in solved_latent["alphas"]],
+        "true_alphas": [[float(np.real(a)), float(np.imag(a))] for a in true_alphas],
+        "solved_alphas": solved_alpha_pairs,
+        "true_alpha_phases_rad": np.angle(true_alphas).astype(float).tolist(),
+        "solved_alpha_phases_rad": solved_alpha_phases,
+        "alpha_phase_error_rad": alpha_phase_errors,
+        "alpha_phase_history_rad": alpha_phase_history,
+        "alpha_identifiability": alpha_identifiability,
+        "point_classification": point_classification,
         "residual_stats": residual_stats,
         "groups": groups,
         "view1_only_vs_view2_only_mean_direction_angle_deg": mean_angle,
@@ -397,19 +594,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-width", type=int, default=1280)
     parser.add_argument("--image-height", type=int, default=720)
     parser.add_argument("--focal", type=float, default=900.0)
+    parser.add_argument(
+        "--motion-direction",
+        type=float,
+        nargs=3,
+        default=(0.0, 1.0, 0.0),
+        metavar=("DX", "DY", "DZ"),
+        help=(
+            "World-space translation direction. The default +Y direction has a strong "
+            "inward/outward component relative to both camera planes."
+        ),
+    )
     parser.add_argument("--ridge-mu", type=float, default=1e-4)
     parser.add_argument("--iterations", type=int, default=8)
+    add_staged_solver_arguments(parser)
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    validate_solver_args(args)
     out_dir = args.out_dir.expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
+    solver_tag = "staged" if args.solver == "staged" else "legacy_als"
+    solver_label = "Solved staged" if args.solver == "staged" else "Solved legacy ALS"
+    solver_parameters = staged_solver_manifest_parameters(args)
+    if args.solver == "legacy-als":
+        solver_parameters.update(
+            {
+                "iterations": int(args.iterations),
+                "ridge_mu": float(args.ridge_mu),
+                "outlier_frac": 0.0,
+            }
+        )
 
     points = _fibonacci_sphere(args.num_points, args.radius)
     colors = _checker_colors(points)
     K = _camera_intrinsics(args.image_width, args.image_height, args.focal)
+    motion_direction = _normalize_direction(np.asarray(args.motion_direction, dtype=np.float64))
     camera_centers = np.array([[-2.5, -3.0, 0.0], [2.5, -3.0, 0.0]], dtype=np.float32)
     world_to_cameras = np.stack(
         [_look_at_world_to_camera(center, np.zeros(3, dtype=np.float64)) for center in camera_centers],
@@ -427,13 +649,14 @@ def main() -> None:
         visibility_margin=args.visibility_margin,
         phase_offset_rad=args.phase_offset_rad,
         freq_hz=args.freq_hz,
+        motion_direction=motion_direction,
     )
     obs_path = _write_npz(out_dir / "observations" / "toy_sphere_observations.npz", **observations)
     _write_viewer_inputs(out_dir, points, colors, K, world_to_cameras, args.image_width, args.image_height)
 
     phi_gt = observations["phi_gt"].astype(np.complex64)
     gt_path = _write_npz(
-        out_dir / "latents" / "gt_horizontal.npz",
+        out_dir / "latents" / "gt_motion.npz",
         points_world=points.astype(np.float32),
         phi=phi_gt,
         colors=colors.astype(np.uint8),
@@ -443,7 +666,7 @@ def main() -> None:
         obs_sample_count_per_point=observations["obs_sample_count_per_point"].astype(np.int32),
     )
 
-    solved_path = out_dir / "latents" / "solved_als.npz"
+    solved_path = out_dir / "latents" / f"solved_{solver_tag}.npz"
     optimize_multi_view(
         observations_path=obs_path,
         out_path=solved_path,
@@ -453,6 +676,7 @@ def main() -> None:
         graph_smooth_lambda=0.0,
         modal_rigid_lambda=0.0,
         modal_fill_unobserved=False,
+        **staged_solver_kwargs(args),
     )
     solved = _load_npz_dict(solved_path)
     overlay_points = np.concatenate([points, points], axis=0).astype(np.float32)
@@ -472,7 +696,7 @@ def main() -> None:
         axis=0,
     )
     overlay_path = _write_npz(
-        out_dir / "latents" / "gt_vs_solved_overlay.npz",
+        out_dir / "latents" / f"gt_vs_solved_{solver_tag}_overlay.npz",
         points_world=overlay_points,
         phi=overlay_phi,
         colors=overlay_colors,
@@ -487,16 +711,17 @@ def main() -> None:
             ],
             axis=0,
         ),
-        point_group_names=np.array(["GT", "Solved"]),
+        point_group_names=np.array(["GT", solver_label]),
     )
     _write_diagnostics(
         out_dir / "diagnostics.json",
         observations,
         solved,
-        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        motion_direction,
         args.image_width,
         args.image_height,
         args.visibility_margin,
+        args.solver,
     )
 
     gt_manifest = out_dir / "manifests" / "gt" / "modal_modes_manifest.json"
@@ -509,7 +734,7 @@ def main() -> None:
             {
                 "mode_index": 0,
                 "freq_hz": float(args.freq_hz),
-                "label": "GT horizontal",
+                "label": "GT configured motion",
                 "latent_path": _rel(gt_path, gt_manifest.parent),
             }
         ],
@@ -520,10 +745,11 @@ def main() -> None:
             {
                 "mode_index": 0,
                 "freq_hz": float(args.freq_hz),
-                "label": "Solved ALS",
+                "label": solver_label,
                 "latent_path": _rel(solved_path, solved_manifest.parent),
             }
         ],
+        solver_parameters=solver_parameters,
     )
     _write_manifest(
         compare_manifest,
@@ -531,16 +757,17 @@ def main() -> None:
             {
                 "mode_index": 0,
                 "freq_hz": float(args.freq_hz),
-                "label": "GT horizontal",
+                "label": "GT configured motion",
                 "latent_path": _rel(gt_path, compare_manifest.parent),
             },
             {
                 "mode_index": 1,
                 "freq_hz": float(args.freq_hz),
-                "label": "Solved ALS",
+                "label": solver_label,
                 "latent_path": _rel(solved_path, compare_manifest.parent),
             },
         ],
+        solver_parameters=solver_parameters,
     )
     _write_manifest(
         overlay_manifest,
@@ -548,10 +775,11 @@ def main() -> None:
             {
                 "mode_index": 0,
                 "freq_hz": float(args.freq_hz),
-                "label": "GT vs Solved overlay",
+                "label": f"GT vs {solver_label} overlay",
                 "latent_path": _rel(overlay_path, overlay_manifest.parent),
             }
         ],
+        solver_parameters=solver_parameters,
     )
 
     visibility = observations["point_view_mask"].astype(bool)
@@ -560,6 +788,7 @@ def main() -> None:
     overlap = int((visibility[:, 0] & visibility[:, 1]).sum())
     unobserved = int((observations["obs_count_per_point"] == 0).sum())
     print(f"Wrote synthetic sphere test to {out_dir}")
+    print(f"Solver: {args.solver} ({solver_label})")
     print(
         "Visibility counts: "
         f"view1_only={view1_only}, view2_only={view2_only}, overlap={overlap}, unobserved={unobserved}"

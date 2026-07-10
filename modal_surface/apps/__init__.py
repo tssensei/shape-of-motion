@@ -1,7 +1,5 @@
-"""Command-line app wrappers for modal_surface tools.
+"""Command adapters registered by :mod:`modal_surface.cli`.
 
-The files in this package are intentionally thin adapters between
-run_modal_surface.py argparse namespaces and the core implementation modules.
-Core logic should live in modal_surface.packets, modal_surface.matching, and
-modal_surface.optimization.
+Each command module owns its argument registration and runner while keeping
+the numerical implementation in the core ``modal_surface`` modules.
 """

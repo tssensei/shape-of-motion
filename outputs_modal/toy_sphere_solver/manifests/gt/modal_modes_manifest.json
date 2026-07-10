@@ -9,7 +9,7 @@
     {
       "mode_index": 0,
       "freq_hz": 1.0,
-      "label": "GT horizontal",
+      "label": "GT camera in/out",
       "latent_path": "../../latents/gt_horizontal.npz"
     }
   ]
