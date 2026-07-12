@@ -1,0 +1,5 @@
+- removed run_modal_surface.py, the only entry point left is modal_surface/__main__.py
+-
+- `modal_surface/carrier.py`: made Gaussian point observation construction pixel-candidates-only, removed Gaussian-center selection/z-buffer branches and metadata, and kept the separate carrier-point hard z-buffer workflow.
+- `modal_surface/apps/solve_gaussian_modes.py`: removed Gaussian observation sampling and z-buffer CLI controls; Gaussian solves now always render depth/alpha and build pixel-candidate observations.
+- `tests/test_modal_surface_cli.py`: updated Gaussian CLI coverage for the pixel-candidates-only command surface and the removed observation controls.

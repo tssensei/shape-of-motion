@@ -67,24 +67,32 @@ def _finite_percentile(values: np.ndarray, percentile: float) -> float | None:
 def _latent_stats(latent_path: Path, observation_path: Path) -> dict[str, Any]:
     latent = np.load(str(latent_path), allow_pickle=False)
     observations = np.load(str(observation_path), allow_pickle=False)
+    required = [
+        "points_world",
+        "obs_point_index",
+        "obs_residual",
+        "obs_residual_valid_mask",
+        "point_residual",
+        "point_residual_valid_mask",
+        "solver_method",
+        "alpha_identifiable_mask",
+        "alpha_optimizer_success",
+        "anchor_mask",
+        "partial_mask",
+        "rejected_mask",
+        "alpha_unresolved_mask",
+        "no_usable_observation_mask",
+    ]
+    missing = [key for key in required if key not in latent.files]
+    if missing:
+        raise ValueError(f"{latent_path} missing staged solver statistic fields: {missing}.")
     obs_residual = latent["obs_residual"].astype(np.float32)
     point_residual = latent["point_residual"].astype(np.float32)
-    if "obs_residual_valid_mask" in latent.files:
-        obs_residual = obs_residual[latent["obs_residual_valid_mask"].astype(bool)]
-    if "point_residual_valid_mask" in latent.files:
-        point_residual = point_residual[latent["point_residual_valid_mask"].astype(bool)]
-    refined_count = None
-    if "single_view_refined_mask" in latent.files:
-        refined_count = int(latent["single_view_refined_mask"].astype(bool).sum())
-    graph_smooth_residual = latent["graph_smooth_residual"].astype(np.float32) if "graph_smooth_residual" in latent.files else None
+    obs_residual = obs_residual[latent["obs_residual_valid_mask"].astype(bool)]
+    point_residual = point_residual[latent["point_residual_valid_mask"].astype(bool)]
     return {
         "num_points": int(latent["points_world"].shape[0]),
         "num_observations": int(latent["obs_point_index"].shape[0]),
-        "single_view_refined_count": refined_count,
-        "graph_edge_count": int(np.asarray(latent["graph_edge_count"]).item()) if "graph_edge_count" in latent.files else None,
-        "graph_auto_radius": float(np.asarray(latent["graph_auto_radius"]).item()) if "graph_auto_radius" in latent.files else None,
-        "graph_smooth_residual_median": float(np.median(graph_smooth_residual)) if graph_smooth_residual is not None else None,
-        "graph_smooth_residual_p90": float(np.percentile(graph_smooth_residual, 90)) if graph_smooth_residual is not None else None,
         "obs_residual_median": _finite_percentile(obs_residual, 50),
         "obs_residual_p90": _finite_percentile(obs_residual, 90),
         "point_residual_median": _finite_percentile(point_residual, 50),
@@ -96,22 +104,14 @@ def _latent_stats(latent_path: Path, observation_path: Path) -> dict[str, Any]:
         "source_mask_kept_count": int(np.asarray(observations["source_mask_kept_count"]).item())
         if "source_mask_kept_count" in observations.files
         else None,
-        "solver_method": str(np.asarray(latent["solver_method"]).item()) if "solver_method" in latent.files else "legacy-als",
-        "alpha_identifiable_count": int(latent["alpha_identifiable_mask"].astype(bool).sum())
-        if "alpha_identifiable_mask" in latent.files
-        else None,
-        "alpha_optimizer_success": bool(np.asarray(latent["alpha_optimizer_success"]).item())
-        if "alpha_optimizer_success" in latent.files
-        else None,
-        "anchor_count": int(latent["anchor_mask"].astype(bool).sum()) if "anchor_mask" in latent.files else None,
-        "partial_unresolved_count": int(latent["partial_mask"].astype(bool).sum()) if "partial_mask" in latent.files else None,
-        "rejected_count": int(latent["rejected_mask"].astype(bool).sum()) if "rejected_mask" in latent.files else None,
-        "alpha_unresolved_point_count": int(latent["alpha_unresolved_mask"].astype(bool).sum())
-        if "alpha_unresolved_mask" in latent.files
-        else None,
-        "no_usable_observation_point_count": int(latent["no_usable_observation_mask"].astype(bool).sum())
-        if "no_usable_observation_mask" in latent.files
-        else None,
+        "solver_method": str(np.asarray(latent["solver_method"]).item()),
+        "alpha_identifiable_count": int(latent["alpha_identifiable_mask"].astype(bool).sum()),
+        "alpha_optimizer_success": bool(np.asarray(latent["alpha_optimizer_success"]).item()),
+        "anchor_count": int(latent["anchor_mask"].astype(bool).sum()),
+        "partial_unresolved_count": int(latent["partial_mask"].astype(bool).sum()),
+        "rejected_count": int(latent["rejected_mask"].astype(bool).sum()),
+        "alpha_unresolved_point_count": int(latent["alpha_unresolved_mask"].astype(bool).sum()),
+        "no_usable_observation_point_count": int(latent["no_usable_observation_mask"].astype(bool).sum()),
     }
 
 
@@ -170,6 +170,12 @@ def _alpha_by_view_diagnostics(latent_path: Path) -> list[dict[str, Any]]:
         "alpha_semantics",
         "alpha_reference_view_index",
         "alpha_view_freqs_hz",
+        "alpha_identifiable_mask",
+        "alpha_exclusion_reason",
+        "alpha_phase_std",
+        "alpha_gain_std",
+        "alpha_log_gain_std",
+        "alpha_gain_bound_active_mask",
     ]
     missing = [key for key in required if key not in latent.files]
     if missing:
@@ -191,36 +197,23 @@ def _alpha_by_view_diagnostics(latent_path: Path) -> list[dict[str, Any]]:
         raise ValueError(f"{latent_path} alpha_by_view length does not match view_ids.")
     if freqs_hz.shape[0] != len(view_ids):
         raise ValueError(f"{latent_path} alpha_view_freqs_hz length does not match view_ids.")
-    identifiable = (
-        latent["alpha_identifiable_mask"].astype(bool).reshape(-1)
-        if "alpha_identifiable_mask" in latent.files
-        else np.ones((len(view_ids),), dtype=bool)
-    )
-    reasons = (
-        latent["alpha_exclusion_reason"].astype(str).reshape(-1)
-        if "alpha_exclusion_reason" in latent.files
-        else np.full((len(view_ids),), "legacy", dtype="<U16")
-    )
-    phase_std = (
-        latent["alpha_phase_std"].astype(np.float32).reshape(-1)
-        if "alpha_phase_std" in latent.files
-        else np.full((len(view_ids),), np.nan, dtype=np.float32)
-    )
-    gain_std = (
-        latent["alpha_gain_std"].astype(np.float32).reshape(-1)
-        if "alpha_gain_std" in latent.files
-        else np.full((len(view_ids),), np.nan, dtype=np.float32)
-    )
-    log_gain_std = (
-        latent["alpha_log_gain_std"].astype(np.float32).reshape(-1)
-        if "alpha_log_gain_std" in latent.files
-        else np.full((len(view_ids),), np.nan, dtype=np.float32)
-    )
-    gain_bound_active = (
-        latent["alpha_gain_bound_active_mask"].astype(bool).reshape(-1)
-        if "alpha_gain_bound_active_mask" in latent.files
-        else np.zeros((len(view_ids),), dtype=bool)
-    )
+    identifiable = latent["alpha_identifiable_mask"].astype(bool).reshape(-1)
+    reasons = latent["alpha_exclusion_reason"].astype(str).reshape(-1)
+    phase_std = latent["alpha_phase_std"].astype(np.float32).reshape(-1)
+    gain_std = latent["alpha_gain_std"].astype(np.float32).reshape(-1)
+    log_gain_std = latent["alpha_log_gain_std"].astype(np.float32).reshape(-1)
+    gain_bound_active = latent["alpha_gain_bound_active_mask"].astype(bool).reshape(-1)
+    staged_diagnostics = {
+        "alpha_identifiable_mask": identifiable,
+        "alpha_exclusion_reason": reasons,
+        "alpha_phase_std": phase_std,
+        "alpha_gain_std": gain_std,
+        "alpha_log_gain_std": log_gain_std,
+        "alpha_gain_bound_active_mask": gain_bound_active,
+    }
+    invalid = [name for name, values in staged_diagnostics.items() if values.shape[0] != len(view_ids)]
+    if invalid:
+        raise ValueError(f"{latent_path} staged alpha diagnostics have invalid lengths: {invalid}.")
     return [
         {
             "view_id": view_id,

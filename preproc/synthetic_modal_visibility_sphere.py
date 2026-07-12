@@ -1,7 +1,7 @@
 """Synthetic sphere test for multi-view modal lifting.
 
 This script builds a noise-free observation graph for a textured sphere with a
-known, configurable 3D complex translation mode. It then calls the selected
+known, configurable 3D complex translation mode. It then calls the staged
 multi-view solver and writes viewer-compatible latent manifests and diagnostics.
 """
 
@@ -21,7 +21,6 @@ from modal_surface.solver_cli import (
     add_staged_solver_arguments,
     staged_solver_kwargs,
     staged_solver_manifest_parameters,
-    validate_solver_args,
 )
 
 
@@ -402,7 +401,6 @@ def _write_diagnostics(
     image_width: int,
     image_height: int,
     visibility_margin: float,
-    solver: str,
 ) -> None:
     obs_count = observations["obs_count_per_point"].astype(np.int32)
     visibility = observations["point_view_mask"].astype(bool)
@@ -433,56 +431,25 @@ def _write_diagnostics(
         residual_stats = _stats(np.sqrt(np.sum(np.abs(obs_y - pred) ** 2, axis=1)).astype(np.float32))
 
     true_alphas = observations["true_alphas"].astype(np.complex64)
-    solved_alphas = solved_latent["alphas"].astype(np.complex64)
-    alpha_history = solved_latent.get("alpha_history")
-
-    solver_method_array = solved_latent.get("solver_method")
-    solver_method = (
-        str(np.asarray(solver_method_array).item())
-        if solver_method_array is not None
-        else ("legacy-als" if solver == "legacy-als" else "staged-unspecified")
-    )
-
-    alpha_identifiable_array = solved_latent.get("alpha_identifiable_mask")
-    alpha_identifiable = (
-        np.asarray(alpha_identifiable_array, dtype=bool).reshape(-1)
-        if alpha_identifiable_array is not None
-        else None
-    )
-    alpha_report_mask = (
-        alpha_identifiable
-        if alpha_identifiable is not None
-        else np.ones((solved_alphas.shape[0],), dtype=bool)
-    )
+    solved_alphas = solved_latent["alpha_by_view"].astype(np.complex64)
+    solved_alpha_phase = np.asarray(solved_latent["alpha_phase"], dtype=np.float32).reshape(-1)
+    solver_method = str(np.asarray(solved_latent["solver_method"]).item())
+    alpha_identifiable = np.asarray(solved_latent["alpha_identifiable_mask"], dtype=bool).reshape(-1)
+    alpha_report_mask = alpha_identifiable
     solved_alpha_pairs = [
         [float(np.real(alpha)), float(np.imag(alpha))] if alpha_report_mask[index] else None
         for index, alpha in enumerate(solved_alphas)
     ]
     solved_alpha_phases = [
-        float(np.angle(alpha)) if alpha_report_mask[index] else None
-        for index, alpha in enumerate(solved_alphas)
+        float(phase) if alpha_report_mask[index] else None
+        for index, phase in enumerate(solved_alpha_phase)
     ]
     alpha_phase_error = np.angle(solved_alphas * np.conj(true_alphas)).astype(np.float32)
     alpha_phase_errors = [
         float(error) if alpha_report_mask[index] else None
         for index, error in enumerate(alpha_phase_error)
     ]
-    alpha_phase_history = None
-    if alpha_history is not None:
-        history_array = np.atleast_2d(np.asarray(alpha_history, dtype=np.complex64))
-        alpha_phase_history = [
-            [
-                float(np.angle(value)) if alpha_report_mask[index] else None
-                for index, value in enumerate(row)
-            ]
-            for row in history_array
-        ]
-    alpha_exclusion_array = solved_latent.get("alpha_exclusion_reason")
-    alpha_exclusion_reason = (
-        np.asarray(alpha_exclusion_array).astype(str).reshape(-1).tolist()
-        if alpha_exclusion_array is not None
-        else None
-    )
+    alpha_exclusion_reason = np.asarray(solved_latent["alpha_exclusion_reason"]).astype(str).reshape(-1).tolist()
     alpha_phase_std_array = solved_latent.get("alpha_phase_std")
     alpha_phase_std = None
     if alpha_phase_std_array is not None:
@@ -500,9 +467,9 @@ def _write_diagnostics(
             for value in alpha_log_gain_std_values.tolist()
         ]
     alpha_identifiability = {
-        "available": alpha_identifiable is not None,
-        "identifiable_mask": alpha_identifiable.tolist() if alpha_identifiable is not None else None,
-        "identifiable_count": int(alpha_identifiable.sum()) if alpha_identifiable is not None else None,
+        "available": True,
+        "identifiable_mask": alpha_identifiable.tolist(),
+        "identifiable_count": int(alpha_identifiable.sum()),
         "exclusion_reason": alpha_exclusion_reason,
         "phase_std_rad": alpha_phase_std,
         "log_gain_std": alpha_log_gain_std,
@@ -565,7 +532,6 @@ def _write_diagnostics(
 
     payload = {
         "solver": {
-            "selection": str(solver),
             "method": solver_method,
         },
         "num_points": int(observations["points_world"].shape[0]),
@@ -591,7 +557,6 @@ def _write_diagnostics(
         "true_alpha_phases_rad": np.angle(true_alphas).astype(float).tolist(),
         "solved_alpha_phases_rad": solved_alpha_phases,
         "alpha_phase_error_rad": alpha_phase_errors,
-        "alpha_phase_history_rad": alpha_phase_history,
         "alpha_identifiability": alpha_identifiability,
         "point_classification": point_classification,
         "residual_stats": residual_stats,
@@ -608,7 +573,7 @@ def _load_npz_dict(path: Path) -> dict[str, np.ndarray]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate a synthetic sphere modal lifting test.")
-    parser.add_argument("--out-dir", type=Path, default=Path("outputs_modal/toy_sphere_solver"))
+    parser.add_argument("--out-dir", type=Path, default=Path("outputs_modal/toy_sphere_solver_staged"))
     parser.add_argument("--num-points", type=int, default=20000)
     parser.add_argument("--radius", type=float, default=1.0)
     parser.add_argument("--visibility-margin", type=float, default=0.03)
@@ -628,28 +593,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "inward/outward component relative to both camera planes."
         ),
     )
-    parser.add_argument("--ridge-mu", type=float, default=1e-4)
-    parser.add_argument("--iterations", type=int, default=8)
     add_staged_solver_arguments(parser)
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    validate_solver_args(args)
     out_dir = args.out_dir.expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    solver_tag = "staged" if args.solver == "staged" else "legacy_als"
-    solver_label = "Solved staged" if args.solver == "staged" else "Solved legacy ALS"
+    solver_label = "Solved staged"
     solver_parameters = staged_solver_manifest_parameters(args)
-    if args.solver == "legacy-als":
-        solver_parameters.update(
-            {
-                "iterations": int(args.iterations),
-                "ridge_mu": float(args.ridge_mu),
-                "outlier_frac": 0.0,
-            }
-        )
 
     points = _fibonacci_sphere(args.num_points, args.radius)
     colors = _checker_colors(points)
@@ -689,16 +642,10 @@ def main() -> None:
         obs_sample_count_per_point=observations["obs_sample_count_per_point"].astype(np.int32),
     )
 
-    solved_path = out_dir / "latents" / f"solved_{solver_tag}.npz"
+    solved_path = out_dir / "latents" / "solved_staged.npz"
     optimize_multi_view(
         observations_path=obs_path,
         out_path=solved_path,
-        iterations=args.iterations,
-        ridge_mu=args.ridge_mu,
-        outlier_frac=0.0,
-        graph_smooth_lambda=0.0,
-        modal_rigid_lambda=0.0,
-        modal_fill_unobserved=False,
         **staged_solver_kwargs(args),
     )
     solved = _load_npz_dict(solved_path)
@@ -719,7 +666,7 @@ def main() -> None:
         axis=0,
     )
     overlay_path = _write_npz(
-        out_dir / "latents" / f"gt_vs_solved_{solver_tag}_overlay.npz",
+        out_dir / "latents" / "gt_vs_solved_staged_overlay.npz",
         points_world=overlay_points,
         phi=overlay_phi,
         colors=overlay_colors,
@@ -744,7 +691,6 @@ def main() -> None:
         args.image_width,
         args.image_height,
         args.visibility_margin,
-        args.solver,
     )
 
     gt_manifest = out_dir / "manifests" / "gt" / "modal_modes_manifest.json"
@@ -811,7 +757,7 @@ def main() -> None:
     overlap = int((visibility[:, 0] & visibility[:, 1]).sum())
     unobserved = int((observations["obs_count_per_point"] == 0).sum())
     print(f"Wrote synthetic sphere test to {out_dir}")
-    print(f"Solver: {args.solver} ({solver_label})")
+    print(f"Solver: staged ({solver_label})")
     print(
         "Visibility counts: "
         f"view1_only={view1_only}, view2_only={view2_only}, overlap={overlap}, unobserved={unobserved}"

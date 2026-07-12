@@ -260,7 +260,6 @@ def prepare_observations(data: Mapping[str, np.ndarray]) -> PreparedObservations
         "colors",
         "carrier_point_indices",
         "gaussian_indices",
-        "gaussian_contribution_max_share_per_point",
     ):
         if key in arrays and arrays[key].shape[:1] != (points.shape[0],):
             raise ValueError(f"{key} must have first dimension {points.shape[0]}.")
@@ -1286,7 +1285,6 @@ def _optional_output_fields(prepared: PreparedObservations) -> dict[str, np.ndar
         "colors",
         "carrier_point_indices",
         "gaussian_indices",
-        "gaussian_contribution_max_share_per_point",
         "point_type",
         "source_checkpoint",
     ):
@@ -1312,9 +1310,6 @@ def optimize_multi_view_staged(
         prepared, alpha, observable.phi
     )
 
-    valid_point_residual = point_residual[point_residual_valid]
-    mean_residual = float(np.mean(valid_point_residual)) if valid_point_residual.size else np.nan
-    median_residual = float(np.median(valid_point_residual)) if valid_point_residual.size else np.nan
     alpha_freqs = (
         prepared.arrays["view_freqs_hz"].astype(np.float32)
         if "view_freqs_hz" in prepared.arrays
@@ -1325,8 +1320,6 @@ def optimize_multi_view_staged(
         )
     )
     num_points = prepared.points.shape[0]
-    zero_i32 = np.zeros((num_points,), dtype=np.int32)
-    zero_f32 = np.zeros((num_points,), dtype=np.float32)
     false_mask = np.zeros((num_points,), dtype=bool)
 
     out = Path(out_path)
@@ -1402,45 +1395,6 @@ def optimize_multi_view_staged(
         point_residual_valid_mask=point_residual_valid.astype(bool),
         obs_count_per_point=prepared.obs_count_per_point.astype(np.int32),
         obs_sample_count_per_point=prepared.obs_sample_count_per_point.astype(np.int32),
-        obs_count_weight_per_point=np.ones((num_points,), dtype=np.float32),
-        graph_degree=zero_i32,
-        graph_edge_count=np.array(0, dtype=np.int64),
-        graph_auto_radius=np.array(0.0, dtype=np.float32),
-        graph_smooth_residual=zero_f32,
-        graph_smooth_lambda=np.array(0.0, dtype=np.float32),
-        graph_smooth_k=np.array(0, dtype=np.int32),
-        graph_auto_radius_scale=np.array(0.0, dtype=np.float32),
-        graph_min_shared_views=np.array(0, dtype=np.int32),
-        modal_rigid_lambda=np.array(0.0, dtype=np.float32),
-        modal_rigid_k=np.array(0, dtype=np.int32),
-        modal_rigid_auto_radius_scale=np.array(0.0, dtype=np.float32),
-        modal_rigid_min_shared_views=np.array(0, dtype=np.int32),
-        modal_rigid_edge_count=np.array(0, dtype=np.int64),
-        modal_rigid_degree=zero_i32,
-        modal_rigid_residual=zero_f32,
-        modal_rigid_auto_radius=np.array(0.0, dtype=np.float32),
-        modal_fill_enabled=np.array(False),
-        modal_fill_k=np.array(0, dtype=np.int32),
-        modal_fill_auto_radius_scale=np.array(0.0, dtype=np.float32),
-        modal_fill_anchor_min_observations=np.array(0, dtype=np.int32),
-        modal_fill_ridge_mu=np.array(0.0, dtype=np.float32),
-        modal_fill_auto_radius=np.array(0.0, dtype=np.float32),
-        modal_fill_anchor_mask=false_mask,
-        modal_fill_target_mask=false_mask,
-        modal_fill_connected_to_anchor=false_mask,
-        modal_fill_degree=zero_i32,
-        modal_fill_anchor_count=np.array(0, dtype=np.int64),
-        modal_fill_target_count=np.array(0, dtype=np.int64),
-        modal_fill_filled_count=np.array(0, dtype=np.int64),
-        modal_fill_unfilled_count=np.array(0, dtype=np.int64),
-        obs_count_weight_1=np.array(1.0, dtype=np.float32),
-        obs_count_weight_2=np.array(1.0, dtype=np.float32),
-        obs_count_weight_3plus=np.array(1.0, dtype=np.float32),
-        single_view_refined_mask=false_mask,
-        single_view_anchor_distance=np.full((num_points,), np.inf, dtype=np.float32),
-        single_view_smooth_lambda=np.array(0.0, dtype=np.float32),
-        single_view_smooth_k=np.array(0, dtype=np.int32),
-        single_view_anchor_min_observations=np.array(2, dtype=np.int32),
         obs_point_index=prepared.obs_point_index.astype(np.int32),
         obs_view_index=prepared.obs_view_index.astype(np.int32),
         obs_pixels_xy=prepared.obs_pixels_xy.astype(np.float32),
@@ -1451,11 +1405,6 @@ def optimize_multi_view_staged(
         obs_pred_y=pred.astype(np.complex64),
         obs_residual=obs_residual.astype(np.float32),
         obs_residual_valid_mask=obs_residual_valid.astype(bool),
-        active_indices=np.arange(num_points, dtype=np.int32),
-        optimization_history=np.asarray(
-            [[0.0, float(num_points), mean_residual, median_residual, 0.0, 0.0]], dtype=np.float32
-        ),
-        alpha_history=alpha.alphas[None, :].astype(np.complex64),
         source_observations=np.array(str(observations_path)),
         staged_summary=np.asarray(
             [
@@ -1496,7 +1445,12 @@ def optimize_multi_view_staged(
             )
 
     if vis_dir is not None:
-        from modal_surface.optimization_multi import _amplitude_colors, _phase_colors, _scatter_mode_image, _write_ply
+        from modal_surface.optimization_visualization import (
+            _amplitude_colors,
+            _phase_colors,
+            _scatter_mode_image,
+            _write_ply,
+        )
 
         if "view_image_width" not in prepared.arrays or "view_image_height" not in prepared.arrays:
             raise ValueError("Visualization requires view_image_width and view_image_height.")

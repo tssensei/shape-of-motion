@@ -299,6 +299,16 @@ class StagedModalSolverTests(unittest.TestCase):
                 self.assertTrue(latent["partial_mask"][1])
                 self.assertTrue(latent["unobserved_mask"][2])
                 self.assertFalse(np.any(latent["completion_mask"]))
+                legacy_fields = {
+                    "graph_degree",
+                    "modal_rigid_edge_count",
+                    "modal_fill_enabled",
+                    "single_view_refined_mask",
+                    "optimization_history",
+                    "alpha_history",
+                    "active_indices",
+                }
+                self.assertTrue(legacy_fields.isdisjoint(latent.files))
 
 
 if __name__ == "__main__":

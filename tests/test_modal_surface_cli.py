@@ -66,10 +66,8 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 ],
                 "modal_surface.apps.optimize_multi_view",
                 {
-                    "solver": "staged",
                     "alpha_model": "phase",
                     "alpha_min_shared_points": 24,
-                    "outlier_frac": None,
                 },
             ),
             (
@@ -89,8 +87,7 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 "modal_surface.apps.solve_carrier_modes",
                 {
                     "mode_indices": "1,3",
-                    "solver": "staged",
-                    "outlier_frac": 0.0,
+                    "alpha_model": "phase",
                 },
             ),
             (
@@ -104,14 +101,11 @@ class ModalSurfaceCliTests(unittest.TestCase):
                     "modal.npz",
                     "--out-dir",
                     "modes",
-                    "--observation-sampling",
-                    "gaussian-center-contribution",
                 ],
                 "modal_surface.apps.solve_gaussian_modes",
                 {
-                    "observation_sampling": "gaussian-center-contribution",
-                    "solver": "staged",
-                    "modal_fill_unobserved": False,
+                    "pixel_candidate_k": 4,
+                    "alpha_model": "phase",
                 },
             ),
         )
@@ -148,6 +142,89 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 }
                 self.assertNotIn("--min-observations", option_strings)
                 self.assertNotIn("--pair-weight", option_strings)
+
+    def test_removed_gaussian_observation_controls_are_not_registered(self) -> None:
+        cli = importlib.import_module("modal_surface.cli")
+        parser = cli.build_arg_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        gaussian_parser = subparsers.choices["solve-gaussian-modes"]
+        option_strings = {
+            option
+            for action in gaussian_parser._actions
+            for option in action.option_strings
+        }
+        removed_options = {
+            "--observation-sampling",
+            "--zbuffer-radius",
+            "--zbuffer-mode",
+            "--zbuffer-soft-sigma",
+            "--zbuffer-soft-min-weight",
+            "--front-percentile",
+            "--zbuffer-tau",
+            "--min-zbuffer-samples",
+            "--gaussian-contribution-radius",
+            "--gaussian-contribution-min-share",
+            "--gaussian-contribution-min-score",
+            "--gaussian-contribution-cov-eps-px",
+        }
+        self.assertTrue(removed_options.isdisjoint(option_strings))
+        retained_pixel_options = {
+            "--pixel-sample-stride",
+            "--pixel-candidate-k",
+            "--pixel-preselect-k",
+            "--pixel-render-acc-min",
+            "--pixel-min-contribution",
+            "--pixel-min-mode-amp-percentile",
+            "--pixel-max-samples-per-view",
+        }
+        self.assertTrue(retained_pixel_options.issubset(option_strings))
+
+    def test_legacy_solver_controls_are_not_registered(self) -> None:
+        cli = importlib.import_module("modal_surface.cli")
+        parser = cli.build_arg_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        legacy_options = {
+            "--solver",
+            "--iterations",
+            "--ridge-mu",
+            "--outlier-frac",
+            "--single-view-smooth-lambda",
+            "--single-view-smooth-k",
+            "--single-view-anchor-min-observations",
+            "--graph-smooth-lambda",
+            "--graph-smooth-k",
+            "--graph-auto-radius-scale",
+            "--graph-min-shared-views",
+            "--modal-rigid-lambda",
+            "--modal-rigid-k",
+            "--modal-rigid-auto-radius-scale",
+            "--modal-rigid-min-shared-views",
+            "--modal-fill-unobserved",
+            "--modal-fill-k",
+            "--modal-fill-auto-radius-scale",
+            "--modal-fill-anchor-min-observations",
+            "--modal-fill-ridge-mu",
+            "--obs-count-weight-1",
+            "--obs-count-weight-2",
+            "--obs-count-weight-3plus",
+        }
+
+        for command in ("optimize-multi-view", "solve-carrier-modes", "solve-gaussian-modes"):
+            with self.subTest(command=command):
+                option_strings = {
+                    option
+                    for action in subparsers.choices[command]._actions
+                    for option in action.option_strings
+                }
+                self.assertTrue(legacy_options.isdisjoint(option_strings))
 
     def test_main_dispatches_to_the_attached_app_runner(self) -> None:
         cli = importlib.import_module("modal_surface.cli")

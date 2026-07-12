@@ -19,10 +19,9 @@ from modal_surface.apps._shared import (
 from modal_surface.carrier import build_carrier_observation_graph
 from modal_surface.optimization_multi import optimize_multi_view
 from modal_surface.solver_cli import (
-    add_solver_arguments,
-    solver_kwargs,
+    add_staged_solver_arguments,
+    staged_solver_kwargs,
     staged_solver_manifest_parameters,
-    validate_solver_args,
 )
 
 
@@ -49,12 +48,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--depth-weight-min", type=float, default=0.02, help="Minimum inverse-z depth weight.")
     parser.add_argument("--depth-weight-reference-percentile", type=float, default=50.0, help="Per-view candidate-depth percentile used as inverse-z reference.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
-    add_solver_arguments(parser)
+    add_staged_solver_arguments(parser)
 
 
 def run(args: argparse.Namespace) -> None:
     """Solve all requested frequency indices and write a manifest."""
-    validate_solver_args(args)
     view_configs = list(args.view_config)
     modal_npzs = list(args.modal_npz)
     if len(view_configs) != len(modal_npzs):
@@ -105,7 +103,7 @@ def run(args: argparse.Namespace) -> None:
             observations_path=obs_path,
             out_path=latent_path,
             vis_dir=mode_vis_dir,
-            **solver_kwargs(args),
+            **staged_solver_kwargs(args),
         )
         freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
         modes.append(
@@ -130,7 +128,6 @@ def run(args: argparse.Namespace) -> None:
         "source_modal_npzs": modal_npzs,
         "mode_indices": mode_indices,
         "parameters": {
-            "legacy_solver_parameters_active": bool(args.solver == "legacy-als"),
             "mask_erode_iters": int(args.mask_erode_iters),
             "source_mask_erode_iters": int(args.source_mask_erode_iters),
             "zbuffer_radius": int(args.zbuffer_radius),
@@ -147,19 +144,6 @@ def run(args: argparse.Namespace) -> None:
             "depth_weight_min": float(args.depth_weight_min),
             "depth_weight_reference_percentile": float(args.depth_weight_reference_percentile),
             "freq_tolerance_hz": float(args.freq_tolerance_hz),
-            "iterations": int(args.iterations),
-            "ridge_mu": float(args.ridge_mu),
-            "outlier_frac": float(args.outlier_frac),
-            "single_view_smooth_lambda": float(args.single_view_smooth_lambda),
-            "single_view_smooth_k": int(args.single_view_smooth_k),
-            "single_view_anchor_min_observations": int(args.single_view_anchor_min_observations),
-            "graph_smooth_lambda": float(args.graph_smooth_lambda),
-            "graph_smooth_k": int(args.graph_smooth_k),
-            "graph_auto_radius_scale": float(args.graph_auto_radius_scale),
-            "graph_min_shared_views": int(args.graph_min_shared_views),
-            "obs_count_weight_1": float(args.obs_count_weight_1),
-            "obs_count_weight_2": float(args.obs_count_weight_2),
-            "obs_count_weight_3plus": float(args.obs_count_weight_3plus),
             "alpha_model": "per_view_per_mode",
             "alpha_reference_view_index": 0,
             **staged_solver_manifest_parameters(args),

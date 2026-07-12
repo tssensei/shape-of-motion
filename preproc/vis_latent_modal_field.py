@@ -49,7 +49,6 @@ class ModalRuntimeData:
     labels: tuple[str, ...]
     colors: np.ndarray | None
     obs_count_per_point: np.ndarray | None
-    refined_mask: np.ndarray | None
     point_group: np.ndarray | None
     point_group_names: tuple[str, ...] | None
     source: str
@@ -223,11 +222,6 @@ def _load_latent_arrays(path: Path) -> dict[str, np.ndarray]:
         if obs_count.shape != (points.shape[0],):
             raise ValueError(f"{path} obs_count_per_point must have shape ({points.shape[0]},), got {obs_count.shape}.")
         out["obs_count_per_point"] = obs_count
-    if "single_view_refined_mask" in z.files:
-        refined = z["single_view_refined_mask"].astype(bool)
-        if refined.shape != (points.shape[0],):
-            raise ValueError(f"{path} single_view_refined_mask must have shape ({points.shape[0]},), got {refined.shape}.")
-        out["single_view_refined_mask"] = refined
     if "point_group" in z.files:
         point_group = z["point_group"].astype(np.int32)
         if point_group.shape != (points.shape[0],):
@@ -273,9 +267,6 @@ def load_single_runtime_mode(path: Path, max_points: int) -> ModalRuntimeData:
     obs_count = arrays.get("obs_count_per_point")
     if obs_count is not None:
         obs_count = obs_count[valid]
-    refined_mask = arrays.get("single_view_refined_mask")
-    if refined_mask is not None:
-        refined_mask = refined_mask[valid]
     point_group = arrays.get("point_group")
     if point_group is not None:
         point_group = point_group[valid]
@@ -288,8 +279,6 @@ def load_single_runtime_mode(path: Path, max_points: int) -> ModalRuntimeData:
             colors = colors[keep]
         if obs_count is not None:
             obs_count = obs_count[keep]
-        if refined_mask is not None:
-            refined_mask = refined_mask[keep]
         if point_group is not None:
             point_group = point_group[keep]
     freq = float(np.asarray(arrays.get("freq_hz", np.array(1.0, dtype=np.float32))).item())
@@ -300,7 +289,6 @@ def load_single_runtime_mode(path: Path, max_points: int) -> ModalRuntimeData:
         labels=(f"0: {freq:.6f} Hz",),
         colors=colors,
         obs_count_per_point=obs_count.astype(np.int32, copy=False) if obs_count is not None else None,
-        refined_mask=refined_mask.astype(bool, copy=False) if refined_mask is not None else None,
         point_group=point_group.astype(np.int32, copy=False) if point_group is not None else None,
         point_group_names=point_group_names,
         source=str(path),
@@ -348,7 +336,6 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
     valid: np.ndarray | None = None
     colors: np.ndarray | None = None
     obs_count_per_point: np.ndarray | None = None
-    refined_mask: np.ndarray | None = None
     point_group: np.ndarray | None = None
     point_group_names: tuple[str, ...] | None = None
     for mode_i, entry in enumerate(entries):
@@ -363,8 +350,6 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
                 colors = arrays["colors"]
             if "obs_count_per_point" in arrays:
                 obs_count_per_point = arrays["obs_count_per_point"]
-            if "single_view_refined_mask" in arrays:
-                refined_mask = arrays["single_view_refined_mask"].copy()
             if "point_group" in arrays:
                 point_group = arrays["point_group"].copy()
                 point_group_names = _point_group_names(arrays)
@@ -373,7 +358,7 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
             if points.shape != ref_points.shape:
                 raise ValueError(
                     f"Manifest mode {entry['label']} has points_world shape {points.shape}, "
-                    f"expected {ref_points.shape}. Re-solve modes with consistent pruning, e.g. --outlier-frac 0.0."
+                    f"expected {ref_points.shape}. Re-solve modes with one consistent carrier point set."
                 )
             if not np.allclose(points, ref_points, rtol=1e-5, atol=1e-5):
                 raise ValueError(
@@ -387,11 +372,6 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
                     raise ValueError(f"Manifest mode {entry['label']} has inconsistent obs_count_per_point.")
             elif "obs_count_per_point" in arrays:
                 raise ValueError("Manifest modes must either all include obs_count_per_point or none of them should.")
-            if "single_view_refined_mask" in arrays:
-                if refined_mask is None:
-                    refined_mask = arrays["single_view_refined_mask"].copy()
-                else:
-                    refined_mask |= arrays["single_view_refined_mask"]
             if point_group is not None:
                 if "point_group" not in arrays:
                     raise ValueError(f"Manifest mode {entry['label']} is missing point_group.")
@@ -415,7 +395,6 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
     phi_out = np.stack([phi[valid] for phi in phi_list], axis=0).astype(np.complex64, copy=False)
     colors_out = colors[valid] if colors is not None else None
     obs_count_out = obs_count_per_point[valid] if obs_count_per_point is not None else None
-    refined_out = refined_mask[valid] if refined_mask is not None else None
     point_group_out = point_group[valid] if point_group is not None else None
     if max_points > 0 and points_out.shape[0] > max_points:
         keep = np.linspace(0, points_out.shape[0] - 1, int(max_points), dtype=np.int64)
@@ -425,8 +404,6 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
             colors_out = colors_out[keep]
         if obs_count_out is not None:
             obs_count_out = obs_count_out[keep]
-        if refined_out is not None:
-            refined_out = refined_out[keep]
         if point_group_out is not None:
             point_group_out = point_group_out[keep]
     return ModalRuntimeData(
@@ -436,7 +413,6 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
         labels=tuple(labels),
         colors=colors_out.astype(np.uint8, copy=False) if colors_out is not None else None,
         obs_count_per_point=obs_count_out.astype(np.int32, copy=False) if obs_count_out is not None else None,
-        refined_mask=refined_out.astype(bool, copy=False) if refined_out is not None else None,
         point_group=point_group_out.astype(np.int32, copy=False) if point_group_out is not None else None,
         point_group_names=point_group_names,
         source=str(path),
@@ -710,7 +686,6 @@ def main() -> None:
     initial_source = str(args.points)
     initial_has_rgb = False
     initial_obs_count = None
-    initial_refined_mask = None
     initial_point_group = None
     initial_point_group_names = None
     if runtime_data is not None:
@@ -718,7 +693,6 @@ def main() -> None:
         initial_phi_modes = runtime_data.phi_modes
         initial_source = runtime_data.source
         initial_obs_count = runtime_data.obs_count_per_point
-        initial_refined_mask = runtime_data.refined_mask
         initial_point_group = runtime_data.point_group
         initial_point_group_names = runtime_data.point_group_names
         if runtime_data.colors is not None:
@@ -738,7 +712,6 @@ def main() -> None:
         has_rgb: bool,
         source: str,
         obs_count_in: np.ndarray | None,
-        refined_mask_in: np.ndarray | None,
         point_group_in: np.ndarray | None,
         point_group_names_in: tuple[str, ...] | None,
     ) -> dict[str, Any]:
@@ -755,7 +728,6 @@ def main() -> None:
             "phase_colors": phase,
             "obs_count_colors": obs_colors,
             "obs_count_per_point": obs_count_in,
-            "refined_mask": refined_mask_in,
             "point_group": point_group_in,
             "point_group_names": point_group_names_in,
             "latent_has_rgb": has_rgb,
@@ -769,7 +741,6 @@ def main() -> None:
         initial_has_rgb,
         initial_source,
         initial_obs_count,
-        initial_refined_mask,
         initial_point_group,
         initial_point_group_names,
     )
@@ -797,11 +768,6 @@ def main() -> None:
             if obs_count is None:
                 return np.zeros_like(mask)
             mask &= obs_count >= 2
-        if "show_refined_only" in gui_handles and bool(gui_handles["show_refined_only"].value):
-            refined = state["refined_mask"]
-            if refined is None:
-                return np.zeros_like(mask)
-            mask &= refined.astype(bool, copy=False)
         point_group = state["point_group"]
         if point_group is not None and "point_group_visibility" in gui_handles:
             group_mask = np.zeros_like(mask)
@@ -984,9 +950,6 @@ def main() -> None:
         if state["obs_count_per_point"] is not None:
             show_obs_count_ge2 = server.gui.add_checkbox("Show obs_count>=2 only", False)
             gui_handles["show_obs_count_ge2"] = show_obs_count_ge2
-        if state["refined_mask"] is not None:
-            show_refined_only = server.gui.add_checkbox("Show refined points only", False)
-            gui_handles["show_refined_only"] = show_refined_only
         if state["point_group"] is not None:
             group_names = state["point_group_names"]
             if group_names is None or len(group_names) == 0:
@@ -1146,8 +1109,6 @@ def main() -> None:
         gui_handles["update_phase"].on_click(update_phase_from_button)
         if "show_obs_count_ge2" in gui_handles:
             gui_handles["show_obs_count_ge2"].on_update(update_display_filter)
-        if "show_refined_only" in gui_handles:
-            gui_handles["show_refined_only"].on_update(update_display_filter)
         if "point_group_visibility" in gui_handles:
             for handle in gui_handles["point_group_visibility"].values():
                 handle.on_update(update_display_filter)

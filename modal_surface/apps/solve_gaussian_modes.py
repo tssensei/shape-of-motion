@@ -23,10 +23,9 @@ from modal_surface.carrier import build_points_observation_graph
 from modal_surface.io import load_view_config
 from modal_surface.optimization_multi import optimize_multi_view
 from modal_surface.solver_cli import (
-    add_solver_arguments,
-    solver_kwargs,
+    add_staged_solver_arguments,
+    staged_solver_kwargs,
     staged_solver_manifest_parameters,
-    validate_solver_args,
 )
 
 
@@ -36,12 +35,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--modal-npz", action="append", required=True, help="modal_analysis.npz path. Repeat per view.")
     parser.add_argument("--out-dir", required=True, help="Output directory for observations, latents, vis, and manifest.")
     parser.add_argument("--mode-indices", default="all", help="Comma-separated zero-based mode indices, or 'all'.")
-    parser.add_argument(
-        "--observation-sampling",
-        choices=["gaussian-center", "pixel-candidates", "gaussian-center-contribution"],
-        default="gaussian-center",
-        help="Observation graph sampling mode.",
-    )
     parser.add_argument("--pixel-sample-stride", type=int, default=4, help="Pixel grid stride for pixel-candidates sampling.")
     parser.add_argument("--pixel-candidate-k", type=int, default=4, help="Number of top contribution Gaussians supervised by each sampled pixel.")
     parser.add_argument("--pixel-preselect-k", type=int, default=32, help="Number of 3D nearest Gaussians scored before top-k contribution selection.")
@@ -49,18 +42,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pixel-min-contribution", type=float, default=1e-12, help="Minimum unnormalized Gaussian contribution retained for a sampled modal pixel.")
     parser.add_argument("--pixel-min-mode-amp-percentile", type=float, default=0.0, help="Discard sampled modal pixels below this foreground amplitude percentile.")
     parser.add_argument("--pixel-max-samples-per-view", type=int, default=20000, help="Maximum sampled modal pixels per view before candidate expansion.")
-    parser.add_argument("--gaussian-contribution-radius", type=int, default=8, help="Pixel radius used to estimate projected Gaussian contribution share.")
-    parser.add_argument("--gaussian-contribution-min-share", type=float, default=1e-4, help="For gaussian-center-contribution, keep observations whose share reaches this ratio of the point's max-view share.")
-    parser.add_argument("--gaussian-contribution-min-score", type=float, default=1e-12, help="Minimum unnormalized projected Gaussian contribution score.")
-    parser.add_argument("--gaussian-contribution-cov-eps-px", type=float, default=0.25, help="2D covariance diagonal epsilon in pixels for projected Gaussian contribution.")
     parser.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
-    parser.add_argument("--zbuffer-radius", type=int, default=5, help="Local robust z-buffer window radius in pixels.")
-    parser.add_argument("--zbuffer-mode", choices=["hard", "soft"], default="hard", help="Hard z-buffer filtering or soft z-buffer confidence weighting.")
-    parser.add_argument("--zbuffer-soft-sigma", type=float, default=0.10, help="Normalized depth sigma used by --zbuffer-mode soft.")
-    parser.add_argument("--zbuffer-soft-min-weight", type=float, default=0.05, help="Minimum z-buffer weight retained by --zbuffer-mode soft.")
-    parser.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
-    parser.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
-    parser.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local point depths for visibility.")
     parser.add_argument("--view-frequency-weighting", choices=["none", "local-snr"], default="none", help="View-frequency reliability weighting method.")
     parser.add_argument("--snr-band-hz", type=float, default=0.3, help="Half-width of the local spectrum band used for local-SNR noise estimation.")
     parser.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
@@ -71,39 +53,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--depth-weight-min", type=float, default=0.02, help="Minimum inverse-z depth weight.")
     parser.add_argument("--depth-weight-reference-percentile", type=float, default=50.0, help="Per-view candidate-depth percentile used as inverse-z reference.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
-    add_solver_arguments(
-        parser,
-        include_modal_rigid=True,
-        include_modal_fill=True,
-    )
+    add_staged_solver_arguments(parser)
 
 
-def _load_fg_means_from_checkpoint(path: str) -> np.ndarray:
-    import torch
-
-    ckpt_path = Path(path)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(ckpt_path)
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state = ckpt.get("model")
-    if not isinstance(state, dict):
-        raise ValueError(f"{path} does not contain a model state")
-    if "fg.params.means" not in state:
-        raise ValueError(f"{path} is missing fg.params.means")
-    means = state["fg.params.means"].detach().cpu().float().numpy().astype(np.float32)
-    if means.ndim != 2 or means.shape[1] != 3:
-        raise ValueError(f"fg.params.means must have shape (N,3), got {means.shape}")
-    finite = np.all(np.isfinite(means), axis=1)
-    if not np.all(finite):
-        bad = int((~finite).sum())
-        raise ValueError(f"{path} contains {bad} non-finite foreground Gaussian centers")
-    return means
-
-
-def _load_fg_contribution_inputs_from_checkpoint(
+def _load_fg_pixel_candidate_inputs_from_checkpoint(
     path: str,
     view_config_paths: list[str],
-    render_views: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
     import torch
 
@@ -137,32 +92,31 @@ def _load_fg_contribution_inputs_from_checkpoint(
 
     rendered_depths: list[np.ndarray] = []
     rendered_accs: list[np.ndarray] = []
-    if render_views:
-        with torch.no_grad():
-            for cfg_path in view_config_paths:
-                cfg = load_view_config(cfg_path)
-                w2c = torch.from_numpy(cfg.world_to_camera).to(device=device, dtype=torch.float32)[None]
-                K = torch.from_numpy(cfg.K).to(device=device, dtype=torch.float32)[None]
-                rendered = model.render(
-                    None,
-                    w2c,
-                    K,
-                    (cfg.image_width, cfg.image_height),
-                    return_depth=True,
-                    return_mask=False,
-                    fg_only=True,
-                )
-                depth = rendered["depth"][0, ..., 0].detach().cpu().float().numpy().astype(np.float32)
-                acc_tensor = rendered["acc"][0]
-                if acc_tensor.ndim == 3:
-                    acc_tensor = acc_tensor[..., 0]
-                acc = acc_tensor.detach().cpu().float().numpy().astype(np.float32)
-                if depth.shape != (cfg.image_height, cfg.image_width):
-                    raise ValueError(f"Rendered depth for {cfg.view_id} has unexpected shape {depth.shape}.")
-                if acc.shape != (cfg.image_height, cfg.image_width):
-                    raise ValueError(f"Rendered alpha for {cfg.view_id} has unexpected shape {acc.shape}.")
-                rendered_depths.append(depth)
-                rendered_accs.append(acc)
+    with torch.no_grad():
+        for cfg_path in view_config_paths:
+            cfg = load_view_config(cfg_path)
+            w2c = torch.from_numpy(cfg.world_to_camera).to(device=device, dtype=torch.float32)[None]
+            K = torch.from_numpy(cfg.K).to(device=device, dtype=torch.float32)[None]
+            rendered = model.render(
+                None,
+                w2c,
+                K,
+                (cfg.image_width, cfg.image_height),
+                return_depth=True,
+                return_mask=False,
+                fg_only=True,
+            )
+            depth = rendered["depth"][0, ..., 0].detach().cpu().float().numpy().astype(np.float32)
+            acc_tensor = rendered["acc"][0]
+            if acc_tensor.ndim == 3:
+                acc_tensor = acc_tensor[..., 0]
+            acc = acc_tensor.detach().cpu().float().numpy().astype(np.float32)
+            if depth.shape != (cfg.image_height, cfg.image_width):
+                raise ValueError(f"Rendered depth for {cfg.view_id} has unexpected shape {depth.shape}.")
+            if acc.shape != (cfg.image_height, cfg.image_width):
+                raise ValueError(f"Rendered alpha for {cfg.view_id} has unexpected shape {acc.shape}.")
+            rendered_depths.append(depth)
+            rendered_accs.append(acc)
     return fg_means, fg_scales, fg_quats, fg_opacities, rendered_depths, rendered_accs
 
 
@@ -171,11 +125,7 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
     latent = np.load(str(latent_path), allow_pickle=False)
     observations = np.load(str(observation_path), allow_pickle=False)
     obs_count = latent["obs_count_per_point"].astype(np.int32)
-    obs_sample_count = (
-        latent["obs_sample_count_per_point"].astype(np.int32)
-        if "obs_sample_count_per_point" in latent.files
-        else obs_count
-    )
+    obs_sample_count = latent["obs_sample_count_per_point"].astype(np.int32)
     gaussian_indices = latent["gaussian_indices"].astype(np.int32)
     stats.update(
         {
@@ -187,79 +137,33 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
             "obs_sample_count_p50": _json_float(np.percentile(obs_sample_count, 50)),
             "obs_sample_count_p90": _json_float(np.percentile(obs_sample_count, 90)),
             "gaussian_indices_contiguous": bool(np.array_equal(gaussian_indices, np.arange(gaussian_indices.shape[0], dtype=np.int32))),
-            "preserved_all_points": bool(np.asarray(observations["preserved_all_points"]).item())
-            if "preserved_all_points" in observations.files
-            else False,
-            "observation_sampling": str(np.asarray(observations["observation_sampling"]).item())
-            if "observation_sampling" in observations.files
-            else "gaussian-center",
+            "preserved_all_points": bool(np.asarray(observations["preserved_all_points"]).item()),
+            "pixel_candidate_method": str(np.asarray(observations["pixel_candidate_method"]).item()),
         }
     )
-    if "pixel_candidate_method" in observations.files:
-        stats["pixel_candidate_method"] = str(np.asarray(observations["pixel_candidate_method"]).item())
-    if "gaussian_candidate_method" in observations.files:
-        stats["gaussian_candidate_method"] = str(np.asarray(observations["gaussian_candidate_method"]).item())
-    if "obs_contribution_weight" in observations.files:
-        contribution_weight = observations["obs_contribution_weight"].astype(np.float32)
-        contribution_score = observations["obs_contribution_score"].astype(np.float32)
-        contribution_sum = observations["obs_contribution_sum"].astype(np.float32)
-        stats.update(
-            {
-                "contribution_weight_p50": _json_float(np.percentile(contribution_weight, 50)),
-                "contribution_weight_p90": _json_float(np.percentile(contribution_weight, 90)),
-                "contribution_weight_max": _json_float(contribution_weight.max()),
-                "contribution_score_p50": _json_float(np.percentile(contribution_score, 50)),
-                "contribution_score_p90": _json_float(np.percentile(contribution_score, 90)),
-                "contribution_score_max": _json_float(contribution_score.max()),
-                "contribution_sum_p50": _json_float(np.percentile(contribution_sum, 50)),
-                "contribution_sum_p90": _json_float(np.percentile(contribution_sum, 90)),
-                "contribution_sum_max": _json_float(contribution_sum.max()),
-            }
-        )
-    if "modal_rigid_edge_count" in latent.files:
-        modal_rigid_degree = latent["modal_rigid_degree"].astype(np.int32)
-        modal_rigid_residual = latent["modal_rigid_residual"].astype(np.float32)
-        stats.update(
-            {
-                "modal_rigid_edge_count": int(np.asarray(latent["modal_rigid_edge_count"]).item()),
-                "modal_rigid_degree_p50": _json_float(np.percentile(modal_rigid_degree, 50)),
-                "modal_rigid_degree_p90": _json_float(np.percentile(modal_rigid_degree, 90)),
-                "modal_rigid_degree_max": int(modal_rigid_degree.max()) if modal_rigid_degree.size else 0,
-                "modal_rigid_residual_median": _json_float(np.median(modal_rigid_residual)),
-                "modal_rigid_residual_p90": _json_float(np.percentile(modal_rigid_residual, 90)),
-            }
-        )
-    if "modal_fill_enabled" in latent.files and bool(np.asarray(latent["modal_fill_enabled"]).item()):
-        modal_fill_degree = latent["modal_fill_degree"].astype(np.int32)
-        modal_fill_target_mask = latent["modal_fill_target_mask"].astype(bool)
-        modal_fill_connected = latent["modal_fill_connected_to_anchor"].astype(bool)
-        target_degree = modal_fill_degree[modal_fill_target_mask]
-        stats.update(
-            {
-                "modal_fill_anchor_count": int(np.asarray(latent["modal_fill_anchor_count"]).item()),
-                "modal_fill_target_count": int(np.asarray(latent["modal_fill_target_count"]).item()),
-                "modal_fill_filled_count": int(np.asarray(latent["modal_fill_filled_count"]).item()),
-                "modal_fill_unfilled_count": int(np.asarray(latent["modal_fill_unfilled_count"]).item()),
-                "modal_fill_auto_radius": _json_float(np.asarray(latent["modal_fill_auto_radius"]).item()),
-                "modal_fill_degree_p50": _json_float(np.percentile(target_degree, 50)) if target_degree.size else 0.0,
-                "modal_fill_degree_p90": _json_float(np.percentile(target_degree, 90)) if target_degree.size else 0.0,
-                "modal_fill_degree_max": int(target_degree.max()) if target_degree.size else 0,
-                "modal_fill_connected_fraction": _json_float(
-                    float((modal_fill_target_mask & modal_fill_connected).sum()) / max(int(modal_fill_target_mask.sum()), 1)
-                ),
-            }
-        )
+    contribution_weight = observations["obs_contribution_weight"].astype(np.float32)
+    contribution_score = observations["obs_contribution_score"].astype(np.float32)
+    contribution_sum = observations["obs_contribution_sum"].astype(np.float32)
+    stats.update(
+        {
+            "contribution_weight_p50": _json_float(np.percentile(contribution_weight, 50)),
+            "contribution_weight_p90": _json_float(np.percentile(contribution_weight, 90)),
+            "contribution_weight_max": _json_float(contribution_weight.max()),
+            "contribution_score_p50": _json_float(np.percentile(contribution_score, 50)),
+            "contribution_score_p90": _json_float(np.percentile(contribution_score, 90)),
+            "contribution_score_max": _json_float(contribution_score.max()),
+            "contribution_sum_p50": _json_float(np.percentile(contribution_sum, 50)),
+            "contribution_sum_p90": _json_float(np.percentile(contribution_sum, 90)),
+            "contribution_sum_max": _json_float(contribution_sum.max()),
+        }
+    )
     return stats
 
 
 def _print_observation_sanity(obs_path: Path, num_fg: int) -> None:
     observations = np.load(str(obs_path), allow_pickle=False)
     obs_count = observations["obs_count_per_point"].astype(np.int32)
-    obs_sample_count = (
-        observations["obs_sample_count_per_point"].astype(np.int32)
-        if "obs_sample_count_per_point" in observations.files
-        else obs_count
-    )
+    obs_sample_count = observations["obs_sample_count_per_point"].astype(np.int32)
     view_ids = observations["view_ids"].astype(str)
     obs_view_index = observations["obs_view_index"].astype(np.int32)
     per_view = np.bincount(obs_view_index, minlength=view_ids.shape[0])
@@ -279,37 +183,21 @@ def _print_observation_sanity(obs_path: Path, num_fg: int) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
-    validate_solver_args(args)
     view_configs = list(args.view_config)
     modal_npzs = list(args.modal_npz)
     if len(view_configs) != len(modal_npzs):
         raise ValueError("--view-config and --modal-npz must be supplied the same number of times.")
-    if float(args.outlier_frac) != 0.0:
-        raise ValueError("solve-gaussian-modes preserves foreground Gaussian order and requires --outlier-frac 0.0")
-
-    if args.observation_sampling in {"pixel-candidates", "gaussian-center-contribution"}:
-        (
-            fg_means,
-            fg_scales,
-            fg_quats,
-            fg_opacities,
-            rendered_depths,
-            rendered_accs,
-        ) = _load_fg_contribution_inputs_from_checkpoint(
-            args.input_ckpt,
-            view_configs,
-            render_views=args.observation_sampling == "pixel-candidates",
-        )
-        if args.observation_sampling == "gaussian-center-contribution":
-            rendered_depths = None
-            rendered_accs = None
-    else:
-        fg_means = _load_fg_means_from_checkpoint(args.input_ckpt)
-        fg_scales = None
-        fg_quats = None
-        fg_opacities = None
-        rendered_depths = None
-        rendered_accs = None
+    (
+        fg_means,
+        fg_scales,
+        fg_quats,
+        fg_opacities,
+        rendered_depths,
+        rendered_accs,
+    ) = _load_fg_pixel_candidate_inputs_from_checkpoint(
+        args.input_ckpt,
+        view_configs,
+    )
     gaussian_indices = np.arange(fg_means.shape[0], dtype=np.int32)
     freqs_per_view = _load_modal_freqs(modal_npzs)
     mode_indices = _parse_mode_indices(args.mode_indices, int(freqs_per_view[0].shape[0]))
@@ -336,13 +224,6 @@ def run(args: argparse.Namespace) -> None:
             out_path=obs_path,
             mode_index=mode_index,
             mask_erode_iters=args.mask_erode_iters,
-            zbuffer_radius=args.zbuffer_radius,
-            zbuffer_mode=args.zbuffer_mode,
-            zbuffer_soft_sigma=args.zbuffer_soft_sigma,
-            zbuffer_soft_min_weight=args.zbuffer_soft_min_weight,
-            front_percentile=args.front_percentile,
-            zbuffer_tau=args.zbuffer_tau,
-            min_zbuffer_samples=args.min_zbuffer_samples,
             freq_tolerance_hz=args.freq_tolerance_hz,
             view_frequency_weighting=args.view_frequency_weighting,
             snr_band_hz=args.snr_band_hz,
@@ -359,7 +240,6 @@ def run(args: argparse.Namespace) -> None:
                 "point_type": np.array("foreground_gaussian_center"),
                 "source_checkpoint": np.array(str(args.input_ckpt)),
             },
-            observation_sampling=args.observation_sampling,
             pixel_sample_stride=args.pixel_sample_stride,
             pixel_candidate_k=args.pixel_candidate_k,
             pixel_preselect_k=args.pixel_preselect_k,
@@ -367,10 +247,6 @@ def run(args: argparse.Namespace) -> None:
             pixel_min_contribution=args.pixel_min_contribution,
             pixel_min_mode_amp_percentile=args.pixel_min_mode_amp_percentile,
             pixel_max_samples_per_view=args.pixel_max_samples_per_view,
-            gaussian_contribution_radius=args.gaussian_contribution_radius,
-            gaussian_contribution_min_share=args.gaussian_contribution_min_share,
-            gaussian_contribution_min_score=args.gaussian_contribution_min_score,
-            gaussian_contribution_cov_eps_px=args.gaussian_contribution_cov_eps_px,
             gaussian_scales=fg_scales,
             gaussian_quats=fg_quats,
             gaussian_opacities=fg_opacities,
@@ -382,28 +258,9 @@ def run(args: argparse.Namespace) -> None:
             observations_path=obs_path,
             out_path=latent_path,
             vis_dir=mode_vis_dir,
-            **solver_kwargs(args),
+            **staged_solver_kwargs(args),
         )
         latent_stats = _gaussian_latent_stats(latent_path, obs_path, fg_means.shape[0])
-        if args.solver == "legacy-als" and float(args.modal_rigid_lambda) > 0:
-            print(
-                "Modal rigidity: "
-                f"edges={latent_stats['modal_rigid_edge_count']}, "
-                f"degree p50/p90/max={latent_stats['modal_rigid_degree_p50']:.0f}/"
-                f"{latent_stats['modal_rigid_degree_p90']:.0f}/{latent_stats['modal_rigid_degree_max']}, "
-                f"residual median/p90={latent_stats['modal_rigid_residual_median']:.3g}/"
-                f"{latent_stats['modal_rigid_residual_p90']:.3g}"
-            )
-        if args.solver == "legacy-als" and bool(args.modal_fill_unobserved):
-            print(
-                "Modal fill: "
-                f"anchors={latent_stats['modal_fill_anchor_count']}, "
-                f"targets={latent_stats['modal_fill_target_count']}, "
-                f"filled={latent_stats['modal_fill_filled_count']}, "
-                f"unfilled={latent_stats['modal_fill_unfilled_count']}, "
-                f"degree p50/p90/max={latent_stats['modal_fill_degree_p50']:.0f}/"
-                f"{latent_stats['modal_fill_degree_p90']:.0f}/{latent_stats['modal_fill_degree_max']}"
-            )
         freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
         modes.append(
             {
@@ -428,9 +285,7 @@ def run(args: argparse.Namespace) -> None:
         "source_modal_npzs": modal_npzs,
         "mode_indices": mode_indices,
         "parameters": {
-            "legacy_solver_parameters_active": bool(args.solver == "legacy-als"),
             "mask_erode_iters": int(args.mask_erode_iters),
-            "observation_sampling": str(args.observation_sampling),
             "pixel_sample_stride": int(args.pixel_sample_stride),
             "pixel_candidate_k": int(args.pixel_candidate_k),
             "pixel_preselect_k": int(args.pixel_preselect_k),
@@ -438,17 +293,6 @@ def run(args: argparse.Namespace) -> None:
             "pixel_min_contribution": float(args.pixel_min_contribution),
             "pixel_min_mode_amp_percentile": float(args.pixel_min_mode_amp_percentile),
             "pixel_max_samples_per_view": int(args.pixel_max_samples_per_view),
-            "gaussian_contribution_radius": int(args.gaussian_contribution_radius),
-            "gaussian_contribution_min_share": float(args.gaussian_contribution_min_share),
-            "gaussian_contribution_min_score": float(args.gaussian_contribution_min_score),
-            "gaussian_contribution_cov_eps_px": float(args.gaussian_contribution_cov_eps_px),
-            "zbuffer_radius": int(args.zbuffer_radius),
-            "zbuffer_mode": str(args.zbuffer_mode),
-            "zbuffer_soft_sigma": float(args.zbuffer_soft_sigma),
-            "zbuffer_soft_min_weight": float(args.zbuffer_soft_min_weight),
-            "front_percentile": float(args.front_percentile),
-            "zbuffer_tau": float(args.zbuffer_tau),
-            "min_zbuffer_samples": int(args.min_zbuffer_samples),
             "view_frequency_weighting": str(args.view_frequency_weighting),
             "snr_band_hz": float(args.snr_band_hz),
             "snr_exclude_hz": float(args.snr_exclude_hz),
@@ -459,28 +303,6 @@ def run(args: argparse.Namespace) -> None:
             "depth_weight_min": float(args.depth_weight_min),
             "depth_weight_reference_percentile": float(args.depth_weight_reference_percentile),
             "freq_tolerance_hz": float(args.freq_tolerance_hz),
-            "iterations": int(args.iterations),
-            "ridge_mu": float(args.ridge_mu),
-            "outlier_frac": float(args.outlier_frac),
-            "single_view_smooth_lambda": float(args.single_view_smooth_lambda),
-            "single_view_smooth_k": int(args.single_view_smooth_k),
-            "single_view_anchor_min_observations": int(args.single_view_anchor_min_observations),
-            "graph_smooth_lambda": float(args.graph_smooth_lambda),
-            "graph_smooth_k": int(args.graph_smooth_k),
-            "graph_auto_radius_scale": float(args.graph_auto_radius_scale),
-            "graph_min_shared_views": int(args.graph_min_shared_views),
-            "modal_rigid_lambda": float(args.modal_rigid_lambda),
-            "modal_rigid_k": int(args.modal_rigid_k),
-            "modal_rigid_auto_radius_scale": float(args.modal_rigid_auto_radius_scale),
-            "modal_rigid_min_shared_views": int(args.modal_rigid_min_shared_views),
-            "modal_fill_unobserved": bool(args.modal_fill_unobserved),
-            "modal_fill_k": int(args.modal_fill_k),
-            "modal_fill_auto_radius_scale": float(args.modal_fill_auto_radius_scale),
-            "modal_fill_anchor_min_observations": int(args.modal_fill_anchor_min_observations),
-            "modal_fill_ridge_mu": float(args.modal_fill_ridge_mu),
-            "obs_count_weight_1": float(args.obs_count_weight_1),
-            "obs_count_weight_2": float(args.obs_count_weight_2),
-            "obs_count_weight_3plus": float(args.obs_count_weight_3plus),
             "alpha_model": "per_view_per_mode",
             "alpha_reference_view_index": 0,
             **staged_solver_manifest_parameters(args),
