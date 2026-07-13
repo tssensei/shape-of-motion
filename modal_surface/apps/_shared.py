@@ -101,12 +101,6 @@ def _latent_stats(
         "point_residual_median": _finite_percentile(point_residual, 50),
         "point_residual_p90": _finite_percentile(point_residual, 90),
         "observations_per_view": observations["observations_per_view"].astype(int).tolist(),
-        "source_mask_candidate_count": int(np.asarray(observations["source_mask_candidate_count"]).item())
-        if "source_mask_candidate_count" in observations.files
-        else None,
-        "source_mask_kept_count": int(np.asarray(observations["source_mask_kept_count"]).item())
-        if "source_mask_kept_count" in observations.files
-        else None,
         "solver_method": str(np.asarray(latent["solver_method"]).item()),
         "alpha_identifiable_count": int(latent["alpha_identifiable_mask"].astype(bool).sum()),
         "alpha_optimizer_success": bool(np.asarray(latent["alpha_optimizer_success"]).item()),

@@ -13,17 +13,9 @@ class _CommandSpec(NamedTuple):
 
 
 COMMANDS: dict[str, _CommandSpec] = {
-    "match-carrier-views": _CommandSpec(
-        module="modal_surface.apps.match_carrier_views",
-        help="Build an N-view observation graph from VGGT carrier points.",
-    ),
     "optimize-multi-view": _CommandSpec(
         module="modal_surface.apps.optimize_multi_view",
         help="Optimize latent 3D modal displacement from N-view observations.",
-    ),
-    "solve-carrier-modes": _CommandSpec(
-        module="modal_surface.apps.solve_carrier_modes",
-        help="Batch solve VGGT carrier modal fields for multiple mode indices.",
     ),
     "solve-gaussian-modes": _CommandSpec(
         module="modal_surface.apps.solve_gaussian_modes",
@@ -34,7 +26,7 @@ COMMANDS: dict[str, _CommandSpec] = {
 
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the canonical command-line parser for modal_surface."""
-    parser = argparse.ArgumentParser(description="VGGT-carrier latent 3D modal field tools.")
+    parser = argparse.ArgumentParser(description="Foreground-Gaussian latent 3D modal field tools.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     for command, spec in COMMANDS.items():

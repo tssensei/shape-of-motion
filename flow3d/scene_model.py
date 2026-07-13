@@ -286,37 +286,6 @@ class SceneModel(nn.Module):
         return int(self.modal_consistency_group_count.item()) > 0
 
     @torch.no_grad()
-    def set_modal_fields(
-        self,
-        modal_phi_real: Tensor,
-        modal_phi_imag: Tensor,
-        modal_freqs_hz: Tensor,
-    ):
-        if self.modal is None:
-            raise RuntimeError("set_modal_fields requires modal activations")
-        device = self.fg.params["means"].device
-        dtype = self.fg.params["means"].dtype
-        modal_phi_real = modal_phi_real.to(device=device, dtype=dtype)
-        modal_phi_imag = modal_phi_imag.to(device=device, dtype=dtype)
-        modal_freqs_hz = modal_freqs_hz.to(device=device, dtype=dtype)
-        if modal_phi_real.shape != modal_phi_imag.shape:
-            raise ValueError("modal phi real/imag tensors must have matching shapes")
-        expected_shape = (self.modal.num_modes, self.num_fg_gaussians, 3)
-        if tuple(modal_phi_real.shape) != expected_shape:
-            raise ValueError(
-                f"modal phi tensors must have shape {expected_shape}, "
-                f"got {tuple(modal_phi_real.shape)}"
-            )
-        if tuple(modal_freqs_hz.shape) != (self.modal.num_modes,):
-            raise ValueError(
-                f"modal_freqs_hz must have shape {(self.modal.num_modes,)}, "
-                f"got {tuple(modal_freqs_hz.shape)}"
-            )
-        self.modal_phi_real = modal_phi_real
-        self.modal_phi_imag = modal_phi_imag
-        self.modal_freqs_hz = modal_freqs_hz
-
-    @torch.no_grad()
     def set_modal_consistency_data(
         self,
         y_real: Tensor | None = None,

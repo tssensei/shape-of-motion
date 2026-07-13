@@ -17,10 +17,9 @@ Optionally, it can also export a VGGT carrier point cloud:
 
     vggt_points.npz
 
-The carrier point cloud is built directly from VGGT depth, intrinsics, and
-extrinsics. It is meant for the modal_surface carrier route, where visibility is
-handled by projecting this point cloud into each modal view with a robust
-z-buffer instead of using external depth maps.
+The optional point cloud is built directly from VGGT depth, intrinsics, and
+extrinsics. It can be used for visualization or Gaussian initialization; modal
+observations are solved directly on foreground Gaussians instead.
 
 Example:
 

@@ -37,9 +37,8 @@ from flow3d.init_utils import (
     init_trainable_poses,
 )
 from flow3d.modal_utils import (
-    interpolate_modal_modes_to_gaussians,
+    load_gaussian_modal_fields,
     load_modal_frame_map,
-    load_modal_modes,
     resolve_required_modal_paths,
 )
 from flow3d.params import CameraScales, GaussianParams, ModalActivations
@@ -89,9 +88,6 @@ class TrainConfig:
     modal_frame_map: str | None = None
     modal_carrier_points: str | None = None
     vggt_view_configs: tuple[str, ...] = ()
-    modal_knn: int = 8
-    modal_interp_power: float = 2.0
-    modal_interp_eps: float = 1e-6
     modal_warmup_epochs: int = 5
     modal_train_base_means: bool = False
     modal_stage1_data_dir: str | None = None
@@ -110,9 +106,6 @@ class TrainConfig:
     modal_stage2_train_bg_quats: bool = False
     modal_stage2_lr_fg_scales: float | None = None
     modal_stage2_lr_fg_quats: float | None = None
-    modal_refresh_every_epochs: int = 0
-    modal_refresh_transport_reg: float = 1e-4
-    modal_refresh_diagnostic_frames: int = 8
     modal_train_view_id: str | None = None
     modal_max_local_frames_per_view: int | None = None
     modal_consistency_target_view_id: str | None = None
@@ -209,13 +202,7 @@ def main(cfg: TrainConfig):
         modal_stage2_train_bg_quats=cfg.modal_stage2_train_bg_quats,
         modal_stage2_lr_fg_scales=cfg.modal_stage2_lr_fg_scales,
         modal_stage2_lr_fg_quats=cfg.modal_stage2_lr_fg_quats,
-        modal_refresh_every_epochs=cfg.modal_refresh_every_epochs,
-        modal_refresh_transport_reg=cfg.modal_refresh_transport_reg,
-        modal_refresh_diagnostic_frames=cfg.modal_refresh_diagnostic_frames,
         modal_manifest=cfg.modal_manifest,
-        modal_knn=cfg.modal_knn,
-        modal_interp_power=cfg.modal_interp_power,
-        modal_interp_eps=cfg.modal_interp_eps,
         modal_consistency_view_configs=cfg.modal_consistency_view_configs,
         modal_consistency_modal_npzs=cfg.modal_consistency_modal_npzs,
         modal_consistency_freq_tolerance_hz=cfg.modal_consistency_freq_tolerance_hz,
@@ -366,6 +353,7 @@ def initialize_and_checkpoint_model(
     modal_phi_real = None
     modal_phi_imag = None
     modal_freqs_hz = None
+    modal_obs_count_per_point = None
     modal_frame_view_indices = None
     modal_frame_local_indices = None
     modal_smooth_triplets = None
@@ -380,16 +368,15 @@ def initialize_and_checkpoint_model(
     modal_consistency_fps = 0.0
     if cfg.trajectory_type == "modal_activation":
         resolve_required_modal_paths(cfg.modal_manifest, cfg.modal_frame_map)
-        modal_modes = load_modal_modes(cfg.modal_manifest)
-        modal_phi_real, modal_phi_imag, modal_freqs_hz, _ = (
-            interpolate_modal_modes_to_gaussians(
-                fg_params.params["means"],
-                modal_modes,
-                cfg.modal_knn,
-                cfg.modal_interp_power,
-                cfg.modal_interp_eps,
-            )
+        modal_fields = load_gaussian_modal_fields(
+            cfg.modal_manifest,
+            fg_params.params["means"],
         )
+        modal_modes = modal_fields.modes
+        modal_phi_real = modal_fields.phi_real
+        modal_phi_imag = modal_fields.phi_imag
+        modal_freqs_hz = modal_fields.freqs_hz
+        modal_obs_count_per_point = modal_fields.obs_count_per_point
         frame_map = load_modal_frame_map(
             cfg.modal_frame_map,
             train_dataset,
@@ -471,6 +458,7 @@ def initialize_and_checkpoint_model(
         modal_phi_real=modal_phi_real,
         modal_phi_imag=modal_phi_imag,
         modal_freqs_hz=modal_freqs_hz,
+        modal_obs_count_per_point=modal_obs_count_per_point,
         modal_frame_view_indices=modal_frame_view_indices,
         modal_frame_local_indices=modal_frame_local_indices,
         modal_smooth_triplets=modal_smooth_triplets,
@@ -588,9 +576,6 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_train_view_id": cfg.modal_train_view_id,
         "modal_max_local_frames_per_view": cfg.modal_max_local_frames_per_view,
         "vggt_view_configs": cfg.vggt_view_configs,
-        "modal_knn": cfg.modal_knn,
-        "modal_interp_power": cfg.modal_interp_power,
-        "modal_interp_eps": cfg.modal_interp_eps,
         "modal_warmup_epochs": cfg.modal_warmup_epochs,
         "modal_train_base_means": cfg.modal_train_base_means,
         "modal_stage1": stage1_metadata,
@@ -610,9 +595,6 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_stage2_train_bg_quats": cfg.modal_stage2_train_bg_quats,
         "modal_stage2_lr_fg_scales": cfg.modal_stage2_lr_fg_scales,
         "modal_stage2_lr_fg_quats": cfg.modal_stage2_lr_fg_quats,
-        "modal_refresh_every_epochs": cfg.modal_refresh_every_epochs,
-        "modal_refresh_transport_reg": cfg.modal_refresh_transport_reg,
-        "modal_refresh_diagnostic_frames": cfg.modal_refresh_diagnostic_frames,
         "modal_consistency_target_view_id": cfg.modal_consistency_target_view_id,
         "modal_consistency_fps": cfg.modal_consistency_fps,
         "modal_consistency_view_configs": cfg.modal_consistency_view_configs,
@@ -999,12 +981,6 @@ def _make_modal_stage1_data_config(
 
 
 def _inject_vggt_static_view_config(cfg: TrainConfig):
-    if cfg.modal_refresh_every_epochs < 0:
-        raise ValueError("--modal-refresh-every-epochs must be non-negative")
-    if cfg.modal_refresh_transport_reg <= 0:
-        raise ValueError("--modal-refresh-transport-reg must be positive")
-    if cfg.modal_refresh_diagnostic_frames < 0:
-        raise ValueError("--modal-refresh-diagnostic-frames must be non-negative")
     if cfg.trajectory_type == "static":
         if cfg.modal_manifest is not None or cfg.modal_frame_map is not None:
             raise ValueError("static trajectory does not use modal training inputs")

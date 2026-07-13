@@ -41,7 +41,7 @@ class Camera:
 
 @dataclass(frozen=True)
 class ModalRuntimeData:
-    """Stacked latent modal fields sharing one carrier point set."""
+    """Stacked latent modal fields sharing one point set."""
 
     points: np.ndarray
     phi_modes: np.ndarray
@@ -358,12 +358,12 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
             if points.shape != ref_points.shape:
                 raise ValueError(
                     f"Manifest mode {entry['label']} has points_world shape {points.shape}, "
-                    f"expected {ref_points.shape}. Re-solve modes with one consistent carrier point set."
+                    f"expected {ref_points.shape}. Re-solve modes with one consistent point set."
                 )
             if not np.allclose(points, ref_points, rtol=1e-5, atol=1e-5):
                 raise ValueError(
                     f"Manifest mode {entry['label']} does not share the same points_world as the first mode. "
-                    "Davis-style modal superposition requires one common carrier point set."
+                    "Davis-style modal superposition requires one common point set."
                 )
             if obs_count_per_point is not None:
                 if "obs_count_per_point" not in arrays:

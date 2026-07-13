@@ -168,10 +168,3 @@ def bilinear_sample(image: np.ndarray, pixels_xy: np.ndarray) -> np.ndarray:
         + (1.0 - wx) * wy * v10
         + wx * wy * v11
     )
-
-
-def in_image_with_margin(pixels_xy: np.ndarray, width: int, height: int, margin: int = 1) -> np.ndarray:
-    """Return a mask for pixels that are safely inside an image boundary."""
-    x = pixels_xy[:, 0]
-    y = pixels_xy[:, 1]
-    return (x >= margin) & (x < width - 1 - margin) & (y >= margin) & (y < height - 1 - margin)

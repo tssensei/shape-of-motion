@@ -102,7 +102,6 @@ class AlphaConstraint:
 @dataclass
 class AlphaComponentSolve:
     alphas: np.ndarray
-    betas: np.ndarray
     consistency_residual: float
     singular_values: np.ndarray
     rank_ratio: float
@@ -122,7 +121,6 @@ class AlphaComponentSolve:
 @dataclass
 class AlphaSyncResult:
     alphas: np.ndarray
-    betas: np.ndarray
     identifiable_mask: np.ndarray
     component_index: np.ndarray
     structural_component_index: np.ndarray
@@ -254,18 +252,13 @@ def prepare_observations(data: Mapping[str, np.ndarray]) -> PreparedObservations
         if key in arrays and arrays[key].shape != (num_views,):
             raise ValueError(f"{key} must have shape ({num_views},).")
     for key in (
-        "point_source_view_mask",
-        "point_source_count",
-        "source_pixels_xy",
         "colors",
-        "carrier_point_indices",
         "gaussian_indices",
     ):
         if key in arrays and arrays[key].shape[:1] != (points.shape[0],):
             raise ValueError(f"{key} must have first dimension {points.shape[0]}.")
-    for key in ("gaussian_indices", "carrier_point_indices"):
-        if key in arrays and arrays[key].shape != (points.shape[0],):
-            raise ValueError(f"{key} must have shape ({points.shape[0]},).")
+    if "gaussian_indices" in arrays and arrays["gaussian_indices"].shape != (points.shape[0],):
+        raise ValueError(f"gaussian_indices must have shape ({points.shape[0]},).")
     if "colors" in arrays and arrays["colors"].shape != (points.shape[0], 3):
         raise ValueError(f"colors must have shape ({points.shape[0]},3).")
 
@@ -873,7 +866,6 @@ def _refine_alpha_component(
             log_gain_uncertainty[gain_bound_active] = np.inf
     return AlphaComponentSolve(
         alphas=alpha,
-        betas=beta,
         consistency_residual=consistency,
         singular_values=singular,
         rank_ratio=rank_ratio,
@@ -900,7 +892,6 @@ def solve_alpha_sync(
     config.validate()
     num_views = prepared.num_views
     alphas = np.ones((num_views,), dtype=np.complex128)
-    betas = np.ones((num_views,), dtype=np.complex128)
     identifiable = np.zeros((num_views,), dtype=bool)
     reasons = np.full((num_views,), "disconnected", dtype="<U32")
     phase_std = np.full((num_views,), np.inf, dtype=np.float64)
@@ -1032,7 +1023,6 @@ def solve_alpha_sync(
         gain_bound_active[candidate] = component.gain_bound_active_mask
         if numerically_identifiable:
             alphas[candidate] = component.alphas
-            betas[candidate] = component.betas
             identifiable[candidate] = True
             reasons[candidate] = "estimated"
             reasons[0] = "reference"
@@ -1087,7 +1077,6 @@ def solve_alpha_sync(
 
     return AlphaSyncResult(
         alphas=alphas.astype(np.complex64),
-        betas=betas.astype(np.complex64),
         identifiable_mask=identifiable,
         component_index=solved_components,
         structural_component_index=structural_components,
@@ -1279,11 +1268,7 @@ def _prediction_and_residuals(
 def _optional_output_fields(prepared: PreparedObservations) -> dict[str, np.ndarray]:
     fields: dict[str, np.ndarray] = {}
     for key in (
-        "point_source_view_mask",
-        "point_source_count",
-        "source_pixels_xy",
         "colors",
-        "carrier_point_indices",
         "gaussian_indices",
         "point_type",
         "source_checkpoint",
@@ -1301,6 +1286,7 @@ def optimize_multi_view_staged(
 ) -> Path:
     config = config or StagedSolverConfig()
     config.validate()
+    # copies every array from the open NPZ into a regular dictionary
     with np.load(str(observations_path), allow_pickle=False) as loaded:
         data = {key: loaded[key] for key in loaded.files}
     prepared = prepare_observations(data)

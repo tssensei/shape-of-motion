@@ -27,6 +27,15 @@ class ModalModeData:
 
 
 @dataclass(frozen=True)
+class GaussianModalFieldData:
+    modes: list[ModalModeData]
+    phi_real: torch.Tensor
+    phi_imag: torch.Tensor
+    freqs_hz: torch.Tensor
+    obs_count_per_point: torch.Tensor
+
+
+@dataclass(frozen=True)
 class ModalFrameMap:
     view_ids: list[str]
     frame_view_indices: torch.Tensor
@@ -101,70 +110,190 @@ def load_modal_modes(manifest_path: str) -> list[ModalModeData]:
     return modes
 
 
-def interpolate_modal_modes_to_gaussians(
+def load_gaussian_modal_fields(
+    manifest_path: str,
     gaussian_means: torch.Tensor,
-    modes: list[ModalModeData],
-    knn: int,
-    power: float,
-    eps: float,
-    chunk_size: int = 4096,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
-    if not modes:
-        raise ValueError("Cannot interpolate empty modal mode list")
-    if knn <= 0:
-        raise ValueError(f"modal knn must be positive, got {knn}")
-    if power <= 0:
-        raise ValueError(f"modal interpolation power must be positive, got {power}")
-    if eps <= 0:
-        raise ValueError(f"modal interpolation eps must be positive, got {eps}")
+) -> GaussianModalFieldData:
+    manifest = Path(manifest_path)
+    with manifest.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if int(payload.get("version", -1)) != 1:
+        raise ValueError(f"{manifest_path} must be a version 1 modal manifest")
+    if payload.get("point_type") != "foreground_gaussian_center":
+        raise ValueError(
+            f"{manifest_path} point_type={payload.get('point_type')!r}; "
+            "expected foreground_gaussian_center"
+        )
+    source_checkpoint = payload.get("source_checkpoint")
+    if not isinstance(source_checkpoint, str) or not source_checkpoint:
+        raise ValueError(f"{manifest_path} is missing source_checkpoint")
+    modes_payload = payload.get("modes")
+    if not isinstance(modes_payload, list) or not modes_payload:
+        raise ValueError(f"{manifest_path} does not contain non-empty modes list")
 
     gaussian_means = gaussian_means.detach()
+    gaussian_points = gaussian_means.cpu().numpy().astype(np.float32)
+    if gaussian_points.ndim != 2 or gaussian_points.shape[1] != 3:
+        raise ValueError(
+            "foreground Gaussian means must have shape (N, 3), "
+            f"got {gaussian_points.shape}"
+        )
+    if not np.isfinite(gaussian_points).all():
+        raise ValueError("foreground Gaussian means must be finite")
+    num_gaussians = gaussian_points.shape[0]
+    expected_indices = np.arange(num_gaussians, dtype=np.int64)
+    modes: list[ModalModeData] = []
+    phi_values: list[np.ndarray] = []
+    freqs_hz: list[float] = []
+    obs_counts: list[np.ndarray] = []
+
+    for mode_payload in modes_payload:
+        latent_rel = mode_payload.get("latent_path")
+        if not isinstance(latent_rel, str) or not latent_rel:
+            raise ValueError(f"Mode entry in {manifest_path} is missing latent_path")
+        latent_path = Path(latent_rel)
+        if not latent_path.is_absolute():
+            latent_path = manifest.parent / latent_path
+
+        with np.load(str(latent_path), allow_pickle=False) as latent:
+            required = {
+                "points_world",
+                "phi",
+                "gaussian_indices",
+                "freq_hz",
+                "mode_index",
+                "obs_count_per_point",
+                "point_type",
+                "source_checkpoint",
+            }
+            missing = sorted(required - set(latent.files))
+            if missing:
+                raise ValueError(f"{latent_path} missing required fields: {missing}")
+
+            point_type = np.asarray(latent["point_type"])
+            if point_type.shape != ():
+                raise ValueError(f"{latent_path} point_type must be a scalar string")
+            if str(point_type.item()) != "foreground_gaussian_center":
+                raise ValueError(
+                    f"{latent_path} point_type={str(point_type.item())!r}; "
+                    "expected foreground_gaussian_center"
+                )
+
+            latent_source_checkpoint = np.asarray(latent["source_checkpoint"])
+            if latent_source_checkpoint.shape != ():
+                raise ValueError(f"{latent_path} source_checkpoint must be a scalar string")
+            if str(latent_source_checkpoint.item()) != source_checkpoint:
+                raise ValueError(
+                    f"{latent_path} source_checkpoint does not match {manifest_path}"
+                )
+
+            points_world = latent["points_world"].astype(np.float32)
+            phi = latent["phi"]
+            gaussian_indices = latent["gaussian_indices"]
+            obs_count = latent["obs_count_per_point"]
+            freq = np.asarray(latent["freq_hz"])
+            mode_index = np.asarray(latent["mode_index"])
+
+        expected_point_shape = (num_gaussians, 3)
+        if points_world.shape != expected_point_shape:
+            raise ValueError(
+                f"{latent_path} points_world shape {points_world.shape} does not match "
+                f"foreground {expected_point_shape}"
+            )
+        if phi.shape != expected_point_shape:
+            raise ValueError(
+                f"{latent_path} phi shape {phi.shape} does not match foreground "
+                f"{expected_point_shape}"
+            )
+        if not np.iscomplexobj(phi):
+            raise ValueError(f"{latent_path} phi must be complex-valued")
+        if not np.isfinite(phi.real).all() or not np.isfinite(phi.imag).all():
+            raise ValueError(f"{latent_path} phi must be finite")
+        if gaussian_indices.shape != (num_gaussians,):
+            raise ValueError(
+                f"{latent_path} gaussian_indices shape {gaussian_indices.shape} does not "
+                f"match foreground {(num_gaussians,)}"
+            )
+        if not np.issubdtype(gaussian_indices.dtype, np.integer):
+            raise ValueError(f"{latent_path} gaussian_indices must be integer-valued")
+        if not np.array_equal(gaussian_indices, expected_indices):
+            raise ValueError(
+                f"{latent_path} gaussian_indices are not contiguous foreground indices"
+            )
+        if obs_count.shape != (num_gaussians,):
+            raise ValueError(
+                f"{latent_path} obs_count_per_point shape {obs_count.shape} does not "
+                f"match foreground {(num_gaussians,)}"
+            )
+        if not np.issubdtype(obs_count.dtype, np.integer):
+            raise ValueError(f"{latent_path} obs_count_per_point must be integer-valued")
+        if np.any(obs_count < 0):
+            raise ValueError(f"{latent_path} obs_count_per_point must be non-negative")
+        if (
+            freq.shape != ()
+            or not np.issubdtype(freq.dtype, np.number)
+            or np.iscomplexobj(freq)
+            or not np.isfinite(freq.item())
+        ):
+            raise ValueError(f"{latent_path} freq_hz must be a finite real scalar")
+        manifest_mode_index = mode_payload.get("mode_index")
+        if not isinstance(manifest_mode_index, int) or isinstance(
+            manifest_mode_index, bool
+        ):
+            raise ValueError(f"Mode entry in {manifest_path} has invalid mode_index")
+        if mode_index.shape != () or not np.issubdtype(mode_index.dtype, np.integer):
+            raise ValueError(f"{latent_path} mode_index must be an integer scalar")
+        if int(mode_index.item()) != manifest_mode_index:
+            raise ValueError(f"{latent_path} mode_index does not match {manifest_path}")
+        manifest_freq_hz = mode_payload.get("freq_hz")
+        if (
+            not isinstance(manifest_freq_hz, (int, float))
+            or isinstance(manifest_freq_hz, bool)
+            or not np.isfinite(manifest_freq_hz)
+        ):
+            raise ValueError(f"Mode entry in {manifest_path} has invalid freq_hz")
+        if not np.isclose(
+            float(freq.item()), float(manifest_freq_hz), rtol=1e-6, atol=1e-6
+        ):
+            raise ValueError(f"{latent_path} freq_hz does not match {manifest_path}")
+        if not np.isfinite(points_world).all():
+            raise ValueError(f"{latent_path} points_world must be finite")
+        max_position_delta = (
+            float(np.max(np.abs(points_world - gaussian_points)))
+            if num_gaussians > 0
+            else 0.0
+        )
+        if max_position_delta > 1e-5:
+            raise ValueError(
+                f"{latent_path} points_world differs from foreground Gaussian means by "
+                f"max {max_position_delta:.6g}, above 1e-05"
+            )
+
+        freq_hz = float(freq.item())
+        mode = ModalModeData(
+            mode_index=manifest_mode_index,
+            freq_hz=freq_hz,
+            latent_path=latent_path,
+            points_world=points_world,
+            phi=phi.astype(np.complex64),
+        )
+        modes.append(mode)
+        phi_values.append(mode.phi)
+        freqs_hz.append(freq_hz)
+        obs_counts.append(obs_count.astype(np.int64))
+
+    phi_all = np.stack(phi_values, axis=0)
     device = gaussian_means.device
     dtype = gaussian_means.dtype
-    num_modes = len(modes)
-    num_gaussians = gaussian_means.shape[0]
-    phi_real = gaussian_means.new_empty((num_modes, num_gaussians, 3))
-    phi_imag = gaussian_means.new_empty((num_modes, num_gaussians, 3))
-    nearest_dists = []
-
-    for mode_idx, mode in enumerate(modes):
-        points = torch.as_tensor(mode.points_world, device=device, dtype=dtype)
-        phi_r = torch.as_tensor(mode.phi.real, device=device, dtype=dtype)
-        phi_i = torch.as_tensor(mode.phi.imag, device=device, dtype=dtype)
-        k = min(knn, points.shape[0])
-
-        for start in range(0, num_gaussians, chunk_size):
-            end = min(start + chunk_size, num_gaussians)
-            means_chunk = gaussian_means[start:end]
-            dists = torch.cdist(means_chunk, points)
-            knn_dists, knn_indices = torch.topk(dists, k=k, largest=False)
-            weights = (knn_dists + eps).pow(-power)
-            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(eps)
-
-            phi_real[mode_idx, start:end] = (
-                phi_r[knn_indices] * weights[..., None]
-            ).sum(dim=1)
-            phi_imag[mode_idx, start:end] = (
-                phi_i[knn_indices] * weights[..., None]
-            ).sum(dim=1)
-            nearest_dists.append(knn_dists[:, 0].detach().cpu())
-
-    all_nearest = torch.cat(nearest_dists)
-    stats = {
-        "nearest_p50": float(torch.quantile(all_nearest, 0.50).item()),
-        "nearest_p90": float(torch.quantile(all_nearest, 0.90).item()),
-        "nearest_p95": float(torch.quantile(all_nearest, 0.95).item()),
-        "nearest_max": float(all_nearest.max().item()),
-    }
-    guru.info(
-        "Modal carrier-to-Gaussian nearest distance stats: "
-        f"p50={stats['nearest_p50']:.6g}, "
-        f"p90={stats['nearest_p90']:.6g}, "
-        f"p95={stats['nearest_p95']:.6g}, "
-        f"max={stats['nearest_max']:.6g}"
+    return GaussianModalFieldData(
+        modes=modes,
+        phi_real=torch.as_tensor(phi_all.real, device=device, dtype=dtype),
+        phi_imag=torch.as_tensor(phi_all.imag, device=device, dtype=dtype),
+        freqs_hz=torch.as_tensor(freqs_hz, device=device, dtype=dtype),
+        obs_count_per_point=torch.as_tensor(
+            np.stack(obs_counts, axis=0), device=device, dtype=torch.long
+        ),
     )
-    freqs_hz = torch.tensor([mode.freq_hz for mode in modes], device=device, dtype=dtype)
-    return phi_real, phi_imag, freqs_hz, stats
 
 
 def _modal_mask_from_npz(modal: Any, shape: tuple[int, int]) -> np.ndarray:

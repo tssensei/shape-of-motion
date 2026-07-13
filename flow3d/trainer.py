@@ -21,7 +21,6 @@ from flow3d.loss_utils import (
 )
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
 from flow3d.modal_utils import (
-    interpolate_modal_modes_to_gaussians,
     load_modal_consistency_data,
     load_modal_modes,
 )
@@ -60,14 +59,8 @@ class Trainer:
         modal_stage2_train_bg_quats: bool = False,
         modal_stage2_lr_fg_scales: float | None = None,
         modal_stage2_lr_fg_quats: float | None = None,
-        modal_refresh_every_epochs: int = 0,
-        modal_refresh_transport_reg: float = 1e-4,
-        modal_refresh_diagnostic_frames: int = 8,
         init_metadata: dict[str, Any] | None = None,
         modal_manifest: str | None = None,
-        modal_knn: int = 8,
-        modal_interp_power: float = 2.0,
-        modal_interp_eps: float = 1e-6,
         modal_consistency_view_configs: tuple[str, ...] = (),
         modal_consistency_modal_npzs: tuple[str, ...] = (),
         modal_consistency_freq_tolerance_hz: float = 0.1,
@@ -106,20 +99,8 @@ class Trainer:
         self.modal_stage2_train_bg_quats = modal_stage2_train_bg_quats
         self.modal_stage2_lr_fg_scales = modal_stage2_lr_fg_scales
         self.modal_stage2_lr_fg_quats = modal_stage2_lr_fg_quats
-        if modal_refresh_every_epochs < 0:
-            raise ValueError("modal_refresh_every_epochs must be non-negative")
-        if modal_refresh_transport_reg <= 0:
-            raise ValueError("modal_refresh_transport_reg must be positive")
-        if modal_refresh_diagnostic_frames < 0:
-            raise ValueError("modal_refresh_diagnostic_frames must be non-negative")
-        self.modal_refresh_every_epochs = modal_refresh_every_epochs
-        self.modal_refresh_transport_reg = modal_refresh_transport_reg
-        self.modal_refresh_diagnostic_frames = modal_refresh_diagnostic_frames
         self.init_metadata = init_metadata
         self.modal_manifest = modal_manifest
-        self.modal_knn = modal_knn
-        self.modal_interp_power = modal_interp_power
-        self.modal_interp_eps = modal_interp_eps
         self.modal_consistency_view_configs = modal_consistency_view_configs
         self.modal_consistency_modal_npzs = modal_consistency_modal_npzs
         self.modal_consistency_freq_tolerance_hz = modal_consistency_freq_tolerance_hz
@@ -130,8 +111,7 @@ class Trainer:
         self.modal_consistency_min_zbuffer_samples = (
             modal_consistency_min_zbuffer_samples
         )
-        self._modal_post_warmup_refreshed = False
-        self._last_modal_refresh_epoch: int | None = None
+        self._modal_consistency_cache_refreshed = False
 
         self.reset_opacity_every = (
             self.optim_cfg.reset_opacity_every_n_controls * self.optim_cfg.control_every
@@ -190,8 +170,7 @@ class Trainer:
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
-        self._refresh_modal_post_warmup_if_needed()
-        self._refresh_modal_periodic_if_needed()
+        self._refresh_modal_consistency_post_warmup_if_needed()
         self._apply_modal_trainability()
         self._apply_modal_stage2_lr_overrides()
 
@@ -247,161 +226,21 @@ class Trainer:
                 group["lr"] = float(lr)
 
     @torch.no_grad()
-    def _refresh_modal_post_warmup_if_needed(self):
+    def _refresh_modal_consistency_post_warmup_if_needed(self):
         if self.model.trajectory_type != "modal_activation":
             return
-        if self._modal_post_warmup_refreshed:
+        if self._modal_consistency_cache_refreshed:
             return
         if not self._modal_in_dynamic_stage():
             return
 
-        self._refresh_modal_fields_from_current_means(
-            reason="post_warmup",
-            transport_activations=True,
-        )
-        self._modal_post_warmup_refreshed = True
-        self._last_modal_refresh_epoch = self.epoch
-
-    @torch.no_grad()
-    def _refresh_modal_periodic_if_needed(self):
-        if self.model.trajectory_type != "modal_activation":
-            return
-        if not self._modal_in_dynamic_stage():
-            return
-        if not self._modal_post_warmup_refreshed:
-            return
-        if not self.modal_stage2_train_base_means:
-            return
-        if self.modal_refresh_every_epochs <= 0:
-            return
-        if self._last_modal_refresh_epoch is None:
-            self._last_modal_refresh_epoch = self.epoch
-            return
-        if self.epoch - self._last_modal_refresh_epoch < self.modal_refresh_every_epochs:
-            return
-
-        self._refresh_modal_fields_from_current_means(
-            reason="periodic",
-            transport_activations=True,
-        )
-        self._last_modal_refresh_epoch = self.epoch
-
-    @torch.no_grad()
-    def _refresh_modal_fields_from_current_means(
-        self,
-        reason: str,
-        transport_activations: bool,
-    ):
-        if self.modal_manifest is None:
-            raise ValueError("modal refresh requires modal_manifest")
-        if self.model.modal is None:
-            raise RuntimeError("modal refresh requires modal activations")
-
-        guru.info(
-            f"Refreshing modal fields ({reason}) from current Gaussian means"
-        )
-        old_phi_real = self.model.modal_phi_real.detach()
-        old_phi_imag = self.model.modal_phi_imag.detach()
-        modal_modes = load_modal_modes(self.modal_manifest)
-        modal_phi_real, modal_phi_imag, modal_freqs_hz, interp_stats = (
-            interpolate_modal_modes_to_gaussians(
-                self.model.fg.params["means"],
-                modal_modes,
-                self.modal_knn,
-                self.modal_interp_power,
-                self.modal_interp_eps,
-            )
-        )
-        transport_stats = {}
-        if transport_activations:
-            transport_stats = self._transport_modal_activations(
-                old_phi_real,
-                old_phi_imag,
-                modal_phi_real,
-                modal_phi_imag,
-            )
-        self.model.set_modal_fields(modal_phi_real, modal_phi_imag, modal_freqs_hz)
+        modal_modes = []
+        if self.modal_consistency_view_configs or self.modal_consistency_modal_npzs:
+            if self.modal_manifest is None:
+                raise ValueError("modal consistency refresh requires modal_manifest")
+            modal_modes = load_modal_modes(self.modal_manifest)
         self._refresh_modal_consistency_cache(modal_modes)
-        self._log_modal_refresh_stats(reason, interp_stats | transport_stats)
-
-    @staticmethod
-    def _modal_basis_matrix(phi_real: torch.Tensor, phi_imag: torch.Tensor) -> torch.Tensor:
-        if phi_real.shape != phi_imag.shape:
-            raise ValueError("modal basis real/imag tensors must have matching shapes")
-        if phi_real.ndim != 3 or phi_real.shape[-1] != 3:
-            raise ValueError("modal basis tensors must have shape (K, G, 3)")
-        real_cols = phi_real.permute(1, 2, 0).reshape(-1, phi_real.shape[0])
-        imag_cols = -phi_imag.permute(1, 2, 0).reshape(-1, phi_imag.shape[0])
-        return torch.cat([real_cols, imag_cols], dim=1)
-
-    @torch.no_grad()
-    def _transport_modal_activations(
-        self,
-        old_phi_real: torch.Tensor,
-        old_phi_imag: torch.Tensor,
-        new_phi_real: torch.Tensor,
-        new_phi_imag: torch.Tensor,
-    ) -> dict[str, float]:
-        if self.model.modal is None:
-            raise RuntimeError("activation transport requires modal activations")
-        old_basis = self._modal_basis_matrix(old_phi_real, old_phi_imag)
-        new_basis = self._modal_basis_matrix(new_phi_real, new_phi_imag)
-        if old_basis.shape != new_basis.shape:
-            raise ValueError("old/new modal bases must have matching shapes")
-
-        num_coeffs = old_basis.shape[1]
-        eye = torch.eye(num_coeffs, device=new_basis.device, dtype=new_basis.dtype)
-        reg_eye = self.modal_refresh_transport_reg * eye
-        lhs = new_basis.T @ new_basis + reg_eye
-        rhs = new_basis.T @ old_basis + reg_eye
-        transport = torch.linalg.solve(lhs, rhs)
-
-        activations = self.model.modal.params["activations"]
-        old_flat = torch.cat(
-            [activations[..., 0], activations[..., 1]], dim=-1
-        )
-        new_flat = old_flat @ transport.T
-        num_modes = self.model.modal.num_modes
-        new_activations = torch.stack(
-            [new_flat[..., :num_modes], new_flat[..., num_modes:]],
-            dim=-1,
-        )
-        activations.copy_(new_activations)
-
-        basis_residual = (
-            torch.linalg.norm(new_basis @ transport - old_basis)
-            / torch.linalg.norm(old_basis).clamp_min(1e-8)
-        )
-        matrix_delta = (
-            torch.linalg.norm(transport - eye)
-            / torch.linalg.norm(eye).clamp_min(1e-8)
-        )
-        activation_delta = (
-            torch.linalg.norm(new_flat - old_flat)
-            / torch.linalg.norm(old_flat).clamp_min(1e-8)
-        )
-        displacement_error = old_basis.new_zeros(())
-        num_diag = min(self.modal_refresh_diagnostic_frames, old_flat.shape[0])
-        if num_diag > 0:
-            diag_indices = torch.linspace(
-                0,
-                old_flat.shape[0] - 1,
-                steps=num_diag,
-                device=old_flat.device,
-            ).round().long().unique()
-            old_disp = old_flat[diag_indices] @ old_basis.T
-            new_disp = new_flat[diag_indices] @ new_basis.T
-            displacement_error = (
-                torch.linalg.norm(new_disp - old_disp)
-                / torch.linalg.norm(old_disp).clamp_min(1e-8)
-            )
-
-        return {
-            "basis_residual": float(basis_residual.item()),
-            "transport_matrix_delta": float(matrix_delta.item()),
-            "activation_delta": float(activation_delta.item()),
-            "displacement_preservation_error": float(displacement_error.item()),
-        }
+        self._modal_consistency_cache_refreshed = True
 
     @torch.no_grad()
     def _refresh_modal_consistency_cache(self, modal_modes):
@@ -450,12 +289,6 @@ class Trainer:
         else:
             self.model.set_modal_consistency_data()
 
-    def _log_modal_refresh_stats(self, reason: str, stats: dict[str, float]):
-        message = ", ".join(f"{key}={value:.6g}" for key, value in sorted(stats.items()))
-        guru.info(f"Modal refresh ({reason}) stats: {message}")
-        for key, value in stats.items():
-            self.writer.add_scalar(f"modal_refresh/{key}", value, self.global_step)
-
     def save_checkpoint(self, path: str):
         model_dict = self.model.state_dict()
         optimizer_dict = {k: v.state_dict() for k, v in self.optimizers.items()}
@@ -467,8 +300,6 @@ class Trainer:
             "global_step": self.global_step,
             "epoch": self.epoch,
             "init_metadata": self.init_metadata,
-            "modal_post_warmup_refreshed": self._modal_post_warmup_refreshed,
-            "last_modal_refresh_epoch": self._last_modal_refresh_epoch,
         }
         torch.save(ckpt, path)
         guru.info(f"Saved checkpoint at {self.global_step=} to {path}")
@@ -497,19 +328,6 @@ class Trainer:
             trainer.load_checkpoint_schedulers(ckpt["schedulers"])
         trainer.global_step = ckpt.get("global_step", 0)
         start_epoch = ckpt.get("epoch", 0)
-        default_refreshed = (
-            "optimizers" in ckpt
-            and model.trajectory_type == "modal_activation"
-            and start_epoch >= trainer.modal_warmup_epochs
-        )
-        trainer._modal_post_warmup_refreshed = ckpt.get(
-            "modal_post_warmup_refreshed",
-            default_refreshed,
-        )
-        trainer._last_modal_refresh_epoch = ckpt.get(
-            "last_modal_refresh_epoch",
-            start_epoch if trainer._modal_post_warmup_refreshed else None,
-        )
         trainer.set_epoch(start_epoch)
         return trainer, start_epoch
 

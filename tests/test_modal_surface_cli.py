@@ -10,9 +10,7 @@ from unittest import mock
 
 
 EXPECTED_COMMANDS = (
-    "match-carrier-views",
     "optimize-multi-view",
-    "solve-carrier-modes",
     "solve-gaussian-modes",
 )
 
@@ -35,26 +33,6 @@ class ModalSurfaceCliTests(unittest.TestCase):
         parser = cli.build_arg_parser()
         cases = (
             (
-                "match-carrier-views",
-                [
-                    "--carrier-points",
-                    "carrier.npz",
-                    "--view-config",
-                    "view.json",
-                    "--modal-npz",
-                    "modal.npz",
-                    "--out",
-                    "observations.npz",
-                    "--mode-index",
-                    "3",
-                ],
-                "modal_surface.apps.match_carrier_views",
-                {
-                    "mode_index": 3,
-                    "view_config": ["view.json"],
-                },
-            ),
-            (
                 "optimize-multi-view",
                 [
                     "--observations",
@@ -68,26 +46,6 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 {
                     "alpha_model": "phase",
                     "alpha_min_shared_points": 24,
-                },
-            ),
-            (
-                "solve-carrier-modes",
-                [
-                    "--carrier-points",
-                    "carrier.npz",
-                    "--view-config",
-                    "view.json",
-                    "--modal-npz",
-                    "modal.npz",
-                    "--out-dir",
-                    "modes",
-                    "--mode-indices",
-                    "1,3",
-                ],
-                "modal_surface.apps.solve_carrier_modes",
-                {
-                    "mode_indices": "1,3",
-                    "alpha_model": "phase",
                 },
             ),
             (
@@ -129,11 +87,7 @@ class ModalSurfaceCliTests(unittest.TestCase):
             if isinstance(action, argparse._SubParsersAction)
         )
 
-        for command in (
-            "match-carrier-views",
-            "solve-carrier-modes",
-            "solve-gaussian-modes",
-        ):
+        for command in ("solve-gaussian-modes",):
             with self.subTest(command=command):
                 option_strings = {
                     option
@@ -159,11 +113,7 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--view-weight-min",
         }
 
-        for command in (
-            "match-carrier-views",
-            "solve-carrier-modes",
-            "solve-gaussian-modes",
-        ):
+        for command in ("solve-gaussian-modes",):
             with self.subTest(command=command):
                 option_strings = {
                     option
@@ -187,11 +137,7 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--depth-weight-reference-percentile",
         }
 
-        for command in (
-            "match-carrier-views",
-            "solve-carrier-modes",
-            "solve-gaussian-modes",
-        ):
+        for command in ("solve-gaussian-modes",):
             with self.subTest(command=command):
                 option_strings = {
                     option
@@ -274,7 +220,7 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--obs-count-weight-3plus",
         }
 
-        for command in ("optimize-multi-view", "solve-carrier-modes", "solve-gaussian-modes"):
+        for command in ("optimize-multi-view", "solve-gaussian-modes"):
             with self.subTest(command=command):
                 option_strings = {
                     option
@@ -302,13 +248,6 @@ class ModalSurfaceCliTests(unittest.TestCase):
         self.assertEqual(args.command, "optimize-multi-view")
         self.assertEqual(args.observations, "observations.npz")
         self.assertEqual(args.out, "latent.npz")
-
-    def test_root_wrapper_reexports_the_package_cli(self) -> None:
-        cli = importlib.import_module("modal_surface.cli")
-        root_cli = importlib.import_module("run_modal_surface")
-
-        self.assertIs(root_cli.build_arg_parser, cli.build_arg_parser)
-        self.assertIs(root_cli.main, cli.main)
 
     def test_parser_and_non_gaussian_help_do_not_import_3dgs_runtime(self) -> None:
         blocked_modules = {

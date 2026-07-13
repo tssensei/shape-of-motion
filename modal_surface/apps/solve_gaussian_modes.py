@@ -19,7 +19,7 @@ from modal_surface.apps._shared import (
     _parse_mode_indices,
     _rel,
 )
-from modal_surface.carrier import build_points_observation_graph
+from modal_surface.gaussian_observations import build_gaussian_observation_graph
 from modal_surface.io import load_view_config
 from modal_surface.optimization_staged import optimize_multi_view_staged
 from modal_surface.solver_cli import (
@@ -212,8 +212,8 @@ def run(args: argparse.Namespace) -> None:
         obs_path = obs_dir / f"{mode_name}.npz"
         latent_path = latent_dir / f"{mode_name}.npz"
         mode_vis_dir = vis_dir / mode_name
-        print(f"Solving Gaussian carrier {mode_name}")
-        build_points_observation_graph(
+        print(f"Solving Gaussian mode {mode_name}")
+        build_gaussian_observation_graph(
             points_world=fg_means,
             view_config_paths=view_configs,
             modal_npz_paths=modal_npzs,

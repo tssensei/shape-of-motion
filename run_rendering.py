@@ -43,7 +43,7 @@ def main(cfg: RenderConfig):
         if binding_diag_path.exists():
             with binding_diag_path.open("r", encoding="utf-8") as f:
                 binding_diag = json.load(f)
-            modal_anchor_manifest = binding_diag.get("modal_manifest")
+            modal_anchor_manifest = binding_diag["gaussian_modal_manifest"]
 
     renderer = Renderer.init_from_checkpoint(
         ckpt_path,
