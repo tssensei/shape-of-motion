@@ -7,7 +7,8 @@ complex displacement field:
     X(t) = X0 + scale * Re(phi * exp(i * phase_t))
 
 With --latent-manifest, it loads all listed modal fields as a Davis-style modal
-basis and synthesizes motion through complex modal coordinates q_k(t):
+basis and synthesizes motion through complex modal coordinates q_k(t). Optional
+per-entry track_label values instead expose the fields as exclusive alternatives:
 
     X(t) = X0 + scale * Re(sum_k phi_k * q_k(t))
 """
@@ -47,6 +48,7 @@ class ModalRuntimeData:
     phi_modes: np.ndarray
     freqs_hz: np.ndarray
     labels: tuple[str, ...]
+    track_labels: tuple[str, ...] | None
     colors: np.ndarray | None
     obs_count_per_point: np.ndarray | None
     point_group: np.ndarray | None
@@ -287,12 +289,77 @@ def load_single_runtime_mode(path: Path, max_points: int) -> ModalRuntimeData:
         phi_modes=phi[None, :, :].astype(np.complex64, copy=False),
         freqs_hz=np.asarray([freq], dtype=np.float32),
         labels=(f"0: {freq:.6f} Hz",),
+        track_labels=None,
         colors=colors,
         obs_count_per_point=obs_count.astype(np.int32, copy=False) if obs_count is not None else None,
         point_group=point_group.astype(np.int32, copy=False) if point_group is not None else None,
         point_group_names=point_group_names,
         source=str(path),
     )
+
+
+def manifest_track_labels(entries: list[dict[str, Any]]) -> tuple[str, ...] | None:
+    """Validate optional exclusive-track labels and return them in mode order."""
+    has_track_label = ["track_label" in entry for entry in entries]
+    if any(has_track_label) and not all(has_track_label):
+        raise ValueError("Manifest modes must either all include track_label or none of them should.")
+    if not any(has_track_label):
+        return None
+
+    track_labels: list[str] = []
+    seen: set[str] = set()
+    for mode_i, entry in enumerate(entries):
+        value = entry["track_label"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Manifest mode entry {mode_i} track_label must be a non-empty string.")
+        label = value.strip()
+        if label in seen:
+            raise ValueError(f"Manifest track_label values must be unique; found duplicate {label!r}.")
+        seen.add(label)
+        track_labels.append(label)
+    return tuple(track_labels)
+
+
+def runtime_mode_mask(
+    enabled: np.ndarray,
+    track_labels: tuple[str, ...] | None,
+    selected_track: str | None,
+) -> np.ndarray:
+    """Return additive mode enables or the selected track's one-hot mask."""
+    enabled_array = np.asarray(enabled, dtype=bool)
+    if enabled_array.ndim != 1:
+        raise ValueError(f"enabled must have shape (K,), got {enabled_array.shape}.")
+    if track_labels is None:
+        return enabled_array.copy()
+    if len(track_labels) != enabled_array.shape[0]:
+        raise ValueError(
+            f"track_labels contains {len(track_labels)} labels for {enabled_array.shape[0]} modes."
+        )
+    if selected_track not in track_labels:
+        raise ValueError(f"Unknown track label: {selected_track!r}.")
+    active = np.zeros_like(enabled_array)
+    active[track_labels.index(selected_track)] = True
+    return active
+
+
+def reset_modal_runtime(runtime: dict[str, Any]) -> None:
+    """Reset modal time and coordinates without changing their allocation."""
+    runtime["time"] = 0.0
+    runtime["q"].fill(0.0)
+    runtime["qdot"].fill(0.0)
+
+
+def selected_track_phase_component(
+    track_labels: tuple[str, ...],
+    selected_track: str,
+    phase_component_options: tuple[str, ...],
+) -> str:
+    """Return the projected-u phase option belonging to the selected track."""
+    if selected_track not in track_labels:
+        raise ValueError(f"Unknown track label: {selected_track!r}.")
+    if len(phase_component_options) != 2 * len(track_labels):
+        raise ValueError("Track manifests require projected-u/v phase options for every track.")
+    return phase_component_options[2 * track_labels.index(selected_track)]
 
 
 def load_latent_manifest(path: Path) -> list[dict[str, Any]]:
@@ -323,12 +390,17 @@ def load_latent_manifest(path: Path) -> list[dict[str, Any]]:
         entry["label"] = label
         entry["latent_path"] = latent_path
         out.append(entry)
+    track_labels = manifest_track_labels(out)
+    if track_labels is not None:
+        for entry, track_label in zip(out, track_labels):
+            entry["track_label"] = track_label
     return out
 
 
 def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData:
-    """Load all manifest modes as one Davis-style modal basis."""
+    """Load manifest modes as an additive basis or exclusive track alternatives."""
     entries = load_latent_manifest(path)
+    track_labels = manifest_track_labels(entries)
     first: dict[str, np.ndarray] | None = None
     phi_list: list[np.ndarray] = []
     freqs: list[float] = []
@@ -411,6 +483,7 @@ def load_manifest_runtime_modes(path: Path, max_points: int) -> ModalRuntimeData
         phi_modes=phi_out,
         freqs_hz=np.asarray(freqs, dtype=np.float32),
         labels=tuple(labels),
+        track_labels=track_labels,
         colors=colors_out.astype(np.uint8, copy=False) if colors_out is not None else None,
         obs_count_per_point=obs_count_out.astype(np.int32, copy=False) if obs_count_out is not None else None,
         point_group=point_group_out.astype(np.int32, copy=False) if point_group_out is not None else None,
@@ -938,6 +1011,13 @@ def main() -> None:
         )
         drive_mode = server.gui.add_dropdown("Drive mode", ("oscillator", "free_decay"), initial_value=str(args.drive_mode))
         damping_slider = server.gui.add_slider("Damping", min=0.0, max=0.5, step=0.005, initial_value=float(args.damping))
+        if runtime_data.track_labels is not None:
+            track_dropdown = server.gui.add_dropdown(
+                "Track",
+                runtime_data.track_labels,
+                initial_value=runtime_data.track_labels[0],
+            )
+            gui_handles["track"] = track_dropdown
         color_options = ["rgb", "phase"] if state["latent_has_rgb"] else ["phase"]
         if state["obs_count_per_point"] is not None:
             color_options.append("obs_count")
@@ -976,25 +1056,27 @@ def main() -> None:
 
         max_mode_gain = max(float(args.max_mode_gain), float(args.mode_gain), 1e-6)
         for mode_i, label in enumerate(runtime_data.labels):
-            mode_handles.append(
-                {
-                    "enabled": server.gui.add_checkbox(f"Mode {mode_i} enabled {label}", True),
-                    "gain": server.gui.add_slider(
-                        f"Mode {mode_i} gain",
-                        min=0.0,
-                        max=max_mode_gain,
-                        step=max_mode_gain / 200.0,
-                        initial_value=float(args.mode_gain),
-                    ),
-                    "phase": server.gui.add_slider(
-                        f"Mode {mode_i} phase",
-                        min=-float(np.pi),
-                        max=float(np.pi),
-                        step=0.01,
-                        initial_value=0.0,
-                    ),
-                }
+            control_label = f"Mode {mode_i}"
+            handles = {}
+            if runtime_data.track_labels is None:
+                handles["enabled"] = server.gui.add_checkbox(f"{control_label} enabled {label}", True)
+            else:
+                control_label = f"Track {runtime_data.track_labels[mode_i]}"
+            handles["gain"] = server.gui.add_slider(
+                f"{control_label} gain",
+                min=0.0,
+                max=max_mode_gain,
+                step=max_mode_gain / 200.0,
+                initial_value=float(args.mode_gain),
             )
+            handles["phase"] = server.gui.add_slider(
+                f"{control_label} phase",
+                min=-float(np.pi),
+                max=float(np.pi),
+                step=0.01,
+                initial_value=0.0,
+            )
+            mode_handles.append(handles)
 
     def mode_control_arrays() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if runtime_data is None:
@@ -1003,7 +1085,13 @@ def main() -> None:
                 np.zeros(0, dtype=np.float64),
                 np.zeros(0, dtype=np.float64),
             )
-        enabled = np.asarray([bool(handles["enabled"].value) for handles in mode_handles], dtype=bool)
+        if runtime_data.track_labels is None:
+            enabled = np.asarray([bool(handles["enabled"].value) for handles in mode_handles], dtype=bool)
+            selected_track = None
+        else:
+            enabled = np.ones(len(mode_handles), dtype=bool)
+            selected_track = str(gui_handles["track"].value)
+        enabled = runtime_mode_mask(enabled, runtime_data.track_labels, selected_track)
         gain = np.asarray([float(handles["gain"].value) for handles in mode_handles], dtype=np.float64)
         phase = np.asarray([float(handles["phase"].value) for handles in mode_handles], dtype=np.float64)
         return enabled, gain, phase
@@ -1020,9 +1108,7 @@ def main() -> None:
     def reset_runtime_state(_) -> None:
         if runtime is None:
             return
-        runtime["time"] = 0.0
-        runtime["q"].fill(0.0)
-        runtime["qdot"].fill(0.0)
+        reset_modal_runtime(runtime)
         if gui_handles["drive_mode"].value == "oscillator":
             set_oscillator_state()
         redraw_points(float(gui_handles["point_size"].value))
@@ -1085,6 +1171,18 @@ def main() -> None:
             update_projected_phase_colors(phase_camera["wxyz"], phase_camera["position"], redraw=False)
         redraw_points(float(gui_handles["point_size"].value))
 
+    def update_track(event) -> None:
+        reset_runtime_state(event)
+        if runtime_data is None or runtime_data.track_labels is None:
+            return
+        selected_track = str(gui_handles["track"].value)
+        gui_handles["phase_component"].value = selected_track_phase_component(
+            runtime_data.track_labels,
+            selected_track,
+            phase_component_options,
+        )
+        update_phase_component(event)
+
     def update_phase_from_button(event) -> None:
         update_projected_phase_from_client(event.client, redraw=True)
 
@@ -1113,11 +1211,14 @@ def main() -> None:
             for handle in gui_handles["point_group_visibility"].values():
                 handle.on_update(update_display_filter)
         gui_handles["drive_mode"].on_update(reset_runtime_state)
+        if "track" in gui_handles:
+            gui_handles["track"].on_update(update_track)
         gui_handles["damping"].on_update(update_modal_controls)
         gui_handles["reset"].on_click(reset_runtime_state)
         gui_handles["impulse"].on_click(trigger_impulse)
         for handles in mode_handles:
-            handles["enabled"].on_update(update_modal_controls)
+            if "enabled" in handles:
+                handles["enabled"].on_update(update_modal_controls)
             handles["gain"].on_update(update_modal_controls)
             handles["phase"].on_update(update_modal_controls)
 
