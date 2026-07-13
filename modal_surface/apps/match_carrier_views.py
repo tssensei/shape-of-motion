@@ -20,15 +20,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
     parser.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
     parser.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local carrier depths for visibility.")
-    parser.add_argument("--view-frequency-weighting", choices=["none", "local-snr"], default="none", help="View-frequency reliability weighting method.")
-    parser.add_argument("--snr-band-hz", type=float, default=0.3, help="Half-width of the local spectrum band used for local-SNR noise estimation.")
-    parser.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
-    parser.add_argument("--snr-good", type=float, default=3.0, help="SNR treated as a clear frequency peak for view-frequency weighting.")
-    parser.add_argument("--view-weight-min", type=float, default=0.05, help="Minimum view-frequency reliability weight.")
-    parser.add_argument("--depth-weighting", choices=["none", "inverse-z"], default="none", help="Depth-based observation weighting method.")
-    parser.add_argument("--depth-weight-power", type=float, default=2.0, help="Power used by inverse-z depth weighting.")
-    parser.add_argument("--depth-weight-min", type=float, default=0.02, help="Minimum inverse-z depth weight.")
-    parser.add_argument("--depth-weight-reference-percentile", type=float, default=50.0, help="Per-view candidate-depth percentile used as inverse-z reference.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
 
 
@@ -47,14 +38,5 @@ def run(args: argparse.Namespace) -> None:
         zbuffer_tau=args.zbuffer_tau,
         min_zbuffer_samples=args.min_zbuffer_samples,
         freq_tolerance_hz=args.freq_tolerance_hz,
-        view_frequency_weighting=args.view_frequency_weighting,
-        snr_band_hz=args.snr_band_hz,
-        snr_exclude_hz=args.snr_exclude_hz,
-        snr_good=args.snr_good,
-        view_weight_min=args.view_weight_min,
-        depth_weighting=args.depth_weighting,
-        depth_weight_power=args.depth_weight_power,
-        depth_weight_min=args.depth_weight_min,
-        depth_weight_reference_percentile=args.depth_weight_reference_percentile,
     )
     print(f"Saved carrier-view observations -> {out}")

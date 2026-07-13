@@ -16,10 +16,10 @@ from typing import Any
 
 import numpy as np
 
-from modal_surface.optimization_multi import optimize_multi_view
+from modal_surface.optimization_staged import optimize_multi_view_staged
 from modal_surface.solver_cli import (
     add_staged_solver_arguments,
-    staged_solver_kwargs,
+    staged_solver_config,
     staged_solver_manifest_parameters,
 )
 
@@ -643,10 +643,10 @@ def main() -> None:
     )
 
     solved_path = out_dir / "latents" / "solved_staged.npz"
-    optimize_multi_view(
+    optimize_multi_view_staged(
         observations_path=obs_path,
         out_path=solved_path,
-        **staged_solver_kwargs(args),
+        config=staged_solver_config(args),
     )
     solved = _load_npz_dict(solved_path)
     overlay_points = np.concatenate([points, points], axis=0).astype(np.float32)

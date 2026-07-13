@@ -108,90 +108,6 @@ def _load_view_inputs(
     return configs, modals, np.asarray(freqs, dtype=np.float32), reference_freq_hz
 
 
-def _local_snr(
-    modal: dict[str, np.ndarray],
-    selected_freq_hz: float,
-    snr_band_hz: float,
-    snr_exclude_hz: float,
-) -> tuple[float, float, float, float]:
-    missing = [key for key in ("freqs_hz", "power_spectrum") if key not in modal]
-    if missing:
-        raise ValueError(f"local-snr weighting requires modal npz keys {missing}. Re-run run_modal_peak_pick.py export.")
-    freqs = np.asarray(modal["freqs_hz"], dtype=np.float64).reshape(-1)
-    power = np.asarray(modal["power_spectrum"], dtype=np.float64).reshape(-1)
-    if freqs.shape != power.shape or freqs.size == 0:
-        raise ValueError("freqs_hz and power_spectrum must be non-empty arrays with matching shape.")
-    finite = np.isfinite(freqs) & np.isfinite(power)
-    if not np.any(finite):
-        raise ValueError("freqs_hz/power_spectrum contain no finite entries.")
-    freq = float(selected_freq_hz)
-    finite_indices = np.where(finite)[0]
-    nearest_idx = int(finite_indices[np.argmin(np.abs(freqs[finite_indices] - freq))])
-    signal = float(power[nearest_idx])
-    bin_hz = float(freqs[nearest_idx])
-    noise_mask = (
-        finite
-        & (freqs >= freq - float(snr_band_hz))
-        & (freqs <= freq + float(snr_band_hz))
-        & (np.abs(freqs - freq) >= float(snr_exclude_hz))
-    )
-    if not np.any(noise_mask):
-        raise ValueError(
-            f"No frequency bins available for local SNR noise estimate around {freq:.6f} Hz. "
-            "Increase --snr-band-hz or decrease --snr-exclude-hz."
-        )
-    noise = float(np.median(power[noise_mask]))
-    snr = signal / max(noise, np.finfo(np.float64).eps)
-    return signal, noise, snr, bin_hz
-
-
-def _view_frequency_reliability(
-    modals: Sequence[dict[str, np.ndarray]],
-    view_freqs_hz: np.ndarray,
-    weighting: str,
-    snr_band_hz: float,
-    snr_exclude_hz: float,
-    snr_good: float,
-    view_weight_min: float,
-) -> dict[str, np.ndarray]:
-    if weighting not in {"none", "local-snr"}:
-        raise ValueError("view_frequency_weighting must be 'none' or 'local-snr'.")
-    if snr_band_hz <= 0:
-        raise ValueError("snr_band_hz must be positive.")
-    if snr_exclude_hz < 0:
-        raise ValueError("snr_exclude_hz must be non-negative.")
-    if snr_exclude_hz >= snr_band_hz:
-        raise ValueError("snr_exclude_hz must be smaller than snr_band_hz.")
-    if snr_good <= 1:
-        raise ValueError("snr_good must be greater than 1.")
-    if not (0.0 <= view_weight_min <= 1.0):
-        raise ValueError("view_weight_min must be in [0, 1].")
-
-    num_views = len(modals)
-    weights = np.ones((num_views,), dtype=np.float32)
-    snr = np.full((num_views,), np.nan, dtype=np.float32)
-    signal = np.full((num_views,), np.nan, dtype=np.float32)
-    noise = np.full((num_views,), np.nan, dtype=np.float32)
-    bin_hz = np.full((num_views,), np.nan, dtype=np.float32)
-    if weighting == "local-snr":
-        for view_idx, (modal, selected_freq_hz) in enumerate(zip(modals, view_freqs_hz)):
-            sig, noi, ratio, freq_bin = _local_snr(modal, float(selected_freq_hz), snr_band_hz, snr_exclude_hz)
-            signal[view_idx] = np.float32(sig)
-            noise[view_idx] = np.float32(noi)
-            snr[view_idx] = np.float32(ratio)
-            bin_hz[view_idx] = np.float32(freq_bin)
-        q = np.maximum(snr.astype(np.float64) - 1.0, 0.0)
-        denom = max(float(np.max(q)), float(snr_good) - 1.0)
-        weights = np.clip(q / max(denom, np.finfo(np.float64).eps), float(view_weight_min), 1.0).astype(np.float32)
-    return {
-        "weights": weights,
-        "snr": snr,
-        "signal": signal,
-        "noise": noise,
-        "bin_hz": bin_hz,
-    }
-
-
 def _candidate_mask(
     pixels_xy: np.ndarray,
     z: np.ndarray,
@@ -375,26 +291,19 @@ def _append_view_pixel_candidate_observations(
     obs_y: list[list[complex]],
     obs_j: list[np.ndarray],
     obs_confidence: list[float],
-    obs_depth_weight: list[float],
     obs_camera_z: list[float],
     obs_contribution_weight: list[float],
     obs_contribution_score: list[float],
     obs_contribution_sum: list[float],
     obs_surface_pixels: list[list[float]],
     obs_surface_camera_z: list[float],
-    view_confidence: float,
-    depth_weighting: str,
-    depth_weight_power: float,
-    depth_weight_min: float,
-    depth_weight_reference_percentile: float,
     pixel_sample_stride: int,
     pixel_candidate_k: int,
     pixel_preselect_k: int,
-    pixel_min_mode_amp_percentile: float,
     pixel_max_samples_per_view: int,
     pixel_render_acc_min: float,
     pixel_min_contribution: float,
-) -> tuple[int, float]:
+) -> int:
     expected_shape = (cfg.image_height, cfg.image_width)
     mask = load_mask(cfg.mask_path, expected_shape)
     valid_mask = erode_mask(mask, mask_erode_iters)
@@ -403,28 +312,23 @@ def _append_view_pixel_candidate_observations(
     valid_acc = np.isfinite(rendered_acc) & (rendered_acc >= float(pixel_render_acc_min))
     visible_mask = valid_mask & valid_depth & valid_acc
     if not np.any(visible_mask):
-        return 0, float("nan")
+        return 0
 
     mode_u = modal["mode_u"][mode_index].astype(np.complex64)
     mode_v = modal["mode_v"][mode_index].astype(np.complex64)
-    mode_amp = np.sqrt(np.abs(mode_u) ** 2 + np.abs(mode_v) ** 2).astype(np.float32)
-    valid_amp = mode_amp[visible_mask]
-    if valid_amp.size == 0:
-        return 0, float("nan")
-    amp_threshold = float(np.percentile(valid_amp, pixel_min_mode_amp_percentile))
 
     ys = np.arange(1, cfg.image_height - 1, int(pixel_sample_stride), dtype=np.int32)
     xs = np.arange(1, cfg.image_width - 1, int(pixel_sample_stride), dtype=np.int32)
     if ys.size == 0 or xs.size == 0:
-        return 0, float("nan")
+        return 0
     yy, xx = np.meshgrid(ys, xs, indexing="ij")
     flat_x = xx.reshape(-1)
     flat_y = yy.reshape(-1)
-    keep = visible_mask[flat_y, flat_x] & (mode_amp[flat_y, flat_x] >= amp_threshold)
+    keep = visible_mask[flat_y, flat_x]
     flat_x = flat_x[keep]
     flat_y = flat_y[keep]
     if flat_x.size == 0:
-        return 0, float("nan")
+        return 0
     if flat_x.size > int(pixel_max_samples_per_view):
         selected = np.linspace(0, flat_x.size - 1, int(pixel_max_samples_per_view)).astype(np.int64)
         flat_x = flat_x[selected]
@@ -435,14 +339,13 @@ def _append_view_pixel_candidate_observations(
     surface_points = unproject_pixels(surface_pixels, depths, cfg.K, cfg.world_to_camera)
     finite_surface = np.all(np.isfinite(surface_points), axis=1) & np.isfinite(depths) & (depths > 0)
     if not np.any(finite_surface):
-        return 0, float("nan")
+        return 0
     flat_x = flat_x[finite_surface]
     flat_y = flat_y[finite_surface]
     depths = depths[finite_surface]
     surface_pixels = surface_pixels[finite_surface]
     surface_points = surface_points[finite_surface]
 
-    z_reference = float(np.percentile(depths, depth_weight_reference_percentile))
     cKDTree = _require_scipy_kdtree()
     preselect_k = min(int(pixel_preselect_k), points_world.shape[0])
     tree = cKDTree(points_world.astype(np.float64))
@@ -491,20 +394,12 @@ def _append_view_pixel_candidate_observations(
             zip(candidate_indices.tolist(), scores.tolist(), weights.tolist())
         ):
             candidate_z = float(point_camera_z[int(point_idx)])
-            depth_weight = _depth_weight(
-                candidate_z,
-                z_reference,
-                depth_weighting,
-                depth_weight_power,
-                depth_weight_min,
-            )
             obs_point_indices.append(int(point_idx))
             obs_view_indices.append(view_index)
             obs_pixels.append([float(x), float(y)])
             obs_y.append([y_u, y_v])
             obs_j.append(jacobians[row_idx].astype(np.float32))
-            obs_confidence.append(float(view_confidence) * depth_weight * float(contribution_weight))
-            obs_depth_weight.append(depth_weight)
+            obs_confidence.append(float(contribution_weight))
             obs_camera_z.append(candidate_z)
             obs_contribution_weight.append(float(contribution_weight))
             obs_contribution_score.append(float(score))
@@ -512,24 +407,7 @@ def _append_view_pixel_candidate_observations(
             obs_surface_pixels.append([float(surface_pixels[row, 0]), float(surface_pixels[row, 1])])
             obs_surface_camera_z.append(float(depth))
             added += 1
-    return added, z_reference
-
-
-def _depth_weight(
-    z_value: float,
-    z_reference: float,
-    weighting: str,
-    power: float,
-    min_weight: float,
-) -> float:
-    if weighting == "none":
-        return 1.0
-    if weighting != "inverse-z":
-        raise ValueError("depth_weighting must be 'none' or 'inverse-z'.")
-    if z_value <= 0 or z_reference <= 0:
-        return float(min_weight)
-    weight = (float(z_reference) / float(z_value)) ** float(power)
-    return float(np.clip(weight, float(min_weight), 1.0))
+    return added
 
 
 def _subset_carrier_points(carrier: dict[str, np.ndarray], keep: np.ndarray) -> dict[str, np.ndarray]:
@@ -598,14 +476,8 @@ def _append_view_carrier_observations(
     obs_y: list[list[complex]],
     obs_j: list[np.ndarray],
     obs_confidence: list[float],
-    obs_depth_weight: list[float],
     obs_camera_z: list[float],
-    view_confidence: float,
-    depth_weighting: str,
-    depth_weight_power: float,
-    depth_weight_min: float,
-    depth_weight_reference_percentile: float,
-) -> tuple[int, float]:
+) -> int:
     expected_shape = (cfg.image_height, cfg.image_width)
     mask = load_mask(cfg.mask_path, expected_shape)
     valid_mask = erode_mask(mask, mask_erode_iters)
@@ -621,8 +493,7 @@ def _append_view_carrier_observations(
     )
     candidate_indices = np.where(candidate)[0]
     if candidate_indices.size == 0:
-        return 0, float("nan")
-    z_reference = float(np.percentile(z[candidate_indices], depth_weight_reference_percentile))
+        return 0
 
     buckets = _build_pixel_buckets(candidate_indices, rounded_x, rounded_y, cfg.image_width)
     jacobians = projection_jacobian(points_world[candidate_indices], cfg.K, cfg.world_to_camera)
@@ -667,18 +538,10 @@ def _append_view_carrier_observations(
         obs_pixels.append([float(pixels_xy[point_idx, 0]), float(pixels_xy[point_idx, 1])])
         obs_y.append([complex(y_u), complex(y_v)])
         obs_j.append(jacobians[candidate_to_row[point_idx]].astype(np.float32))
-        depth_weight = _depth_weight(
-            float(z[point_idx]),
-            z_reference,
-            depth_weighting,
-            depth_weight_power,
-            depth_weight_min,
-        )
-        obs_confidence.append(float(view_confidence) * depth_weight * float(z_weight))
-        obs_depth_weight.append(depth_weight)
+        obs_confidence.append(float(z_weight))
         obs_camera_z.append(float(z[point_idx]))
         added += 1
-    return added, z_reference
+    return added
 
 
 def _write_point_observation_graph(
@@ -687,19 +550,9 @@ def _write_point_observation_graph(
     modals: Sequence[dict[str, np.ndarray]],
     view_freqs_hz: np.ndarray,
     reference_freq_hz: float,
-    reliability: dict[str, np.ndarray],
     out_path: str | Path,
     mode_index: int,
     mask_erode_iters: int,
-    view_frequency_weighting: str,
-    snr_band_hz: float,
-    snr_exclude_hz: float,
-    snr_good: float,
-    view_weight_min: float,
-    depth_weighting: str,
-    depth_weight_power: float,
-    depth_weight_min: float,
-    depth_weight_reference_percentile: float,
     source_view_config_paths: Sequence[str | Path],
     source_modal_npz_paths: Sequence[str | Path],
     preserve_all_points: bool = False,
@@ -710,7 +563,6 @@ def _write_point_observation_graph(
     pixel_preselect_k: int = 32,
     pixel_render_acc_min: float = 0.05,
     pixel_min_contribution: float = 1e-12,
-    pixel_min_mode_amp_percentile: float = 0.0,
     pixel_max_samples_per_view: int = 20000,
     gaussian_scales: np.ndarray | None = None,
     gaussian_quats: np.ndarray | None = None,
@@ -735,14 +587,12 @@ def _write_point_observation_graph(
         pixel_candidate_inputs
     )
 
-    view_frequency_weights = reliability["weights"]
     obs_point_indices: list[int] = []
     obs_view_indices: list[int] = []
     obs_pixels: list[list[float]] = []
     obs_y: list[list[complex]] = []
     obs_j: list[np.ndarray] = []
     obs_confidence: list[float] = []
-    obs_depth_weight: list[float] = []
     obs_camera_z: list[float] = []
     obs_contribution_weight: list[float] = []
     obs_contribution_score: list[float] = []
@@ -750,9 +600,8 @@ def _write_point_observation_graph(
     obs_surface_pixels: list[list[float]] = []
     obs_surface_camera_z: list[float] = []
     observations_per_view: list[int] = []
-    view_depth_reference_z: list[float] = []
     for view_index, (cfg, modal) in enumerate(zip(configs, modals)):
-        count, z_reference = _append_view_pixel_candidate_observations(
+        count = _append_view_pixel_candidate_observations(
             points_world_all,
             pixel_candidate_scales,
             pixel_candidate_rotmats,
@@ -770,28 +619,20 @@ def _write_point_observation_graph(
             obs_y,
             obs_j,
             obs_confidence,
-            obs_depth_weight,
             obs_camera_z,
             obs_contribution_weight,
             obs_contribution_score,
             obs_contribution_sum,
             obs_surface_pixels,
             obs_surface_camera_z,
-            float(view_frequency_weights[view_index]),
-            depth_weighting,
-            depth_weight_power,
-            depth_weight_min,
-            depth_weight_reference_percentile,
             pixel_sample_stride,
             pixel_candidate_k,
             pixel_preselect_k,
-            pixel_min_mode_amp_percentile,
             pixel_max_samples_per_view,
             pixel_render_acc_min,
             pixel_min_contribution,
         )
         observations_per_view.append(count)
-        view_depth_reference_z.append(z_reference)
 
     obs_point_arr = np.asarray(obs_point_indices, dtype=np.int64)
     obs_view_arr = np.asarray(obs_view_indices, dtype=np.int32)
@@ -846,7 +687,6 @@ def _write_point_observation_graph(
         obs_y=np.asarray(obs_y, dtype=np.complex64),
         obs_J=np.asarray(obs_j, dtype=np.float32),
         obs_confidence=obs_confidence_arr,
-        obs_depth_weight=np.asarray(obs_depth_weight, dtype=np.float32),
         obs_camera_z=np.asarray(obs_camera_z, dtype=np.float32),
         obs_count_per_point=counts[active_old_indices].astype(np.int32),
         obs_sample_count_per_point=sample_counts[active_old_indices].astype(np.int32),
@@ -854,21 +694,6 @@ def _write_point_observation_graph(
         view_image_width=np.asarray([cfg.image_width for cfg in configs], dtype=np.int32),
         view_image_height=np.asarray([cfg.image_height for cfg in configs], dtype=np.int32),
         view_freqs_hz=view_freqs_hz.astype(np.float32),
-        view_frequency_weighting=np.array(str(view_frequency_weighting)),
-        view_frequency_weights=view_frequency_weights.astype(np.float32),
-        view_frequency_snr=reliability["snr"].astype(np.float32),
-        view_frequency_signal=reliability["signal"].astype(np.float32),
-        view_frequency_noise=reliability["noise"].astype(np.float32),
-        view_frequency_bin_hz=reliability["bin_hz"].astype(np.float32),
-        view_depth_reference_z=np.asarray(view_depth_reference_z, dtype=np.float32),
-        depth_weighting=np.array(str(depth_weighting)),
-        depth_weight_power=np.array(depth_weight_power, dtype=np.float32),
-        depth_weight_min=np.array(depth_weight_min, dtype=np.float32),
-        depth_weight_reference_percentile=np.array(depth_weight_reference_percentile, dtype=np.float32),
-        snr_band_hz=np.array(snr_band_hz, dtype=np.float32),
-        snr_exclude_hz=np.array(snr_exclude_hz, dtype=np.float32),
-        snr_good=np.array(snr_good, dtype=np.float32),
-        view_weight_min=np.array(view_weight_min, dtype=np.float32),
         freq_hz=np.array(reference_freq_hz, dtype=np.float32),
         mode_index=np.array(mode_index, dtype=np.int32),
         mask_erode_iters=np.array(mask_erode_iters, dtype=np.int32),
@@ -879,7 +704,6 @@ def _write_point_observation_graph(
         pixel_preselect_k=np.array(pixel_preselect_k, dtype=np.int32),
         pixel_render_acc_min=np.array(pixel_render_acc_min, dtype=np.float32),
         pixel_min_contribution=np.array(pixel_min_contribution, dtype=np.float32),
-        pixel_min_mode_amp_percentile=np.array(pixel_min_mode_amp_percentile, dtype=np.float32),
         pixel_max_samples_per_view=np.array(pixel_max_samples_per_view, dtype=np.int32),
         pixel_candidate_method=np.array("rendered_depth_gaussian_contribution"),
         observations_per_view=np.asarray(observations_per_view, dtype=np.int32),
@@ -892,29 +716,12 @@ def _write_point_observation_graph(
     return out
 
 
-def _validate_depth_weight_args(
-    depth_weighting: str,
-    depth_weight_power: float,
-    depth_weight_min: float,
-    depth_weight_reference_percentile: float,
-) -> None:
-    if depth_weighting not in {"none", "inverse-z"}:
-        raise ValueError("depth_weighting must be 'none' or 'inverse-z'.")
-    if depth_weight_power <= 0:
-        raise ValueError("depth_weight_power must be positive.")
-    if not (0.0 <= depth_weight_min <= 1.0):
-        raise ValueError("depth_weight_min must be in [0, 1].")
-    if not (0.0 <= depth_weight_reference_percentile <= 100.0):
-        raise ValueError("depth_weight_reference_percentile must be in [0, 100].")
-
-
 def _validate_pixel_candidate_args(
     pixel_sample_stride: int,
     pixel_candidate_k: int,
     pixel_preselect_k: int,
     pixel_render_acc_min: float,
     pixel_min_contribution: float,
-    pixel_min_mode_amp_percentile: float,
     pixel_max_samples_per_view: int,
 ) -> None:
     if pixel_sample_stride < 1:
@@ -927,8 +734,6 @@ def _validate_pixel_candidate_args(
         raise ValueError("pixel_render_acc_min must be in [0, 1].")
     if pixel_min_contribution < 0:
         raise ValueError("pixel_min_contribution must be non-negative.")
-    if not (0.0 <= pixel_min_mode_amp_percentile <= 100.0):
-        raise ValueError("pixel_min_mode_amp_percentile must be in [0, 100].")
     if pixel_max_samples_per_view < 1:
         raise ValueError("pixel_max_samples_per_view must be at least 1.")
 
@@ -941,15 +746,6 @@ def build_points_observation_graph(
     mode_index: int = 0,
     mask_erode_iters: int = 1,
     freq_tolerance_hz: float = 0.1,
-    view_frequency_weighting: str = "none",
-    snr_band_hz: float = 0.3,
-    snr_exclude_hz: float = 0.08,
-    snr_good: float = 3.0,
-    view_weight_min: float = 0.05,
-    depth_weighting: str = "none",
-    depth_weight_power: float = 2.0,
-    depth_weight_min: float = 0.02,
-    depth_weight_reference_percentile: float = 50.0,
     preserve_all_points: bool = False,
     optional_point_fields: dict[str, np.ndarray] | None = None,
     extra_metadata: dict[str, np.ndarray] | None = None,
@@ -958,7 +754,6 @@ def build_points_observation_graph(
     pixel_preselect_k: int = 32,
     pixel_render_acc_min: float = 0.05,
     pixel_min_contribution: float = 1e-12,
-    pixel_min_mode_amp_percentile: float = 0.0,
     pixel_max_samples_per_view: int = 20000,
     gaussian_scales: np.ndarray | None = None,
     gaussian_quats: np.ndarray | None = None,
@@ -967,19 +762,12 @@ def build_points_observation_graph(
     rendered_accs: Sequence[np.ndarray] | None = None,
 ) -> Path:
     """Build an N-view observation graph for an arbitrary fixed 3D point set."""
-    _validate_depth_weight_args(
-        depth_weighting,
-        depth_weight_power,
-        depth_weight_min,
-        depth_weight_reference_percentile,
-    )
     _validate_pixel_candidate_args(
         pixel_sample_stride,
         pixel_candidate_k,
         pixel_preselect_k,
         pixel_render_acc_min,
         pixel_min_contribution,
-        pixel_min_mode_amp_percentile,
         pixel_max_samples_per_view,
     )
     configs, modals, view_freqs_hz, reference_freq_hz = _load_view_inputs(
@@ -988,34 +776,15 @@ def build_points_observation_graph(
         mode_index,
         freq_tolerance_hz,
     )
-    reliability = _view_frequency_reliability(
-        modals,
-        view_freqs_hz,
-        view_frequency_weighting,
-        snr_band_hz,
-        snr_exclude_hz,
-        snr_good,
-        view_weight_min,
-    )
     return _write_point_observation_graph(
         points_world,
         configs,
         modals,
         view_freqs_hz,
         reference_freq_hz,
-        reliability,
         out_path,
         mode_index,
         mask_erode_iters,
-        view_frequency_weighting,
-        snr_band_hz,
-        snr_exclude_hz,
-        snr_good,
-        view_weight_min,
-        depth_weighting,
-        depth_weight_power,
-        depth_weight_min,
-        depth_weight_reference_percentile,
         view_config_paths,
         modal_npz_paths,
         preserve_all_points=preserve_all_points,
@@ -1026,7 +795,6 @@ def build_points_observation_graph(
         pixel_preselect_k=pixel_preselect_k,
         pixel_render_acc_min=pixel_render_acc_min,
         pixel_min_contribution=pixel_min_contribution,
-        pixel_min_mode_amp_percentile=pixel_min_mode_amp_percentile,
         pixel_max_samples_per_view=pixel_max_samples_per_view,
         gaussian_scales=gaussian_scales,
         gaussian_quats=gaussian_quats,
@@ -1049,15 +817,6 @@ def build_carrier_observation_graph(
     zbuffer_tau: float = 0.05,
     min_zbuffer_samples: int = 5,
     freq_tolerance_hz: float = 0.1,
-    view_frequency_weighting: str = "none",
-    snr_band_hz: float = 0.3,
-    snr_exclude_hz: float = 0.08,
-    snr_good: float = 3.0,
-    view_weight_min: float = 0.05,
-    depth_weighting: str = "none",
-    depth_weight_power: float = 2.0,
-    depth_weight_min: float = 0.02,
-    depth_weight_reference_percentile: float = 50.0,
 ) -> Path:
     """Build an N-view observation graph using VGGT carrier points."""
     if zbuffer_radius < 0:
@@ -1068,14 +827,6 @@ def build_carrier_observation_graph(
         raise ValueError("zbuffer_tau must be positive.")
     if min_zbuffer_samples < 1:
         raise ValueError("min_zbuffer_samples must be at least 1.")
-    if depth_weighting not in {"none", "inverse-z"}:
-        raise ValueError("depth_weighting must be 'none' or 'inverse-z'.")
-    if depth_weight_power <= 0:
-        raise ValueError("depth_weight_power must be positive.")
-    if not (0.0 <= depth_weight_min <= 1.0):
-        raise ValueError("depth_weight_min must be in [0, 1].")
-    if not (0.0 <= depth_weight_reference_percentile <= 100.0):
-        raise ValueError("depth_weight_reference_percentile must be in [0, 100].")
 
     carrier = _load_carrier_points(carrier_points_path)
     configs, modals, view_freqs_hz, reference_freq_hz = _load_view_inputs(
@@ -1084,16 +835,6 @@ def build_carrier_observation_graph(
         mode_index,
         freq_tolerance_hz,
     )
-    reliability = _view_frequency_reliability(
-        modals,
-        view_freqs_hz,
-        view_frequency_weighting,
-        snr_band_hz,
-        snr_exclude_hz,
-        snr_good,
-        view_weight_min,
-    )
-    view_frequency_weights = reliability["weights"]
     source_mask_candidate_count = int(carrier["points_world"].shape[0])
     source_keep = _source_mask_keep(carrier, configs, source_mask_erode_iters)
     source_mask_kept_count = int(source_keep.sum())
@@ -1108,12 +849,10 @@ def build_carrier_observation_graph(
     obs_y: list[list[complex]] = []
     obs_j: list[np.ndarray] = []
     obs_confidence: list[float] = []
-    obs_depth_weight: list[float] = []
     obs_camera_z: list[float] = []
     observations_per_view: list[int] = []
-    view_depth_reference_z: list[float] = []
     for view_index, (cfg, modal) in enumerate(zip(configs, modals)):
-        count, z_reference = _append_view_carrier_observations(
+        count = _append_view_carrier_observations(
             points_world_all,
             view_index,
             cfg,
@@ -1130,16 +869,9 @@ def build_carrier_observation_graph(
             obs_y,
             obs_j,
             obs_confidence,
-            obs_depth_weight,
             obs_camera_z,
-            float(view_frequency_weights[view_index]),
-            depth_weighting,
-            depth_weight_power,
-            depth_weight_min,
-            depth_weight_reference_percentile,
         )
         observations_per_view.append(count)
-        view_depth_reference_z.append(z_reference)
 
     obs_point_arr = np.asarray(obs_point_indices, dtype=np.int64)
     obs_view_arr = np.asarray(obs_view_indices, dtype=np.int32)
@@ -1178,28 +910,12 @@ def build_carrier_observation_graph(
         obs_y=np.asarray(obs_y, dtype=np.complex64),
         obs_J=np.asarray(obs_j, dtype=np.float32),
         obs_confidence=obs_confidence_arr,
-        obs_depth_weight=np.asarray(obs_depth_weight, dtype=np.float32),
         obs_camera_z=np.asarray(obs_camera_z, dtype=np.float32),
         obs_count_per_point=counts[active_old_indices].astype(np.int32),
         view_ids=np.asarray([cfg.view_id for cfg in configs]),
         view_image_width=np.asarray([cfg.image_width for cfg in configs], dtype=np.int32),
         view_image_height=np.asarray([cfg.image_height for cfg in configs], dtype=np.int32),
         view_freqs_hz=view_freqs_hz.astype(np.float32),
-        view_frequency_weighting=np.array(str(view_frequency_weighting)),
-        view_frequency_weights=view_frequency_weights.astype(np.float32),
-        view_frequency_snr=reliability["snr"].astype(np.float32),
-        view_frequency_signal=reliability["signal"].astype(np.float32),
-        view_frequency_noise=reliability["noise"].astype(np.float32),
-        view_frequency_bin_hz=reliability["bin_hz"].astype(np.float32),
-        view_depth_reference_z=np.asarray(view_depth_reference_z, dtype=np.float32),
-        depth_weighting=np.array(str(depth_weighting)),
-        depth_weight_power=np.array(depth_weight_power, dtype=np.float32),
-        depth_weight_min=np.array(depth_weight_min, dtype=np.float32),
-        depth_weight_reference_percentile=np.array(depth_weight_reference_percentile, dtype=np.float32),
-        snr_band_hz=np.array(snr_band_hz, dtype=np.float32),
-        snr_exclude_hz=np.array(snr_exclude_hz, dtype=np.float32),
-        snr_good=np.array(snr_good, dtype=np.float32),
-        view_weight_min=np.array(view_weight_min, dtype=np.float32),
         freq_hz=np.array(reference_freq_hz, dtype=np.float32),
         mode_index=np.array(mode_index, dtype=np.int32),
         zbuffer_radius=np.array(zbuffer_radius, dtype=np.int32),

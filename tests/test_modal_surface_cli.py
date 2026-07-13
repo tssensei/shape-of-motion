@@ -143,6 +143,63 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 self.assertNotIn("--min-observations", option_strings)
                 self.assertNotIn("--pair-weight", option_strings)
 
+    def test_snr_weighting_controls_are_not_registered(self) -> None:
+        cli = importlib.import_module("modal_surface.cli")
+        parser = cli.build_arg_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        removed_options = {
+            "--view-frequency-weighting",
+            "--snr-band-hz",
+            "--snr-exclude-hz",
+            "--snr-good",
+            "--view-weight-min",
+        }
+
+        for command in (
+            "match-carrier-views",
+            "solve-carrier-modes",
+            "solve-gaussian-modes",
+        ):
+            with self.subTest(command=command):
+                option_strings = {
+                    option
+                    for action in subparsers.choices[command]._actions
+                    for option in action.option_strings
+                }
+                self.assertTrue(removed_options.isdisjoint(option_strings))
+
+    def test_depth_weighting_controls_are_not_registered(self) -> None:
+        cli = importlib.import_module("modal_surface.cli")
+        parser = cli.build_arg_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        removed_options = {
+            "--depth-weighting",
+            "--depth-weight-power",
+            "--depth-weight-min",
+            "--depth-weight-reference-percentile",
+        }
+
+        for command in (
+            "match-carrier-views",
+            "solve-carrier-modes",
+            "solve-gaussian-modes",
+        ):
+            with self.subTest(command=command):
+                option_strings = {
+                    option
+                    for action in subparsers.choices[command]._actions
+                    for option in action.option_strings
+                }
+                self.assertTrue(removed_options.isdisjoint(option_strings))
+
     def test_removed_gaussian_observation_controls_are_not_registered(self) -> None:
         cli = importlib.import_module("modal_surface.cli")
         parser = cli.build_arg_parser()
@@ -170,6 +227,7 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--gaussian-contribution-min-share",
             "--gaussian-contribution-min-score",
             "--gaussian-contribution-cov-eps-px",
+            "--pixel-min-mode-amp-percentile",
         }
         self.assertTrue(removed_options.isdisjoint(option_strings))
         retained_pixel_options = {
@@ -178,7 +236,6 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--pixel-preselect-k",
             "--pixel-render-acc-min",
             "--pixel-min-contribution",
-            "--pixel-min-mode-amp-percentile",
             "--pixel-max-samples-per-view",
         }
         self.assertTrue(retained_pixel_options.issubset(option_strings))

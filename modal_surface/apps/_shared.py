@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from numpy.lib.npyio import NpzFile
 
 
 def _load_modal_freqs(paths: list[str]) -> list[np.ndarray]:
@@ -64,9 +65,11 @@ def _finite_percentile(values: np.ndarray, percentile: float) -> float | None:
     return float(np.percentile(finite, percentile)) if finite.size else None
 
 
-def _latent_stats(latent_path: Path, observation_path: Path) -> dict[str, Any]:
-    latent = np.load(str(latent_path), allow_pickle=False)
-    observations = np.load(str(observation_path), allow_pickle=False)
+def _latent_stats(
+    latent_path: Path,
+    latent: NpzFile,
+    observations: NpzFile,
+) -> dict[str, Any]:
     required = [
         "points_world",
         "obs_point_index",
@@ -122,47 +125,10 @@ def _json_float(value: float) -> float | None:
     return value
 
 
-def _view_frequency_reliability(observation_path: Path) -> dict[str, Any]:
-    observations = np.load(str(observation_path), allow_pickle=False)
-    required = [
-        "view_ids",
-        "view_frequency_weights",
-        "view_frequency_snr",
-        "view_frequency_signal",
-        "view_frequency_noise",
-        "view_frequency_bin_hz",
-    ]
-    missing = [key for key in required if key not in observations.files]
-    if missing:
-        raise ValueError(f"{observation_path} missing view-frequency reliability fields: {missing}.")
-    view_ids = [str(v) for v in observations["view_ids"].tolist()]
-    weights = observations["view_frequency_weights"].astype(float)
-    snr = observations["view_frequency_snr"].astype(float)
-    signal = observations["view_frequency_signal"].astype(float)
-    noise = observations["view_frequency_noise"].astype(float)
-    bin_hz = observations["view_frequency_bin_hz"].astype(float)
-    return {
-        "weighting": str(np.asarray(observations["view_frequency_weighting"]).item()),
-        "snr_band_hz": float(np.asarray(observations["snr_band_hz"]).item()),
-        "snr_exclude_hz": float(np.asarray(observations["snr_exclude_hz"]).item()),
-        "snr_good": float(np.asarray(observations["snr_good"]).item()),
-        "view_weight_min": float(np.asarray(observations["view_weight_min"]).item()),
-        "views": [
-            {
-                "view_id": view_id,
-                "weight": _json_float(weights[idx]),
-                "snr": _json_float(snr[idx]),
-                "signal": _json_float(signal[idx]),
-                "noise": _json_float(noise[idx]),
-                "bin_hz": _json_float(bin_hz[idx]),
-            }
-            for idx, view_id in enumerate(view_ids)
-        ],
-    }
-
-
-def _alpha_by_view_diagnostics(latent_path: Path) -> list[dict[str, Any]]:
-    latent = np.load(str(latent_path), allow_pickle=False)
+def _alpha_by_view_diagnostics(
+    latent_path: Path,
+    latent: NpzFile,
+) -> list[dict[str, Any]]:
     required = [
         "view_ids",
         "alphas",

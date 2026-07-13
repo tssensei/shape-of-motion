@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import unittest
-from unittest import mock
 
-from modal_surface.optimization_multi import optimize_multi_view
+from modal_surface.optimization_staged import StagedSolverConfig
 from modal_surface.solver_cli import (
     add_staged_solver_arguments,
-    staged_solver_kwargs,
+    staged_solver_config,
     staged_solver_manifest_parameters,
 )
 
@@ -19,31 +17,21 @@ class SolverCliTests(unittest.TestCase):
         add_staged_solver_arguments(parser)
         return parser
 
-    def test_staged_solver_kwargs_use_current_defaults(self) -> None:
+    def test_staged_solver_config_uses_current_defaults(self) -> None:
         args = self._standalone_parser().parse_args([])
         self.assertEqual(
-            staged_solver_kwargs(args),
-            {
-                "alpha_model": "phase",
-                "alpha_gain_min": 0.25,
-                "alpha_gain_max": 4.0,
-                "alpha_min_shared_points": 16,
-                "alpha_rank_ratio_min": 1e-4,
-                "alpha_info_ratio_min": 1e-4,
-                "alpha_failure": "exclude",
-                "anchor_svd_ratio_min": 1e-2,
-                "anchor_residual_max": 0.1,
-            },
+            staged_solver_config(args),
+            StagedSolverConfig(),
         )
 
-    def test_staged_solver_options_are_forwarded(self) -> None:
+    def test_staged_solver_options_are_added_to_config(self) -> None:
         args = self._standalone_parser().parse_args(
             ["--alpha-model", "bounded-complex", "--alpha-gain-min", "0.5", "--alpha-failure", "error"]
         )
-        kwargs = staged_solver_kwargs(args)
-        self.assertEqual(kwargs["alpha_model"], "bounded-complex")
-        self.assertEqual(kwargs["alpha_gain_min"], 0.5)
-        self.assertEqual(kwargs["alpha_failure"], "error")
+        config = staged_solver_config(args)
+        self.assertEqual(config.alpha_model, "bounded-complex")
+        self.assertEqual(config.alpha_gain_min, 0.5)
+        self.assertEqual(config.alpha_failure, "error")
 
     def test_manifest_parameters_identify_staged_solver(self) -> None:
         args = self._standalone_parser().parse_args([])
@@ -84,25 +72,6 @@ class SolverCliTests(unittest.TestCase):
             "--obs-count-weight-3plus",
         }
         self.assertTrue(legacy_options.isdisjoint(registered_options))
-
-    def test_public_solver_facade_builds_staged_config(self) -> None:
-        expected = Path("latent.npz")
-        with mock.patch(
-            "modal_surface.optimization_multi.optimize_multi_view_staged",
-            return_value=expected,
-        ) as staged:
-            actual = optimize_multi_view(
-                "observations.npz",
-                expected,
-                alpha_model="bounded-complex",
-                alpha_gain_min=0.5,
-            )
-
-        self.assertEqual(actual, expected)
-        config = staged.call_args.kwargs["config"]
-        self.assertEqual(config.alpha_model, "bounded-complex")
-        self.assertEqual(config.alpha_gain_min, 0.5)
-
 
 if __name__ == "__main__":
     unittest.main()

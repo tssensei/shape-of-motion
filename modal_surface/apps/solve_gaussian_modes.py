@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from numpy.lib.npyio import NpzFile
 
 from modal_surface.apps._shared import (
     _alpha_by_view_diagnostics,
@@ -17,14 +18,13 @@ from modal_surface.apps._shared import (
     _load_modal_freqs,
     _parse_mode_indices,
     _rel,
-    _view_frequency_reliability,
 )
 from modal_surface.carrier import build_points_observation_graph
 from modal_surface.io import load_view_config
-from modal_surface.optimization_multi import optimize_multi_view
+from modal_surface.optimization_staged import optimize_multi_view_staged
 from modal_surface.solver_cli import (
     add_staged_solver_arguments,
-    staged_solver_kwargs,
+    staged_solver_config,
     staged_solver_manifest_parameters,
 )
 
@@ -40,18 +40,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pixel-preselect-k", type=int, default=32, help="Number of 3D nearest Gaussians scored before top-k contribution selection.")
     parser.add_argument("--pixel-render-acc-min", type=float, default=0.05, help="Minimum rendered foreground alpha for sampled modal pixels.")
     parser.add_argument("--pixel-min-contribution", type=float, default=1e-12, help="Minimum unnormalized Gaussian contribution retained for a sampled modal pixel.")
-    parser.add_argument("--pixel-min-mode-amp-percentile", type=float, default=0.0, help="Discard sampled modal pixels below this foreground amplitude percentile.")
     parser.add_argument("--pixel-max-samples-per-view", type=int, default=20000, help="Maximum sampled modal pixels per view before candidate expansion.")
     parser.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
-    parser.add_argument("--view-frequency-weighting", choices=["none", "local-snr"], default="none", help="View-frequency reliability weighting method.")
-    parser.add_argument("--snr-band-hz", type=float, default=0.3, help="Half-width of the local spectrum band used for local-SNR noise estimation.")
-    parser.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
-    parser.add_argument("--snr-good", type=float, default=3.0, help="SNR treated as a clear frequency peak for view-frequency weighting.")
-    parser.add_argument("--view-weight-min", type=float, default=0.05, help="Minimum view-frequency reliability weight.")
-    parser.add_argument("--depth-weighting", choices=["none", "inverse-z"], default="none", help="Depth-based observation weighting method.")
-    parser.add_argument("--depth-weight-power", type=float, default=2.0, help="Power used by inverse-z depth weighting.")
-    parser.add_argument("--depth-weight-min", type=float, default=0.02, help="Minimum inverse-z depth weight.")
-    parser.add_argument("--depth-weight-reference-percentile", type=float, default=50.0, help="Per-view candidate-depth percentile used as inverse-z reference.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
     add_staged_solver_arguments(parser)
 
@@ -120,10 +110,13 @@ def _load_fg_pixel_candidate_inputs_from_checkpoint(
     return fg_means, fg_scales, fg_quats, fg_opacities, rendered_depths, rendered_accs
 
 
-def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: int) -> dict[str, Any]:
-    stats = _latent_stats(latent_path, observation_path)
-    latent = np.load(str(latent_path), allow_pickle=False)
-    observations = np.load(str(observation_path), allow_pickle=False)
+def _gaussian_latent_stats(
+    latent_path: Path,
+    latent: NpzFile,
+    observations: NpzFile,
+    num_fg: int,
+) -> dict[str, Any]:
+    stats = _latent_stats(latent_path, latent, observations)
     obs_count = latent["obs_count_per_point"].astype(np.int32)
     obs_sample_count = latent["obs_sample_count_per_point"].astype(np.int32)
     gaussian_indices = latent["gaussian_indices"].astype(np.int32)
@@ -160,8 +153,7 @@ def _gaussian_latent_stats(latent_path: Path, observation_path: Path, num_fg: in
     return stats
 
 
-def _print_observation_sanity(obs_path: Path, num_fg: int) -> None:
-    observations = np.load(str(obs_path), allow_pickle=False)
+def _print_observation_sanity(observations: NpzFile, num_fg: int) -> None:
     obs_count = observations["obs_count_per_point"].astype(np.int32)
     obs_sample_count = observations["obs_sample_count_per_point"].astype(np.int32)
     view_ids = observations["view_ids"].astype(str)
@@ -200,6 +192,10 @@ def run(args: argparse.Namespace) -> None:
     )
     gaussian_indices = np.arange(fg_means.shape[0], dtype=np.int32)
     freqs_per_view = _load_modal_freqs(modal_npzs)
+    # e.g. freqs_per_view = [
+    # np.array([0.357, 0.714]),  # view 1
+    # np.array([0.359, 0.711]),  # view 2
+    # np.array([0.356, 0.716]),  # view 3 ]
     mode_indices = _parse_mode_indices(args.mode_indices, int(freqs_per_view[0].shape[0]))
     out_dir = Path(args.out_dir)
     obs_dir = out_dir / "observations"
@@ -224,16 +220,7 @@ def run(args: argparse.Namespace) -> None:
             out_path=obs_path,
             mode_index=mode_index,
             mask_erode_iters=args.mask_erode_iters,
-            freq_tolerance_hz=args.freq_tolerance_hz,
-            view_frequency_weighting=args.view_frequency_weighting,
-            snr_band_hz=args.snr_band_hz,
-            snr_exclude_hz=args.snr_exclude_hz,
-            snr_good=args.snr_good,
-            view_weight_min=args.view_weight_min,
-            depth_weighting=args.depth_weighting,
-            depth_weight_power=args.depth_weight_power,
-            depth_weight_min=args.depth_weight_min,
-            depth_weight_reference_percentile=args.depth_weight_reference_percentile,
+            freq_tolerance_hz=args.freq_tolerance_hz,  #
             preserve_all_points=True,
             optional_point_fields={"gaussian_indices": gaussian_indices},
             extra_metadata={
@@ -245,7 +232,6 @@ def run(args: argparse.Namespace) -> None:
             pixel_preselect_k=args.pixel_preselect_k,
             pixel_render_acc_min=args.pixel_render_acc_min,
             pixel_min_contribution=args.pixel_min_contribution,
-            pixel_min_mode_amp_percentile=args.pixel_min_mode_amp_percentile,
             pixel_max_samples_per_view=args.pixel_max_samples_per_view,
             gaussian_scales=fg_scales,
             gaussian_quats=fg_quats,
@@ -253,29 +239,35 @@ def run(args: argparse.Namespace) -> None:
             rendered_depths=rendered_depths,
             rendered_accs=rendered_accs,
         )
-        _print_observation_sanity(obs_path, fg_means.shape[0])
-        optimize_multi_view(
-            observations_path=obs_path,
-            out_path=latent_path,
-            vis_dir=mode_vis_dir,
-            **staged_solver_kwargs(args),
-        )
-        latent_stats = _gaussian_latent_stats(latent_path, obs_path, fg_means.shape[0])
-        freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
-        modes.append(
-            {
-                "mode_index": int(mode_index),
-                "freq_hz": reference_freq,
-                "freqs_hz_by_view": freqs_by_view,
-                "label": f"{mode_index}: {reference_freq:.6f} Hz",
-                "observation_path": _rel(obs_path, out_dir),
-                "latent_path": _rel(latent_path, out_dir),
-                "vis_dir": _rel(mode_vis_dir, out_dir),
-                "alpha_by_view": _alpha_by_view_diagnostics(latent_path),
-                "view_frequency_reliability": _view_frequency_reliability(obs_path),
-                "stats": latent_stats,
-            }
-        )
+        with np.load(str(obs_path), allow_pickle=False) as observations:
+            _print_observation_sanity(observations, fg_means.shape[0])
+            optimize_multi_view_staged(
+                observations_path=obs_path,
+                out_path=latent_path,
+                vis_dir=mode_vis_dir,
+                config=staged_solver_config(args),
+            )
+            with np.load(str(latent_path), allow_pickle=False) as latent:
+                latent_stats = _gaussian_latent_stats(
+                    latent_path,
+                    latent,
+                    observations,
+                    fg_means.shape[0],
+                )
+                freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
+                modes.append(
+                    {
+                        "mode_index": int(mode_index),
+                        "freq_hz": reference_freq,
+                        "freqs_hz_by_view": freqs_by_view,
+                        "label": f"{mode_index}: {reference_freq:.6f} Hz",
+                        "observation_path": _rel(obs_path, out_dir),
+                        "latent_path": _rel(latent_path, out_dir),
+                        "vis_dir": _rel(mode_vis_dir, out_dir),
+                        "alpha_by_view": _alpha_by_view_diagnostics(latent_path, latent),
+                        "stats": latent_stats,
+                    }
+                )
 
     manifest = {
         "version": 1,
@@ -291,17 +283,7 @@ def run(args: argparse.Namespace) -> None:
             "pixel_preselect_k": int(args.pixel_preselect_k),
             "pixel_render_acc_min": float(args.pixel_render_acc_min),
             "pixel_min_contribution": float(args.pixel_min_contribution),
-            "pixel_min_mode_amp_percentile": float(args.pixel_min_mode_amp_percentile),
             "pixel_max_samples_per_view": int(args.pixel_max_samples_per_view),
-            "view_frequency_weighting": str(args.view_frequency_weighting),
-            "snr_band_hz": float(args.snr_band_hz),
-            "snr_exclude_hz": float(args.snr_exclude_hz),
-            "snr_good": float(args.snr_good),
-            "view_weight_min": float(args.view_weight_min),
-            "depth_weighting": str(args.depth_weighting),
-            "depth_weight_power": float(args.depth_weight_power),
-            "depth_weight_min": float(args.depth_weight_min),
-            "depth_weight_reference_percentile": float(args.depth_weight_reference_percentile),
             "freq_tolerance_hz": float(args.freq_tolerance_hz),
             "alpha_model": "per_view_per_mode",
             "alpha_reference_view_index": 0,

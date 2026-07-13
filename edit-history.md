@@ -1,5 +1,15 @@
 - removed run_modal_surface.py, the only entry point left is modal_surface/__main__.py
--
 - `modal_surface/carrier.py`: made Gaussian point observation construction pixel-candidates-only, removed Gaussian-center selection/z-buffer branches and metadata, and kept the separate carrier-point hard z-buffer workflow.
 - `modal_surface/apps/solve_gaussian_modes.py`: removed Gaussian observation sampling and z-buffer CLI controls; Gaussian solves now always render depth/alpha and build pixel-candidate observations.
 - `tests/test_modal_surface_cli.py`: updated Gaussian CLI coverage for the pixel-candidates-only command surface and the removed observation controls.
+- `modal_surface/apps/_shared.py`, `solve_gaussian_modes.py`, and `solve_carrier_modes.py`: reused one open observation NPZ and one open latent NPZ per mode for diagnostic and manifest generation, eliminating repeated diagnostic file loads without changing output contracts.
+- `modal_surface/carrier.py`: removed local-SNR estimation and per-view reliability weighting; observation confidence now uses only depth, contribution, and carrier z-buffer factors while frequency matching remains unchanged.
+- `modal_surface/apps/_shared.py`, `match_carrier_views.py`, `solve_carrier_modes.py`, and `solve_gaussian_modes.py`: removed SNR-weighting CLI controls, builder arguments, diagnostics, and manifest fields.
+- `tests/test_modal_surface_cli.py`: added coverage that the removed SNR-weighting options are unavailable on all observation commands.
+- `modal_surface/carrier.py`: removed inverse-depth observation weighting and its reference-depth metadata while retaining rendered-depth unprojection, camera-depth diagnostics, and carrier z-buffer visibility.
+- `modal_surface/apps/match_carrier_views.py`, `solve_carrier_modes.py`, and `solve_gaussian_modes.py`: removed depth-weighting CLI controls, builder arguments, and manifest parameters.
+- `tests/test_modal_surface_cli.py`: added coverage that the removed depth-weighting options are unavailable on all observation commands.
+- `modal_surface/carrier.py` and `modal_surface/apps/solve_gaussian_modes.py`: removed modal-amplitude percentile filtering from pixel-candidate sampling and deleted its CLI, API, NPZ, and manifest parameter.
+- `tests/test_modal_surface_cli.py`: updated Gaussian CLI coverage for the removed `--pixel-min-mode-amp-percentile` option.
+- deleted `modal_surface/optimization_multi.py`; app and toy callers now invoke `optimize_multi_view_staged` directly with a `StagedSolverConfig` built by `modal_surface/solver_cli.py`.
+- `tests/test_solver_cli.py`: replaced facade-forwarding coverage with direct staged configuration construction checks.

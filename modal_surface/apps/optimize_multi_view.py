@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 
-from modal_surface.optimization_multi import optimize_multi_view
-from modal_surface.solver_cli import add_staged_solver_arguments, staged_solver_kwargs
+from modal_surface.optimization_staged import optimize_multi_view_staged
+from modal_surface.solver_cli import add_staged_solver_arguments, staged_solver_config
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -18,10 +18,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run(args: argparse.Namespace) -> None:
     """Run optimize-multi-view from an argparse namespace."""
-    out = optimize_multi_view(
+    out = optimize_multi_view_staged(
         observations_path=args.observations,
         out_path=args.out,
         vis_dir=args.vis_dir,
-        **staged_solver_kwargs(args),
+        config=staged_solver_config(args),
     )
     print(f"Saved multi-view latent field -> {out}")

@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
+from modal_surface.optimization_staged import StagedSolverConfig
+
 
 def add_staged_solver_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -53,18 +55,18 @@ def add_staged_solver_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def staged_solver_kwargs(args: argparse.Namespace) -> dict[str, Any]:
-    return {
-        "alpha_model": str(args.alpha_model),
-        "alpha_gain_min": float(args.alpha_gain_min),
-        "alpha_gain_max": float(args.alpha_gain_max),
-        "alpha_min_shared_points": int(args.alpha_min_shared_points),
-        "alpha_rank_ratio_min": float(args.alpha_rank_ratio_min),
-        "alpha_info_ratio_min": float(args.alpha_info_ratio_min),
-        "alpha_failure": str(args.alpha_failure),
-        "anchor_svd_ratio_min": float(args.anchor_svd_ratio_min),
-        "anchor_residual_max": float(args.anchor_residual_max),
-    }
+def staged_solver_config(args: argparse.Namespace) -> StagedSolverConfig:
+    return StagedSolverConfig(
+        alpha_model=str(args.alpha_model),
+        alpha_gain_min=float(args.alpha_gain_min),
+        alpha_gain_max=float(args.alpha_gain_max),
+        alpha_min_shared_points=int(args.alpha_min_shared_points),
+        alpha_rank_ratio_min=float(args.alpha_rank_ratio_min),
+        alpha_info_ratio_min=float(args.alpha_info_ratio_min),
+        alpha_failure=str(args.alpha_failure),
+        anchor_svd_ratio_min=float(args.anchor_svd_ratio_min),
+        anchor_residual_max=float(args.anchor_residual_max),
+    )
 
 
 def staged_solver_manifest_parameters(args: argparse.Namespace) -> dict[str, Any]:

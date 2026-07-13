@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from modal_surface.apps._shared import (
     _alpha_by_view_diagnostics,
     _freq_slug,
@@ -14,13 +16,12 @@ from modal_surface.apps._shared import (
     _load_modal_freqs,
     _parse_mode_indices,
     _rel,
-    _view_frequency_reliability,
 )
 from modal_surface.carrier import build_carrier_observation_graph
-from modal_surface.optimization_multi import optimize_multi_view
+from modal_surface.optimization_staged import optimize_multi_view_staged
 from modal_surface.solver_cli import (
     add_staged_solver_arguments,
-    staged_solver_kwargs,
+    staged_solver_config,
     staged_solver_manifest_parameters,
 )
 
@@ -38,15 +39,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--front-percentile", type=float, default=10.0, help="Local depth percentile treated as front surface.")
     parser.add_argument("--zbuffer-tau", type=float, default=0.05, help="Relative depth threshold against local front depth.")
     parser.add_argument("--min-zbuffer-samples", type=int, default=5, help="Minimum local carrier depths for visibility.")
-    parser.add_argument("--view-frequency-weighting", choices=["none", "local-snr"], default="none", help="View-frequency reliability weighting method.")
-    parser.add_argument("--snr-band-hz", type=float, default=0.3, help="Half-width of the local spectrum band used for local-SNR noise estimation.")
-    parser.add_argument("--snr-exclude-hz", type=float, default=0.08, help="Half-width around the selected frequency excluded from local-SNR noise estimation.")
-    parser.add_argument("--snr-good", type=float, default=3.0, help="SNR treated as a clear frequency peak for view-frequency weighting.")
-    parser.add_argument("--view-weight-min", type=float, default=0.05, help="Minimum view-frequency reliability weight.")
-    parser.add_argument("--depth-weighting", choices=["none", "inverse-z"], default="none", help="Depth-based observation weighting method.")
-    parser.add_argument("--depth-weight-power", type=float, default=2.0, help="Power used by inverse-z depth weighting.")
-    parser.add_argument("--depth-weight-min", type=float, default=0.02, help="Minimum inverse-z depth weight.")
-    parser.add_argument("--depth-weight-reference-percentile", type=float, default=50.0, help="Per-view candidate-depth percentile used as inverse-z reference.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
     add_staged_solver_arguments(parser)
 
@@ -89,37 +81,31 @@ def run(args: argparse.Namespace) -> None:
             zbuffer_tau=args.zbuffer_tau,
             min_zbuffer_samples=args.min_zbuffer_samples,
             freq_tolerance_hz=args.freq_tolerance_hz,
-            view_frequency_weighting=args.view_frequency_weighting,
-            snr_band_hz=args.snr_band_hz,
-            snr_exclude_hz=args.snr_exclude_hz,
-            snr_good=args.snr_good,
-            view_weight_min=args.view_weight_min,
-            depth_weighting=args.depth_weighting,
-            depth_weight_power=args.depth_weight_power,
-            depth_weight_min=args.depth_weight_min,
-            depth_weight_reference_percentile=args.depth_weight_reference_percentile,
         )
-        optimize_multi_view(
+        optimize_multi_view_staged(
             observations_path=obs_path,
             out_path=latent_path,
             vis_dir=mode_vis_dir,
-            **staged_solver_kwargs(args),
+            config=staged_solver_config(args),
         )
-        freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
-        modes.append(
-            {
-                "mode_index": int(mode_index),
-                "freq_hz": reference_freq,
-                "freqs_hz_by_view": freqs_by_view,
-                "label": f"{mode_index}: {reference_freq:.6f} Hz",
-                "observation_path": _rel(obs_path, out_dir),
-                "latent_path": _rel(latent_path, out_dir),
-                "vis_dir": _rel(mode_vis_dir, out_dir),
-                "alpha_by_view": _alpha_by_view_diagnostics(latent_path),
-                "view_frequency_reliability": _view_frequency_reliability(obs_path),
-                "stats": _latent_stats(latent_path, obs_path),
-            }
-        )
+        with (
+            np.load(str(obs_path), allow_pickle=False) as observations,
+            np.load(str(latent_path), allow_pickle=False) as latent,
+        ):
+            freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
+            modes.append(
+                {
+                    "mode_index": int(mode_index),
+                    "freq_hz": reference_freq,
+                    "freqs_hz_by_view": freqs_by_view,
+                    "label": f"{mode_index}: {reference_freq:.6f} Hz",
+                    "observation_path": _rel(obs_path, out_dir),
+                    "latent_path": _rel(latent_path, out_dir),
+                    "vis_dir": _rel(mode_vis_dir, out_dir),
+                    "alpha_by_view": _alpha_by_view_diagnostics(latent_path, latent),
+                    "stats": _latent_stats(latent_path, latent, observations),
+                }
+            )
 
     manifest = {
         "version": 1,
@@ -134,15 +120,6 @@ def run(args: argparse.Namespace) -> None:
             "front_percentile": float(args.front_percentile),
             "zbuffer_tau": float(args.zbuffer_tau),
             "min_zbuffer_samples": int(args.min_zbuffer_samples),
-            "view_frequency_weighting": str(args.view_frequency_weighting),
-            "snr_band_hz": float(args.snr_band_hz),
-            "snr_exclude_hz": float(args.snr_exclude_hz),
-            "snr_good": float(args.snr_good),
-            "view_weight_min": float(args.view_weight_min),
-            "depth_weighting": str(args.depth_weighting),
-            "depth_weight_power": float(args.depth_weight_power),
-            "depth_weight_min": float(args.depth_weight_min),
-            "depth_weight_reference_percentile": float(args.depth_weight_reference_percentile),
             "freq_tolerance_hz": float(args.freq_tolerance_hz),
             "alpha_model": "per_view_per_mode",
             "alpha_reference_view_index": 0,
