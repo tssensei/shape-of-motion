@@ -9,102 +9,112 @@ import unittest
 from unittest import mock
 
 
-EXPECTED_COMMANDS = (
-    "optimize-multi-view",
-    "solve-gaussian-modes",
-)
+def _option_strings(parser: argparse.ArgumentParser) -> set[str]:
+    return {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+    }
 
 
 class ModalSurfaceCliTests(unittest.TestCase):
-    def test_registry_contains_exactly_the_public_commands(self) -> None:
-        cli = importlib.import_module("modal_surface.cli")
+    def test_parser_has_no_subcommands(self) -> None:
+        cli = importlib.import_module("modal_surface.__main__")
         parser = cli.build_arg_parser()
-        subparsers = next(
-            action
-            for action in parser._actions
-            if isinstance(action, argparse._SubParsersAction)
+
+        self.assertFalse(
+            any(
+                isinstance(action, argparse._SubParsersAction)
+                for action in parser._actions
+            )
         )
 
-        self.assertEqual(tuple(cli.COMMANDS), EXPECTED_COMMANDS)
-        self.assertEqual(tuple(subparsers.choices), EXPECTED_COMMANDS)
-
-    def test_each_command_uses_its_app_parser_and_current_defaults(self) -> None:
-        cli = importlib.import_module("modal_surface.cli")
+    def test_parser_uses_gaussian_arguments_and_current_defaults(self) -> None:
+        cli = importlib.import_module("modal_surface.__main__")
         parser = cli.build_arg_parser()
-        cases = (
-            (
-                "optimize-multi-view",
-                [
-                    "--observations",
-                    "observations.npz",
-                    "--out",
-                    "latent.npz",
-                    "--alpha-min-shared-points",
-                    "24",
-                ],
-                "modal_surface.apps.optimize_multi_view",
-                {
-                    "alpha_model": "phase",
-                    "alpha_min_shared_points": 24,
-                },
-            ),
-            (
-                "solve-gaussian-modes",
-                [
-                    "--input-ckpt",
-                    "checkpoint.ckpt",
-                    "--view-config",
-                    "view.json",
-                    "--modal-npz",
-                    "modal.npz",
-                    "--out-dir",
-                    "modes",
-                ],
-                "modal_surface.apps.solve_gaussian_modes",
-                {
-                    "pixel_candidate_k": 4,
-                    "alpha_model": "phase",
-                },
-            ),
+        args = parser.parse_args(
+            [
+                "--input-ckpt",
+                "checkpoint.ckpt",
+                "--view-config",
+                "view.json",
+                "--modal-npz",
+                "modal.npz",
+                "--out-dir",
+                "modes",
+            ]
         )
 
-        for command, command_args, module_name, expected in cases:
-            with self.subTest(command=command):
-                args = parser.parse_args([command, *command_args])
-                app = importlib.import_module(module_name)
-
-                self.assertEqual(args.command, command)
-                self.assertIs(args._runner, app.run)
-                for name, value in expected.items():
-                    self.assertEqual(getattr(args, name), value)
+        self.assertNotIn("command", vars(args))
+        self.assertNotIn("_runner", vars(args))
+        self.assertEqual(args.pixel_candidate_k, 4)
+        self.assertEqual(args.alpha_model, "phase")
+        self.assertFalse(args.motion_fill)
+        self.assertEqual(args.motion_fill_k, 8)
+        self.assertIsNone(args.motion_fill_max_distance)
 
     def test_observation_filter_controls_are_not_registered(self) -> None:
-        cli = importlib.import_module("modal_surface.cli")
+        cli = importlib.import_module("modal_surface.__main__")
         parser = cli.build_arg_parser()
-        subparsers = next(
-            action
-            for action in parser._actions
-            if isinstance(action, argparse._SubParsersAction)
+        option_strings = _option_strings(parser)
+
+        self.assertNotIn("--min-observations", option_strings)
+        self.assertNotIn("--pair-weight", option_strings)
+
+    def test_gaussian_motion_fill_controls_are_registered(self) -> None:
+        cli = importlib.import_module("modal_surface.__main__")
+        parser = cli.build_arg_parser()
+        option_strings = _option_strings(parser)
+
+        self.assertTrue(
+            {
+                "--motion-fill",
+                "--motion-fill-k",
+                "--motion-fill-max-distance",
+            }.issubset(option_strings)
         )
 
-        for command in ("solve-gaussian-modes",):
-            with self.subTest(command=command):
-                option_strings = {
-                    option
-                    for action in subparsers.choices[command]._actions
-                    for option in action.option_strings
-                }
-                self.assertNotIn("--min-observations", option_strings)
-                self.assertNotIn("--pair-weight", option_strings)
+    def test_gaussian_motion_fill_requires_explicit_valid_distance(self) -> None:
+        app = importlib.import_module("modal_surface.apps.solve_gaussian_modes")
+        base = {
+            "motion_fill": True,
+            "motion_fill_k": 8,
+            "motion_fill_max_distance": 0.05,
+        }
+
+        app._validate_motion_fill_arguments(argparse.Namespace(**base), num_points=20)
+        for changes, message in (
+            ({"motion_fill_max_distance": None}, "requires"),
+            ({"motion_fill_max_distance": 0.0}, "finite and positive"),
+            ({"motion_fill_k": 20}, "smaller"),
+        ):
+            with self.subTest(changes=changes):
+                values = {**base, **changes}
+                with self.assertRaisesRegex(ValueError, message):
+                    app._validate_motion_fill_arguments(
+                        argparse.Namespace(**values), num_points=20
+                    )
+
+        with self.assertRaisesRegex(ValueError, "requires --motion-fill"):
+            app._validate_motion_fill_arguments(
+                argparse.Namespace(
+                    motion_fill=False,
+                    motion_fill_k=8,
+                    motion_fill_max_distance=0.05,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "requires --motion-fill"):
+            app._validate_motion_fill_arguments(
+                argparse.Namespace(
+                    motion_fill=False,
+                    motion_fill_k=4,
+                    motion_fill_max_distance=None,
+                )
+            )
 
     def test_snr_weighting_controls_are_not_registered(self) -> None:
-        cli = importlib.import_module("modal_surface.cli")
+        cli = importlib.import_module("modal_surface.__main__")
         parser = cli.build_arg_parser()
-        subparsers = next(
-            action
-            for action in parser._actions
-            if isinstance(action, argparse._SubParsersAction)
-        )
         removed_options = {
             "--view-frequency-weighting",
             "--snr-band-hz",
@@ -113,23 +123,11 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--view-weight-min",
         }
 
-        for command in ("solve-gaussian-modes",):
-            with self.subTest(command=command):
-                option_strings = {
-                    option
-                    for action in subparsers.choices[command]._actions
-                    for option in action.option_strings
-                }
-                self.assertTrue(removed_options.isdisjoint(option_strings))
+        self.assertTrue(removed_options.isdisjoint(_option_strings(parser)))
 
     def test_depth_weighting_controls_are_not_registered(self) -> None:
-        cli = importlib.import_module("modal_surface.cli")
+        cli = importlib.import_module("modal_surface.__main__")
         parser = cli.build_arg_parser()
-        subparsers = next(
-            action
-            for action in parser._actions
-            if isinstance(action, argparse._SubParsersAction)
-        )
         removed_options = {
             "--depth-weighting",
             "--depth-weight-power",
@@ -137,29 +135,12 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--depth-weight-reference-percentile",
         }
 
-        for command in ("solve-gaussian-modes",):
-            with self.subTest(command=command):
-                option_strings = {
-                    option
-                    for action in subparsers.choices[command]._actions
-                    for option in action.option_strings
-                }
-                self.assertTrue(removed_options.isdisjoint(option_strings))
+        self.assertTrue(removed_options.isdisjoint(_option_strings(parser)))
 
     def test_removed_gaussian_observation_controls_are_not_registered(self) -> None:
-        cli = importlib.import_module("modal_surface.cli")
+        cli = importlib.import_module("modal_surface.__main__")
         parser = cli.build_arg_parser()
-        subparsers = next(
-            action
-            for action in parser._actions
-            if isinstance(action, argparse._SubParsersAction)
-        )
-        gaussian_parser = subparsers.choices["solve-gaussian-modes"]
-        option_strings = {
-            option
-            for action in gaussian_parser._actions
-            for option in action.option_strings
-        }
+        option_strings = _option_strings(parser)
         removed_options = {
             "--observation-sampling",
             "--zbuffer-radius",
@@ -187,13 +168,8 @@ class ModalSurfaceCliTests(unittest.TestCase):
         self.assertTrue(retained_pixel_options.issubset(option_strings))
 
     def test_legacy_solver_controls_are_not_registered(self) -> None:
-        cli = importlib.import_module("modal_surface.cli")
+        cli = importlib.import_module("modal_surface.__main__")
         parser = cli.build_arg_parser()
-        subparsers = next(
-            action
-            for action in parser._actions
-            if isinstance(action, argparse._SubParsersAction)
-        )
         legacy_options = {
             "--solver",
             "--iterations",
@@ -220,24 +196,20 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--obs-count-weight-3plus",
         }
 
-        for command in ("optimize-multi-view", "solve-gaussian-modes"):
-            with self.subTest(command=command):
-                option_strings = {
-                    option
-                    for action in subparsers.choices[command]._actions
-                    for option in action.option_strings
-                }
-                self.assertTrue(legacy_options.isdisjoint(option_strings))
+        self.assertTrue(legacy_options.isdisjoint(_option_strings(parser)))
 
-    def test_main_dispatches_to_the_attached_app_runner(self) -> None:
-        cli = importlib.import_module("modal_surface.cli")
-        app = importlib.import_module("modal_surface.apps.optimize_multi_view")
+    def test_main_invokes_gaussian_runner(self) -> None:
+        cli = importlib.import_module("modal_surface.__main__")
+        app = importlib.import_module("modal_surface.apps.solve_gaussian_modes")
         argv = [
-            "optimize-multi-view",
-            "--observations",
-            "observations.npz",
-            "--out",
-            "latent.npz",
+            "--input-ckpt",
+            "checkpoint.ckpt",
+            "--view-config",
+            "view.json",
+            "--modal-npz",
+            "modal.npz",
+            "--out-dir",
+            "modes",
         ]
 
         with mock.patch.object(app, "run") as runner:
@@ -245,28 +217,29 @@ class ModalSurfaceCliTests(unittest.TestCase):
 
         runner.assert_called_once()
         args = runner.call_args.args[0]
-        self.assertEqual(args.command, "optimize-multi-view")
-        self.assertEqual(args.observations, "observations.npz")
-        self.assertEqual(args.out, "latent.npz")
+        self.assertNotIn("command", vars(args))
+        self.assertNotIn("_runner", vars(args))
+        self.assertEqual(args.input_ckpt, "checkpoint.ckpt")
+        self.assertEqual(args.out_dir, "modes")
 
-    def test_parser_and_non_gaussian_help_do_not_import_3dgs_runtime(self) -> None:
+    def test_parser_and_help_do_not_import_3dgs_runtime(self) -> None:
         blocked_modules = {
             "torch": None,
             "flow3d": None,
             "flow3d.scene_model": None,
         }
         with mock.patch.dict(sys.modules, blocked_modules):
-            sys.modules.pop("modal_surface.cli", None)
+            sys.modules.pop("modal_surface.__main__", None)
             sys.modules.pop("modal_surface.apps.solve_gaussian_modes", None)
-            cli = importlib.import_module("modal_surface.cli")
+            cli = importlib.import_module("modal_surface.__main__")
             parser = cli.build_arg_parser()
 
             stdout = io.StringIO()
             with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
-                parser.parse_args(["optimize-multi-view", "--help"])
+                parser.parse_args(["--help"])
 
             self.assertEqual(raised.exception.code, 0)
-            self.assertIn("--observations", stdout.getvalue())
+            self.assertIn("--input-ckpt", stdout.getvalue())
             self.assertIsNone(sys.modules["torch"])
             self.assertIsNone(sys.modules["flow3d"])
             self.assertIsNone(sys.modules["flow3d.scene_model"])

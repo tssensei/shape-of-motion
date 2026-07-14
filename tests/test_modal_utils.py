@@ -21,6 +21,7 @@ class GaussianModalFieldLoadingTests(unittest.TestCase):
         *,
         point_type: str = "foreground_gaussian_center",
         obs_count: np.ndarray | None = None,
+        extra_fields: dict[str, np.ndarray] | None = None,
     ) -> Path:
         latent_path = root / "mode.npz"
         np.savez_compressed(
@@ -35,6 +36,7 @@ class GaussianModalFieldLoadingTests(unittest.TestCase):
             ),
             point_type=np.array(point_type),
             source_checkpoint=np.array("source.ckpt"),
+            **({} if extra_fields is None else extra_fields),
         )
         manifest_path = root / "modal_modes_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as f:
@@ -82,6 +84,34 @@ class GaussianModalFieldLoadingTests(unittest.TestCase):
             fields.obs_count_per_point,
             torch.tensor([[3, 1]], dtype=torch.long),
         )
+
+    def test_loads_final_phi_and_ignores_motion_fill_provenance_fields(self) -> None:
+        points = np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]], dtype=np.float32)
+        phi = np.array(
+            [[1.0 + 2.0j, 3.0 + 4.0j, 5.0 + 6.0j], [7.0 + 8.0j, 9.0 + 10.0j, 11.0 + 12.0j]],
+            dtype=np.complex64,
+        )
+        phi_observable = np.zeros_like(phi)
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = self._write_mode(
+                Path(tmp),
+                points,
+                phi,
+                np.arange(points.shape[0], dtype=np.int32),
+                extra_fields={
+                    "phi_observable": phi_observable,
+                    "phi_nullspace_correction": phi - phi_observable,
+                    "motion_fill_role": np.asarray([0, 2], dtype=np.int8),
+                    "motion_fill_method": np.array("joint_knn_nullspace_lsmr"),
+                },
+            )
+            fields = load_gaussian_modal_fields(
+                str(manifest_path),
+                torch.from_numpy(points.copy()),
+            )
+
+        torch.testing.assert_close(fields.phi_real[0], torch.from_numpy(phi.real))
+        torch.testing.assert_close(fields.phi_imag[0], torch.from_numpy(phi.imag))
 
     def test_rejects_noncontiguous_gaussian_indices(self) -> None:
         points = np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]], dtype=np.float32)

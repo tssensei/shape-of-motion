@@ -148,6 +148,21 @@ def load_modal_npz(path: str | Path) -> dict[str, np.ndarray]:
     return {k: z[k] for k in z.files}
 
 
+def load_modal_freqs(paths: list[str | Path]) -> list[np.ndarray]:
+    """Load and validate selected modal frequencies for multiple views."""
+    freqs_per_view: list[np.ndarray] = []
+    for path in paths:
+        modal = load_modal_npz(path)
+        mode_u = modal["mode_u"]
+        freqs = modal["selected_freqs_hz"].astype(np.float32).reshape(-1)
+        if mode_u.shape[0] != freqs.shape[0]:
+            raise ValueError(f"{path} selected_freqs_hz length does not match mode_u/mode_v.")
+        freqs_per_view.append(freqs)
+    if len({freqs.shape[0] for freqs in freqs_per_view}) != 1:
+        raise ValueError("All modal npz files must contain the same number of selected frequencies.")
+    return freqs_per_view
+
+
 def ensure_modal_shape(modal: dict[str, np.ndarray], expected_shape: tuple[int, int]) -> None:
     """Ensure modal image arrays are aligned to a view_config image size."""
     mode_shape = tuple(int(v) for v in modal["mode_u"].shape[1:])

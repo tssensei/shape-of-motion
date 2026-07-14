@@ -283,6 +283,122 @@ class MotionFillCoreTests(unittest.TestCase):
             [True, True, False, False],
         )
 
+    def test_excluded_point_is_neither_boundary_nor_bridge(self) -> None:
+        points = np.asarray(
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.2, 0.0, 0.0], [0.3, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+        target = np.asarray([1.0 + 0.5j, -2.0, 3.0 - 0.25j], dtype=np.complex128)
+        phi_observable = np.zeros((4, 3), dtype=np.complex128)
+        phi_observable[0] = target
+        phi_observable[2] = np.asarray([50.0, -75.0j, 100.0])
+        basis = np.zeros((4, 3, 3), dtype=np.complex128)
+        basis[1] = np.eye(3, dtype=np.complex128)
+        basis[3] = np.eye(3, dtype=np.complex128)
+        nullity = np.asarray([0, 3, 0, 3], dtype=np.int8)
+        anchor_mask = np.asarray([True, False, False, False])
+        partial_mask = np.zeros((4,), dtype=bool)
+        unobserved_mask = np.asarray([False, True, False, True])
+        excluded_mask = np.asarray([False, False, True, False])
+
+        result = fill_nullspace_motion(
+            _chain_graph(points),
+            phi_observable,
+            basis,
+            nullity,
+            anchor_mask,
+            partial_mask,
+            unobserved_mask,
+            excluded_mask=excluded_mask,
+        )
+
+        np.testing.assert_allclose(result.phi[1], target, atol=1e-9)
+        np.testing.assert_array_equal(result.phi[2:], phi_observable[2:])
+        np.testing.assert_array_equal(result.phi_nullspace_correction[2], np.zeros(3))
+        np.testing.assert_array_equal(result.completion_mask, [False, True, False, False])
+        np.testing.assert_array_equal(
+            result.completion_connected_to_anchor,
+            [True, True, False, False],
+        )
+        np.testing.assert_array_equal(result.connectivity.active_mask, ~excluded_mask)
+        np.testing.assert_array_equal(result.connectivity.component_index, [0, 0, -1, 1])
+        np.testing.assert_array_equal(result.connectivity.component_sizes, [2, 1])
+        np.testing.assert_array_equal(result.connectivity.component_has_anchor, [True, False])
+        np.testing.assert_array_equal(result.connectivity.component_anchor_count, [1, 0])
+        np.testing.assert_array_equal(result.connectivity.hop_distance, [0, 1, -1, -1])
+        self.assertEqual(result.active_edge_count, 1)
+
+    def test_four_way_partition_and_excluded_nullity_validation(self) -> None:
+        case = list(_constant_field_case(np.asarray([1.0, 2.0, 3.0])))
+        case[4] = np.concatenate((case[4], [False]))
+        case[5] = np.concatenate((case[5], [False]))
+        case[6] = np.concatenate((case[6], [False]))
+        phi = np.vstack((case[1], np.asarray([[4.0, 5.0, 6.0]])))
+        basis = np.concatenate((case[2], (2.0 * np.eye(3))[None]), axis=0)
+        nullity = np.concatenate((case[3], np.asarray([3], dtype=np.int8)))
+        excluded = np.asarray([False, False, False, True])
+
+        validated = validate_motion_fill_inputs(
+            phi,
+            basis,
+            nullity,
+            case[4],
+            case[5],
+            case[6],
+            excluded_mask=excluded,
+        )
+        np.testing.assert_array_equal(validated.excluded_mask, excluded)
+
+        overlapping = excluded.copy()
+        overlapping[0] = True
+        with self.assertRaisesRegex(ValueError, "mutually exclusive and exhaustive"):
+            validate_motion_fill_inputs(
+                phi,
+                basis,
+                nullity,
+                case[4],
+                case[5],
+                case[6],
+                excluded_mask=overlapping,
+            )
+
+        missing = excluded.copy()
+        missing[3] = False
+        with self.assertRaisesRegex(ValueError, "mutually exclusive and exhaustive"):
+            validate_motion_fill_inputs(
+                phi,
+                basis,
+                nullity,
+                case[4],
+                case[5],
+                case[6],
+                excluded_mask=missing,
+            )
+
+        with self.assertRaisesRegex(ValueError, "boolean dtype"):
+            validate_motion_fill_inputs(
+                phi,
+                basis,
+                nullity,
+                case[4],
+                case[5],
+                case[6],
+                excluded_mask=excluded.astype(np.int8),
+            )
+
+        wide_nullity = nullity.astype(np.int16)
+        wide_nullity[3] = 257
+        with self.assertRaisesRegex(ValueError, r"\[0,3\]"):
+            validate_motion_fill_inputs(
+                phi,
+                basis,
+                wide_nullity,
+                case[4],
+                case[5],
+                case[6],
+                excluded_mask=excluded,
+            )
+
     def test_variable_nullity_uses_all_active_basis_columns(self) -> None:
         target = np.asarray([1.0, 2.0 - 0.5j, 3.0 + 0.25j], dtype=np.complex128)
         points = np.asarray([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]], dtype=np.float64)
@@ -378,14 +494,30 @@ class MotionFillCoreTests(unittest.TestCase):
         for first, second in graph_k2.edge_index:
             self.assertLess(int(first), int(second))
 
-    def test_knn_candidates_reject_duplicate_points(self) -> None:
+    def test_knn_candidates_support_duplicate_points_deterministically(self) -> None:
         points = np.asarray(
-            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
             dtype=np.float64,
         )
+        candidates = query_knn_candidates(points, max_k=2)
+        graph = build_knn_graph(candidates, k=1, max_distance=0.1, epsilon=1e-8)
 
-        with self.assertRaisesRegex(ValueError, "duplicate|zero-distance"):
-            query_knn_candidates(points, max_k=1)
+        np.testing.assert_array_equal(candidates.neighbor_indices[0], [1, 2])
+        np.testing.assert_array_equal(candidates.neighbor_indices[1], [0, 2])
+        np.testing.assert_array_equal(candidates.neighbor_indices[2], [0, 1])
+        np.testing.assert_array_equal(candidates.neighbor_indices[3], [0, 1])
+        np.testing.assert_array_equal(
+            candidates.neighbor_distances[:3],
+            np.zeros((3, 2), dtype=np.float64),
+        )
+        self.assertEqual(_edge_set(graph.edge_index), {(0, 1), (0, 2)})
+        np.testing.assert_allclose(graph.edge_distance, 0.0, atol=0.0)
+        np.testing.assert_allclose(graph.edge_weight, 1.0 / graph.epsilon, atol=0.0)
 
     def test_same_graph_has_track_specific_anchor_connectivity(self) -> None:
         points = np.asarray(

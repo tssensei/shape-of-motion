@@ -1,5 +1,5 @@
-"""Command adapters registered by :mod:`modal_surface.cli`.
+"""Application runner used by the :mod:`modal_surface` package entrypoint.
 
-Each command module owns its argument registration and runner while keeping
+The application module owns its argument registration and runner while keeping
 the numerical implementation in the core ``modal_surface`` modules.
 """

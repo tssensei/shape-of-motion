@@ -55,6 +55,9 @@ class AnchorConnectivity:
     """Track-specific graph connectivity relative to fixed anchor points."""
 
     connected_to_anchor: np.ndarray
+    active_mask: np.ndarray
+    component_index: np.ndarray
+    component_sizes: np.ndarray
     component_has_anchor: np.ndarray
     component_anchor_count: np.ndarray
     hop_distance: np.ndarray
@@ -85,6 +88,7 @@ class ValidatedMotionFillInputs:
     anchor_mask: np.ndarray
     partial_mask: np.ndarray
     unobserved_mask: np.ndarray
+    excluded_mask: np.ndarray
     output_dtype: np.dtype
 
 
@@ -141,8 +145,6 @@ def _validate_points(points_world: np.ndarray) -> np.ndarray:
         raise ValueError("Motion-fill KNN construction requires at least two points.")
     if not np.all(np.isfinite(points)):
         raise ValueError("points_world must contain only finite values.")
-    if np.unique(points, axis=0).shape[0] != points.shape[0]:
-        raise ValueError("points_world contains duplicate points with zero pairwise distance.")
     return points
 
 
@@ -156,29 +158,35 @@ def query_knn_candidates(points_world: np.ndarray, max_k: int) -> KnnCandidateSe
         raise ValueError(f"max_k must be smaller than the point count ({num_points}), got {max_k}.")
 
     cKDTree = _require_scipy_kdtree()
-    distances, indices = cKDTree(points).query(points, k=max_k + 1)
+    tree = cKDTree(points)
+    distances, _ = tree.query(points, k=max_k + 1)
     distances = np.asarray(distances, dtype=np.float64)
-    indices = np.asarray(indices, dtype=np.int64)
     neighbors = np.empty((num_points, max_k), dtype=np.int64)
     neighbor_distances = np.empty((num_points, max_k), dtype=np.float64)
 
     for point_index in range(num_points):
-        keep = indices[point_index] != point_index
-        row_indices = indices[point_index, keep]
-        row_distances = distances[point_index, keep]
-        if row_indices.size != max_k:
+        boundary = np.nextafter(distances[point_index, -1], np.inf)
+        row_indices = np.asarray(
+            tree.query_ball_point(points[point_index], boundary), dtype=np.int64
+        )
+        row_indices = row_indices[row_indices != point_index]
+        row_distances = np.linalg.norm(
+            points[row_indices] - points[point_index], axis=1
+        )
+        if row_indices.size < max_k:
             raise ValueError(
-                f"KNN query returned {row_indices.size} non-self neighbors for point "
-                f"{point_index}; expected {max_k}."
+                f"KNN query returned only {row_indices.size} non-self candidates for "
+                f"point {point_index}; expected at least {max_k}."
             )
         order = np.lexsort((row_indices, row_distances))
-        neighbors[point_index] = row_indices[order]
-        neighbor_distances[point_index] = row_distances[order]
+        selected = order[:max_k]
+        neighbors[point_index] = row_indices[selected]
+        neighbor_distances[point_index] = row_distances[selected]
 
     if not np.all(np.isfinite(neighbor_distances)):
         raise ValueError("KNN query produced non-finite neighbor distances.")
-    if np.any(neighbor_distances <= 0.0):
-        raise ValueError("KNN query produced a zero-distance neighbor pair.")
+    if np.any(neighbor_distances < 0.0):
+        raise ValueError("KNN query produced a negative neighbor distance.")
     return KnnCandidateSet(
         neighbor_indices=neighbors,
         neighbor_distances=neighbor_distances,
@@ -219,6 +227,28 @@ def _stable_component_labels(num_points: int, edge_index: np.ndarray) -> tuple[n
     return component_index, component_sizes
 
 
+def _active_component_labels(
+    num_points: int,
+    edge_index: np.ndarray,
+    active_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    active_points = np.where(active_mask)[0]
+    component_index = np.full((num_points,), -1, dtype=np.int32)
+    if active_points.size == 0:
+        return component_index, np.empty((0,), dtype=np.int32)
+
+    point_to_active = np.full((num_points,), -1, dtype=np.int64)
+    point_to_active[active_points] = np.arange(active_points.size, dtype=np.int64)
+    active_edge_mask = active_mask[edge_index[:, 0]] & active_mask[edge_index[:, 1]]
+    active_edges = point_to_active[edge_index[active_edge_mask]]
+    active_component_index, component_sizes = _stable_component_labels(
+        int(active_points.size),
+        active_edges,
+    )
+    component_index[active_points] = active_component_index
+    return component_index, component_sizes
+
+
 def build_knn_graph(
     candidates: KnnCandidateSet,
     k: int,
@@ -255,8 +285,8 @@ def build_knn_graph(
     neighbor_distances = np.asarray(candidates.neighbor_distances[:, :k], dtype=np.float64)
     if np.any(neighbor_indices < 0) or np.any(neighbor_indices >= num_points):
         raise ValueError("KNN candidates contain an out-of-range point index.")
-    if np.any(~np.isfinite(neighbor_distances)) or np.any(neighbor_distances <= 0.0):
-        raise ValueError("KNN candidates must contain finite, positive distances.")
+    if np.any(~np.isfinite(neighbor_distances)) or np.any(neighbor_distances < 0.0):
+        raise ValueError("KNN candidates must contain finite, non-negative distances.")
 
     source = np.repeat(np.arange(num_points, dtype=np.int64), k)
     target = neighbor_indices.reshape(-1)
@@ -328,8 +358,8 @@ def _validate_graph(graph: KnnGraph) -> None:
         raise ValueError("graph.edge_index must contain unique ordered undirected edges with i < j.")
     if graph.edge_distance.shape != (num_edges,) or graph.edge_weight.shape != (num_edges,):
         raise ValueError("graph edge distance/weight arrays must match graph.edge_index length.")
-    if np.any(~np.isfinite(graph.edge_distance)) or np.any(graph.edge_distance <= 0.0):
-        raise ValueError("graph.edge_distance must contain finite, positive values.")
+    if np.any(~np.isfinite(graph.edge_distance)) or np.any(graph.edge_distance < 0.0):
+        raise ValueError("graph.edge_distance must contain finite, non-negative values.")
     if np.any(~np.isfinite(graph.edge_weight)) or np.any(graph.edge_weight <= 0.0):
         raise ValueError("graph.edge_weight must contain finite, positive values.")
     if graph.degree.shape != (num_points,):
@@ -338,22 +368,41 @@ def _validate_graph(graph: KnnGraph) -> None:
         raise ValueError("graph.component_index must match graph.num_points.")
 
 
-def compute_anchor_connectivity(graph: KnnGraph, anchor_mask: np.ndarray) -> AnchorConnectivity:
-    """Find anchor-connected components and nearest-anchor hop distances."""
+def compute_anchor_connectivity(
+    graph: KnnGraph,
+    anchor_mask: np.ndarray,
+    excluded_mask: np.ndarray | None = None,
+) -> AnchorConnectivity:
+    """Find anchor connectivity after removing excluded vertices and incident edges."""
 
     _validate_graph(graph)
     anchor = _validate_boolean_mask(anchor_mask, "anchor_mask", graph.num_points)
-    num_components = int(graph.component_sizes.shape[0])
+    if excluded_mask is None:
+        excluded = np.zeros((graph.num_points,), dtype=bool)
+    else:
+        excluded = _validate_boolean_mask(excluded_mask, "excluded_mask", graph.num_points)
+    if np.any(anchor & excluded):
+        raise ValueError("anchor_mask and excluded_mask must be mutually exclusive.")
+    active_mask = ~excluded
+    component_index, component_sizes = _active_component_labels(
+        graph.num_points,
+        graph.edge_index,
+        active_mask,
+    )
+    num_components = int(component_sizes.shape[0])
     component_anchor_count = np.bincount(
-        graph.component_index,
-        weights=anchor.astype(np.int32),
+        component_index[active_mask],
+        weights=anchor[active_mask].astype(np.int32),
         minlength=num_components,
     ).astype(np.int32)
     component_has_anchor = component_anchor_count > 0
-    connected_to_anchor = component_has_anchor[graph.component_index]
+    connected_to_anchor = np.zeros((graph.num_points,), dtype=bool)
+    connected_to_anchor[active_mask] = component_has_anchor[component_index[active_mask]]
 
     adjacency: list[list[int]] = [[] for _ in range(graph.num_points)]
     for point_i, point_j in graph.edge_index.tolist():
+        if excluded[int(point_i)] or excluded[int(point_j)]:
+            continue
         adjacency[int(point_i)].append(int(point_j))
         adjacency[int(point_j)].append(int(point_i))
     hop_distance = np.full((graph.num_points,), -1, dtype=np.int32)
@@ -373,6 +422,9 @@ def compute_anchor_connectivity(graph: KnnGraph, anchor_mask: np.ndarray) -> Anc
         raise RuntimeError("Anchor hop-distance traversal disagrees with graph component labels.")
     return AnchorConnectivity(
         connected_to_anchor=connected_to_anchor,
+        active_mask=active_mask,
+        component_index=component_index,
+        component_sizes=component_sizes,
         component_has_anchor=component_has_anchor,
         component_anchor_count=component_anchor_count,
         hop_distance=hop_distance,
@@ -387,6 +439,7 @@ def validate_motion_fill_inputs(
     partial_mask: np.ndarray,
     unobserved_mask: np.ndarray,
     *,
+    excluded_mask: np.ndarray | None = None,
     basis_real_atol: float = 1e-7,
     basis_orthonormal_atol: float = 1e-5,
     observable_orthogonality_atol: float = 1e-5,
@@ -441,10 +494,20 @@ def validate_motion_fill_inputs(
     anchor = _validate_boolean_mask(anchor_mask, "anchor_mask", num_points)
     partial = _validate_boolean_mask(partial_mask, "partial_mask", num_points)
     unobserved = _validate_boolean_mask(unobserved_mask, "unobserved_mask", num_points)
-    partition_count = anchor.astype(np.int8) + partial.astype(np.int8) + unobserved.astype(np.int8)
+    if excluded_mask is None:
+        excluded = np.zeros((num_points,), dtype=bool)
+    else:
+        excluded = _validate_boolean_mask(excluded_mask, "excluded_mask", num_points)
+    partition_count = (
+        anchor.astype(np.int8)
+        + partial.astype(np.int8)
+        + unobserved.astype(np.int8)
+        + excluded.astype(np.int8)
+    )
     if np.any(partition_count != 1):
         raise ValueError(
-            "anchor_mask, partial_mask, and unobserved_mask must be mutually exclusive and exhaustive."
+            "anchor_mask, partial_mask, unobserved_mask, and excluded_mask must be "
+            "mutually exclusive and exhaustive."
         )
     if np.any(nullity[anchor] != 0):
         raise ValueError("Every anchor point must have nullity zero.")
@@ -457,6 +520,8 @@ def validate_motion_fill_inputs(
 
     identity = np.eye(3, dtype=np.float64)
     for point in range(num_points):
+        if excluded[point]:
+            continue
         dimension = int(nullity[point])
         if dimension == 0:
             continue
@@ -481,6 +546,7 @@ def validate_motion_fill_inputs(
         anchor_mask=anchor,
         partial_mask=partial,
         unobserved_mask=unobserved,
+        excluded_mask=excluded,
         output_dtype=np.dtype(output_dtype),
     )
 
@@ -497,7 +563,10 @@ def _assemble_sparse_system(
     coefficient_offsets[1:] = np.cumsum(variable_dimensions, dtype=np.int64)
     column_count = int(coefficient_offsets[-1])
 
-    active_edge_mask = connectivity.connected_to_anchor[graph.edge_index[:, 0]]
+    active_edge_mask = (
+        connectivity.connected_to_anchor[graph.edge_index[:, 0]]
+        & connectivity.connected_to_anchor[graph.edge_index[:, 1]]
+    )
     active_edge_indices = np.where(active_edge_mask)[0]
     edges = graph.edge_index[active_edge_indices]
     sqrt_weight = np.sqrt(graph.edge_weight[active_edge_indices])
@@ -608,6 +677,7 @@ def fill_nullspace_motion(
     partial_mask: np.ndarray,
     unobserved_mask: np.ndarray,
     *,
+    excluded_mask: np.ndarray | None = None,
     lsmr_atol: float = 1e-10,
     lsmr_btol: float = 1e-10,
     lsmr_conlim: float = 1e8,
@@ -623,6 +693,7 @@ def fill_nullspace_motion(
         anchor_mask,
         partial_mask,
         unobserved_mask,
+        excluded_mask=excluded_mask,
     )
     if inputs.phi_observable.shape[0] != graph.num_points:
         raise ValueError(
@@ -637,7 +708,11 @@ def fill_nullspace_motion(
     if lsmr_maxiter is not None:
         lsmr_maxiter = _require_positive_integer(lsmr_maxiter, "lsmr_maxiter")
 
-    connectivity = compute_anchor_connectivity(graph, inputs.anchor_mask)
+    connectivity = compute_anchor_connectivity(
+        graph,
+        inputs.anchor_mask,
+        inputs.excluded_mask,
+    )
     matrix, rhs, coefficient_offsets, variable_mask, active_edge_count = _assemble_sparse_system(
         graph, inputs, connectivity
     )
@@ -685,6 +760,7 @@ def fill_nullspace_motion(
             inputs.phi_observable[point] + point_correction
         ).astype(inputs.output_dtype, copy=False)
     phi_filled[inputs.anchor_mask] = phi_source[inputs.anchor_mask]
+    phi_filled[inputs.excluded_mask] = phi_source[inputs.excluded_mask]
 
     completion_mask = connectivity.connected_to_anchor & ~inputs.anchor_mask
     return MotionFillResult(
