@@ -48,6 +48,7 @@ MOTION_FILL_EXCLUDED_REASON_NAMES = (
 
 MOTION_FILL_METHOD = "joint_knn_nullspace_lsmr"
 MOTION_FILL_VERSION = 1
+MOTION_FILL_NUMERICAL_RANK_POLICY = "svd_max_shape_float64_epsilon"
 MOTION_FILL_EPSILON = 1e-8
 MOTION_FILL_LSMR_ATOL = 1e-10
 MOTION_FILL_LSMR_BTOL = 1e-10
@@ -68,6 +69,24 @@ class GaussianMotionFillRoles:
     @property
     def active_mask(self) -> np.ndarray:
         return ~self.excluded_mask
+
+
+@dataclass(frozen=True)
+class GaussianObservationOperator:
+    point_index: np.ndarray
+    view_index: np.ndarray
+    jacobian: np.ndarray
+    weight: np.ndarray
+    alphas: np.ndarray
+    valid_rows: np.ndarray
+    weighted_operator: np.ndarray
+
+
+@dataclass(frozen=True)
+class GaussianMotionFillSubspaces:
+    basis: np.ndarray
+    nullity: np.ndarray
+    valid_rows: np.ndarray
 
 
 def _require(arrays: Mapping[str, np.ndarray], key: str) -> np.ndarray:
@@ -168,51 +187,146 @@ def derive_gaussian_motion_fill_roles(
     )
 
 
-def _validate_observation_nullspaces(
+def _load_observation_operator(
     arrays: Mapping[str, np.ndarray],
-    constrained_mask: np.ndarray,
-) -> tuple[float, np.ndarray]:
-    num_points = int(constrained_mask.shape[0])
-    point_index = _require(arrays, "obs_point_index")
-    view_index = _require(arrays, "obs_view_index")
-    jacobian = _require(arrays, "obs_J")
-    weight = _require(arrays, "obs_effective_weight")
-    alphas = _require(arrays, "alphas")
+    num_points: int,
+) -> GaussianObservationOperator:
+    point_index_source = _require(arrays, "obs_point_index")
+    view_index_source = _require(arrays, "obs_view_index")
+    jacobian_source = _require(arrays, "obs_J")
+    weight_source = _require(arrays, "obs_effective_weight")
+    alphas_source = _require(arrays, "alphas")
     identifiable = _require(arrays, "alpha_identifiable_mask")
-    basis = _require(arrays, "point_nullspace_basis")
-    nullity = _require(arrays, "point_nullity")
-    num_observations = int(point_index.shape[0])
-    if not np.issubdtype(point_index.dtype, np.integer):
+    if point_index_source.ndim != 1:
+        raise ValueError(
+            f"obs_point_index must be a 1-D array, got {point_index_source.shape}."
+        )
+    num_observations = int(point_index_source.shape[0])
+    if not np.issubdtype(point_index_source.dtype, np.integer):
         raise ValueError("obs_point_index must have integer dtype.")
-    if not np.issubdtype(view_index.dtype, np.integer):
+    if not np.issubdtype(view_index_source.dtype, np.integer):
         raise ValueError("obs_view_index must have integer dtype.")
-    if view_index.shape != (num_observations,):
+    if view_index_source.shape != (num_observations,):
         raise ValueError("obs_view_index must match obs_point_index length.")
-    if jacobian.shape != (num_observations, 2, 3):
+    if jacobian_source.shape != (num_observations, 2, 3):
         raise ValueError(f"obs_J must have shape ({num_observations},2,3).")
-    if weight.shape != (num_observations,):
+    if weight_source.shape != (num_observations,):
         raise ValueError("obs_effective_weight must match obs_point_index length.")
-    if alphas.ndim != 1 or alphas.size == 0:
-        raise ValueError(f"alphas must be a non-empty 1-D array, got {alphas.shape}.")
-    if identifiable.shape != alphas.shape or identifiable.dtype != np.bool_:
+    if alphas_source.ndim != 1 or alphas_source.size == 0:
+        raise ValueError(
+            f"alphas must be a non-empty 1-D array, got {alphas_source.shape}."
+        )
+    if identifiable.shape != alphas_source.shape or identifiable.dtype != np.bool_:
         raise ValueError("alpha_identifiable_mask must be boolean and match alphas.")
-    if basis.shape != (num_points, 3, 3) or nullity.shape != (num_points,):
-        raise ValueError("Point nullspace arrays do not match points_world length.")
+    point_index = point_index_source.astype(np.int64, copy=False)
+    view_index = view_index_source.astype(np.int64, copy=False)
     if np.any(point_index < 0) or np.any(point_index >= num_points):
         raise ValueError("obs_point_index contains an out-of-range point index.")
-    if np.any(view_index < 0) or np.any(view_index >= alphas.shape[0]):
+    if np.any(view_index < 0) or np.any(view_index >= alphas_source.shape[0]):
         raise ValueError("obs_view_index contains an out-of-range view index.")
+    jacobian = jacobian_source.astype(np.float64)
+    weight = weight_source.astype(np.float64)
+    alphas = alphas_source.astype(np.complex128)
     if np.any(~np.isfinite(weight)) or np.any(weight < 0.0):
         raise ValueError("obs_effective_weight must contain finite non-negative values.")
 
-    point_index = point_index.astype(np.int64, copy=False)
-    view_index = view_index.astype(np.int64, copy=False)
-    weighted_operator = (
-        np.sqrt(weight.astype(np.float64))[:, None, None]
-        * alphas.astype(np.complex128)[view_index, None, None]
-        * jacobian.astype(np.float64)
-    )
     valid_rows = identifiable[view_index] & (weight > 0.0)
+    if np.any(~np.isfinite(jacobian[valid_rows])):
+        raise ValueError("obs_J must be finite on positive-weight identifiable rows.")
+    valid_alphas = alphas[view_index[valid_rows]]
+    if np.any(~np.isfinite(valid_alphas)) or np.any(np.abs(valid_alphas) == 0.0):
+        raise ValueError(
+            "alphas must be finite and non-zero on positive-weight identifiable rows."
+        )
+    weighted_operator = np.zeros(
+        (num_observations, 2, 3), dtype=np.complex128
+    )
+    weighted_operator[valid_rows] = (
+        np.sqrt(weight[valid_rows])[:, None, None]
+        * valid_alphas[:, None, None]
+        * jacobian[valid_rows]
+    )
+    return GaussianObservationOperator(
+        point_index=point_index,
+        view_index=view_index,
+        jacobian=jacobian,
+        weight=weight,
+        alphas=alphas,
+        valid_rows=valid_rows,
+        weighted_operator=weighted_operator,
+    )
+
+
+def _derive_numerical_completion_subspaces(
+    operator: GaussianObservationOperator,
+    num_points: int,
+) -> GaussianMotionFillSubspaces:
+    """Derive completion-only nullspaces without changing staged rank fields."""
+
+    basis = np.broadcast_to(
+        np.eye(3, dtype=np.float64), (num_points, 3, 3)
+    ).copy()
+    nullity = np.full((num_points,), 3, dtype=np.int8)
+    valid_indices = np.flatnonzero(operator.valid_rows)
+    if valid_indices.size == 0:
+        return GaussianMotionFillSubspaces(
+            basis=basis,
+            nullity=nullity,
+            valid_rows=operator.valid_rows,
+        )
+
+    ordered_rows = valid_indices[
+        np.argsort(operator.point_index[valid_indices], kind="stable")
+    ]
+    counts = np.bincount(
+        operator.point_index[ordered_rows], minlength=num_points
+    ).astype(np.int64)
+    offsets = np.zeros((num_points + 1,), dtype=np.int64)
+    offsets[1:] = np.cumsum(counts, dtype=np.int64)
+    epsilon = np.finfo(np.float64).eps
+    for point in np.flatnonzero(counts):
+        rows = ordered_rows[offsets[point] : offsets[point + 1]]
+        geometry = (
+            np.sqrt(operator.weight[rows])[:, None, None]
+            * np.abs(operator.alphas[operator.view_index[rows]])[:, None, None]
+            * operator.jacobian[rows]
+        ).reshape(-1, 3)
+        _, singular, vh = np.linalg.svd(
+            geometry,
+            full_matrices=geometry.shape[0] < geometry.shape[1],
+        )
+        if singular.size == 0 or singular[0] <= 0.0:
+            raise ValueError(
+                f"Point {int(point)} has positive-weight observations but zero "
+                "operator energy."
+            )
+        tolerance = float(singular[0]) * max(geometry.shape) * epsilon
+        rank = int(np.count_nonzero(singular > tolerance))
+        dimension = 3 - rank
+        basis[point] = 0.0
+        if dimension:
+            basis[point, :, :dimension] = vh[rank:].T
+        nullity[point] = dimension
+    return GaussianMotionFillSubspaces(
+        basis=basis,
+        nullity=nullity,
+        valid_rows=operator.valid_rows,
+    )
+
+
+def _validate_observation_nullspaces(
+    arrays: Mapping[str, np.ndarray],
+    operator: GaussianObservationOperator,
+    constrained_mask: np.ndarray,
+) -> float:
+    num_points = int(constrained_mask.shape[0])
+    basis = _require(arrays, "point_nullspace_basis")
+    nullity = _require(arrays, "point_nullity")
+    if basis.shape != (num_points, 3, 3) or nullity.shape != (num_points,):
+        raise ValueError("Point nullspace arrays do not match points_world length.")
+    point_index = operator.point_index
+    weighted_operator = operator.weighted_operator
+    valid_rows = operator.valid_rows
     active_rows = constrained_mask[point_index] & valid_rows
     operator_energy = np.zeros((num_points,), dtype=np.float64)
     nullspace_energy = np.zeros((num_points,), dtype=np.float64)
@@ -247,11 +361,11 @@ def _validate_observation_nullspaces(
     if maximum > MOTION_FILL_NULLSPACE_RTOL:
         point = int(np.argmax(relative))
         raise ValueError(
-            f"Stored nullspace fails A_i N_i = 0 at point {point}: "
+            f"Motion-fill nullspace fails A_i N_i = 0 at point {point}: "
             f"relative error {relative[point]:.6g} exceeds "
             f"{MOTION_FILL_NULLSPACE_RTOL:.6g}."
         )
-    return maximum, valid_rows
+    return maximum
 
 
 def _observation_drift(
@@ -413,8 +527,14 @@ def apply_gaussian_motion_fill(
     path = Path(latent_path)
     with np.load(path, allow_pickle=False) as loaded:
         arrays = {key: loaded[key] for key in loaded.files}
-    roles = derive_gaussian_motion_fill_roles(arrays)
+    staged_roles = derive_gaussian_motion_fill_roles(arrays)
     phi_observable = _require(arrays, "phi_observable")
+    num_points = int(_require(arrays, "points_world").shape[0])
+    if phi_observable.shape != (num_points, 3):
+        raise ValueError(
+            f"phi_observable must have shape ({num_points},3), got "
+            f"{phi_observable.shape}."
+        )
     if not np.array_equal(_require(arrays, "phi"), phi_observable):
         raise ValueError("Gaussian latent phi must equal phi_observable before motion fill.")
     if np.any(_require(arrays, "completion_mask")) or np.any(
@@ -422,14 +542,26 @@ def apply_gaussian_motion_fill(
     ):
         raise ValueError("Gaussian latent already contains motion-fill completion.")
 
-    nullspace_error, valid_rows = _validate_observation_nullspaces(
-        arrays, roles.constrained_variable_mask
+    operator = _load_observation_operator(arrays, num_points)
+    subspaces = _derive_numerical_completion_subspaces(operator, num_points)
+    completion_arrays = dict(arrays)
+    completion_arrays["point_nullspace_basis"] = subspaces.basis
+    completion_arrays["point_nullity"] = subspaces.nullity
+    roles = derive_gaussian_motion_fill_roles(completion_arrays)
+    staged_nullity = _require(arrays, "point_nullity").astype(np.int8, copy=False)
+    refined_partial_mask = (
+        _require(arrays, "partial_mask") & (staged_nullity != subspaces.nullity)
+    )
+    nullspace_error = _validate_observation_nullspaces(
+        completion_arrays,
+        operator,
+        roles.constrained_variable_mask,
     )
     result = fill_nullspace_motion(
         graph,
         phi_observable,
-        _require(arrays, "point_nullspace_basis"),
-        _require(arrays, "point_nullity"),
+        subspaces.basis,
+        subspaces.nullity,
         roles.fixed_anchor_mask,
         roles.constrained_variable_mask,
         roles.free_variable_mask,
@@ -447,7 +579,7 @@ def apply_gaussian_motion_fill(
         arrays,
         result.phi_nullspace_correction,
         roles.constrained_variable_mask,
-        valid_rows,
+        subspaces.valid_rows,
     )
 
     pred, obs_residual, obs_residual_valid, point_residual, point_residual_valid = (
@@ -481,6 +613,11 @@ def apply_gaussian_motion_fill(
             "motion_fill_excluded_reason": roles.excluded_reason,
             "motion_fill_excluded_reason_names": np.asarray(
                 MOTION_FILL_EXCLUDED_REASON_NAMES
+            ),
+            "motion_fill_point_numerical_nullity": subspaces.nullity,
+            "motion_fill_staged_nullity_refined_mask": refined_partial_mask,
+            "motion_fill_numerical_rank_policy": np.array(
+                MOTION_FILL_NUMERICAL_RANK_POLICY
             ),
             "motion_fill_active_mask": roles.active_mask,
             "motion_fill_excluded_mask": roles.excluded_mask,
@@ -559,11 +696,23 @@ def apply_gaussian_motion_fill(
         for index, name in enumerate(MOTION_FILL_EXCLUDED_REASON_NAMES)
         if index != MOTION_FILL_EXCLUDED_NONE
     }
+    numerical_nullity_counts = {
+        str(dimension): int(np.count_nonzero(subspaces.nullity == dimension))
+        for dimension in range(4)
+    }
     return {
         "method": MOTION_FILL_METHOD,
         "version": MOTION_FILL_VERSION,
         "role_counts": role_counts,
         "excluded_reason_counts": excluded_reason_counts,
+        "numerical_subspace": {
+            "rank_policy": MOTION_FILL_NUMERICAL_RANK_POLICY,
+            "nullity_counts": numerical_nullity_counts,
+            "refined_partial_count": int(np.count_nonzero(refined_partial_mask)),
+            "staged_constrained_count": int(
+                np.count_nonzero(staged_roles.constrained_variable_mask)
+            ),
+        },
         "completion_count": int(np.count_nonzero(result.completion_mask)),
         "anchor_connected_point_count": int(
             np.count_nonzero(result.completion_connected_to_anchor)

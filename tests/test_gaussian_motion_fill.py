@@ -26,6 +26,7 @@ from modal_surface.motion_fill import build_knn_graph, query_knn_candidates
 from modal_surface.optimization_staged import (
     POINT_STATUS_COMPLETED_OBSERVED,
     POINT_STATUS_COMPLETED_UNOBSERVED,
+    POINT_STATUS_PARTIAL_UNRESOLVED,
     POINT_STATUS_REJECTED_UNRESOLVED,
 )
 
@@ -243,23 +244,55 @@ class GaussianMotionFillTests(unittest.TestCase):
         self.assertEqual(diagnostics["system"]["eligible_edge_count"], 2)
         self.assertEqual(saved_diagnostics["method"], diagnostics["method"])
 
-    def test_near_nullspace_leakage_fails_for_zero_measurement(self) -> None:
-        arrays, _, _ = _formal_latent_case()
-        target = np.asarray([0.0, 0.0, 1e4], dtype=np.complex64)
-        arrays["phi_observable"][0] = target
-        arrays["phi_observable"][1:3] = 0.0
-        arrays["phi"] = arrays["phi_observable"].copy()
-        leakage = 1e-6
-        arrays["point_nullspace_basis"][1] = 0.0
-        arrays["point_nullspace_basis"][1, :, 0] = np.asarray(
-            [leakage, 0.0, np.sqrt(1.0 - leakage**2)], dtype=np.float32
+    def test_weak_full_rank_partial_is_excluded_without_blocking_exact_fill(self) -> None:
+        arrays, target, excluded_value = _formal_latent_case()
+        weak_value = excluded_value.copy()
+        weak_value[2] = 0.0
+        arrays["phi_observable"][3] = weak_value
+        arrays["phi"][3] = weak_value
+        arrays["rejected_mask"][3] = False
+        arrays["partial_mask"][3] = True
+        arrays["point_nullity"][3] = 1
+        arrays["point_nullspace_basis"][3, 2, 0] = 1.0
+        arrays["point_solution_status"][3] = POINT_STATUS_PARTIAL_UNRESOLVED
+        arrays["obs_y"][5] = arrays["alphas"][0] * (
+            arrays["obs_J"][5] @ weak_value
         )
-        for row in (0, 1):
-            view = int(arrays["obs_view_index"][row])
-            arrays["obs_y"][row] = arrays["alphas"][view] * (
-                arrays["obs_J"][row] @ target
-            )
-        arrays["obs_y"][2:4] = 0.0
+        weak_jacobian = np.asarray(
+            [[0.0, 0.0, 0.008], [0.0, 0.0, 0.0]], dtype=np.float32
+        )
+        arrays["obs_point_index"] = np.append(arrays["obs_point_index"], 3).astype(
+            np.int32
+        )
+        arrays["obs_view_index"] = np.append(arrays["obs_view_index"], 1).astype(
+            np.int32
+        )
+        arrays["obs_J"] = np.concatenate(
+            [arrays["obs_J"], weak_jacobian[None]], axis=0
+        )
+        arrays["obs_y"] = np.concatenate(
+            [
+                arrays["obs_y"],
+                (
+                    arrays["alphas"][1] * (weak_jacobian @ weak_value)
+                )[None].astype(np.complex64),
+            ],
+            axis=0,
+        )
+        arrays["obs_effective_weight"] = np.append(
+            arrays["obs_effective_weight"], np.float32(1.0)
+        )
+        arrays["obs_pred_y"] = np.concatenate(
+            [arrays["obs_pred_y"], np.zeros((1, 2), dtype=np.complex64)], axis=0
+        )
+        arrays["obs_residual"] = np.append(
+            arrays["obs_residual"], np.float32(0.0)
+        )
+        arrays["obs_residual_valid_mask"] = np.append(
+            arrays["obs_residual_valid_mask"], True
+        )
+        arrays["obs_count_per_point"][3] = 2
+        arrays["obs_sample_count_per_point"][3] = 2
         graph = build_knn_graph(
             query_knn_candidates(arrays["points_world"], max_k=1),
             k=1,
@@ -269,12 +302,70 @@ class GaussianMotionFillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             latent_path = Path(tmp) / "mode.npz"
             np.savez_compressed(latent_path, **arrays)
-            with self.assertRaisesRegex(RuntimeError, "relative drift"):
-                apply_gaussian_motion_fill(
-                    latent_path,
-                    graph,
-                    "motion_fill/graph.npz",
+            diagnostics = apply_gaussian_motion_fill(
+                latent_path,
+                graph,
+                "motion_fill/graph.npz",
+            )
+
+            with np.load(latent_path, allow_pickle=False) as filled:
+                np.testing.assert_allclose(
+                    filled["phi"][0:3],
+                    np.broadcast_to(target, (3, 3)),
+                    atol=1e-5,
                 )
+                np.testing.assert_array_equal(filled["phi"][3], weak_value)
+                np.testing.assert_array_equal(
+                    filled["phi_nullspace_correction"][3],
+                    np.zeros((3,), dtype=np.complex64),
+                )
+                np.testing.assert_array_equal(
+                    filled["completion_mask"], [False, True, True, False]
+                )
+                np.testing.assert_array_equal(
+                    filled["motion_fill_role"], [0, 1, 2, 3]
+                )
+                np.testing.assert_array_equal(
+                    filled["motion_fill_excluded_reason"],
+                    [
+                        MOTION_FILL_EXCLUDED_NONE,
+                        MOTION_FILL_EXCLUDED_NONE,
+                        MOTION_FILL_EXCLUDED_NONE,
+                        MOTION_FILL_EXCLUDED_FULL_RANK_NONANCHOR,
+                    ],
+                )
+                np.testing.assert_array_equal(filled["point_nullity"], [0, 1, 3, 1])
+                np.testing.assert_array_equal(
+                    filled["motion_fill_point_numerical_nullity"], [0, 1, 3, 0]
+                )
+                np.testing.assert_array_equal(
+                    filled["motion_fill_staged_nullity_refined_mask"],
+                    [False, False, False, True],
+                )
+                self.assertNotIn("motion_fill_point_nullspace_basis", filled.files)
+                np.testing.assert_array_equal(
+                    filled["point_solution_status"],
+                    [
+                        0,
+                        POINT_STATUS_COMPLETED_OBSERVED,
+                        POINT_STATUS_COMPLETED_UNOBSERVED,
+                        POINT_STATUS_PARTIAL_UNRESOLVED,
+                    ],
+                )
+                self.assertLessEqual(
+                    float(filled["motion_fill_nullspace_operator_max_relative_error"]),
+                    1e-4,
+                )
+                self.assertLessEqual(
+                    float(filled["motion_fill_observation_drift_max_relative"]),
+                    1e-4,
+                )
+
+        self.assertEqual(diagnostics["completion_count"], 2)
+        self.assertEqual(
+            diagnostics["excluded_reason_counts"]["full_rank_nonanchor"], 1
+        )
+        self.assertEqual(diagnostics["numerical_subspace"]["refined_partial_count"], 1)
 
 
 if __name__ == "__main__":
