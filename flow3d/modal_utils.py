@@ -8,6 +8,13 @@ import numpy as np
 import torch
 from loguru import logger as guru
 
+from modal_surface.gaussian_motion_fill import (
+    MOTION_FILL_ROLE_CONSTRAINED_VARIABLE,
+    MOTION_FILL_ROLE_EXCLUDED,
+    MOTION_FILL_ROLE_FIXED_ANCHOR,
+    MOTION_FILL_ROLE_FREE_VARIABLE,
+    MOTION_FILL_ROLE_NAMES,
+)
 from modal_surface.geometry import (
     bilinear_sample,
     erode_mask,
@@ -17,6 +24,30 @@ from modal_surface.geometry import (
 from modal_surface.io import load_view_config
 
 
+MOTION_FILL_DISPLAY_ANCHOR = 0
+MOTION_FILL_DISPLAY_PARTIAL = 1
+MOTION_FILL_DISPLAY_FILLED = 2
+MOTION_FILL_DISPLAY_UNOBSERVED = 3
+MOTION_FILL_DISPLAY_EXCLUDED = 4
+MOTION_FILL_DISPLAY_NAMES = (
+    "anchor",
+    "partial",
+    "filled",
+    "unobserved",
+    "excluded",
+)
+MOTION_FILL_DISPLAY_COLORS = np.asarray(
+    [
+        [0.05, 0.55, 1.0],
+        [1.0, 0.55, 0.1],
+        [0.1, 0.85, 0.3],
+        [0.65, 0.35, 1.0],
+        [0.45, 0.45, 0.45],
+    ],
+    dtype=np.float32,
+)
+
+
 @dataclass(frozen=True)
 class ModalModeData:
     mode_index: int
@@ -24,6 +55,7 @@ class ModalModeData:
     latent_path: Path
     points_world: np.ndarray
     phi: np.ndarray
+    motion_fill_display_class: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +84,132 @@ class ModalConsistencyData:
     mode_indices: torch.Tensor
     group_indices: torch.Tensor
     group_count: int
+
+
+def classify_motion_fill_display_points(
+    motion_fill_role: np.ndarray,
+    completion_mask: np.ndarray,
+) -> np.ndarray:
+    """Derive exclusive anchor/partial/filled/unobserved/excluded display classes."""
+
+    role = np.asarray(motion_fill_role)
+    completion = np.asarray(completion_mask)
+    if role.ndim != 1:
+        raise ValueError(f"motion_fill_role must be a 1-D array, got {role.shape}")
+    if not np.issubdtype(role.dtype, np.integer):
+        raise ValueError(f"motion_fill_role must have integer dtype, got {role.dtype}")
+    if completion.shape != role.shape:
+        raise ValueError(
+            f"completion_mask must have shape {role.shape}, got {completion.shape}"
+        )
+    if completion.dtype != np.bool_:
+        raise ValueError(
+            f"completion_mask must have boolean dtype, got {completion.dtype}"
+        )
+    if np.any(role < 0) or np.any(role >= len(MOTION_FILL_ROLE_NAMES)):
+        raise ValueError(
+            f"motion_fill_role values must lie in [0,{len(MOTION_FILL_ROLE_NAMES) - 1}]"
+        )
+    completable = (role == MOTION_FILL_ROLE_CONSTRAINED_VARIABLE) | (
+        role == MOTION_FILL_ROLE_FREE_VARIABLE
+    )
+    if np.any(completion & ~completable):
+        point = int(np.where(completion & ~completable)[0][0])
+        raise ValueError(
+            "completion_mask is true for non-completable motion_fill_role "
+            f"at point {point}"
+        )
+
+    display_class = np.full(role.shape, -1, dtype=np.int8)
+    display_class[role == MOTION_FILL_ROLE_FIXED_ANCHOR] = MOTION_FILL_DISPLAY_ANCHOR
+    display_class[
+        (role == MOTION_FILL_ROLE_CONSTRAINED_VARIABLE) & ~completion
+    ] = MOTION_FILL_DISPLAY_PARTIAL
+    display_class[completion] = MOTION_FILL_DISPLAY_FILLED
+    display_class[
+        (role == MOTION_FILL_ROLE_FREE_VARIABLE) & ~completion
+    ] = MOTION_FILL_DISPLAY_UNOBSERVED
+    display_class[role == MOTION_FILL_ROLE_EXCLUDED] = MOTION_FILL_DISPLAY_EXCLUDED
+    if np.any(display_class < 0):
+        point = int(np.where(display_class < 0)[0][0])
+        raise RuntimeError(
+            f"Motion-fill display class was not assigned at point {point}"
+        )
+    return display_class
+
+
+def motion_fill_display_colors(display_class: np.ndarray) -> np.ndarray:
+    """Map motion-fill display classes to deterministic float RGB colors."""
+
+    classes = np.asarray(display_class)
+    if not np.issubdtype(classes.dtype, np.integer):
+        raise ValueError(
+            f"motion-fill display classes must have integer dtype, got {classes.dtype}"
+        )
+    if np.any(classes < 0) or np.any(classes >= len(MOTION_FILL_DISPLAY_NAMES)):
+        raise ValueError(
+            "motion-fill display classes must lie in "
+            f"[0,{len(MOTION_FILL_DISPLAY_NAMES) - 1}]"
+        )
+    return MOTION_FILL_DISPLAY_COLORS[classes]
+
+
+def stack_modal_motion_fill_display_colors(
+    modes: list[ModalModeData],
+) -> np.ndarray | None:
+    """Stack per-mode role colors, preserving legacy manifests without role metadata."""
+
+    has_metadata = [mode.motion_fill_display_class is not None for mode in modes]
+    if not any(has_metadata):
+        return None
+    if not all(has_metadata):
+        raise ValueError(
+            "Manifest modes must either all include motion_fill_role metadata "
+            "or none do"
+        )
+    classes = np.stack(
+        [np.asarray(mode.motion_fill_display_class) for mode in modes], axis=0
+    )
+    return motion_fill_display_colors(classes)
+
+
+def _load_motion_fill_display_class(
+    latent: Any,
+    latent_path: Path,
+    num_points: int,
+) -> np.ndarray | None:
+    if "motion_fill_role" not in latent.files:
+        return None
+    required = {"completion_mask", "motion_fill_role_names"}
+    missing = sorted(required - set(latent.files))
+    if missing:
+        raise ValueError(
+            f"{latent_path} has motion_fill_role but is missing required fields: {missing}"
+        )
+    raw_names = np.asarray(latent["motion_fill_role_names"])
+    if raw_names.ndim != 1:
+        raise ValueError(
+            f"{latent_path} motion_fill_role_names must be a 1-D string array"
+        )
+    names = []
+    for item in raw_names:
+        value = np.asarray(item).item()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        names.append(str(value))
+    if tuple(names) != tuple(MOTION_FILL_ROLE_NAMES):
+        raise ValueError(
+            f"{latent_path} motion_fill_role_names={tuple(names)!r}; "
+            f"expected {tuple(MOTION_FILL_ROLE_NAMES)!r}"
+        )
+    role = np.asarray(latent["motion_fill_role"])
+    completion = np.asarray(latent["completion_mask"])
+    if role.shape != (num_points,):
+        raise ValueError(
+            f"{latent_path} motion_fill_role must have shape ({num_points},), "
+            f"got {role.shape}"
+        )
+    return classify_motion_fill_display_points(role, completion)
 
 
 def load_modal_modes(manifest_path: str) -> list[ModalModeData]:
@@ -88,6 +246,11 @@ def load_modal_modes(manifest_path: str) -> list[ModalModeData]:
             )
         if not np.iscomplexobj(phi):
             raise ValueError(f"{latent_path} phi must be complex-valued")
+        motion_fill_display_class = _load_motion_fill_display_class(
+            latent,
+            latent_path,
+            points_world.shape[0],
+        )
 
         freq_hz = mode_payload.get("freq_hz")
         if freq_hz is None:
@@ -104,9 +267,18 @@ def load_modal_modes(manifest_path: str) -> list[ModalModeData]:
                 latent_path=latent_path,
                 points_world=points_world,
                 phi=phi.astype(np.complex64),
+                motion_fill_display_class=motion_fill_display_class,
             )
         )
 
+    has_motion_fill_metadata = [
+        mode.motion_fill_display_class is not None for mode in modes
+    ]
+    if any(has_motion_fill_metadata) and not all(has_motion_fill_metadata):
+        raise ValueError(
+            "Manifest modes must either all include motion_fill_role metadata "
+            "or none do"
+        )
     return modes
 
 

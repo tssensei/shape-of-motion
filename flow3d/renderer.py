@@ -4,7 +4,10 @@ import torch.nn.functional as F
 from loguru import logger as guru
 from nerfview import CameraState
 
-from flow3d.modal_utils import load_modal_modes
+from flow3d.modal_utils import (
+    load_modal_modes,
+    stack_modal_motion_fill_display_colors,
+)
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import draw_tracks_2d_th, get_server
 from flow3d.vis.viewer import (
@@ -39,6 +42,8 @@ class Renderer:
             self.modal_anchor_phi_real,
             self.modal_anchor_phi_imag,
             modal_anchor_freqs_hz,
+            self.modal_anchor_role_colors,
+            modal_anchor_role_mode_labels,
         ) = self._load_modal_anchor_data(modal_anchor_manifest)
 
         self.viewer = None
@@ -77,6 +82,8 @@ class Renderer:
                     if self.modal_anchor_points is None
                     else int(self.modal_anchor_points.shape[0])
                 ),
+                modal_anchor_role_colors=self.modal_anchor_role_colors,
+                modal_anchor_role_mode_labels=modal_anchor_role_mode_labels,
             )
 
         self.tracks_3d = self.model.compute_poses_fg(
@@ -143,9 +150,16 @@ class Renderer:
 
     def _load_modal_anchor_data(
         self, modal_anchor_manifest: str | None
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, tuple[float, ...]]:
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        tuple[float, ...],
+        np.ndarray | None,
+        tuple[str, ...],
+    ]:
         if modal_anchor_manifest is None:
-            return None, None, None, ()
+            return None, None, None, (), None, ()
 
         modes = load_modal_modes(modal_anchor_manifest)
         points = modes[0].points_world.astype(np.float32)
@@ -167,10 +181,25 @@ class Renderer:
         phi_real = torch.as_tensor(phi.real, device=self.device, dtype=torch.float32)
         phi_imag = torch.as_tensor(phi.imag, device=self.device, dtype=torch.float32)
         freqs_hz = tuple(float(mode.freq_hz) for mode in modes)
+        role_colors = stack_modal_motion_fill_display_colors(modes)
+        role_mode_labels = (
+            tuple(
+                f"Mode {mode.mode_index}: {mode.freq_hz:.3f} Hz" for mode in modes
+            )
+            if role_colors is not None
+            else ()
+        )
         guru.info(
             f"Loaded {points.shape[0]} modal anchor points from {modal_anchor_manifest}"
         )
-        return points_th, phi_real, phi_imag, freqs_hz
+        return (
+            points_th,
+            phi_real,
+            phi_imag,
+            freqs_hz,
+            role_colors,
+            role_mode_labels,
+        )
 
     def _current_modal_anchor_points(
         self, modal_oscillator: tuple[np.ndarray, float] | None

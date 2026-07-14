@@ -90,6 +90,8 @@ class DynamicViewer(Viewer):
         has_modal_obs_count: bool = False,
         gaussian_center_count: int = 0,
         modal_anchor_count: int = 0,
+        modal_anchor_role_colors: np.ndarray | None = None,
+        modal_anchor_role_mode_labels: tuple[str, ...] = (),
     ):
         self.num_frames = num_frames
         self.work_dir = Path(work_dir)
@@ -101,6 +103,33 @@ class DynamicViewer(Viewer):
         self.has_modal_obs_count = bool(has_modal_obs_count)
         self.gaussian_center_count = int(gaussian_center_count)
         self.modal_anchor_count = int(modal_anchor_count)
+        self.modal_anchor_role_mode_labels = tuple(modal_anchor_role_mode_labels)
+        self.modal_anchor_role_colors = None
+        if modal_anchor_role_colors is not None:
+            role_colors = np.asarray(modal_anchor_role_colors, dtype=np.float32)
+            expected_shape = (
+                len(self.modal_anchor_role_mode_labels),
+                self.modal_anchor_count,
+                3,
+            )
+            if role_colors.shape != expected_shape:
+                raise ValueError(
+                    "Modal anchor role colors must have shape "
+                    f"{expected_shape}, got {role_colors.shape}"
+                )
+            if len(set(self.modal_anchor_role_mode_labels)) != len(
+                self.modal_anchor_role_mode_labels
+            ):
+                raise ValueError("Modal anchor role mode labels must be unique")
+            if not np.isfinite(role_colors).all():
+                raise ValueError("Modal anchor role colors must be finite")
+            if np.any(role_colors < 0.0) or np.any(role_colors > 1.0):
+                raise ValueError("Modal anchor role colors must lie in [0,1]")
+            self.modal_anchor_role_colors = role_colors
+        elif self.modal_anchor_role_mode_labels:
+            raise ValueError(
+                "Modal anchor role mode labels require modal anchor role colors"
+            )
         self._gaussian_center_handle = None
         self._modal_anchor_handle = None
         self._gaussian_center_cache_key = None
@@ -341,22 +370,46 @@ class DynamicViewer(Viewer):
             show_anchors = None
             anchor_count = None
             anchor_point_size = None
+            anchor_role_mode = None
             if self.modal_anchor_count > 0:
-                show_anchors = self.server.gui.add_checkbox("Show modal anchors", False)
+                role_coloring = self.modal_anchor_role_colors is not None
+                show_anchors = self.server.gui.add_checkbox(
+                    (
+                        "Show modal points by role"
+                        if role_coloring
+                        else "Show modal anchors"
+                    ),
+                    False,
+                )
                 anchor_count = self.server.gui.add_slider(
-                    "Anchor visible count",
+                    (
+                        "Modal point visible count"
+                        if role_coloring
+                        else "Anchor visible count"
+                    ),
                     min=0,
                     max=max_anchor_count,
                     step=anchor_step,
                     initial_value=min(5000, max_anchor_count),
                 )
                 anchor_point_size = self.server.gui.add_slider(
-                    "Anchor point size",
+                    "Modal point size" if role_coloring else "Anchor point size",
                     min=0.0002,
                     max=0.008,
                     step=0.0001,
                     initial_value=0.002,
                 )
+                if role_coloring:
+                    self.server.gui.add_markdown(
+                        "**Role colors:** anchor = blue | partial = orange | "
+                        "filled = green | unobserved = purple | excluded = gray"
+                    )
+                    if len(self.modal_anchor_role_mode_labels) > 1:
+                        anchor_role_mode = self.server.gui.add_dropdown(
+                            "Modal role mode",
+                            options=self.modal_anchor_role_mode_labels,
+                            initial_value=self.modal_anchor_role_mode_labels[0],
+                        )
         self._debug_point_handles = {
             "hide_render": hide_render,
             "show_centers": show_centers,
@@ -366,6 +419,7 @@ class DynamicViewer(Viewer):
             "show_anchors": show_anchors,
             "anchor_count": anchor_count,
             "anchor_point_size": anchor_point_size,
+            "anchor_role_mode": anchor_role_mode,
         }
 
         def _on_update(event) -> None:
@@ -386,6 +440,8 @@ class DynamicViewer(Viewer):
             anchor_count.on_update(_on_update)
         if anchor_point_size is not None:
             anchor_point_size.on_update(_on_update)
+        if anchor_role_mode is not None:
+            anchor_role_mode.on_update(_on_update)
 
     def _remove_gaussian_center_cloud(self) -> None:
         if self._gaussian_center_handle is not None:
@@ -414,6 +470,19 @@ class DynamicViewer(Viewer):
             and handles["show_anchors"] is not None
             and bool(handles["show_anchors"].value)
         )
+
+    def _modal_anchor_role_mode_index(self) -> int:
+        if self.modal_anchor_role_colors is None:
+            return 0
+        handles = self._debug_point_handles
+        assert handles is not None
+        role_mode = handles["anchor_role_mode"]
+        if role_mode is None:
+            return 0
+        selected = str(role_mode.value)
+        if selected not in self.modal_anchor_role_mode_labels:
+            raise ValueError(f"Unknown modal role mode: {selected}")
+        return self.modal_anchor_role_mode_labels.index(selected)
 
     def current_gaussian_color_mode(self) -> tuple[str, int]:
         handles = getattr(self, "_gaussian_color_handles", None)
@@ -506,7 +575,8 @@ class DynamicViewer(Viewer):
 
         selected = np.arange(visible_count, dtype=np.int64)
         point_size = float(handles["anchor_point_size"].value)
-        cache_key = (visible_count, point_size, update_key)
+        role_mode_index = self._modal_anchor_role_mode_index()
+        cache_key = (visible_count, point_size, role_mode_index, update_key)
         if (
             self._modal_anchor_handle is not None
             and self._modal_anchor_cache_key == cache_key
@@ -514,7 +584,12 @@ class DynamicViewer(Viewer):
             return
 
         self._remove_modal_anchor_cloud()
-        colors = np.full((visible_count, 3), [0.05, 0.55, 1.0], dtype=np.float32)
+        if self.modal_anchor_role_colors is None:
+            colors = np.full(
+                (visible_count, 3), [0.05, 0.55, 1.0], dtype=np.float32
+            )
+        else:
+            colors = self.modal_anchor_role_colors[role_mode_index, selected]
         self._modal_anchor_handle = self.server.scene.add_point_cloud(
             "/debug/modal_anchors",
             points=points[selected],
