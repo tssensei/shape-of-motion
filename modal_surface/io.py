@@ -23,11 +23,38 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
-from typing import Any
+import tempfile
+from typing import Any, Mapping
 
 import cv2
 import numpy as np
+
+
+def save_npz_compressed_atomic(
+    path: str | Path,
+    arrays: Mapping[str, np.ndarray],
+) -> Path:
+    """Atomically replace one compressed NumPy archive."""
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{out.stem}.",
+        suffix=".tmp.npz",
+        dir=out.parent,
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        save_arrays: dict[str, Any] = dict(arrays)
+        np.savez_compressed(temporary, **save_arrays)
+        os.replace(temporary, out)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return out
 
 
 @dataclass(frozen=True)

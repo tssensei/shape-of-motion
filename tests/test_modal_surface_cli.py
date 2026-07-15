@@ -155,6 +155,7 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--gaussian-contribution-min-score",
             "--gaussian-contribution-cov-eps-px",
             "--pixel-min-mode-amp-percentile",
+            "--pixel-max-samples-per-view",
         }
         self.assertTrue(removed_options.isdisjoint(option_strings))
         retained_pixel_options = {
@@ -163,7 +164,6 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "--pixel-preselect-k",
             "--pixel-render-acc-min",
             "--pixel-min-contribution",
-            "--pixel-max-samples-per-view",
         }
         self.assertTrue(retained_pixel_options.issubset(option_strings))
 

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
+if TYPE_CHECKING:
+    from modal_surface.optimization_staged import StagedSolveResult
 
 
 def _scatter_mode_image(
@@ -72,3 +76,70 @@ def _phase_colors(phi: np.ndarray) -> np.ndarray:
     hue = (phase + np.pi) / (2.0 * np.pi)
     rgb = plt.get_cmap("hsv")(hue)[:, :3]
     return (255.0 * rgb).astype(np.uint8)
+
+
+def write_solve_visualizations(
+    staged: StagedSolveResult,
+    phi: np.ndarray,
+    obs_pred_y: np.ndarray,
+    obs_residual_valid_mask: np.ndarray,
+    vis_dir: str | Path,
+) -> None:
+    """Write final per-view observation images and solved-field point clouds."""
+
+    prepared = staged.prepared
+    if (
+        "view_image_width" not in prepared.arrays
+        or "view_image_height" not in prepared.arrays
+    ):
+        raise ValueError("Visualization requires view_image_width and view_image_height.")
+    prediction = np.asarray(obs_pred_y)
+    valid = np.asarray(obs_residual_valid_mask)
+    if prediction.shape != prepared.obs_y.shape:
+        raise ValueError(
+            f"obs_pred_y must have shape {prepared.obs_y.shape}, got {prediction.shape}."
+        )
+    if valid.shape != (prepared.obs_y.shape[0],) or valid.dtype != np.bool_:
+        raise ValueError("obs_residual_valid_mask must be boolean and match observations.")
+
+    vis = Path(vis_dir)
+    vis.mkdir(parents=True, exist_ok=True)
+    widths = prepared.arrays["view_image_width"].astype(np.int32)
+    heights = prepared.arrays["view_image_height"].astype(np.int32)
+    for view_idx in range(prepared.num_views):
+        rows = np.where((prepared.obs_view_index == view_idx) & valid)[0]
+        if rows.size == 0:
+            continue
+        view_name = str(prepared.view_ids[view_idx])
+        _scatter_mode_image(
+            vis / f"{view_name}_observed.png",
+            prepared.obs_pixels_xy[rows],
+            prepared.obs_y[rows],
+            int(widths[view_idx]),
+            int(heights[view_idx]),
+            f"{view_name} observed",
+        )
+        _scatter_mode_image(
+            vis / f"{view_name}_predicted.png",
+            prepared.obs_pixels_xy[rows],
+            prediction[rows],
+            int(widths[view_idx]),
+            int(heights[view_idx]),
+            f"{view_name} predicted",
+        )
+        _scatter_mode_image(
+            vis / f"{view_name}_residual.png",
+            prepared.obs_pixels_xy[rows],
+            prepared.obs_y[rows] - prediction[rows],
+            int(widths[view_idx]),
+            int(heights[view_idx]),
+            f"{view_name} residual",
+            cmap="viridis",
+            normalize=False,
+        )
+    points = prepared.points.astype(np.float32, copy=False)
+    final_phi = np.asarray(phi, dtype=np.complex64)
+    if final_phi.shape != points.shape:
+        raise ValueError(f"phi must have shape {points.shape}, got {final_phi.shape}.")
+    _write_ply(vis / "pointcloud_amplitude.ply", points, _amplitude_colors(final_phi))
+    _write_ply(vis / "pointcloud_phase_u.ply", points, _phase_colors(final_phi))

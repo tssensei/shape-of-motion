@@ -10,10 +10,12 @@ from modal_surface.optimization_staged import (
     POINT_STATUS_ALPHA_UNRESOLVED,
     POINT_STATUS_NO_USABLE_OBSERVATION,
     StagedSolverConfig,
+    enforce_alpha_failure,
     optimize_multi_view_staged,
     prepare_observations,
     solve_alpha_sync,
     solve_observable_points,
+    write_staged_debug_npz,
 )
 
 
@@ -57,7 +59,7 @@ def _observation_dict(
         "obs_pixels_xy": np.zeros((point_arr.size, 2), dtype=np.float32),
         "obs_y": np.asarray(obs_y, dtype=np.complex64).reshape(-1, 2),
         "obs_J": np.asarray(obs_J, dtype=np.float32).reshape(-1, 2, 3),
-        "obs_confidence": np.ones((point_arr.size,), dtype=np.float32),
+        "obs_contribution_weight": np.ones((point_arr.size,), dtype=np.float32),
         "obs_count_per_point": view_mask.sum(axis=1).astype(np.int32),
         "obs_sample_count_per_point": sample_count,
         "view_ids": np.asarray([f"view{i}" for i in range(num_views)]),
@@ -179,7 +181,7 @@ class StagedModalSolverTests(unittest.TestCase):
         )
         self.assertTrue(result.identifiable_mask[0])
         self.assertFalse(result.identifiable_mask[1])
-        self.assertIn(result.exclusion_reason[1], {"insufficient_overlap", "degenerate_geometry"})
+        self.assertEqual(str(result.exclusion_reason[1]), "insufficient_information")
 
     def test_single_view_point_stays_at_observable_minimum_norm(self) -> None:
         modes = np.asarray([[1.0, 0.5, 0.25], [0.2, -0.4, 2.0]], dtype=np.complex64)
@@ -195,7 +197,7 @@ class StagedModalSolverTests(unittest.TestCase):
         projected = J_VIEW_0 @ solved.phi[1]
         np.testing.assert_allclose(projected, J_VIEW_0 @ modes[1], atol=1e-6)
 
-    def test_disconnected_view_is_excluded(self) -> None:
+    def test_zero_overlap_view_is_insufficient_information(self) -> None:
         modes = np.asarray([[1.0, 0.5, 0.25], [0.2, -0.4, 2.0]], dtype=np.complex64)
         alpha = np.asarray([1.0 + 0.0j, np.exp(0.8j), np.exp(-0.3j)], dtype=np.complex64)
         data = _observation_dict(modes, [[0, 1], [2]], alpha, num_views=3)
@@ -203,6 +205,11 @@ class StagedModalSolverTests(unittest.TestCase):
         self.assertTrue(result.identifiable_mask[0])
         self.assertTrue(result.identifiable_mask[1])
         self.assertFalse(result.identifiable_mask[2])
+        np.testing.assert_array_equal(
+            result.reference_connected_mask,
+            [True, True, False],
+        )
+        self.assertEqual(str(result.exclusion_reason[2]), "insufficient_information")
 
     def test_point_seen_only_by_excluded_view_is_not_called_unobserved(self) -> None:
         modes = np.asarray([[1.0, 0.5, 0.25], [0.2, -0.4, 2.0]], dtype=np.complex64)
@@ -227,10 +234,10 @@ class StagedModalSolverTests(unittest.TestCase):
         self.assertFalse(result.identifiable_mask[0])
         self.assertEqual(str(result.exclusion_reason[0]), "empty_reference")
 
-    def test_zero_confidence_rows_are_marked_no_usable_observation(self) -> None:
+    def test_zero_contribution_weight_rows_are_marked_no_usable_observation(self) -> None:
         modes = np.asarray([[1.0, 0.5, 0.25], [0.2, -0.4, 2.0]], dtype=np.complex64)
         data = _observation_dict(modes, [[0], [0]], self.true_alpha)
-        data["obs_confidence"][data["obs_point_index"] == 1] = 0.0
+        data["obs_contribution_weight"][data["obs_point_index"] == 1] = 0.0
         prepared = prepare_observations(data)
         alpha = solve_alpha_sync(prepared, self.config)
         solved = solve_observable_points(prepared, alpha, self.config)
@@ -273,24 +280,38 @@ class StagedModalSolverTests(unittest.TestCase):
             alpha_failure="error",
         )
         with tempfile.TemporaryDirectory() as tmp:
-            obs_path = Path(tmp) / "observations.npz"
             out_path = Path(tmp) / "latent.npz"
-            np.savez_compressed(obs_path, **data)
+            result = optimize_multi_view_staged(data, config=config)
+            self.assertFalse(out_path.exists())
+            write_staged_debug_npz(result, out_path)
             with self.assertRaises(ValueError):
-                optimize_multi_view_staged(obs_path, out_path, config=config)
+                enforce_alpha_failure(result, out_path)
             self.assertTrue(out_path.exists())
             with np.load(out_path, allow_pickle=False) as latent:
                 self.assertFalse(latent["alpha_identifiable_mask"][1])
-                self.assertEqual(str(latent["alpha_exclusion_reason"][1]), "disconnected")
+                self.assertEqual(
+                    str(latent["alpha_exclusion_reason"][1]),
+                    "insufficient_information",
+                )
 
     def test_output_preserves_point_order_and_adds_status_fields(self) -> None:
         modes = np.asarray([[1.0, 0.5, 0.25], [0.2, -0.4, 2.0], [0.0, 0.0, 0.0]], dtype=np.complex64)
         data = _observation_dict(modes, [[0, 1], [0], []], self.true_alpha)
         with tempfile.TemporaryDirectory() as tmp:
-            obs_path = Path(tmp) / "observations.npz"
             out_path = Path(tmp) / "latent.npz"
-            np.savez_compressed(obs_path, **data)
-            optimize_multi_view_staged(obs_path, out_path, config=self.config)
+            result = optimize_multi_view_staged(data, config=self.config)
+            self.assertFalse(out_path.exists())
+            np.testing.assert_array_equal(
+                result.prepared.arrays["gaussian_indices"],
+                np.arange(3, dtype=np.int32),
+            )
+            np.testing.assert_allclose(result.prepared.points, data["points_world"])
+            self.assertTrue(result.observable.anchor_mask[0])
+            self.assertTrue(result.observable.partial_mask[1])
+            self.assertTrue(result.observable.unobserved_mask[2])
+            self.assertEqual(result.obs_pred_y.shape, data["obs_y"].shape)
+            self.assertEqual(result.obs_residual.shape, (data["obs_y"].shape[0],))
+            write_staged_debug_npz(result, out_path)
             with np.load(out_path, allow_pickle=False) as latent:
                 np.testing.assert_array_equal(latent["gaussian_indices"], np.arange(3, dtype=np.int32))
                 np.testing.assert_allclose(latent["points_world"], data["points_world"])
@@ -299,7 +320,13 @@ class StagedModalSolverTests(unittest.TestCase):
                 self.assertTrue(latent["partial_mask"][1])
                 self.assertTrue(latent["unobserved_mask"][2])
                 self.assertFalse(np.any(latent["completion_mask"]))
+                np.testing.assert_array_equal(
+                    latent["alpha_reference_connected_mask"],
+                    [True, True],
+                )
                 legacy_fields = {
+                    "alpha_component_index",
+                    "alpha_information_component_index",
                     "graph_degree",
                     "modal_rigid_edge_count",
                     "modal_fill_enabled",

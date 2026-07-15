@@ -16,7 +16,11 @@ from typing import Any
 
 import numpy as np
 
-from modal_surface.optimization_staged import optimize_multi_view_staged
+from modal_surface.optimization_staged import (
+    enforce_alpha_failure,
+    optimize_multi_view_staged,
+    write_staged_debug_npz,
+)
 from modal_surface.solver_cli import (
     add_staged_solver_arguments,
     staged_solver_config,
@@ -246,7 +250,7 @@ def _build_observations(
     obs_pixels_xy: list[np.ndarray] = []
     obs_y: list[np.ndarray] = []
     obs_J: list[np.ndarray] = []
-    obs_confidence: list[float] = []
+    obs_contribution_weight: list[float] = []
 
     for view_idx, w2c in enumerate(world_to_cameras):
         pixels, z = _project_points(points, K, w2c)
@@ -270,7 +274,7 @@ def _build_observations(
         obs_pixels_xy.extend(pixels[indices].astype(np.float32))
         obs_y.extend(y)
         obs_J.extend(jac.astype(np.float32))
-        obs_confidence.extend([1.0] * int(indices.size))
+        obs_contribution_weight.extend([1.0] * int(indices.size))
 
     obs_point_arr = np.asarray(obs_point_index, dtype=np.int32)
     obs_view_arr = np.asarray(obs_view_index, dtype=np.int32)
@@ -282,7 +286,7 @@ def _build_observations(
         "obs_pixels_xy": np.asarray(obs_pixels_xy, dtype=np.float32),
         "obs_y": np.asarray(obs_y, dtype=np.complex64),
         "obs_J": np.asarray(obs_J, dtype=np.float32),
-        "obs_confidence": np.asarray(obs_confidence, dtype=np.float32),
+        "obs_contribution_weight": np.asarray(obs_contribution_weight, dtype=np.float32),
         "obs_count_per_point": obs_count,
         "obs_sample_count_per_point": obs_count.copy(),
         "view_ids": np.array([f"view{view_idx + 1}" for view_idx in range(num_views)]),
@@ -1077,18 +1081,20 @@ def main() -> None:
     )
 
     solved_path = out_dir / "latents" / "solved_staged.npz"
-    optimize_multi_view_staged(
-        observations_path=obs_path,
-        out_path=solved_path,
+    solved_result = optimize_multi_view_staged(
+        observations=observations,
         config=staged_solver_config(args),
     )
+    write_staged_debug_npz(solved_result, solved_path)
+    enforce_alpha_failure(solved_result, solved_path)
     solved = _load_npz_dict(solved_path)
     ellipse_solved_path = out_dir / "latents" / "solved_staged_tilted_ellipse.npz"
-    optimize_multi_view_staged(
-        observations_path=ellipse_obs_path,
-        out_path=ellipse_solved_path,
+    ellipse_solved_result = optimize_multi_view_staged(
+        observations=ellipse_observations,
         config=staged_solver_config(args),
     )
+    write_staged_debug_npz(ellipse_solved_result, ellipse_solved_path)
+    enforce_alpha_failure(ellipse_solved_result, ellipse_solved_path)
     ellipse_solved = _load_npz_dict(ellipse_solved_path)
     num_views = int(np.asarray(observations["view_ids"]).reshape(-1).shape[0])
     valid_view_count = np.asarray(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -113,7 +114,7 @@ class MotionFillResult:
 
 def _require_scipy_kdtree():
     try:
-        from scipy.spatial import cKDTree
+        from scipy.spatial import cKDTree # pyright: ignore[reportAttributeAccessIssue]
     except ImportError as exc:
         raise ImportError("Motion-fill KNN construction requires scipy.spatial.cKDTree.") from exc
     return cKDTree
@@ -148,8 +149,12 @@ def _validate_points(points_world: np.ndarray) -> np.ndarray:
     return points
 
 
-def query_knn_candidates(points_world: np.ndarray, max_k: int) -> KnnCandidateSet:
-    """Query ordered neighbor candidates once for reuse across a K sweep."""
+def query_knn_candidates(
+    points_world: np.ndarray,
+    max_k: int,
+    tree: Any | None = None,
+) -> KnnCandidateSet:
+    """Query ordered neighbors, reusing a supplied spatial tree when available."""
 
     points = _validate_points(points_world)
     max_k = _require_positive_integer(max_k, "max_k")
@@ -157,24 +162,28 @@ def query_knn_candidates(points_world: np.ndarray, max_k: int) -> KnnCandidateSe
     if max_k >= num_points:
         raise ValueError(f"max_k must be smaller than the point count ({num_points}), got {max_k}.")
 
-    cKDTree = _require_scipy_kdtree()
-    tree = cKDTree(points)
+    if tree is None:
+        cKDTree = _require_scipy_kdtree()
+        tree = cKDTree(points)
     distances, _ = tree.query(points, k=max_k + 1)
     distances = np.asarray(distances, dtype=np.float64)
+    boundaries = np.nextafter(distances[:, -1], np.inf)
+    candidate_rows = tree.query_ball_point(
+        points,
+        boundaries,
+        return_sorted=False,
+    )
     neighbors = np.empty((num_points, max_k), dtype=np.int64)
     neighbor_distances = np.empty((num_points, max_k), dtype=np.float64)
 
-    for point_index in range(num_points):
-        boundary = np.nextafter(distances[point_index, -1], np.inf)
-        row_indices = np.asarray(
-            tree.query_ball_point(points[point_index], boundary), dtype=np.int64
-        )
+    for point_index, row in enumerate(candidate_rows):
+        row_indices = np.asarray(row, dtype=np.int64)
         row_indices = row_indices[row_indices != point_index]
         row_distances = np.linalg.norm(
             points[row_indices] - points[point_index], axis=1
         )
         if row_indices.size < max_k:
-            raise ValueError(
+            raise RuntimeError(
                 f"KNN query returned only {row_indices.size} non-self candidates for "
                 f"point {point_index}; expected at least {max_k}."
             )
@@ -194,7 +203,7 @@ def query_knn_candidates(points_world: np.ndarray, max_k: int) -> KnnCandidateSe
         max_k=max_k,
     )
 
-
+# tianyi's method fit in?
 def _stable_component_labels(num_points: int, edge_index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     parent = np.arange(num_points, dtype=np.int64)
 
@@ -257,6 +266,7 @@ def build_knn_graph(
 ) -> KnnGraph:
     """Build one fixed-cutoff undirected graph from a candidate prefix."""
 
+    # safety check
     if not isinstance(candidates, KnnCandidateSet):
         raise TypeError("candidates must be a KnnCandidateSet returned by query_knn_candidates().")
     k = _require_positive_integer(k, "k")
@@ -268,7 +278,6 @@ def build_knn_graph(
         raise ValueError("max_distance must be finite and positive.")
     if not np.isfinite(epsilon) or epsilon <= 0.0:
         raise ValueError("epsilon must be finite and positive.")
-
     num_points = int(candidates.num_points)
     expected_shape = (num_points, int(candidates.max_k))
     if candidates.neighbor_indices.shape != expected_shape:
@@ -303,9 +312,12 @@ def build_knn_graph(
         pairs = np.column_stack((np.minimum(source, target), np.maximum(source, target)))
         if np.any(pairs[:, 0] == pairs[:, 1]):
             raise ValueError("KNN candidates contain a self edge.")
-        edge_index, inverse = np.unique(pairs, axis=0, return_inverse=True)
-        edge_distance = np.full((edge_index.shape[0],), np.inf, dtype=np.float64)
-        np.minimum.at(edge_distance, inverse, distance)
+        edge_index, first_indices = np.unique(
+            pairs,
+            axis=0,
+            return_index=True,
+        )
+        edge_distance = distance[first_indices]
     else:
         edge_index = np.empty((0, 2), dtype=np.int64)
         edge_distance = np.empty((0,), dtype=np.float64)
@@ -315,6 +327,8 @@ def build_knn_graph(
     if edge_index.size:
         np.add.at(degree, edge_index[:, 0], 1)
         np.add.at(degree, edge_index[:, 1], 1)
+    
+    # component for gaussian cluster driven by some anchor
     component_index, component_sizes = _stable_component_labels(num_points, edge_index)
     return KnnGraph(
         edge_index=edge_index.astype(np.int64, copy=False),

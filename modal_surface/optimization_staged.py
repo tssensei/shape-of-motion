@@ -13,13 +13,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Mapping
 
 import numpy as np
 
+from modal_surface.io import save_npz_compressed_atomic
+
 
 _EPS = 1e-12
-_ANCHOR_CONDITION_MAX = 100.0
+ANCHOR_CONDITION_MAX = 100.0
 POINT_STATUS_ANCHOR = 0
 POINT_STATUS_COMPLETED_OBSERVED = 1
 POINT_STATUS_COMPLETED_UNOBSERVED = 2
@@ -80,7 +82,6 @@ class PreparedObservations:
     obs_pixels_xy: np.ndarray
     obs_y: np.ndarray
     obs_J: np.ndarray
-    obs_confidence: np.ndarray
     obs_weights: np.ndarray
     obs_count_per_point: np.ndarray
     obs_sample_count_per_point: np.ndarray
@@ -100,7 +101,7 @@ class AlphaConstraint:
 
 
 @dataclass
-class AlphaComponentSolve:
+class AlphaCandidateSolve:
     alphas: np.ndarray
     consistency_residual: float
     singular_values: np.ndarray
@@ -122,10 +123,7 @@ class AlphaComponentSolve:
 class AlphaSyncResult:
     alphas: np.ndarray
     identifiable_mask: np.ndarray
-    component_index: np.ndarray
-    structural_component_index: np.ndarray
-    shared_count_component_index: np.ndarray
-    information_component_index: np.ndarray
+    reference_connected_mask: np.ndarray
     exclusion_reason: np.ndarray
     shared_point_count: np.ndarray
     edge_point_count: np.ndarray
@@ -171,6 +169,21 @@ class ObservableSolveResult:
     point_status: np.ndarray
 
 
+@dataclass
+class StagedSolveResult:
+    config: StagedSolverConfig
+    prepared: PreparedObservations
+    alpha: AlphaSyncResult
+    observable: ObservableSolveResult
+    alpha_view_freqs_hz: np.ndarray
+    obs_pred_y: np.ndarray
+    obs_residual: np.ndarray
+    obs_residual_valid_mask: np.ndarray
+    point_residual: np.ndarray
+    point_residual_valid_mask: np.ndarray
+    unidentifiable_observed_view_indices: np.ndarray
+
+
 def _rows_by_point(num_points: int, point_index: np.ndarray) -> list[np.ndarray]:
     rows: list[list[int]] = [[] for _ in range(num_points)]
     for row, point in enumerate(point_index.tolist()):
@@ -186,7 +199,7 @@ def prepare_observations(data: Mapping[str, np.ndarray]) -> PreparedObservations
         "obs_pixels_xy",
         "obs_y",
         "obs_J",
-        "obs_confidence",
+        "obs_contribution_weight",
         "obs_count_per_point",
         "view_ids",
         "freq_hz",
@@ -203,7 +216,7 @@ def prepare_observations(data: Mapping[str, np.ndarray]) -> PreparedObservations
     pixels = arrays["obs_pixels_xy"].astype(np.float32)
     obs_y = arrays["obs_y"].astype(np.complex64)
     obs_J = arrays["obs_J"].astype(np.float32)
-    confidence = arrays["obs_confidence"].astype(np.float32)
+    contribution_weight = arrays["obs_contribution_weight"].astype(np.float32)
     obs_count = arrays["obs_count_per_point"].astype(np.int32)
     sample_count = (
         arrays["obs_sample_count_per_point"].astype(np.int32)
@@ -224,16 +237,19 @@ def prepare_observations(data: Mapping[str, np.ndarray]) -> PreparedObservations
         raise ValueError("obs_pixels_xy and obs_y must have shape (O,2).")
     if obs_J.shape != (num_obs, 2, 3):
         raise ValueError(f"obs_J must have shape ({num_obs},2,3), got {obs_J.shape}.")
-    if confidence.shape != (num_obs,):
-        raise ValueError(f"obs_confidence must have shape ({num_obs},), got {confidence.shape}.")
+    if contribution_weight.shape != (num_obs,):
+        raise ValueError(
+            "obs_contribution_weight must have shape "
+            f"({num_obs},), got {contribution_weight.shape}."
+        )
     if obs_count.shape != (points.shape[0],) or sample_count.shape != (points.shape[0],):
         raise ValueError("Per-point observation count arrays must match points_world length.")
     if np.any(point_index < 0) or np.any(point_index >= points.shape[0]):
         raise ValueError("obs_point_index contains invalid point indices.")
     if np.any(view_index < 0) or np.any(view_index >= num_views):
         raise ValueError("obs_view_index contains invalid view indices.")
-    if np.any(~np.isfinite(confidence)) or np.any(confidence < 0):
-        raise ValueError("obs_confidence must be finite and non-negative.")
+    if np.any(~np.isfinite(contribution_weight)) or np.any(contribution_weight < 0):
+        raise ValueError("obs_contribution_weight must be finite and non-negative.")
     if np.any(~np.isfinite(points)):
         raise ValueError("points_world must be finite.")
     if np.any(~np.isfinite(obs_J)):
@@ -280,7 +296,7 @@ def prepare_observations(data: Mapping[str, np.ndarray]) -> PreparedObservations
     pair_key = point_index * max(num_views, 1) + view_index
     _, inverse, counts = np.unique(pair_key, return_inverse=True, return_counts=True)
     row_multiplicity = counts[inverse].astype(np.float64)
-    weights = confidence.astype(np.float64) / np.maximum(row_multiplicity, 1.0)
+    weights = contribution_weight.astype(np.float64) / np.maximum(row_multiplicity, 1.0)
 
     return PreparedObservations(
         arrays=arrays,
@@ -290,7 +306,6 @@ def prepare_observations(data: Mapping[str, np.ndarray]) -> PreparedObservations
         obs_pixels_xy=pixels,
         obs_y=obs_y,
         obs_J=obs_J,
-        obs_confidence=confidence,
         obs_weights=weights,
         obs_count_per_point=obs_count,
         obs_sample_count_per_point=sample_count,
@@ -331,13 +346,11 @@ def _build_alpha_constraints(
             continue
         rank = int(np.count_nonzero(singular > 1e-8 * singular[0]))
         left_null = U[:, rank:]
-        if left_null.shape[1] == 0:
-            continue
         C = left_null.conj().T @ B
         if float(np.linalg.norm(C)) <= _EPS:
             # Keep exact/near-exact zero constraints out of the numerical solve,
             # but edge accounting below will still classify this geometry as weak.
-            pass
+            continue
         constraints.append(
             AlphaConstraint(
                 point_index=point_idx,
@@ -383,34 +396,12 @@ def _raw_shared_point_counts(prepared: PreparedObservations) -> np.ndarray:
     return counts
 
 
-def _graph_components(adjacency: np.ndarray) -> np.ndarray:
-    num_views = adjacency.shape[0]
-    components = np.full((num_views,), -1, dtype=np.int32)
-    component = 0
-    for start in range(num_views):
-        if components[start] >= 0:
-            continue
-        queue = [start]
-        components[start] = component
-        cursor = 0
-        while cursor < len(queue):
-            node = queue[cursor]
-            cursor += 1
-            for neighbor in np.where(adjacency[node])[0].tolist():
-                if components[neighbor] >= 0:
-                    continue
-                components[neighbor] = component
-                queue.append(int(neighbor))
-        component += 1
-    return components
-
-
-def _reference_connected_subset(
+def _reference_connected_views(
     adjacency: np.ndarray,
-    candidate: np.ndarray,
+    allowed_view_indices: np.ndarray,
 ) -> np.ndarray:
     allowed = np.zeros((adjacency.shape[0],), dtype=bool)
-    allowed[candidate] = True
+    allowed[allowed_view_indices] = True
     connected = np.zeros_like(allowed)
     if not allowed[0]:
         return np.asarray([], dtype=np.int64)
@@ -469,12 +460,12 @@ def _complex_initialization(H: np.ndarray, reference_local: int) -> np.ndarray:
 
 def _parameterized_beta(
     parameters: np.ndarray,
-    num_component_views: int,
+    num_candidate_views: int,
     reference_local: int,
     model: str,
 ) -> np.ndarray:
-    beta = np.ones((num_component_views,), dtype=np.complex128)
-    unknown = [i for i in range(num_component_views) if i != reference_local]
+    beta = np.ones((num_candidate_views,), dtype=np.complex128)
+    unknown = [i for i in range(num_candidate_views) if i != reference_local]
     count = len(unknown)
     theta = parameters[:count]
     if model == "phase":
@@ -601,16 +592,16 @@ def _block_residuals(information_blocks: np.ndarray, beta: np.ndarray) -> np.nda
 def _profiled_observation_residual_blocks(
     prepared: PreparedObservations,
     constraints: list[AlphaConstraint],
-    component_views: np.ndarray,
+    candidate_views: np.ndarray,
     parameters: np.ndarray,
     reference_local: int,
 ) -> list[np.ndarray]:
     beta = _parameterized_beta(
-        parameters, component_views.size, reference_local, "bounded-complex"
+        parameters, candidate_views.size, reference_local, "bounded-complex"
     )
     alpha = 1.0 / beta
     global_to_local = np.full((prepared.num_views,), -1, dtype=np.int64)
-    global_to_local[component_views] = np.arange(component_views.size, dtype=np.int64)
+    global_to_local[candidate_views] = np.arange(candidate_views.size, dtype=np.int64)
     blocks: list[np.ndarray] = []
     for constraint in constraints:
         rows = constraint.rows
@@ -658,21 +649,21 @@ def _information_summary(
     return singular, rank_ratio, information_ratio, condition
 
 
-def _refine_alpha_component(
+def _refine_alpha_candidate(
     prepared: PreparedObservations,
     constraints: list[AlphaConstraint],
-    component_views: np.ndarray,
+    candidate_views: np.ndarray,
     config: StagedSolverConfig,
-) -> AlphaComponentSolve:
-    reference_local = int(np.where(component_views == 0)[0][0])
-    information_blocks = _constraint_information_blocks(constraints, component_views)
+) -> AlphaCandidateSolve:
+    reference_local = int(np.where(candidate_views == 0)[0][0])
+    information_blocks = _constraint_information_blocks(constraints, candidate_views)
     aggregate = np.sum(information_blocks, axis=0)
     if config.alpha_model == "phase":
         beta_init = _phase_initialization(aggregate, reference_local)
     else:
         beta_init = _complex_initialization(aggregate, reference_local)
 
-    unknown = [i for i in range(component_views.size) if i != reference_local]
+    unknown = [i for i in range(candidate_views.size) if i != reference_local]
     theta0 = -np.angle(beta_init[unknown])
     if config.alpha_model == "phase":
         x0 = theta0.astype(np.float64)
@@ -706,7 +697,7 @@ def _refine_alpha_component(
     if config.alpha_model == "phase":
         def phase_residual(parameters: np.ndarray) -> np.ndarray:
             beta_value = _parameterized_beta(
-                parameters, component_views.size, reference_local, "phase"
+                parameters, candidate_views.size, reference_local, "phase"
             )
             return _block_residuals(information_blocks, beta_value)
 
@@ -724,7 +715,7 @@ def _refine_alpha_component(
             max_nfev=100,
         )
         beta = _parameterized_beta(
-            result.x, component_views.size, reference_local, "phase"
+            result.x, candidate_views.size, reference_local, "phase"
         )
         final_block_residual = phase_residual(result.x)
         robust_weights = np.ones_like(final_block_residual)
@@ -744,14 +735,14 @@ def _refine_alpha_component(
         weighted_squared_residual = float(
             np.sum(robust_weights * final_block_residual**2)
         )
-        gain_bound_active = np.zeros((component_views.size,), dtype=bool)
+        gain_bound_active = np.zeros((candidate_views.size,), dtype=bool)
         information_kind = "exact_block_huber_hessian"
         optimizer_success = bool(result.success)
         optimizer_status = int(result.status)
         optimizer_message = str(result.message)
     else:
         initial_blocks = _profiled_observation_residual_blocks(
-            prepared, constraints, component_views, x0, reference_local
+            prepared, constraints, candidate_views, x0, reference_local
         )
         initial_norms = np.asarray(
             [np.linalg.norm(block) for block in initial_blocks], dtype=np.float64
@@ -768,7 +759,7 @@ def _refine_alpha_component(
             fixed_weights: np.ndarray,
         ) -> np.ndarray:
             blocks = _profiled_observation_residual_blocks(
-                prepared, constraints, component_views, parameters, reference_local
+                prepared, constraints, candidate_views, parameters, reference_local
             )
             return _flatten_weighted_complex_blocks(blocks, fixed_weights)
 
@@ -785,7 +776,7 @@ def _refine_alpha_component(
             )
             current = result.x
             current_blocks = _profiled_observation_residual_blocks(
-                prepared, constraints, component_views, current, reference_local
+                prepared, constraints, candidate_views, current, reference_local
             )
             current_norms = np.asarray(
                 [np.linalg.norm(block) for block in current_blocks], dtype=np.float64
@@ -806,11 +797,13 @@ def _refine_alpha_component(
                 loss="linear",
                 max_nfev=100,
             )
+        if result is None:
+            raise RuntimeError("Internal error: bounded-complex optimizer did not run.")
         beta = _parameterized_beta(
-            result.x, component_views.size, reference_local, "bounded-complex"
+            result.x, candidate_views.size, reference_local, "bounded-complex"
         )
         final_blocks = _profiled_observation_residual_blocks(
-            prepared, constraints, component_views, result.x, reference_local
+            prepared, constraints, candidate_views, result.x, reference_local
         )
         final_block_residual = np.asarray(
             [np.linalg.norm(block) for block in final_blocks], dtype=np.float64
@@ -819,7 +812,7 @@ def _refine_alpha_component(
         parameter_information = jacobian.T @ jacobian
         effective_row_count = float(jacobian.shape[0])
         weighted_squared_residual = float(np.sum(np.asarray(result.fun) ** 2))
-        gain_bound_active = np.zeros((component_views.size,), dtype=bool)
+        gain_bound_active = np.zeros((candidate_views.size,), dtype=bool)
         active_mask = np.asarray(result.active_mask, dtype=np.int8)
         gain_active = active_mask[len(unknown) :] != 0
         gain_bound_active[np.asarray(unknown, dtype=np.int64)] = gain_active
@@ -846,12 +839,12 @@ def _refine_alpha_component(
         else 0.0
     )
 
-    phase_uncertainty = np.full((component_views.size,), np.inf, dtype=np.float64)
+    phase_uncertainty = np.full((candidate_views.size,), np.inf, dtype=np.float64)
     phase_uncertainty[reference_local] = 0.0
     log_gain_uncertainty = (
-        np.zeros((component_views.size,), dtype=np.float64)
+        np.zeros((candidate_views.size,), dtype=np.float64)
         if config.alpha_model == "phase"
-        else np.full((component_views.size,), np.inf, dtype=np.float64)
+        else np.full((candidate_views.size,), np.inf, dtype=np.float64)
     )
     log_gain_uncertainty[reference_local] = 0.0
     if parameter_information.size and singular.size and singular[-1] > _EPS:
@@ -864,7 +857,7 @@ def _refine_alpha_component(
         if config.alpha_model == "bounded-complex":
             log_gain_uncertainty[unknown_array] = param_std[len(unknown) :]
             log_gain_uncertainty[gain_bound_active] = np.inf
-    return AlphaComponentSolve(
+    return AlphaCandidateSolve(
         alphas=alpha,
         consistency_residual=consistency,
         singular_values=singular,
@@ -893,7 +886,7 @@ def solve_alpha_sync(
     num_views = prepared.num_views
     alphas = np.ones((num_views,), dtype=np.complex128)
     identifiable = np.zeros((num_views,), dtype=bool)
-    reasons = np.full((num_views,), "disconnected", dtype="<U32")
+    reasons = np.full((num_views,), "insufficient_information", dtype="<U32")
     phase_std = np.full((num_views,), np.inf, dtype=np.float64)
     log_gain_std = np.full((num_views,), np.inf, dtype=np.float64)
     gain_bound_active = np.zeros((num_views,), dtype=bool)
@@ -909,40 +902,25 @@ def solve_alpha_sync(
     else:
         reasons[0] = "empty_reference"
 
-    all_constraints = _build_alpha_constraints(prepared)
-    edge_counts, edge_information = _alpha_edge_statistics(all_constraints, num_views)
+    graph_constraints = _build_alpha_constraints(prepared)
+    edge_counts, edge_information = _alpha_edge_statistics(graph_constraints, num_views)
     raw_shared_counts = _raw_shared_point_counts(prepared)
-    raw_adjacency = raw_shared_counts > 0
-    np.fill_diagonal(raw_adjacency, False)
-    structural_components = _graph_components(raw_adjacency)
-    shared_count_adjacency = raw_shared_counts >= int(config.alpha_min_shared_points)
-    np.fill_diagonal(shared_count_adjacency, False)
-    shared_count_components = _graph_components(shared_count_adjacency)
     information_adjacency = edge_counts >= int(config.alpha_min_shared_points)
     np.fill_diagonal(information_adjacency, False)
-    information_components = _graph_components(information_adjacency)
-    solved_components = np.full((num_views,), -1, dtype=np.int32)
-    if reference_usable:
-        solved_components[0] = 0
-    reference_component = int(information_components[0])
-    candidate = (
-        np.where(information_components == reference_component)[0]
+
+    all_view_indices = np.arange(num_views, dtype=np.int64)
+    reference_connected_views = _reference_connected_views(
+        information_adjacency, all_view_indices
+    )
+    reference_connected_mask = np.zeros((num_views,), dtype=bool)
+    reference_connected_mask[reference_connected_views] = True
+    candidate_views = (
+        reference_connected_views.copy()
         if reference_usable
         else np.asarray([0], dtype=np.int64)
     )
 
-    for view_idx in range(1, num_views):
-        if not reference_usable:
-            reasons[view_idx] = "disconnected"
-        elif information_components[view_idx] != reference_component:
-            if structural_components[view_idx] != structural_components[0]:
-                reasons[view_idx] = "disconnected"
-            elif shared_count_components[view_idx] != shared_count_components[0]:
-                reasons[view_idx] = "insufficient_overlap"
-            else:
-                reasons[view_idx] = "degenerate_geometry"
-
-    final_constraints: list[AlphaConstraint] = []
+    final_solve_constraints: list[AlphaConstraint] = []
     final_information = np.zeros((num_views, num_views), dtype=np.complex128)
     final_singular = np.zeros((0,), dtype=np.float64)
     final_rank_ratio = 1.0
@@ -961,104 +939,111 @@ def solve_alpha_sync(
     )
     final_information_kind = "not_computed"
 
-    while candidate.size > 1:
-        connected_candidate = _reference_connected_subset(
-            information_adjacency, candidate
+    while candidate_views.size > 1:
+        reference_connected_candidate = _reference_connected_views(
+            information_adjacency, candidate_views
         )
-        disconnected_after_exclusion = np.setdiff1d(
-            candidate, connected_candidate, assume_unique=True
+        newly_unconnected_views = np.setdiff1d(
+            candidate_views, reference_connected_candidate, assume_unique=True
         )
-        if disconnected_after_exclusion.size:
-            reasons[disconnected_after_exclusion] = "insufficient_overlap"
-            candidate = connected_candidate
-            if candidate.size <= 1:
+        if newly_unconnected_views.size:
+            reasons[newly_unconnected_views] = "insufficient_information"
+            candidate_views = reference_connected_candidate
+            if candidate_views.size <= 1:
                 break
-        allowed = np.zeros((num_views,), dtype=bool)
-        allowed[candidate] = True
-        constraints = _build_alpha_constraints(prepared, allowed)
-        if not constraints:
-            weakest = int(candidate[-1])
-            reasons[weakest] = "insufficient_overlap"
-            candidate = candidate[candidate != weakest]
+        if candidate_views.size == num_views:
+            solve_constraints = graph_constraints
+        else:
+            allowed = np.zeros((num_views,), dtype=bool)
+            allowed[candidate_views] = True
+            solve_constraints = _build_alpha_constraints(prepared, allowed)
+        if not solve_constraints:
+            view_to_remove = int(candidate_views[-1])
+            reasons[view_to_remove] = "insufficient_information"
+            candidate_views = candidate_views[candidate_views != view_to_remove]
             continue
 
-        component = _refine_alpha_component(
-            prepared, constraints, candidate, config
+        candidate_solve = _refine_alpha_candidate(
+            prepared, solve_constraints, candidate_views, config
         )
-        reference_local = int(np.where(candidate == 0)[0][0])
-        parameter_count = (candidate.size - 1) * (2 if config.alpha_model == "bounded-complex" else 1)
-        full_rank = component.singular_values.size == parameter_count and (
-            parameter_count == 0 or component.singular_values[-1] > _EPS
+        parameter_count_alpha = (candidate_views.size - 1) * (
+            2 if config.alpha_model == "bounded-complex" else 1
         )
-        no_active_gain_bound = not bool(np.any(component.gain_bound_active_mask))
+        full_rank = candidate_solve.singular_values.size == parameter_count_alpha and (
+            parameter_count_alpha == 0 or candidate_solve.singular_values[-1] > _EPS
+        )
+        no_active_gain_bound = not bool(
+            np.any(candidate_solve.gain_bound_active_mask)
+        )
         numerically_identifiable = (
-            component.optimizer_success
+            candidate_solve.optimizer_success
             and no_active_gain_bound
             and full_rank
-            and component.rank_ratio >= config.alpha_rank_ratio_min
-            and component.information_ratio >= config.alpha_info_ratio_min
+            and candidate_solve.rank_ratio >= config.alpha_rank_ratio_min
+            and candidate_solve.information_ratio >= config.alpha_info_ratio_min
         )
-        final_constraints = constraints
+        final_solve_constraints = solve_constraints
         final_information.fill(0.0)
-        final_information[np.ix_(candidate, candidate)] = component.constraint_information
-        final_singular = component.singular_values
-        final_rank_ratio = component.rank_ratio
-        final_info_ratio = component.information_ratio
-        final_condition = component.condition
-        final_consistency = component.consistency_residual
-        final_parameter_information = component.parameter_information
-        nonreference_candidate = candidate[candidate != 0].astype(np.int32)
+        final_information[np.ix_(candidate_views, candidate_views)] = (
+            candidate_solve.constraint_information
+        )
+        final_singular = candidate_solve.singular_values
+        final_rank_ratio = candidate_solve.rank_ratio
+        final_info_ratio = candidate_solve.information_ratio
+        final_condition = candidate_solve.condition
+        final_consistency = candidate_solve.consistency_residual
+        final_parameter_information = candidate_solve.parameter_information
+        nonreference_views = candidate_views[candidate_views != 0].astype(np.int32)
         if config.alpha_model == "phase":
-            final_parameter_view_indices = nonreference_candidate
+            final_parameter_view_indices = nonreference_views
             final_parameter_order = "phase"
         else:
             final_parameter_view_indices = np.concatenate(
-                [nonreference_candidate, nonreference_candidate]
+                [nonreference_views, nonreference_views]
             )
             final_parameter_order = "phase_then_log_gain"
-        final_optimizer_success = component.optimizer_success
-        final_optimizer_status = component.optimizer_status
-        final_optimizer_message = component.optimizer_message
-        final_information_kind = component.information_kind
-        gain_bound_active[candidate] = component.gain_bound_active_mask
+        final_optimizer_success = candidate_solve.optimizer_success
+        final_optimizer_status = candidate_solve.optimizer_status
+        final_optimizer_message = candidate_solve.optimizer_message
+        final_information_kind = candidate_solve.information_kind
+        gain_bound_active[candidate_views] = candidate_solve.gain_bound_active_mask
         if numerically_identifiable:
-            alphas[candidate] = component.alphas
-            identifiable[candidate] = True
-            reasons[candidate] = "estimated"
+            alphas[candidate_views] = candidate_solve.alphas
+            identifiable[candidate_views] = True
+            reasons[candidate_views] = "estimated"
             reasons[0] = "reference"
-            phase_std[candidate] = component.phase_std
-            log_gain_std[candidate] = component.log_gain_std
-            solved_components[candidate] = 0
+            phase_std[candidate_views] = candidate_solve.phase_std
+            log_gain_std[candidate_views] = candidate_solve.log_gain_std
             break
 
-        active_nonreference = candidate[
-            (candidate != 0) & component.gain_bound_active_mask
+        active_nonreference = candidate_views[
+            (candidate_views != 0) & candidate_solve.gain_bound_active_mask
         ]
         if active_nonreference.size:
             weakest = int(active_nonreference[0])
             failure_reason = "gain_bound_limited"
-        elif candidate.size == 2:
-            weakest = int(candidate[candidate != 0][0])
+        elif candidate_views.size == 2:
+            weakest = int(candidate_views[candidate_views != 0][0])
             failure_reason = (
                 "optimizer_failure"
-                if not component.optimizer_success
-                else "degenerate_geometry"
+                if not candidate_solve.optimizer_success
+                else "insufficient_information"
             )
         else:
-            diagonal = np.abs(np.diag(component.parameter_information))
-            phase_strength = diagonal[: candidate.size - 1]
+            diagonal = np.abs(np.diag(candidate_solve.parameter_information))
+            phase_strength = diagonal[: candidate_views.size - 1]
             if config.alpha_model == "bounded-complex":
-                gain_strength = diagonal[candidate.size - 1 :]
+                gain_strength = diagonal[candidate_views.size - 1 :]
                 phase_strength = np.minimum(phase_strength, gain_strength)
-            nonreference = candidate[candidate != 0]
+            nonreference = candidate_views[candidate_views != 0]
             weakest = int(nonreference[int(np.argmin(phase_strength))])
             failure_reason = (
                 "optimizer_failure"
-                if not component.optimizer_success
-                else "degenerate_geometry"
+                if not candidate_solve.optimizer_success
+                else "insufficient_information"
             )
         reasons[weakest] = failure_reason
-        candidate = candidate[candidate != weakest]
+        candidate_views = candidate_views[candidate_views != weakest]
 
     if config.alpha_failure == "error" and enforce_failure:
         observed_views = np.zeros((num_views,), dtype=bool)
@@ -1071,17 +1056,14 @@ def solve_alpha_sync(
             raise ValueError(f"Unidentifiable alpha for observed views: {labels}.")
 
     constraint_counts = np.zeros((num_views,), dtype=np.int32)
-    for constraint in final_constraints:
+    for constraint in final_solve_constraints:
         nonzero = np.linalg.norm(constraint.C, axis=0) > _EPS
         constraint_counts[nonzero] += 1
 
     return AlphaSyncResult(
         alphas=alphas.astype(np.complex64),
         identifiable_mask=identifiable,
-        component_index=solved_components,
-        structural_component_index=structural_components,
-        shared_count_component_index=shared_count_components,
-        information_component_index=information_components,
+        reference_connected_mask=reference_connected_mask,
         exclusion_reason=reasons,
         shared_point_count=raw_shared_counts,
         edge_point_count=edge_counts,
@@ -1172,7 +1154,7 @@ def solve_observable_points(
     anchor_candidates = (
         (valid_view_count >= 2)
         & (rank_out == 3)
-        & (condition <= _ANCHOR_CONDITION_MAX)
+        & (condition <= ANCHOR_CONDITION_MAX)
         & np.isfinite(residual)
     )
     anchor_candidate_residual = residual[anchor_candidates]
@@ -1228,7 +1210,7 @@ def solve_observable_points(
     )
 
 
-def _prediction_and_residuals(
+def compute_prediction_and_residuals(
     prepared: PreparedObservations,
     alpha: AlphaSyncResult,
     phi: np.ndarray,
@@ -1279,20 +1261,15 @@ def _optional_output_fields(prepared: PreparedObservations) -> dict[str, np.ndar
 
 
 def optimize_multi_view_staged(
-    observations_path: str | Path,
-    out_path: str | Path,
-    vis_dir: str | Path | None = None,
+    observations: Mapping[str, np.ndarray],
     config: StagedSolverConfig | None = None,
-) -> Path:
+) -> StagedSolveResult:
     config = config or StagedSolverConfig()
     config.validate()
-    # copies every array from the open NPZ into a regular dictionary
-    with np.load(str(observations_path), allow_pickle=False) as loaded:
-        data = {key: loaded[key] for key in loaded.files}
-    prepared = prepare_observations(data)
+    prepared = prepare_observations(observations)
     alpha = solve_alpha_sync(prepared, config, enforce_failure=False)
     observable = solve_observable_points(prepared, alpha, config)
-    pred, obs_residual, obs_residual_valid, point_residual, point_residual_valid = _prediction_and_residuals(
+    pred, obs_residual, obs_residual_valid, point_residual, point_residual_valid = compute_prediction_and_residuals(
         prepared, alpha, observable.phi
     )
 
@@ -1305,94 +1282,112 @@ def optimize_multi_view_staged(
             dtype=np.float32,
         )
     )
-    num_points = prepared.points.shape[0]
-    false_mask = np.zeros((num_points,), dtype=bool)
+    observed_views = np.zeros((prepared.num_views,), dtype=bool)
+    observed_views[
+        np.unique(prepared.obs_view_index[prepared.obs_weights > 0.0])
+    ] = True
+    invalid = np.where(observed_views & ~alpha.identifiable_mask)[0]
 
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out,
-        points_world=prepared.points.astype(np.float32),
-        phi=observable.phi.astype(np.complex64),
-        phi_observable=observable.phi_observable.astype(np.complex64),
-        phi_nullspace_correction=np.zeros_like(observable.phi, dtype=np.complex64),
-        point_nullspace_basis=observable.nullspace_basis.astype(np.complex64),
-        point_nullity=observable.nullity.astype(np.int8),
-        alphas=alpha.alphas.astype(np.complex64),
-        alpha_by_view=alpha.alphas.astype(np.complex64),
-        alpha_semantics=np.array("per_view_per_mode"),
-        alpha_reference_view_index=np.array(0, dtype=np.int32),
+    return StagedSolveResult(
+        config=config,
+        prepared=prepared,
+        alpha=alpha,
+        observable=observable,
         alpha_view_freqs_hz=alpha_freqs,
-        alpha_identifiable_mask=alpha.identifiable_mask.astype(bool),
-        alpha_component_index=alpha.component_index.astype(np.int32),
-        alpha_structural_component_index=alpha.structural_component_index.astype(np.int32),
-        alpha_shared_count_component_index=alpha.shared_count_component_index.astype(np.int32),
-        alpha_information_component_index=alpha.information_component_index.astype(np.int32),
-        alpha_exclusion_reason=alpha.exclusion_reason,
-        alpha_phase=np.angle(alpha.alphas).astype(np.float32),
-        alpha_gain=np.abs(alpha.alphas).astype(np.float32),
-        alpha_shared_point_count=alpha.shared_point_count.astype(np.int32),
-        alpha_edge_point_count=alpha.edge_point_count.astype(np.int32),
-        alpha_edge_information=alpha.edge_information.astype(np.float32),
-        alpha_constraint_count_per_view=alpha.constraint_count_per_view.astype(np.int32),
-        alpha_information_matrix=alpha.information_matrix.astype(np.complex64),
-        alpha_parameter_information=alpha.parameter_information.astype(np.float32),
-        alpha_parameter_view_indices=alpha.parameter_view_indices.astype(np.int32),
-        alpha_parameter_order=np.array(alpha.parameter_order),
-        alpha_singular_values=alpha.singular_values.astype(np.float32),
-        alpha_rank_ratio=np.array(alpha.rank_ratio, dtype=np.float32),
-        alpha_information_ratio=np.array(alpha.information_ratio, dtype=np.float32),
-        alpha_condition=np.array(alpha.condition, dtype=np.float32),
-        alpha_consistency_residual=np.array(alpha.consistency_residual, dtype=np.float32),
-        alpha_phase_std=alpha.phase_std.astype(np.float32),
-        alpha_log_gain_std=alpha.log_gain_std.astype(np.float32),
-        alpha_gain_std=(np.abs(alpha.alphas) * alpha.log_gain_std).astype(np.float32),
-        alpha_gain_bound_active_mask=alpha.gain_bound_active_mask.astype(bool),
-        alpha_optimizer_success=np.array(alpha.optimizer_success),
-        alpha_optimizer_status=np.array(alpha.optimizer_status, dtype=np.int32),
-        alpha_optimizer_message=np.array(alpha.optimizer_message),
-        alpha_information_kind=np.array(alpha.information_kind),
-        view_ids=prepared.view_ids,
-        freq_hz=prepared.arrays["freq_hz"].astype(np.float32),
-        mode_index=prepared.arrays["mode_index"].astype(np.int32),
-        solver_method=np.array("staged_overlap_observable"),
-        solver_version=np.array(2, dtype=np.int32),
-        solver_alpha_model=np.array(config.alpha_model),
-        point_singular_values=observable.singular_values.astype(np.float32),
-        point_observable_rank=observable.observable_rank.astype(np.int8),
-        point_condition=observable.condition.astype(np.float32),
-        point_distinct_view_count=prepared.derived_view_count_per_point.astype(np.int32),
-        point_distinct_valid_view_count=observable.distinct_valid_view_count.astype(np.int32),
-        point_usable_observation_row_count=observable.usable_observation_row_count.astype(np.int32),
-        point_precompletion_residual=observable.precompletion_residual.astype(np.float32),
-        anchor_residual_threshold=np.array(observable.anchor_residual_threshold, dtype=np.float32),
-        anchor_condition_max=np.array(_ANCHOR_CONDITION_MAX, dtype=np.float32),
-        anchor_mask=observable.anchor_mask.astype(bool),
-        partial_mask=observable.partial_mask.astype(bool),
-        rejected_mask=observable.rejected_mask.astype(bool),
-        unobserved_mask=observable.unobserved_mask.astype(bool),
-        alpha_unresolved_mask=observable.alpha_unresolved_mask.astype(bool),
-        no_usable_observation_mask=observable.no_usable_observation_mask.astype(bool),
-        completion_mask=false_mask,
-        completion_connected_to_anchor=false_mask,
-        point_solution_status=observable.point_status.astype(np.int8),
-        point_solution_status_names=np.asarray(POINT_STATUS_NAMES),
-        point_residual=point_residual.astype(np.float32),
-        point_residual_valid_mask=point_residual_valid.astype(bool),
-        obs_count_per_point=prepared.obs_count_per_point.astype(np.int32),
-        obs_sample_count_per_point=prepared.obs_sample_count_per_point.astype(np.int32),
-        obs_point_index=prepared.obs_point_index.astype(np.int32),
-        obs_view_index=prepared.obs_view_index.astype(np.int32),
-        obs_pixels_xy=prepared.obs_pixels_xy.astype(np.float32),
-        obs_y=prepared.obs_y.astype(np.complex64),
-        obs_J=prepared.obs_J.astype(np.float32),
-        obs_confidence=prepared.obs_confidence.astype(np.float32),
-        obs_effective_weight=prepared.obs_weights.astype(np.float32),
-        obs_pred_y=pred.astype(np.complex64),
-        obs_residual=obs_residual.astype(np.float32),
-        obs_residual_valid_mask=obs_residual_valid.astype(bool),
-        source_observations=np.array(str(observations_path)),
-        staged_summary=np.asarray(
+        obs_pred_y=pred,
+        obs_residual=obs_residual,
+        obs_residual_valid_mask=obs_residual_valid,
+        point_residual=point_residual,
+        point_residual_valid_mask=point_residual_valid,
+        unidentifiable_observed_view_indices=invalid.astype(np.int64),
+    )
+
+
+def write_staged_debug_npz(
+    result: StagedSolveResult,
+    out_path: str | Path,
+) -> Path:
+    prepared = result.prepared
+    alpha = result.alpha
+    observable = result.observable
+    false_mask = np.zeros((prepared.points.shape[0],), dtype=bool)
+    arrays: dict[str, np.ndarray] = {
+        "points_world": prepared.points.astype(np.float32),
+        "phi": observable.phi.astype(np.complex64),
+        "phi_observable": observable.phi_observable.astype(np.complex64),
+        "phi_nullspace_correction": np.zeros_like(observable.phi, dtype=np.complex64),
+        "point_nullspace_basis": observable.nullspace_basis.astype(np.complex64),
+        "point_nullity": observable.nullity.astype(np.int8),
+        "alphas": alpha.alphas.astype(np.complex64),
+        "alpha_by_view": alpha.alphas.astype(np.complex64),
+        "alpha_semantics": np.array("per_view_per_mode"),
+        "alpha_reference_view_index": np.array(0, dtype=np.int32),
+        "alpha_view_freqs_hz": result.alpha_view_freqs_hz.astype(np.float32),
+        "alpha_identifiable_mask": alpha.identifiable_mask.astype(bool),
+        "alpha_reference_connected_mask": alpha.reference_connected_mask.astype(bool),
+        "alpha_exclusion_reason": alpha.exclusion_reason,
+        "alpha_phase": np.angle(alpha.alphas).astype(np.float32),
+        "alpha_gain": np.abs(alpha.alphas).astype(np.float32),
+        "alpha_shared_point_count": alpha.shared_point_count.astype(np.int32),
+        "alpha_edge_point_count": alpha.edge_point_count.astype(np.int32),
+        "alpha_edge_information": alpha.edge_information.astype(np.float32),
+        "alpha_constraint_count_per_view": alpha.constraint_count_per_view.astype(np.int32),
+        "alpha_information_matrix": alpha.information_matrix.astype(np.complex64),
+        "alpha_parameter_information": alpha.parameter_information.astype(np.float32),
+        "alpha_parameter_view_indices": alpha.parameter_view_indices.astype(np.int32),
+        "alpha_parameter_order": np.array(alpha.parameter_order),
+        "alpha_singular_values": alpha.singular_values.astype(np.float32),
+        "alpha_rank_ratio": np.array(alpha.rank_ratio, dtype=np.float32),
+        "alpha_information_ratio": np.array(alpha.information_ratio, dtype=np.float32),
+        "alpha_condition": np.array(alpha.condition, dtype=np.float32),
+        "alpha_consistency_residual": np.array(alpha.consistency_residual, dtype=np.float32),
+        "alpha_phase_std": alpha.phase_std.astype(np.float32),
+        "alpha_log_gain_std": alpha.log_gain_std.astype(np.float32),
+        "alpha_gain_std": (np.abs(alpha.alphas) * alpha.log_gain_std).astype(np.float32),
+        "alpha_gain_bound_active_mask": alpha.gain_bound_active_mask.astype(bool),
+        "alpha_optimizer_success": np.array(alpha.optimizer_success),
+        "alpha_optimizer_status": np.array(alpha.optimizer_status, dtype=np.int32),
+        "alpha_optimizer_message": np.array(alpha.optimizer_message),
+        "alpha_information_kind": np.array(alpha.information_kind),
+        "view_ids": prepared.view_ids,
+        "freq_hz": prepared.arrays["freq_hz"].astype(np.float32),
+        "mode_index": prepared.arrays["mode_index"].astype(np.int32),
+        "solver_method": np.array("staged_overlap_observable"),
+        "solver_version": np.array(2, dtype=np.int32),
+        "solver_alpha_model": np.array(result.config.alpha_model),
+        "point_singular_values": observable.singular_values.astype(np.float32),
+        "point_observable_rank": observable.observable_rank.astype(np.int8),
+        "point_condition": observable.condition.astype(np.float32),
+        "point_distinct_view_count": prepared.derived_view_count_per_point.astype(np.int32),
+        "point_distinct_valid_view_count": observable.distinct_valid_view_count.astype(np.int32),
+        "point_usable_observation_row_count": observable.usable_observation_row_count.astype(np.int32),
+        "point_precompletion_residual": observable.precompletion_residual.astype(np.float32),
+        "anchor_residual_threshold": np.array(observable.anchor_residual_threshold, dtype=np.float32),
+        "anchor_condition_max": np.array(ANCHOR_CONDITION_MAX, dtype=np.float32),
+        "anchor_mask": observable.anchor_mask.astype(bool),
+        "partial_mask": observable.partial_mask.astype(bool),
+        "rejected_mask": observable.rejected_mask.astype(bool),
+        "unobserved_mask": observable.unobserved_mask.astype(bool),
+        "alpha_unresolved_mask": observable.alpha_unresolved_mask.astype(bool),
+        "no_usable_observation_mask": observable.no_usable_observation_mask.astype(bool),
+        "completion_mask": false_mask,
+        "completion_connected_to_anchor": false_mask,
+        "point_solution_status": observable.point_status.astype(np.int8),
+        "point_solution_status_names": np.asarray(POINT_STATUS_NAMES),
+        "point_residual": result.point_residual.astype(np.float32),
+        "point_residual_valid_mask": result.point_residual_valid_mask.astype(bool),
+        "obs_count_per_point": prepared.obs_count_per_point.astype(np.int32),
+        "obs_sample_count_per_point": prepared.obs_sample_count_per_point.astype(np.int32),
+        "obs_point_index": prepared.obs_point_index.astype(np.int32),
+        "obs_view_index": prepared.obs_view_index.astype(np.int32),
+        "obs_pixels_xy": prepared.obs_pixels_xy.astype(np.float32),
+        "obs_y": prepared.obs_y.astype(np.complex64),
+        "obs_J": prepared.obs_J.astype(np.float32),
+        "obs_effective_weight": prepared.obs_weights.astype(np.float32),
+        "obs_pred_y": result.obs_pred_y.astype(np.complex64),
+        "obs_residual": result.obs_residual.astype(np.float32),
+        "obs_residual_valid_mask": result.obs_residual_valid_mask.astype(bool),
+        "staged_summary": np.asarray(
             [
                 int(alpha.identifiable_mask.sum()),
                 int(observable.anchor_mask.sum()),
@@ -1404,7 +1399,7 @@ def optimize_multi_view_staged(
             ],
             dtype=np.int64,
         ),
-        staged_summary_names=np.asarray(
+        "staged_summary_names": np.asarray(
             [
                 "identifiable_views",
                 "anchors",
@@ -1415,67 +1410,21 @@ def optimize_multi_view_staged(
                 "no_usable_observation",
             ]
         ),
-        **_optional_output_fields(prepared),
-    )
+    }
+    arrays.update(_optional_output_fields(prepared))
+    return save_npz_compressed_atomic(out_path, arrays)
 
-    if config.alpha_failure == "error":
-        observed_views = np.zeros((prepared.num_views,), dtype=bool)
-        observed_views[
-            np.unique(prepared.obs_view_index[prepared.obs_weights > 0.0])
-        ] = True
-        invalid = np.where(observed_views & ~alpha.identifiable_mask)[0]
-        if invalid.size:
-            labels = [str(prepared.view_ids[idx]) for idx in invalid.tolist()]
-            raise ValueError(
-                f"Unidentifiable alpha for observed views after writing diagnostics to {out}: {labels}."
-            )
 
-    if vis_dir is not None:
-        from modal_surface.optimization_visualization import (
-            _amplitude_colors,
-            _phase_colors,
-            _scatter_mode_image,
-            _write_ply,
+def enforce_alpha_failure(
+    result: StagedSolveResult,
+    diagnostics_path: str | Path,
+) -> None:
+    if result.config.alpha_failure != "error":
+        return
+    invalid = result.unidentifiable_observed_view_indices
+    if invalid.size:
+        labels = [str(result.prepared.view_ids[idx]) for idx in invalid.tolist()]
+        raise ValueError(
+            "Unidentifiable alpha for observed views after writing diagnostics "
+            f"to {Path(diagnostics_path)}: {labels}."
         )
-
-        if "view_image_width" not in prepared.arrays or "view_image_height" not in prepared.arrays:
-            raise ValueError("Visualization requires view_image_width and view_image_height.")
-        vis = Path(vis_dir)
-        vis.mkdir(parents=True, exist_ok=True)
-        widths = prepared.arrays["view_image_width"].astype(np.int32)
-        heights = prepared.arrays["view_image_height"].astype(np.int32)
-        for view_idx in range(prepared.num_views):
-            rows = np.where((prepared.obs_view_index == view_idx) & obs_residual_valid)[0]
-            if rows.size == 0:
-                continue
-            view_name = str(prepared.view_ids[view_idx])
-            _scatter_mode_image(
-                vis / f"{view_name}_observed.png",
-                prepared.obs_pixels_xy[rows],
-                prepared.obs_y[rows],
-                int(widths[view_idx]),
-                int(heights[view_idx]),
-                f"{view_name} observed",
-            )
-            _scatter_mode_image(
-                vis / f"{view_name}_predicted.png",
-                prepared.obs_pixels_xy[rows],
-                pred[rows],
-                int(widths[view_idx]),
-                int(heights[view_idx]),
-                f"{view_name} predicted",
-            )
-            _scatter_mode_image(
-                vis / f"{view_name}_residual.png",
-                prepared.obs_pixels_xy[rows],
-                prepared.obs_y[rows] - pred[rows],
-                int(widths[view_idx]),
-                int(heights[view_idx]),
-                f"{view_name} residual",
-                cmap="viridis",
-                normalize=False,
-            )
-        _write_ply(vis / "pointcloud_amplitude.ply", prepared.points, _amplitude_colors(observable.phi))
-        _write_ply(vis / "pointcloud_phase_u.ply", prepared.points, _phase_colors(observable.phi))
-
-    return out

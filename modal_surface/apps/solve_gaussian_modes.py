@@ -5,25 +5,41 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, SupportsFloat
+from typing import Any, Mapping, SupportsFloat
 
 import numpy as np
-from numpy.lib.npyio import NpzFile
 
 from modal_surface.gaussian_observations import build_gaussian_observation_graph
 from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_EPSILON,
+    MOTION_FILL_LSMR_ATOL,
+    MOTION_FILL_LSMR_BTOL,
+    MOTION_FILL_LSMR_CONLIM,
     MOTION_FILL_NULLSPACE_RTOL,
+    MOTION_FILL_NUMERICAL_RANK_POLICY,
     MOTION_FILL_OBSERVATION_DRIFT_RTOL,
     MOTION_FILL_METHOD,
+    MOTION_FILL_ROLE_NAMES,
+    MOTION_FILL_VERSION,
+    GaussianMotionFillResult,
     apply_gaussian_motion_fill,
-    rewrite_motion_fill_pointclouds,
     write_motion_fill_diagnostics,
     write_motion_fill_graph,
 )
-from modal_surface.io import load_modal_freqs, load_view_config
-from modal_surface.motion_fill import build_knn_graph, query_knn_candidates
-from modal_surface.optimization_staged import optimize_multi_view_staged
+from modal_surface.io import (
+    load_modal_freqs,
+    load_view_config,
+    save_npz_compressed_atomic,
+)
+from modal_surface.motion_fill import KnnGraph, build_knn_graph, query_knn_candidates
+from modal_surface.optimization_staged import (
+    ANCHOR_CONDITION_MAX,
+    POINT_STATUS_NAMES,
+    StagedSolveResult,
+    enforce_alpha_failure,
+    optimize_multi_view_staged,
+)
+from modal_surface.optimization_visualization import write_solve_visualizations
 from modal_surface.solver_cli import (
     add_staged_solver_arguments,
     staged_solver_config,
@@ -70,49 +86,42 @@ def _finite_percentile(values: np.ndarray, percentile: float) -> float | None:
 
 
 def latent_stats(
-    latent_path: Path,
-    latent: NpzFile,
-    observations: NpzFile,
+    staged: StagedSolveResult,
+    motion_fill: GaussianMotionFillResult | None,
+    observations: Mapping[str, np.ndarray],
 ) -> dict[str, Any]:
-    required = [
-        "points_world",
-        "obs_point_index",
-        "obs_residual",
-        "obs_residual_valid_mask",
-        "point_residual",
-        "point_residual_valid_mask",
-        "solver_method",
-        "alpha_identifiable_mask",
-        "alpha_optimizer_success",
-        "anchor_mask",
-        "partial_mask",
-        "rejected_mask",
-        "alpha_unresolved_mask",
-        "no_usable_observation_mask",
-    ]
-    missing = [key for key in required if key not in latent.files]
-    if missing:
-        raise ValueError(f"{latent_path} missing staged solver statistic fields: {missing}.")
-    obs_residual = latent["obs_residual"].astype(np.float32)
-    point_residual = latent["point_residual"].astype(np.float32)
-    obs_residual = obs_residual[latent["obs_residual_valid_mask"].astype(bool)]
-    point_residual = point_residual[latent["point_residual_valid_mask"].astype(bool)]
+    observable = staged.observable
+    alpha = staged.alpha
+    if motion_fill is None:
+        obs_residual = staged.obs_residual
+        obs_residual_valid = staged.obs_residual_valid_mask
+        point_residual = staged.point_residual
+        point_residual_valid = staged.point_residual_valid_mask
+    else:
+        obs_residual = motion_fill.obs_residual
+        obs_residual_valid = motion_fill.obs_residual_valid_mask
+        point_residual = motion_fill.point_residual
+        point_residual_valid = motion_fill.point_residual_valid_mask
+    obs_residual = np.asarray(obs_residual)[np.asarray(obs_residual_valid, dtype=bool)]
+    point_residual = np.asarray(point_residual)[np.asarray(point_residual_valid, dtype=bool)]
     return {
-        "num_points": int(latent["points_world"].shape[0]),
-        "num_observations": int(latent["obs_point_index"].shape[0]),
+        "num_points": int(staged.prepared.points.shape[0]),
+        "num_observations": int(staged.prepared.obs_point_index.shape[0]),
         "obs_residual_median": _finite_percentile(obs_residual, 50),
         "obs_residual_p90": _finite_percentile(obs_residual, 90),
         "point_residual_median": _finite_percentile(point_residual, 50),
         "point_residual_p90": _finite_percentile(point_residual, 90),
         "observations_per_view": observations["observations_per_view"].astype(int).tolist(),
-        "solver_method": str(np.asarray(latent["solver_method"]).item()),
-        "alpha_identifiable_count": int(latent["alpha_identifiable_mask"].astype(bool).sum()),
-        "alpha_optimizer_success": bool(np.asarray(latent["alpha_optimizer_success"]).item()),
-        "anchor_count": int(latent["anchor_mask"].astype(bool).sum()),
-        "partial_unresolved_count": int(latent["partial_mask"].astype(bool).sum()),
-        "rejected_count": int(latent["rejected_mask"].astype(bool).sum()),
-        "alpha_unresolved_point_count": int(latent["alpha_unresolved_mask"].astype(bool).sum()),
-        "no_usable_observation_point_count": int(latent["no_usable_observation_mask"].astype(bool).sum()),
+        "solver_method": "staged_overlap_observable",
+        "alpha_identifiable_count": int(alpha.identifiable_mask.sum()),
+        "alpha_optimizer_success": bool(alpha.optimizer_success),
+        "anchor_count": int(observable.anchor_mask.sum()),
+        "partial_unresolved_count": int(observable.partial_mask.sum()),
+        "rejected_count": int(observable.rejected_mask.sum()),
+        "alpha_unresolved_point_count": int(observable.alpha_unresolved_mask.sum()),
+        "no_usable_observation_point_count": int(
+            observable.no_usable_observation_mask.sum()
+        ),
     }
 
 
@@ -124,49 +133,22 @@ def json_float(value: SupportsFloat) -> float | None:
 
 
 def alpha_by_view_diagnostics(
-    latent_path: Path,
-    latent: NpzFile,
+    staged: StagedSolveResult,
 ) -> list[dict[str, Any]]:
-    required = [
-        "view_ids",
-        "alphas",
-        "alpha_by_view",
-        "alpha_semantics",
-        "alpha_reference_view_index",
-        "alpha_view_freqs_hz",
-        "alpha_identifiable_mask",
-        "alpha_exclusion_reason",
-        "alpha_phase_std",
-        "alpha_gain_std",
-        "alpha_log_gain_std",
-        "alpha_gain_bound_active_mask",
-    ]
-    missing = [key for key in required if key not in latent.files]
-    if missing:
-        raise ValueError(f"{latent_path} missing alpha diagnostic fields: {missing}.")
-    semantics = str(np.asarray(latent["alpha_semantics"]).item())
-    if semantics != "per_view_per_mode":
-        raise ValueError(f"{latent_path} has unexpected alpha_semantics={semantics!r}.")
-    reference_view_index = int(np.asarray(latent["alpha_reference_view_index"]).item())
-    if reference_view_index != 0:
-        raise ValueError(f"{latent_path} has unexpected alpha_reference_view_index={reference_view_index}.")
-
-    view_ids = [str(v) for v in latent["view_ids"].tolist()]
-    saved_alphas = latent["alphas"].astype(np.complex64).reshape(-1)
-    alphas = latent["alpha_by_view"].astype(np.complex64).reshape(-1)
-    freqs_hz = latent["alpha_view_freqs_hz"].astype(np.float32).reshape(-1)
-    if saved_alphas.shape != alphas.shape or not np.array_equal(saved_alphas, alphas):
-        raise ValueError(f"{latent_path} alphas and alpha_by_view are inconsistent.")
+    alpha = staged.alpha
+    view_ids = [str(v) for v in staged.prepared.view_ids.tolist()]
+    alphas = alpha.alphas.astype(np.complex64).reshape(-1)
+    freqs_hz = staged.alpha_view_freqs_hz.astype(np.float32).reshape(-1)
     if alphas.shape[0] != len(view_ids):
-        raise ValueError(f"{latent_path} alpha_by_view length does not match view_ids.")
+        raise ValueError("Alpha count does not match view_ids.")
     if freqs_hz.shape[0] != len(view_ids):
-        raise ValueError(f"{latent_path} alpha_view_freqs_hz length does not match view_ids.")
-    identifiable = latent["alpha_identifiable_mask"].astype(bool).reshape(-1)
-    reasons = latent["alpha_exclusion_reason"].astype(str).reshape(-1)
-    phase_std = latent["alpha_phase_std"].astype(np.float32).reshape(-1)
-    gain_std = latent["alpha_gain_std"].astype(np.float32).reshape(-1)
-    log_gain_std = latent["alpha_log_gain_std"].astype(np.float32).reshape(-1)
-    gain_bound_active = latent["alpha_gain_bound_active_mask"].astype(bool).reshape(-1)
+        raise ValueError("alpha_view_freqs_hz length does not match view_ids.")
+    identifiable = alpha.identifiable_mask.astype(bool).reshape(-1)
+    reasons = alpha.exclusion_reason.astype(str).reshape(-1)
+    phase_std = alpha.phase_std.astype(np.float32).reshape(-1)
+    log_gain_std = alpha.log_gain_std.astype(np.float32).reshape(-1)
+    gain_std = (np.abs(alphas) * log_gain_std).astype(np.float32)
+    gain_bound_active = alpha.gain_bound_active_mask.astype(bool).reshape(-1)
     staged_diagnostics = {
         "alpha_identifiable_mask": identifiable,
         "alpha_exclusion_reason": reasons,
@@ -177,7 +159,7 @@ def alpha_by_view_diagnostics(
     }
     invalid = [name for name, values in staged_diagnostics.items() if values.shape[0] != len(view_ids)]
     if invalid:
-        raise ValueError(f"{latent_path} staged alpha diagnostics have invalid lengths: {invalid}.")
+        raise ValueError(f"Staged alpha diagnostics have invalid lengths: {invalid}.")
     return [
         {
             "view_id": view_id,
@@ -201,14 +183,17 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input-ckpt", required=True, help="Static 3DGS checkpoint containing foreground Gaussian centers.")
     parser.add_argument("--view-config", action="append", required=True, help="View JSON config path. Repeat per view.")
     parser.add_argument("--modal-npz", action="append", required=True, help="modal_analysis.npz path. Repeat per view.")
-    parser.add_argument("--out-dir", required=True, help="Output directory for observations, latents, vis, and manifest.")
+    parser.add_argument(
+        "--out-dir",
+        required=True,
+        help="Output directory for observations, diagnostics, latents, vis, and manifest.",
+    )
     parser.add_argument("--mode-indices", default="all", help="Comma-separated zero-based mode indices, or 'all'.")
     parser.add_argument("--pixel-sample-stride", type=int, default=4, help="Pixel grid stride for pixel-candidates sampling.")
     parser.add_argument("--pixel-candidate-k", type=int, default=4, help="Number of top contribution Gaussians supervised by each sampled pixel.")
     parser.add_argument("--pixel-preselect-k", type=int, default=32, help="Number of 3D nearest Gaussians scored before top-k contribution selection.")
     parser.add_argument("--pixel-render-acc-min", type=float, default=0.05, help="Minimum rendered foreground alpha for sampled modal pixels.")
     parser.add_argument("--pixel-min-contribution", type=float, default=1e-12, help="Minimum unnormalized Gaussian contribution retained for a sampled modal pixel.")
-    parser.add_argument("--pixel-max-samples-per-view", type=int, default=20000, help="Maximum sampled modal pixels per view before candidate expansion.")
     parser.add_argument("--mask-erode-iters", type=int, default=1, help="3x3 modal mask erosion iterations.")
     parser.add_argument("--freq-tolerance-hz", type=float, default=0.1, help="Allowed selected frequency mismatch.")
     parser.add_argument(
@@ -318,19 +303,23 @@ def _load_fg_pixel_candidate_inputs_from_checkpoint(path: str, view_config_paths
 
 
 def _gaussian_latent_stats(
-    latent_path: Path,
-    latent: NpzFile,
-    observations: NpzFile,
+    staged: StagedSolveResult,
+    motion_fill: GaussianMotionFillResult | None,
+    observations: Mapping[str, np.ndarray],
     num_fg: int,
 ) -> dict[str, Any]:
-    stats = latent_stats(latent_path, latent, observations)
-    obs_count = latent["obs_count_per_point"].astype(np.int32)
-    obs_sample_count = latent["obs_sample_count_per_point"].astype(np.int32)
-    gaussian_indices = latent["gaussian_indices"].astype(np.int32)
+    stats = latent_stats(staged, motion_fill, observations)
+    prepared = staged.prepared
+    observable = staged.observable
+    obs_count = prepared.obs_count_per_point.astype(np.int32)
+    obs_sample_count = prepared.obs_sample_count_per_point.astype(np.int32)
+    if "gaussian_indices" not in prepared.arrays:
+        raise ValueError("Gaussian observations are missing gaussian_indices.")
+    gaussian_indices = prepared.arrays["gaussian_indices"].astype(np.int32)
     stats.update(
         {
             "num_foreground_gaussians": int(num_fg),
-            "num_output_points": int(latent["points_world"].shape[0]),
+            "num_output_points": int(prepared.points.shape[0]),
             "unobserved_output_count": int((obs_count == 0).sum()),
             "obs_count_p50": json_float(np.percentile(obs_count, 50)),
             "obs_count_p90": json_float(np.percentile(obs_count, 90)),
@@ -341,12 +330,12 @@ def _gaussian_latent_stats(
             "pixel_candidate_method": str(np.asarray(observations["pixel_candidate_method"]).item()),
         }
     )
-    if "motion_fill_method" in latent.files:
-        completion = latent["completion_mask"].astype(bool)
-        partial = latent["partial_mask"].astype(bool)
-        unobserved = latent["unobserved_mask"].astype(bool)
-        staged_solver_method = str(np.asarray(latent["solver_method"]).item())
-        motion_fill_method = str(np.asarray(latent["motion_fill_method"]).item())
+    if motion_fill is not None:
+        completion = motion_fill.motion.completion_mask.astype(bool)
+        partial = observable.partial_mask.astype(bool)
+        unobserved = observable.unobserved_mask.astype(bool)
+        staged_solver_method = "staged_overlap_observable"
+        motion_fill_method = MOTION_FILL_METHOD
         stats.update(
             {
                 "staged_solver_method": staged_solver_method,
@@ -378,7 +367,274 @@ def _gaussian_latent_stats(
     return stats
 
 
-def _print_observation_sanity(observations: NpzFile, num_fg: int) -> None:
+def _required_scalar_array(
+    arrays: Mapping[str, np.ndarray],
+    key: str,
+    dtype: Any,
+) -> np.ndarray:
+    if key not in arrays:
+        raise ValueError(f"Gaussian observations are missing {key}.")
+    value = np.asarray(arrays[key])
+    if value.shape != ():
+        raise ValueError(f"Gaussian observation field {key} must be scalar, got {value.shape}.")
+    return value.astype(dtype)
+
+
+def _write_compact_gaussian_latent(
+    out_path: str | Path,
+    staged: StagedSolveResult,
+    motion_fill: GaussianMotionFillResult | None,
+) -> Path:
+    prepared = staged.prepared
+    num_points = int(prepared.points.shape[0])
+    if "gaussian_indices" not in prepared.arrays:
+        raise ValueError("Gaussian observations are missing gaussian_indices.")
+    gaussian_indices = np.asarray(prepared.arrays["gaussian_indices"])
+    if gaussian_indices.shape != (num_points,):
+        raise ValueError(
+            f"gaussian_indices must have shape ({num_points},), got {gaussian_indices.shape}."
+        )
+    phi = staged.observable.phi if motion_fill is None else motion_fill.motion.phi
+    phi = np.asarray(phi)
+    if phi.shape != (num_points, 3):
+        raise ValueError(f"Final phi must have shape ({num_points},3), got {phi.shape}.")
+
+    arrays: dict[str, np.ndarray] = {
+        "points_world": prepared.points.astype(np.float32),
+        "phi": phi.astype(np.complex64),
+        "gaussian_indices": gaussian_indices.astype(np.int32),
+        "freq_hz": _required_scalar_array(prepared.arrays, "freq_hz", np.float32),
+        "mode_index": _required_scalar_array(prepared.arrays, "mode_index", np.int32),
+        "obs_count_per_point": prepared.obs_count_per_point.astype(np.int32),
+        "point_type": _required_scalar_array(prepared.arrays, "point_type", str),
+        "source_checkpoint": _required_scalar_array(
+            prepared.arrays, "source_checkpoint", str
+        ),
+    }
+    if motion_fill is not None:
+        arrays.update(
+            {
+                "motion_fill_role": motion_fill.roles.role.astype(np.int8),
+                "motion_fill_role_names": np.asarray(MOTION_FILL_ROLE_NAMES),
+                "completion_mask": motion_fill.motion.completion_mask.astype(bool),
+            }
+        )
+    return save_npz_compressed_atomic(out_path, arrays)
+
+
+def _motion_fill_solver_arrays(prefix: str, metadata: Any) -> dict[str, np.ndarray]:
+    return {
+        f"{prefix}_performed": np.array(bool(metadata.performed)),
+        f"{prefix}_converged": np.array(bool(metadata.converged)),
+        f"{prefix}_stop_code": np.array(int(metadata.stop_code), dtype=np.int32),
+        f"{prefix}_iterations": np.array(int(metadata.iterations), dtype=np.int32),
+        f"{prefix}_residual_norm": np.array(float(metadata.residual_norm), dtype=np.float64),
+        f"{prefix}_normal_residual_norm": np.array(
+            float(metadata.normal_residual_norm), dtype=np.float64
+        ),
+        f"{prefix}_matrix_norm": np.array(float(metadata.matrix_norm), dtype=np.float64),
+        f"{prefix}_condition_estimate": np.array(
+            float(metadata.condition_estimate), dtype=np.float64
+        ),
+        f"{prefix}_solution_norm": np.array(float(metadata.solution_norm), dtype=np.float64),
+    }
+
+
+def _write_solver_diagnostics(
+    out_path: str | Path,
+    staged: StagedSolveResult,
+    motion_fill: GaussianMotionFillResult | None,
+    graph: KnnGraph | None = None,
+    graph_path: str | None = None,
+) -> Path:
+    alpha = staged.alpha
+    observable = staged.observable
+    final_status = (
+        observable.point_status
+        if motion_fill is None
+        else motion_fill.point_solution_status
+    )
+    final_point_residual = (
+        staged.point_residual
+        if motion_fill is None
+        else motion_fill.point_residual
+    )
+    final_point_residual_valid = (
+        staged.point_residual_valid_mask
+        if motion_fill is None
+        else motion_fill.point_residual_valid_mask
+    )
+    arrays: dict[str, np.ndarray] = {
+        "alphas": alpha.alphas.astype(np.complex64),
+        "alpha_reference_view_index": np.array(0, dtype=np.int32),
+        "alpha_view_freqs_hz": staged.alpha_view_freqs_hz.astype(np.float32),
+        "alpha_identifiable_mask": alpha.identifiable_mask.astype(bool),
+        "alpha_reference_connected_mask": alpha.reference_connected_mask.astype(bool),
+        "alpha_exclusion_reason": alpha.exclusion_reason,
+        "alpha_shared_point_count": alpha.shared_point_count.astype(np.int32),
+        "alpha_edge_point_count": alpha.edge_point_count.astype(np.int32),
+        "alpha_edge_information": alpha.edge_information.astype(np.float32),
+        "alpha_constraint_count_per_view": alpha.constraint_count_per_view.astype(np.int32),
+        "alpha_information_matrix": alpha.information_matrix.astype(np.complex64),
+        "alpha_parameter_information": alpha.parameter_information.astype(np.float32),
+        "alpha_parameter_view_indices": alpha.parameter_view_indices.astype(np.int32),
+        "alpha_parameter_order": np.array(alpha.parameter_order),
+        "alpha_singular_values": alpha.singular_values.astype(np.float32),
+        "alpha_rank_ratio": np.array(alpha.rank_ratio, dtype=np.float32),
+        "alpha_information_ratio": np.array(alpha.information_ratio, dtype=np.float32),
+        "alpha_condition": np.array(alpha.condition, dtype=np.float32),
+        "alpha_consistency_residual": np.array(
+            alpha.consistency_residual, dtype=np.float32
+        ),
+        "alpha_phase_std": alpha.phase_std.astype(np.float32),
+        "alpha_log_gain_std": alpha.log_gain_std.astype(np.float32),
+        "alpha_gain_bound_active_mask": alpha.gain_bound_active_mask.astype(bool),
+        "alpha_optimizer_success": np.array(alpha.optimizer_success),
+        "alpha_optimizer_status": np.array(alpha.optimizer_status, dtype=np.int32),
+        "alpha_optimizer_message": np.array(alpha.optimizer_message),
+        "alpha_information_kind": np.array(alpha.information_kind),
+        "point_singular_values": observable.singular_values.astype(np.float32),
+        "point_observable_rank": observable.observable_rank.astype(np.int8),
+        "point_nullity": observable.nullity.astype(np.int8),
+        "point_condition": observable.condition.astype(np.float32),
+        "point_distinct_view_count": staged.prepared.derived_view_count_per_point.astype(
+            np.int32
+        ),
+        "point_distinct_valid_view_count": observable.distinct_valid_view_count.astype(
+            np.int32
+        ),
+        "point_usable_observation_row_count": observable.usable_observation_row_count.astype(
+            np.int32
+        ),
+        "point_precompletion_residual": observable.precompletion_residual.astype(
+            np.float32
+        ),
+        "staged_point_solution_status": observable.point_status.astype(np.int8),
+        "final_point_solution_status": np.asarray(final_status, dtype=np.int8),
+        "point_solution_status_names": np.asarray(POINT_STATUS_NAMES),
+        "point_residual": np.asarray(final_point_residual, dtype=np.float32),
+        "point_residual_valid_mask": np.asarray(
+            final_point_residual_valid, dtype=bool
+        ),
+        "obs_sample_count_per_point": staged.prepared.obs_sample_count_per_point.astype(
+            np.int32
+        ),
+        "anchor_residual_threshold": np.array(
+            observable.anchor_residual_threshold, dtype=np.float32
+        ),
+        "anchor_condition_max": np.array(ANCHOR_CONDITION_MAX, dtype=np.float32),
+    }
+    if motion_fill is not None:
+        if graph is None or graph_path is None:
+            raise ValueError("Motion-fill diagnostics require graph metadata.")
+        motion = motion_fill.motion
+        diagnostics = motion_fill.diagnostics
+        system = diagnostics["system"]
+        arrays.update(
+            {
+                "phi_nullspace_correction": motion.phi_nullspace_correction.astype(
+                    np.complex64
+                ),
+                "motion_fill_role": motion_fill.roles.role.astype(np.int8),
+                "motion_fill_excluded_reason": motion_fill.roles.excluded_reason.astype(
+                    np.int8
+                ),
+                "motion_fill_point_numerical_nullity": motion_fill.numerical_nullity.astype(
+                    np.int8
+                ),
+                "motion_fill_staged_nullity_refined_mask": motion_fill.staged_nullity_refined_mask.astype(
+                    bool
+                ),
+                "completion_mask": motion.completion_mask.astype(bool),
+                "completion_connected_to_anchor": motion.completion_connected_to_anchor.astype(
+                    bool
+                ),
+                "point_active_component_index": motion.connectivity.component_index.astype(
+                    np.int32
+                ),
+                "point_anchor_hop_distance": motion.connectivity.hop_distance.astype(
+                    np.int32
+                ),
+                "active_component_sizes": motion.connectivity.component_sizes.astype(
+                    np.int32
+                ),
+                "active_component_has_anchor": motion.connectivity.component_has_anchor.astype(
+                    bool
+                ),
+                "active_component_anchor_count": motion.connectivity.component_anchor_count.astype(
+                    np.int32
+                ),
+                "motion_fill_method": np.array(MOTION_FILL_METHOD),
+                "motion_fill_version": np.array(MOTION_FILL_VERSION, dtype=np.int32),
+                "motion_fill_numerical_rank_policy": np.array(
+                    MOTION_FILL_NUMERICAL_RANK_POLICY
+                ),
+                "motion_fill_excluded_policy": np.array(
+                    "retain_observable_exclude_from_graph"
+                ),
+                "motion_fill_graph_path": np.array(graph_path),
+                "motion_fill_graph_k": np.array(graph.k, dtype=np.int32),
+                "motion_fill_graph_max_distance": np.array(
+                    graph.max_distance, dtype=np.float64
+                ),
+                "motion_fill_graph_epsilon": np.array(
+                    graph.epsilon, dtype=np.float64
+                ),
+                "motion_fill_nullspace_operator_max_relative_error": np.array(
+                    diagnostics["nullspace_operator_max_relative_error"],
+                    dtype=np.float64,
+                ),
+                "motion_fill_nullspace_operator_rtol": np.array(
+                    MOTION_FILL_NULLSPACE_RTOL, dtype=np.float64
+                ),
+                "motion_fill_observation_drift_max_relative": np.array(
+                    diagnostics["observation_drift_max_relative"], dtype=np.float64
+                ),
+                "motion_fill_observation_drift_rtol": np.array(
+                    MOTION_FILL_OBSERVATION_DRIFT_RTOL, dtype=np.float64
+                ),
+                "motion_fill_relative_denominator_epsilon": np.array(
+                    MOTION_FILL_EPSILON, dtype=np.float64
+                ),
+                "motion_fill_system_row_count": np.array(
+                    motion.system_row_count, dtype=np.int64
+                ),
+                "motion_fill_system_column_count": np.array(
+                    motion.system_column_count, dtype=np.int64
+                ),
+                "motion_fill_active_edge_count": np.array(
+                    motion.active_edge_count, dtype=np.int64
+                ),
+                "motion_fill_eligible_edge_count": np.array(
+                    system["eligible_edge_count"], dtype=np.int64
+                ),
+                "motion_fill_lsmr_atol": np.array(
+                    MOTION_FILL_LSMR_ATOL, dtype=np.float64
+                ),
+                "motion_fill_lsmr_btol": np.array(
+                    MOTION_FILL_LSMR_BTOL, dtype=np.float64
+                ),
+                "motion_fill_lsmr_conlim": np.array(
+                    MOTION_FILL_LSMR_CONLIM, dtype=np.float64
+                ),
+                "motion_fill_source_solver_method": np.array(
+                    "staged_overlap_observable"
+                ),
+                **_motion_fill_solver_arrays(
+                    "motion_fill_lsmr_real", motion.real_solver
+                ),
+                **_motion_fill_solver_arrays(
+                    "motion_fill_lsmr_imaginary", motion.imag_solver
+                ),
+            }
+        )
+    return save_npz_compressed_atomic(out_path, arrays)
+
+
+def _print_observation_sanity(
+    observations: Mapping[str, np.ndarray],
+    num_fg: int,
+) -> None:
     obs_count = observations["obs_count_per_point"].astype(np.int32)
     obs_sample_count = observations["obs_sample_count_per_point"].astype(np.int32)
     view_ids = observations["view_ids"].astype(str)
@@ -418,9 +674,12 @@ def run(args: argparse.Namespace) -> None:
         view_configs_paths,
     )
 
+    from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
+
+    gaussian_tree = cKDTree(fg_means.astype(np.float64))
+
     _validate_motion_fill_arguments(args, fg_means.shape[0])
     
-    gaussian_indices = np.arange(fg_means.shape[0], dtype=np.int32)
     freqs_per_view = load_modal_freqs(modal_npzs_paths)
     # e.g. freqs_per_view = [
     # np.array([0.357, 0.714]),  # view 1
@@ -430,16 +689,23 @@ def run(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     obs_dir = out_dir / "observations"
     latent_dir = out_dir / "latents"
+    diagnostics_dir = out_dir / "diagnostics"
     vis_dir = out_dir / "vis"
     obs_dir.mkdir(parents=True, exist_ok=True)
     latent_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build KNN graph from gaussian centers
     motion_fill_graph = None
     motion_fill_graph_path: Path | None = None
     motion_fill_mode_diagnostics: dict[str, Any] = {}
     if args.motion_fill:
-        candidates = query_knn_candidates(fg_means, int(args.motion_fill_k))
+        candidates = query_knn_candidates(
+            fg_means,
+            int(args.motion_fill_k),
+            tree=gaussian_tree,
+        )
         motion_fill_graph = build_knn_graph(
             candidates,
             int(args.motion_fill_k),
@@ -459,75 +725,112 @@ def run(args: argparse.Namespace) -> None:
         mode_name = f"mode_{mode_index:03d}_{freq_slug(reference_freq)}hz"
         obs_path = obs_dir / f"{mode_name}.npz"
         latent_path = latent_dir / f"{mode_name}.npz"
+        diagnostics_path = diagnostics_dir / f"{mode_name}.npz"
         mode_vis_dir = vis_dir / mode_name
         print(f"Solving Gaussian mode {mode_name}")
+        latent_path.unlink(missing_ok=True)
         build_gaussian_observation_graph(
             points_world=fg_means,
             view_config_paths=view_configs_paths,
             modal_npz_paths=modal_npzs_paths,
             out_path=obs_path,
+            source_checkpoint=args.input_ckpt,
             mode_index=mode_index,
             mask_erode_iters=args.mask_erode_iters,
             freq_tolerance_hz=args.freq_tolerance_hz,  #
-            preserve_all_points=True,
-            optional_point_fields={"gaussian_indices": gaussian_indices},
-            extra_metadata={
-                "point_type": np.array("foreground_gaussian_center"),
-                "source_checkpoint": np.array(str(args.input_ckpt)),
-            },
             pixel_sample_stride=args.pixel_sample_stride,
             pixel_candidate_k=args.pixel_candidate_k,
             pixel_preselect_k=args.pixel_preselect_k,
             pixel_render_acc_min=args.pixel_render_acc_min,
             pixel_min_contribution=args.pixel_min_contribution,
-            pixel_max_samples_per_view=args.pixel_max_samples_per_view,
             gaussian_scales=fg_scales,
             gaussian_quats=fg_quats,
             gaussian_opacities=fg_opacities,
             rendered_depths=rendered_depths,
             rendered_accs=rendered_accs,
+            gaussian_tree=gaussian_tree,
         )
-        with np.load(str(obs_path), allow_pickle=False) as observations:
-            _print_observation_sanity(observations, fg_means.shape[0])
-            optimize_multi_view_staged(
-                observations_path=obs_path,
-                out_path=latent_path,
-                vis_dir=mode_vis_dir,
-                config=staged_solver_config(args),
-            )
-            motion_fill_diagnostics = None
-            if motion_fill_graph is not None:
-                assert motion_fill_graph_path is not None
-                motion_fill_diagnostics = apply_gaussian_motion_fill(
-                    latent_path,
+        with np.load(str(obs_path), allow_pickle=False) as loaded:
+            observations = {key: loaded[key] for key in loaded.files}
+        _print_observation_sanity(observations, fg_means.shape[0])
+        staged = optimize_multi_view_staged(
+            observations=observations,
+            config=staged_solver_config(args),
+        )
+        if (
+            staged.config.alpha_failure == "error"
+            and staged.unidentifiable_observed_view_indices.size
+        ):
+            _write_solver_diagnostics(diagnostics_path, staged, None)
+            enforce_alpha_failure(staged, diagnostics_path)
+
+        motion_fill_result = None
+        if motion_fill_graph is not None:
+            assert motion_fill_graph_path is not None
+            graph_relative_path = relative_path(motion_fill_graph_path, out_dir)
+            try:
+                motion_fill_result = apply_gaussian_motion_fill(
+                    staged,
                     motion_fill_graph,
-                    relative_path(motion_fill_graph_path, out_dir),
+                    graph_relative_path,
                 )
-                rewrite_motion_fill_pointclouds(latent_path, mode_vis_dir)
-                motion_fill_mode_diagnostics[mode_name] = motion_fill_diagnostics
-            with np.load(str(latent_path), allow_pickle=False) as latent:
-                latent_stats = _gaussian_latent_stats(
-                    latent_path,
-                    latent,
-                    observations,
-                    fg_means.shape[0],
-                )
-                if motion_fill_diagnostics is not None:
-                    latent_stats["motion_fill"] = motion_fill_diagnostics
-                freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
-                modes.append(
-                    {
-                        "mode_index": int(mode_index),
-                        "freq_hz": reference_freq,
-                        "freqs_hz_by_view": freqs_by_view,
-                        "label": f"{mode_index}: {reference_freq:.6f} Hz",
-                        "observation_path": relative_path(obs_path, out_dir),
-                        "latent_path": relative_path(latent_path, out_dir),
-                        "vis_dir": relative_path(mode_vis_dir, out_dir),
-                        "alpha_by_view": alpha_by_view_diagnostics(latent_path, latent),
-                        "stats": latent_stats,
-                    }
-                )
+            except Exception:
+                _write_solver_diagnostics(diagnostics_path, staged, None)
+                raise
+            motion_fill_mode_diagnostics[mode_name] = motion_fill_result.diagnostics
+
+        if motion_fill_result is None:
+            final_phi = staged.observable.phi
+            final_prediction = staged.obs_pred_y
+            final_residual_valid = staged.obs_residual_valid_mask
+        else:
+            final_phi = motion_fill_result.motion.phi
+            final_prediction = motion_fill_result.obs_pred_y
+            final_residual_valid = motion_fill_result.obs_residual_valid_mask
+        write_solve_visualizations(
+            staged,
+            final_phi,
+            final_prediction,
+            final_residual_valid,
+            mode_vis_dir,
+        )
+        graph_relative_path = (
+            relative_path(motion_fill_graph_path, out_dir)
+            if motion_fill_graph_path is not None
+            else None
+        )
+        _write_solver_diagnostics(
+            diagnostics_path,
+            staged,
+            motion_fill_result,
+            motion_fill_graph,
+            graph_relative_path,
+        )
+        _write_compact_gaussian_latent(latent_path, staged, motion_fill_result)
+
+        mode_stats = _gaussian_latent_stats(
+            staged,
+            motion_fill_result,
+            observations,
+            fg_means.shape[0],
+        )
+        if motion_fill_result is not None:
+            mode_stats["motion_fill"] = motion_fill_result.diagnostics
+        freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
+        modes.append(
+            {
+                "mode_index": int(mode_index),
+                "freq_hz": reference_freq,
+                "freqs_hz_by_view": freqs_by_view,
+                "label": f"{mode_index}: {reference_freq:.6f} Hz",
+                "observation_path": relative_path(obs_path, out_dir),
+                "latent_path": relative_path(latent_path, out_dir),
+                "diagnostics_path": relative_path(diagnostics_path, out_dir),
+                "vis_dir": relative_path(mode_vis_dir, out_dir),
+                "alpha_by_view": alpha_by_view_diagnostics(staged),
+                "stats": mode_stats,
+            }
+        )
 
     manifest_parameters = {
         "mask_erode_iters": int(args.mask_erode_iters),
@@ -536,7 +839,6 @@ def run(args: argparse.Namespace) -> None:
         "pixel_preselect_k": int(args.pixel_preselect_k),
         "pixel_render_acc_min": float(args.pixel_render_acc_min),
         "pixel_min_contribution": float(args.pixel_min_contribution),
-        "pixel_max_samples_per_view": int(args.pixel_max_samples_per_view),
         "freq_tolerance_hz": float(args.freq_tolerance_hz),
         "alpha_model": "per_view_per_mode",
         "alpha_reference_view_index": 0,

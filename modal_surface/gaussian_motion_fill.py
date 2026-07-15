@@ -4,21 +4,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
-import tempfile
 from typing import Any, Mapping
 
 import numpy as np
 
+from modal_surface.io import save_npz_compressed_atomic
 from modal_surface.motion_fill import (
     KnnCandidateSet,
     KnnGraph,
+    MotionFillResult,
     fill_nullspace_motion,
 )
 from modal_surface.optimization_staged import (
     POINT_STATUS_COMPLETED_OBSERVED,
     POINT_STATUS_COMPLETED_UNOBSERVED,
+    AlphaSyncResult,
+    ObservableSolveResult,
+    PreparedObservations,
+    StagedSolveResult,
+    compute_prediction_and_residuals,
 )
 
 
@@ -89,18 +94,27 @@ class GaussianMotionFillSubspaces:
     valid_rows: np.ndarray
 
 
-def _require(arrays: Mapping[str, np.ndarray], key: str) -> np.ndarray:
-    if key not in arrays:
-        raise ValueError(f"Gaussian staged latent is missing required array {key!r}.")
-    return np.asarray(arrays[key])
+@dataclass(frozen=True)
+class GaussianMotionFillResult:
+    motion: MotionFillResult
+    roles: GaussianMotionFillRoles
+    numerical_nullity: np.ndarray
+    staged_nullity_refined_mask: np.ndarray
+    point_solution_status: np.ndarray
+    obs_pred_y: np.ndarray
+    obs_residual: np.ndarray
+    obs_residual_valid_mask: np.ndarray
+    point_residual: np.ndarray
+    point_residual_valid_mask: np.ndarray
+    diagnostics: dict[str, Any]
 
 
 def _require_boolean_mask(
-    arrays: Mapping[str, np.ndarray],
+    value: np.ndarray,
     key: str,
     num_points: int,
 ) -> np.ndarray:
-    mask = _require(arrays, key)
+    mask = np.asarray(value)
     if mask.shape != (num_points,):
         raise ValueError(f"{key} must have shape ({num_points},), got {mask.shape}.")
     if mask.dtype != np.bool_:
@@ -109,20 +123,29 @@ def _require_boolean_mask(
 
 
 def derive_gaussian_motion_fill_roles(
-    arrays: Mapping[str, np.ndarray],
+    observable: ObservableSolveResult,
+    point_nullity: np.ndarray,
 ) -> GaussianMotionFillRoles:
     """Map staged solver states to the four production motion-fill roles."""
 
-    points = _require(arrays, "points_world")
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError(f"points_world must have shape (N,3), got {points.shape}.")
-    num_points = int(points.shape[0])
-    anchor = _require_boolean_mask(arrays, "anchor_mask", num_points)
-    partial = _require_boolean_mask(arrays, "partial_mask", num_points)
-    unobserved = _require_boolean_mask(arrays, "unobserved_mask", num_points)
-    rejected = _require_boolean_mask(arrays, "rejected_mask", num_points)
-    alpha_unresolved = _require_boolean_mask(arrays, "alpha_unresolved_mask", num_points)
-    no_usable = _require_boolean_mask(arrays, "no_usable_observation_mask", num_points)
+    phi = np.asarray(observable.phi_observable)
+    if phi.ndim != 2 or phi.shape[1] != 3:
+        raise ValueError(f"phi_observable must have shape (N,3), got {phi.shape}.")
+    num_points = int(phi.shape[0])
+    anchor = _require_boolean_mask(observable.anchor_mask, "anchor_mask", num_points)
+    partial = _require_boolean_mask(observable.partial_mask, "partial_mask", num_points)
+    unobserved = _require_boolean_mask(
+        observable.unobserved_mask, "unobserved_mask", num_points
+    )
+    rejected = _require_boolean_mask(observable.rejected_mask, "rejected_mask", num_points)
+    alpha_unresolved = _require_boolean_mask(
+        observable.alpha_unresolved_mask, "alpha_unresolved_mask", num_points
+    )
+    no_usable = _require_boolean_mask(
+        observable.no_usable_observation_mask,
+        "no_usable_observation_mask",
+        num_points,
+    )
 
     staged_state_count = sum(
         mask.astype(np.int8)
@@ -141,7 +164,7 @@ def derive_gaussian_motion_fill_roles(
             "no-usable masks must be mutually exclusive and exhaustive."
         )
 
-    nullity_source = _require(arrays, "point_nullity")
+    nullity_source = np.asarray(point_nullity)
     if nullity_source.shape != (num_points,):
         raise ValueError(
             f"point_nullity must have shape ({num_points},), got {nullity_source.shape}."
@@ -187,16 +210,17 @@ def derive_gaussian_motion_fill_roles(
     )
 
 
-def _load_observation_operator(
-    arrays: Mapping[str, np.ndarray],
-    num_points: int,
+def _build_observation_operator(
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
 ) -> GaussianObservationOperator:
-    point_index_source = _require(arrays, "obs_point_index")
-    view_index_source = _require(arrays, "obs_view_index")
-    jacobian_source = _require(arrays, "obs_J")
-    weight_source = _require(arrays, "obs_effective_weight")
-    alphas_source = _require(arrays, "alphas")
-    identifiable = _require(arrays, "alpha_identifiable_mask")
+    point_index_source = np.asarray(prepared.obs_point_index)
+    view_index_source = np.asarray(prepared.obs_view_index)
+    jacobian_source = np.asarray(prepared.obs_J)
+    weight_source = np.asarray(prepared.obs_weights)
+    alphas_source = np.asarray(alpha.alphas)
+    identifiable = np.asarray(alpha.identifiable_mask)
+    num_points = int(prepared.points.shape[0])
     if point_index_source.ndim != 1:
         raise ValueError(
             f"obs_point_index must be a 1-D array, got {point_index_source.shape}."
@@ -315,13 +339,13 @@ def _derive_numerical_completion_subspaces(
 
 
 def _validate_observation_nullspaces(
-    arrays: Mapping[str, np.ndarray],
+    subspaces: GaussianMotionFillSubspaces,
     operator: GaussianObservationOperator,
     constrained_mask: np.ndarray,
 ) -> float:
     num_points = int(constrained_mask.shape[0])
-    basis = _require(arrays, "point_nullspace_basis")
-    nullity = _require(arrays, "point_nullity")
+    basis = np.asarray(subspaces.basis)
+    nullity = np.asarray(subspaces.nullity)
     if basis.shape != (num_points, 3, 3) or nullity.shape != (num_points,):
         raise ValueError("Point nullspace arrays do not match points_world length.")
     point_index = operator.point_index
@@ -369,19 +393,20 @@ def _validate_observation_nullspaces(
 
 
 def _observation_drift(
-    arrays: Mapping[str, np.ndarray],
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
     correction: np.ndarray,
     constrained_mask: np.ndarray,
     valid_rows: np.ndarray,
 ) -> float:
     correction_complex = np.asarray(correction, dtype=np.complex128)
     num_points = correction_complex.shape[0]
-    point_index = np.asarray(arrays["obs_point_index"], dtype=np.int64)
-    view_index = np.asarray(arrays["obs_view_index"], dtype=np.int64)
-    jacobian = np.asarray(arrays["obs_J"], dtype=np.float64)
-    measurement = np.asarray(arrays["obs_y"], dtype=np.complex128)
-    weight = np.asarray(arrays["obs_effective_weight"], dtype=np.float64)
-    alphas = np.asarray(arrays["alphas"], dtype=np.complex128)
+    point_index = np.asarray(prepared.obs_point_index, dtype=np.int64)
+    view_index = np.asarray(prepared.obs_view_index, dtype=np.int64)
+    jacobian = np.asarray(prepared.obs_J, dtype=np.float64)
+    measurement = np.asarray(prepared.obs_y, dtype=np.complex128)
+    weight = np.asarray(prepared.obs_weights, dtype=np.float64)
+    alphas = np.asarray(alpha.alphas, dtype=np.complex128)
     if valid_rows.shape != point_index.shape or valid_rows.dtype != np.bool_:
         raise ValueError("valid_rows must be boolean and match the observation count.")
     projected = np.einsum(
@@ -419,68 +444,6 @@ def _observation_drift(
     return maximum
 
 
-def _prediction_and_residuals(
-    arrays: Mapping[str, np.ndarray],
-    phi: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    point_index = np.asarray(arrays["obs_point_index"], dtype=np.int64)
-    view_index = np.asarray(arrays["obs_view_index"], dtype=np.int64)
-    jacobian = np.asarray(arrays["obs_J"], dtype=np.float32)
-    measurement = np.asarray(arrays["obs_y"], dtype=np.complex64)
-    weight = np.asarray(arrays["obs_effective_weight"], dtype=np.float64)
-    alphas = np.asarray(arrays["alphas"], dtype=np.complex64)
-    identifiable = np.asarray(arrays["alpha_identifiable_mask"], dtype=bool)
-    valid = identifiable[view_index] & (weight > 0.0)
-    valid_rows = np.where(valid)[0]
-    pred = np.full(measurement.shape, np.nan + 1j * np.nan, dtype=np.complex64)
-    obs_residual = np.full((measurement.shape[0],), np.nan, dtype=np.float32)
-    if valid_rows.size:
-        projected = np.einsum(
-            "oij,oj->oi",
-            jacobian[valid_rows],
-            phi[point_index[valid_rows]].astype(np.complex64),
-        )
-        pred[valid_rows] = (
-            alphas[view_index[valid_rows], None] * projected
-        ).astype(np.complex64)
-        obs_residual[valid_rows] = np.linalg.norm(
-            measurement[valid_rows] - pred[valid_rows], axis=1
-        ).astype(np.float32)
-    sums = np.zeros((phi.shape[0],), dtype=np.float64)
-    counts = np.zeros((phi.shape[0],), dtype=np.int32)
-    if valid_rows.size:
-        np.add.at(
-            sums,
-            point_index[valid_rows],
-            obs_residual[valid_rows].astype(np.float64) ** 2,
-        )
-        np.add.at(counts, point_index[valid_rows], 1)
-    point_residual = np.full((phi.shape[0],), np.nan, dtype=np.float32)
-    has_residual = counts > 0
-    point_residual[has_residual] = np.sqrt(
-        sums[has_residual] / counts[has_residual]
-    ).astype(np.float32)
-    return pred, obs_residual, valid, point_residual, has_residual
-
-
-def _solver_arrays(prefix: str, metadata: Any) -> dict[str, np.ndarray]:
-    return {
-        f"{prefix}_performed": np.array(bool(metadata.performed)),
-        f"{prefix}_converged": np.array(bool(metadata.converged)),
-        f"{prefix}_stop_code": np.array(int(metadata.stop_code), dtype=np.int32),
-        f"{prefix}_iterations": np.array(int(metadata.iterations), dtype=np.int32),
-        f"{prefix}_residual_norm": np.array(float(metadata.residual_norm), dtype=np.float64),
-        f"{prefix}_normal_residual_norm": np.array(
-            float(metadata.normal_residual_norm), dtype=np.float64
-        ),
-        f"{prefix}_matrix_norm": np.array(float(metadata.matrix_norm), dtype=np.float64),
-        f"{prefix}_condition_estimate": np.array(
-            float(metadata.condition_estimate), dtype=np.float64
-        ),
-        f"{prefix}_solution_norm": np.array(float(metadata.solution_norm), dtype=np.float64),
-    }
-
-
 def _json_float(value: float) -> float | None:
     value = float(value)
     return value if np.isfinite(value) else None
@@ -500,64 +463,53 @@ def _solver_diagnostics(metadata: Any) -> dict[str, Any]:
     }
 
 
-def _atomic_write_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        prefix=f".{path.stem}.",
-        suffix=".tmp.npz",
-        dir=path.parent,
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-    try:
-        np.savez_compressed(temporary, **arrays)
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
 def apply_gaussian_motion_fill(
-    latent_path: str | Path,
+    staged: StagedSolveResult,
     graph: KnnGraph,
     graph_path: str,
-) -> dict[str, Any]:
-    """Fill one staged Gaussian latent in place and return JSON-safe diagnostics."""
+) -> GaussianMotionFillResult:
+    """Complete one staged Gaussian field without reading or writing artifacts."""
 
-    path = Path(latent_path)
-    with np.load(path, allow_pickle=False) as loaded:
-        arrays = {key: loaded[key] for key in loaded.files}
-    staged_roles = derive_gaussian_motion_fill_roles(arrays)
-    phi_observable = _require(arrays, "phi_observable")
-    num_points = int(_require(arrays, "points_world").shape[0])
+    if not graph_path:
+        raise ValueError("graph_path must be non-empty.")
+    prepared = staged.prepared
+    alpha = staged.alpha
+    observable = staged.observable
+    points = np.asarray(prepared.points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points_world must have shape (N,3), got {points.shape}.")
+    phi_observable = np.asarray(observable.phi_observable)
+    num_points = int(points.shape[0])
     if phi_observable.shape != (num_points, 3):
         raise ValueError(
             f"phi_observable must have shape ({num_points},3), got "
             f"{phi_observable.shape}."
         )
-    if not np.array_equal(_require(arrays, "phi"), phi_observable):
-        raise ValueError("Gaussian latent phi must equal phi_observable before motion fill.")
-    if np.any(_require(arrays, "completion_mask")) or np.any(
-        _require(arrays, "phi_nullspace_correction") != 0
-    ):
-        raise ValueError("Gaussian latent already contains motion-fill completion.")
+    if np.asarray(observable.phi).shape != (num_points, 3):
+        raise ValueError(
+            f"phi must have shape ({num_points},3), got {np.asarray(observable.phi).shape}."
+        )
+    if not np.array_equal(observable.phi, phi_observable):
+        raise ValueError("Staged phi must equal phi_observable before motion fill.")
+    if graph.num_points != num_points:
+        raise ValueError(
+            f"Motion-fill graph has {graph.num_points} points, expected {num_points}."
+        )
 
-    operator = _load_observation_operator(arrays, num_points)
+    staged_roles = derive_gaussian_motion_fill_roles(observable, observable.nullity)
+    operator = _build_observation_operator(prepared, alpha)
     subspaces = _derive_numerical_completion_subspaces(operator, num_points)
-    completion_arrays = dict(arrays)
-    completion_arrays["point_nullspace_basis"] = subspaces.basis
-    completion_arrays["point_nullity"] = subspaces.nullity
-    roles = derive_gaussian_motion_fill_roles(completion_arrays)
-    staged_nullity = _require(arrays, "point_nullity").astype(np.int8, copy=False)
+    roles = derive_gaussian_motion_fill_roles(observable, subspaces.nullity)
+    staged_nullity = np.asarray(observable.nullity, dtype=np.int8)
     refined_partial_mask = (
-        _require(arrays, "partial_mask") & (staged_nullity != subspaces.nullity)
+        observable.partial_mask & (staged_nullity != subspaces.nullity)
     )
     nullspace_error = _validate_observation_nullspaces(
-        completion_arrays,
+        subspaces,
         operator,
         roles.constrained_variable_mask,
     )
-    result = fill_nullspace_motion(
+    motion = fill_nullspace_motion(
         graph,
         phi_observable,
         subspaces.basis,
@@ -571,122 +523,32 @@ def apply_gaussian_motion_fill(
         lsmr_conlim=MOTION_FILL_LSMR_CONLIM,
     )
     fixed_mask = roles.fixed_anchor_mask | roles.excluded_mask
-    if not np.array_equal(result.phi[fixed_mask], phi_observable[fixed_mask]):
+    if not np.array_equal(motion.phi[fixed_mask], phi_observable[fixed_mask]):
         raise RuntimeError("Motion fill changed a fixed anchor or excluded point.")
-    if np.any(result.phi_nullspace_correction[fixed_mask] != 0):
+    if np.any(motion.phi_nullspace_correction[fixed_mask] != 0):
         raise RuntimeError("Motion fill assigned a correction to a fixed or excluded point.")
     observation_drift = _observation_drift(
-        arrays,
-        result.phi_nullspace_correction,
+        prepared,
+        alpha,
+        motion.phi_nullspace_correction,
         roles.constrained_variable_mask,
         subspaces.valid_rows,
     )
 
     pred, obs_residual, obs_residual_valid, point_residual, point_residual_valid = (
-        _prediction_and_residuals(arrays, result.phi)
+        compute_prediction_and_residuals(prepared, alpha, motion.phi)
     )
-    point_status = _require(arrays, "point_solution_status").astype(np.int8, copy=True)
+    point_status = np.asarray(observable.point_status, dtype=np.int8).copy()
     point_status[
-        roles.constrained_variable_mask & result.completion_mask
+        roles.constrained_variable_mask & motion.completion_mask
     ] = POINT_STATUS_COMPLETED_OBSERVED
     point_status[
-        roles.free_variable_mask & result.completion_mask
+        roles.free_variable_mask & motion.completion_mask
     ] = POINT_STATUS_COMPLETED_UNOBSERVED
     active_edges = roles.active_mask[graph.edge_index[:, 0]] & roles.active_mask[
         graph.edge_index[:, 1]
     ]
 
-    arrays.update(
-        {
-            "phi": np.asarray(result.phi, dtype=np.complex64),
-            "phi_observable": np.asarray(result.phi_observable, dtype=np.complex64),
-            "phi_nullspace_correction": np.asarray(
-                result.phi_nullspace_correction, dtype=np.complex64
-            ),
-            "completion_mask": np.asarray(result.completion_mask, dtype=bool),
-            "completion_connected_to_anchor": np.asarray(
-                result.completion_connected_to_anchor, dtype=bool
-            ),
-            "point_solution_status": point_status,
-            "motion_fill_role": roles.role,
-            "motion_fill_role_names": np.asarray(MOTION_FILL_ROLE_NAMES),
-            "motion_fill_excluded_reason": roles.excluded_reason,
-            "motion_fill_excluded_reason_names": np.asarray(
-                MOTION_FILL_EXCLUDED_REASON_NAMES
-            ),
-            "motion_fill_point_numerical_nullity": subspaces.nullity,
-            "motion_fill_staged_nullity_refined_mask": refined_partial_mask,
-            "motion_fill_numerical_rank_policy": np.array(
-                MOTION_FILL_NUMERICAL_RANK_POLICY
-            ),
-            "motion_fill_active_mask": roles.active_mask,
-            "motion_fill_excluded_mask": roles.excluded_mask,
-            "point_active_component_index": np.asarray(
-                result.connectivity.component_index, dtype=np.int32
-            ),
-            "active_component_sizes": np.asarray(
-                result.connectivity.component_sizes, dtype=np.int32
-            ),
-            "active_component_has_anchor": np.asarray(
-                result.connectivity.component_has_anchor, dtype=bool
-            ),
-            "active_component_anchor_count": np.asarray(
-                result.connectivity.component_anchor_count, dtype=np.int32
-            ),
-            "point_anchor_hop_distance": np.asarray(
-                result.connectivity.hop_distance, dtype=np.int32
-            ),
-            "motion_fill_method": np.array(MOTION_FILL_METHOD),
-            "motion_fill_version": np.array(MOTION_FILL_VERSION, dtype=np.int32),
-            "motion_fill_excluded_policy": np.array(
-                "retain_observable_exclude_from_graph"
-            ),
-            "motion_fill_graph_path": np.array(graph_path),
-            "motion_fill_graph_k": np.array(graph.k, dtype=np.int32),
-            "motion_fill_graph_max_distance": np.array(
-                graph.max_distance, dtype=np.float64
-            ),
-            "motion_fill_graph_epsilon": np.array(graph.epsilon, dtype=np.float64),
-            "motion_fill_nullspace_operator_max_relative_error": np.array(
-                nullspace_error, dtype=np.float64
-            ),
-            "motion_fill_nullspace_operator_rtol": np.array(
-                MOTION_FILL_NULLSPACE_RTOL, dtype=np.float64
-            ),
-            "motion_fill_observation_drift_max_relative": np.array(
-                observation_drift, dtype=np.float64
-            ),
-            "motion_fill_observation_drift_rtol": np.array(
-                MOTION_FILL_OBSERVATION_DRIFT_RTOL, dtype=np.float64
-            ),
-            "motion_fill_system_row_count": np.array(
-                result.system_row_count, dtype=np.int64
-            ),
-            "motion_fill_system_column_count": np.array(
-                result.system_column_count, dtype=np.int64
-            ),
-            "motion_fill_active_edge_count": np.array(
-                result.active_edge_count, dtype=np.int64
-            ),
-            "motion_fill_eligible_edge_count": np.array(
-                np.count_nonzero(active_edges), dtype=np.int64
-            ),
-            "motion_fill_lsmr_atol": np.array(MOTION_FILL_LSMR_ATOL),
-            "motion_fill_lsmr_btol": np.array(MOTION_FILL_LSMR_BTOL),
-            "motion_fill_lsmr_conlim": np.array(MOTION_FILL_LSMR_CONLIM),
-            "motion_fill_source_solver_method": np.asarray(
-                _require(arrays, "solver_method")
-            ),
-            "obs_pred_y": pred,
-            "obs_residual": obs_residual,
-            "obs_residual_valid_mask": obs_residual_valid,
-            "point_residual": point_residual,
-            "point_residual_valid_mask": point_residual_valid,
-            **_solver_arrays("motion_fill_lsmr_real", result.real_solver),
-            **_solver_arrays("motion_fill_lsmr_imaginary", result.imag_solver),
-        }
-    )
-    _atomic_write_npz(path, arrays)
     role_counts = {
         name: int(np.count_nonzero(roles.role == index))
         for index, name in enumerate(MOTION_FILL_ROLE_NAMES)
@@ -700,7 +562,7 @@ def apply_gaussian_motion_fill(
         str(dimension): int(np.count_nonzero(subspaces.nullity == dimension))
         for dimension in range(4)
     }
-    return {
+    diagnostics = {
         "method": MOTION_FILL_METHOD,
         "version": MOTION_FILL_VERSION,
         "role_counts": role_counts,
@@ -713,13 +575,13 @@ def apply_gaussian_motion_fill(
                 np.count_nonzero(staged_roles.constrained_variable_mask)
             ),
         },
-        "completion_count": int(np.count_nonzero(result.completion_mask)),
+        "completion_count": int(np.count_nonzero(motion.completion_mask)),
         "anchor_connected_point_count": int(
-            np.count_nonzero(result.completion_connected_to_anchor)
+            np.count_nonzero(motion.completion_connected_to_anchor)
         ),
-        "active_component_count": int(result.connectivity.component_sizes.shape[0]),
+        "active_component_count": int(motion.connectivity.component_sizes.shape[0]),
         "anchor_connected_component_count": int(
-            np.count_nonzero(result.connectivity.component_has_anchor)
+            np.count_nonzero(motion.connectivity.component_has_anchor)
         ),
         "nullspace_operator_max_relative_error": nullspace_error,
         "observation_drift_max_relative": observation_drift,
@@ -729,14 +591,27 @@ def apply_gaussian_motion_fill(
             "relative_denominator_epsilon": MOTION_FILL_EPSILON,
         },
         "system": {
-            "row_count": int(result.system_row_count),
-            "column_count": int(result.system_column_count),
-            "active_edge_count": int(result.active_edge_count),
+            "row_count": int(motion.system_row_count),
+            "column_count": int(motion.system_column_count),
+            "active_edge_count": int(motion.active_edge_count),
             "eligible_edge_count": int(np.count_nonzero(active_edges)),
         },
-        "lsmr_real": _solver_diagnostics(result.real_solver),
-        "lsmr_imaginary": _solver_diagnostics(result.imag_solver),
+        "lsmr_real": _solver_diagnostics(motion.real_solver),
+        "lsmr_imaginary": _solver_diagnostics(motion.imag_solver),
     }
+    return GaussianMotionFillResult(
+        motion=motion,
+        roles=roles,
+        numerical_nullity=subspaces.nullity,
+        staged_nullity_refined_mask=refined_partial_mask,
+        point_solution_status=point_status,
+        obs_pred_y=pred,
+        obs_residual=obs_residual,
+        obs_residual_valid_mask=obs_residual_valid,
+        point_residual=point_residual,
+        point_residual_valid_mask=point_residual_valid,
+        diagnostics=diagnostics,
+    )
 
 
 def write_motion_fill_graph(
@@ -753,60 +628,45 @@ def write_motion_fill_graph(
         raise ValueError(
             f"points_world must have shape ({graph.num_points},3), got {points.shape}."
         )
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         out,
-        points_world=points,
-        gaussian_indices=np.arange(graph.num_points, dtype=np.int32),
-        candidate_neighbor_indices=np.asarray(
-            candidates.neighbor_indices[:, : graph.k], dtype=np.int64
-        ),
-        candidate_neighbor_distances=np.asarray(
-            candidates.neighbor_distances[:, : graph.k], dtype=np.float64
-        ),
-        edge_index=np.asarray(graph.edge_index, dtype=np.int64),
-        edge_distance=np.asarray(graph.edge_distance, dtype=np.float64),
-        edge_weight=np.asarray(graph.edge_weight, dtype=np.float64),
-        degree=np.asarray(graph.degree, dtype=np.int32),
-        component_index=np.asarray(graph.component_index, dtype=np.int32),
-        component_sizes=np.asarray(graph.component_sizes, dtype=np.int32),
-        isolated_mask=np.asarray(graph.isolated_mask, dtype=bool),
-        k=np.array(graph.k, dtype=np.int32),
-        max_distance=np.array(graph.max_distance, dtype=np.float64),
-        epsilon=np.array(graph.epsilon, dtype=np.float64),
-        candidate_directed_count=np.array(
-            graph.candidate_directed_count, dtype=np.int64
-        ),
-        retained_directed_count=np.array(
-            graph.retained_directed_count, dtype=np.int64
-        ),
-        pruned_directed_count=np.array(graph.pruned_directed_count, dtype=np.int64),
-        unique_undirected_edge_count=np.array(
-            graph.unique_undirected_edge_count, dtype=np.int64
-        ),
-        zero_distance_edge_count=np.array(
-            np.count_nonzero(graph.edge_distance == 0.0), dtype=np.int64
-        ),
+        {
+            "points_world": points,
+            "gaussian_indices": np.arange(graph.num_points, dtype=np.int32),
+            "candidate_neighbor_indices": np.asarray(
+                candidates.neighbor_indices[:, : graph.k], dtype=np.int64
+            ),
+            "candidate_neighbor_distances": np.asarray(
+                candidates.neighbor_distances[:, : graph.k], dtype=np.float64
+            ),
+            "edge_index": np.asarray(graph.edge_index, dtype=np.int64),
+            "edge_distance": np.asarray(graph.edge_distance, dtype=np.float64),
+            "edge_weight": np.asarray(graph.edge_weight, dtype=np.float64),
+            "degree": np.asarray(graph.degree, dtype=np.int32),
+            "component_index": np.asarray(graph.component_index, dtype=np.int32),
+            "component_sizes": np.asarray(graph.component_sizes, dtype=np.int32),
+            "isolated_mask": np.asarray(graph.isolated_mask, dtype=bool),
+            "k": np.array(graph.k, dtype=np.int32),
+            "max_distance": np.array(graph.max_distance, dtype=np.float64),
+            "epsilon": np.array(graph.epsilon, dtype=np.float64),
+            "candidate_directed_count": np.array(
+                graph.candidate_directed_count, dtype=np.int64
+            ),
+            "retained_directed_count": np.array(
+                graph.retained_directed_count, dtype=np.int64
+            ),
+            "pruned_directed_count": np.array(
+                graph.pruned_directed_count, dtype=np.int64
+            ),
+            "unique_undirected_edge_count": np.array(
+                graph.unique_undirected_edge_count, dtype=np.int64
+            ),
+            "zero_distance_edge_count": np.array(
+                np.count_nonzero(graph.edge_distance == 0.0), dtype=np.int64
+            ),
+        },
     )
     return out
-
-
-def rewrite_motion_fill_pointclouds(latent_path: str | Path, vis_dir: str | Path) -> None:
-    """Replace staged point-cloud PLY colors with the final filled field."""
-
-    with np.load(str(latent_path), allow_pickle=False) as latent:
-        points = latent["points_world"].astype(np.float32)
-        phi = latent["phi"].astype(np.complex64)
-    from modal_surface.optimization_visualization import (
-        _amplitude_colors,
-        _phase_colors,
-        _write_ply,
-    )
-
-    out = Path(vis_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    _write_ply(out / "pointcloud_amplitude.ply", points, _amplitude_colors(phi))
-    _write_ply(out / "pointcloud_phase_u.ply", points, _phase_colors(phi))
 
 
 def write_motion_fill_diagnostics(path: str | Path, payload: Mapping[str, Any]) -> Path:
