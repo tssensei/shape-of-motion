@@ -78,6 +78,7 @@ J_VIEW_1 = np.asarray(
 def _formal_observations(
     duplicate_rows: int = 1,
     identifiable_alpha: bool = True,
+    mode_index: int = 4,
 ) -> dict[str, np.ndarray]:
     points = np.column_stack(
         [
@@ -126,6 +127,7 @@ def _formal_observations(
     sample_count = np.bincount(
         obs_point_index, minlength=points.shape[0]
     ).astype(np.int32)
+    contribution = np.ones((obs_point_index.size,), dtype=np.float32)
     return {
         "points_world": points,
         "obs_point_index": obs_point_index,
@@ -133,18 +135,23 @@ def _formal_observations(
         "obs_pixels_xy": np.zeros((obs_point_index.size, 2), dtype=np.float32),
         "obs_y": np.asarray(observation_values, dtype=np.complex64).reshape(-1, 2),
         "obs_J": np.asarray(jacobians, dtype=np.float32).reshape(-1, 2, 3),
-        "obs_contribution_weight": np.ones(
-            (obs_point_index.size,), dtype=np.float32
-        ),
+        "obs_contribution_weight": contribution,
+        "obs_contribution_score": contribution.copy(),
+        "obs_contribution_sum": contribution.copy(),
         "obs_count_per_point": point_view_mask.sum(axis=1).astype(np.int32),
         "obs_sample_count_per_point": sample_count,
+        "observations_per_view": np.bincount(
+            obs_view_index, minlength=alphas.shape[0]
+        ).astype(np.int32),
         "view_ids": np.asarray(["view0", "view1"]),
         "view_freqs_hz": np.asarray([2.5, 2.5], dtype=np.float32),
         "freq_hz": np.array(2.5, dtype=np.float32),
-        "mode_index": np.array(4, dtype=np.int32),
+        "mode_index": np.array(mode_index, dtype=np.int32),
         "gaussian_indices": np.arange(points.shape[0], dtype=np.int32),
         "point_type": np.array("foreground_gaussian_center"),
         "source_checkpoint": np.array("source.ckpt"),
+        "preserved_all_points": np.array(True),
+        "pixel_candidate_method": np.array("gaussian_ellipsoid_contribution"),
     }
 
 
@@ -169,6 +176,9 @@ def _formal_run_args(
     *,
     alpha_failure: str,
     motion_fill: bool = False,
+    lsmr_atol: float | None = None,
+    edge_weighting: str = "spatial",
+    color_sigma: float | None = None,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     gaussian_solver_app.add_arguments(parser)
@@ -206,10 +216,17 @@ def _formal_run_args(
                 "0.11",
             ]
         )
+        if lsmr_atol is not None:
+            argv.extend(["--motion-fill-lsmr-atol", str(lsmr_atol)])
+        if edge_weighting != "spatial":
+            argv.extend(["--motion-fill-edge-weighting", edge_weighting])
+        if color_sigma is not None:
+            argv.extend(["--motion-fill-color-sigma", str(color_sigma)])
     return parser.parse_args(argv)
 
 
 def _checkpoint_inputs(points: np.ndarray) -> tuple[
+    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -225,6 +242,12 @@ def _checkpoint_inputs(points: np.ndarray) -> tuple[
         np.ones((num_points, 3), dtype=np.float32),
         quaternions,
         np.ones((num_points,), dtype=np.float32),
+        np.column_stack(
+            [
+                np.linspace(0.0, 1.0, num_points, dtype=np.float32),
+                np.zeros((num_points, 2), dtype=np.float32),
+            ]
+        ),
         [],
         [],
     )
@@ -331,7 +354,10 @@ class CompactGaussianArtifactTests(unittest.TestCase):
         np.testing.assert_allclose(diagnostics["point_residual"], staged.point_residual)
 
     def test_run_alpha_failure_writes_diagnostics_without_final_latent(self) -> None:
-        observations = _formal_observations(identifiable_alpha=False)
+        observations = _formal_observations(
+            identifiable_alpha=False,
+            mode_index=0,
+        )
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "solve"
             args = _formal_run_args(
@@ -392,7 +418,7 @@ class CompactGaussianArtifactTests(unittest.TestCase):
         )
 
     def test_run_motion_fill_failure_writes_staged_only_diagnostics(self) -> None:
-        observations = _formal_observations()
+        observations = _formal_observations(mode_index=0)
         failure = RuntimeError("mock motion-fill invariant failure")
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "solve"
@@ -444,8 +470,13 @@ class CompactGaussianArtifactTests(unittest.TestCase):
             self.assertFalse(latent_path.exists())
             self.assertFalse((out_dir / "modal_modes_manifest.json").exists())
             self.assertTrue((out_dir / "motion_fill" / "graph.npz").is_file())
+            graph = _load_archive(out_dir / "motion_fill" / "graph.npz")
             diagnostics = _load_archive(diagnostics_path)
 
+        self.assertEqual(str(graph["edge_weighting"].item()), "spatial")
+        self.assertEqual(str(graph["color_metric"].item()), "none")
+        self.assertTrue(np.isnan(float(graph["color_sigma"].item())))
+        self.assertEqual(str(graph["color_sigma_source"].item()), "none")
         self.assertTrue(FORBIDDEN_OBSERVATION_ROW_KEYS.isdisjoint(diagnostics))
         self.assertTrue(
             {
@@ -458,6 +489,158 @@ class CompactGaussianArtifactTests(unittest.TestCase):
         np.testing.assert_array_equal(
             diagnostics["final_point_solution_status"],
             diagnostics["staged_point_solution_status"],
+        )
+
+    def test_rgb_motion_fill_artifacts_keep_lightweight_runtime_contract(
+        self,
+    ) -> None:
+        observations = _formal_observations(mode_index=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "solve"
+            args = _formal_run_args(
+                out_dir,
+                alpha_failure="exclude",
+                motion_fill=True,
+                lsmr_atol=1e-6,
+                edge_weighting="spatial-rgb",
+            )
+            with (
+                patch.object(
+                    gaussian_solver_app,
+                    "_load_fg_pixel_candidate_inputs_from_checkpoint",
+                    return_value=_checkpoint_inputs(observations["points_world"]),
+                ),
+                patch.object(
+                    gaussian_solver_app,
+                    "load_modal_freqs",
+                    return_value=[
+                        np.asarray([2.5], dtype=np.float32),
+                        np.asarray([2.5], dtype=np.float32),
+                    ],
+                ),
+                patch.object(
+                    gaussian_solver_app,
+                    "build_gaussian_observation_graph",
+                    side_effect=_observation_writer(observations),
+                ),
+                patch.object(gaussian_solver_app, "_print_observation_sanity"),
+                patch.object(
+                    gaussian_solver_app, "write_solve_visualizations"
+                ) as visualization,
+            ):
+                gaussian_solver_app.run(args)
+
+            visualization.assert_called_once()
+            graph = _load_archive(out_dir / "motion_fill" / "graph.npz")
+            diagnostics = _load_archive(
+                out_dir / "diagnostics" / "mode_000_2p5hz.npz"
+            )
+            latent = _load_archive(
+                out_dir / "latents" / "mode_000_2p5hz.npz"
+            )
+            manifest_path = out_dir / "modal_modes_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            motion_fill_diagnostics = json.loads(
+                (out_dir / "motion_fill" / "diagnostics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            loaded_fields = load_gaussian_modal_fields(
+                str(manifest_path),
+                torch.from_numpy(observations["points_world"].copy()),
+            )
+            viewer_modes = load_modal_modes(str(manifest_path))
+
+        resolved_color_sigma = float(graph["color_sigma"].item())
+        self.assertGreater(resolved_color_sigma, 0.0)
+        expected_provenance = {
+            "edge_weighting": "spatial-rgb",
+            "color_metric": "activated_rgb_l2",
+            "color_sigma": resolved_color_sigma,
+            "color_sigma_source": "auto_edge_median",
+        }
+        self.assertTrue(
+            {
+                "observation_path",
+                "latent_path",
+                "diagnostics_path",
+                "vis_dir",
+                "alpha_by_view",
+                "stats",
+            }.issubset(manifest["modes"][0])
+        )
+        self.assertEqual(str(graph["edge_weighting"].item()), "spatial-rgb")
+        self.assertEqual(str(graph["color_metric"].item()), "activated_rgb_l2")
+        self.assertEqual(
+            str(graph["color_sigma_source"].item()), "auto_edge_median"
+        )
+        self.assertEqual(
+            {
+                key: manifest["parameters"][key]
+                for key in expected_provenance
+            },
+            expected_provenance,
+        )
+        self.assertEqual(manifest["version"], 1)
+        self.assertEqual(manifest["parameters"]["motion_fill_version"], 2)
+        self.assertEqual(manifest["parameters"]["motion_fill_lsmr_atol"], 1e-6)
+        self.assertEqual(
+            manifest["parameters"]["motion_fill_solver_scope"], "componentwise"
+        )
+        self.assertTrue(manifest["parameters"]["motion_fill_parallel_channels"])
+        self.assertEqual(motion_fill_diagnostics["version"], 2)
+        mode_diagnostics = motion_fill_diagnostics["modes"]["mode_000_2p5hz"]
+        self.assertEqual(mode_diagnostics["tolerances"]["lsmr_atol"], 1e-6)
+        self.assertEqual(mode_diagnostics["solver_scope"], "componentwise")
+        self.assertTrue(mode_diagnostics["parallel_channels"])
+        self.assertEqual(float(diagnostics["motion_fill_lsmr_atol"].item()), 1e-6)
+        self.assertEqual(
+            str(diagnostics["motion_fill_solver_scope"].item()), "componentwise"
+        )
+        self.assertTrue(bool(diagnostics["motion_fill_parallel_channels"].item()))
+        self.assertEqual(
+            {
+                key: motion_fill_diagnostics["graph"][key]
+                for key in expected_provenance
+            },
+            expected_provenance,
+        )
+
+        for artifact in (graph, diagnostics):
+            for key, value in artifact.items():
+                if any(token in key for token in ("color", "rgb", "affinity")):
+                    self.assertEqual(
+                        value.shape,
+                        (),
+                        msg=f"{key} must remain scalar provenance",
+                    )
+        self.assertNotIn("gaussian_colors", graph)
+        self.assertNotIn("edge_color_distance", graph)
+        self.assertNotIn("edge_color_affinity", graph)
+        serialized_json = json.dumps(
+            {"manifest": manifest, "motion_fill": motion_fill_diagnostics}
+        )
+        for forbidden in (
+            "gaussian_colors",
+            "edge_color_distance",
+            "edge_color_affinity",
+            "color_distance_percentile",
+            "affinity_percentile",
+        ):
+            self.assertNotIn(forbidden, serialized_json)
+        self.assertEqual(
+            set(latent), CORE_LATENT_KEYS | MOTION_FILL_LATENT_KEYS
+        )
+        torch.testing.assert_close(
+            loaded_fields.phi_real[0], torch.from_numpy(latent["phi"].real)
+        )
+        self.assertIsNotNone(viewer_modes[0].motion_fill_display_class)
+        assert viewer_modes[0].motion_fill_display_class is not None
+        np.testing.assert_array_equal(
+            viewer_modes[0].motion_fill_display_class,
+            classify_motion_fill_display_points(
+                latent["motion_fill_role"], latent["completion_mask"]
+            ),
         )
 
     def test_motion_fill_latent_diagnostics_and_runtime_loaders(self) -> None:
@@ -546,6 +729,34 @@ class CompactGaussianArtifactTests(unittest.TestCase):
         self.assertAlmostEqual(
             float(diagnostics["motion_fill_graph_max_distance"].item()),
             graph.max_distance,
+        )
+        self.assertEqual(int(diagnostics["motion_fill_version"].item()), 2)
+        self.assertEqual(
+            str(diagnostics["motion_fill_solver_scope"].item()), "componentwise"
+        )
+        self.assertTrue(bool(diagnostics["motion_fill_parallel_channels"].item()))
+        self.assertEqual(
+            float(diagnostics["motion_fill_lsmr_atol"].item()), 1e-8
+        )
+        component_count = len(filled.motion.component_solvers)
+        np.testing.assert_array_equal(
+            diagnostics["motion_fill_solver_component_index"],
+            [
+                component.component_index
+                for component in filled.motion.component_solvers
+            ],
+        )
+        self.assertEqual(
+            diagnostics["motion_fill_solver_component_row_count"].shape,
+            (component_count,),
+        )
+        self.assertEqual(
+            diagnostics["motion_fill_lsmr_real_component_iterations"].shape,
+            (component_count,),
+        )
+        self.assertEqual(
+            int(diagnostics["motion_fill_lsmr_real_iterations_max"].item()),
+            filled.motion.real_solver.iterations_max,
         )
 
         torch.testing.assert_close(

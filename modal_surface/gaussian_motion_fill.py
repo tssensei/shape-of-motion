@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -52,14 +52,113 @@ MOTION_FILL_EXCLUDED_REASON_NAMES = (
 )
 
 MOTION_FILL_METHOD = "joint_knn_nullspace_lsmr"
-MOTION_FILL_VERSION = 1
+MOTION_FILL_VERSION = 2
 MOTION_FILL_NUMERICAL_RANK_POLICY = "svd_max_shape_float64_epsilon"
 MOTION_FILL_EPSILON = 1e-8
-MOTION_FILL_LSMR_ATOL = 1e-10
+MOTION_FILL_LSMR_ATOL = 1e-8
 MOTION_FILL_LSMR_BTOL = 1e-10
 MOTION_FILL_LSMR_CONLIM = 1e8
 MOTION_FILL_NULLSPACE_RTOL = 1e-4
 MOTION_FILL_OBSERVATION_DRIFT_RTOL = 1e-4
+MOTION_FILL_EDGE_WEIGHTING_SPATIAL = "spatial"
+MOTION_FILL_EDGE_WEIGHTING_SPATIAL_RGB = "spatial-rgb"
+MOTION_FILL_COLOR_METRIC_NONE = "none"
+MOTION_FILL_COLOR_METRIC_ACTIVATED_RGB_L2 = "activated_rgb_l2"
+MOTION_FILL_COLOR_SIGMA_SOURCE_NONE = "none"
+MOTION_FILL_COLOR_SIGMA_SOURCE_AUTO = "auto_edge_median"
+MOTION_FILL_COLOR_SIGMA_SOURCE_EXPLICIT = "explicit"
+
+
+@dataclass(frozen=True)
+class GaussianGraphWeightingResult:
+    graph: KnnGraph
+    edge_weighting: str
+    color_metric: str
+    resolved_color_sigma: float | None
+    color_sigma_source: str
+
+
+def weight_gaussian_motion_fill_graph(
+    spatial_graph: KnnGraph,
+    gaussian_colors: np.ndarray,
+    method: str,
+    color_sigma: float | None,
+) -> GaussianGraphWeightingResult:
+    """Optionally add activated-RGB affinity to an existing spatial graph."""
+
+    if method == MOTION_FILL_EDGE_WEIGHTING_SPATIAL:
+        if color_sigma is not None:
+            raise ValueError("color_sigma is only valid for spatial-rgb edge weighting.")
+        return GaussianGraphWeightingResult(
+            graph=spatial_graph,
+            edge_weighting=method,
+            color_metric=MOTION_FILL_COLOR_METRIC_NONE,
+            resolved_color_sigma=None,
+            color_sigma_source=MOTION_FILL_COLOR_SIGMA_SOURCE_NONE,
+        )
+    if method != MOTION_FILL_EDGE_WEIGHTING_SPATIAL_RGB:
+        raise ValueError(
+            "motion-fill edge weighting must be 'spatial' or 'spatial-rgb'."
+        )
+
+    colors = np.asarray(gaussian_colors)
+    if colors.shape != (spatial_graph.num_points, 3):
+        raise ValueError(
+            "gaussian_colors must have shape "
+            f"({spatial_graph.num_points},3), got {colors.shape}."
+        )
+    if not np.all(np.isfinite(colors)):
+        raise ValueError("gaussian_colors must be finite activated RGB values.")
+    if np.any((colors < 0.0) | (colors > 1.0)):
+        raise ValueError("gaussian_colors must be activated RGB values in [0,1].")
+
+    edge_index = np.asarray(spatial_graph.edge_index, dtype=np.int64)
+    color_delta = (
+        colors[edge_index[:, 0]].astype(np.float64)
+        - colors[edge_index[:, 1]].astype(np.float64)
+    )
+    color_distance = np.linalg.norm(color_delta, axis=1)
+    if color_sigma is None:
+        if color_distance.size == 0:
+            raise ValueError(
+                "Cannot infer --motion-fill-color-sigma from an empty retained graph; "
+                "provide an explicit positive value."
+            )
+        resolved_sigma = float(np.median(color_distance))
+        sigma_source = MOTION_FILL_COLOR_SIGMA_SOURCE_AUTO
+        if not np.isfinite(resolved_sigma) or resolved_sigma <= 0.0:
+            raise ValueError(
+                "Automatic --motion-fill-color-sigma is non-finite or zero; "
+                "provide an explicit positive value."
+            )
+    else:
+        if isinstance(color_sigma, (bool, np.bool_)):
+            raise ValueError("color_sigma must be finite and positive.")
+        resolved_sigma = float(color_sigma)
+        if not np.isfinite(resolved_sigma) or resolved_sigma <= 0.0:
+            raise ValueError("color_sigma must be finite and positive.")
+        sigma_source = MOTION_FILL_COLOR_SIGMA_SOURCE_EXPLICIT
+
+    color_affinity = np.exp(
+        -(color_distance * color_distance) / (2.0 * resolved_sigma * resolved_sigma)
+    )
+    if np.any(~np.isfinite(color_affinity)) or np.any(color_affinity <= 0.0):
+        raise ValueError(
+            "Activated-RGB edge affinity is zero or non-finite; increase color sigma."
+        )
+    combined_weight = np.asarray(spatial_graph.edge_weight, dtype=np.float64) * color_affinity
+    if np.any(~np.isfinite(combined_weight)) or np.any(combined_weight <= 0.0):
+        raise ValueError(
+            "Combined spatial-RGB edge weight is zero or non-finite; increase color sigma."
+        )
+
+    return GaussianGraphWeightingResult(
+        graph=replace(spatial_graph, edge_weight=combined_weight),
+        edge_weighting=method,
+        color_metric=MOTION_FILL_COLOR_METRIC_ACTIVATED_RGB_L2,
+        resolved_color_sigma=resolved_sigma,
+        color_sigma_source=sigma_source,
+    )
 
 
 @dataclass(frozen=True)
@@ -455,6 +554,7 @@ def _solver_diagnostics(metadata: Any) -> dict[str, Any]:
         "converged": bool(metadata.converged),
         "stop_code": int(metadata.stop_code),
         "iterations": int(metadata.iterations),
+        "iterations_max": int(metadata.iterations_max),
         "residual_norm": _json_float(metadata.residual_norm),
         "normal_residual_norm": _json_float(metadata.normal_residual_norm),
         "matrix_norm": _json_float(metadata.matrix_norm),
@@ -467,11 +567,17 @@ def apply_gaussian_motion_fill(
     staged: StagedSolveResult,
     graph: KnnGraph,
     graph_path: str,
+    *,
+    lsmr_atol: float = MOTION_FILL_LSMR_ATOL,
 ) -> GaussianMotionFillResult:
     """Complete one staged Gaussian field without reading or writing artifacts."""
 
     if not graph_path:
         raise ValueError("graph_path must be non-empty.")
+    if isinstance(lsmr_atol, (bool, np.bool_)):
+        raise ValueError("lsmr_atol must be finite and positive.")
+    if not np.isfinite(lsmr_atol) or lsmr_atol <= 0.0:
+        raise ValueError("lsmr_atol must be finite and positive.")
     prepared = staged.prepared
     alpha = staged.alpha
     observable = staged.observable
@@ -518,7 +624,7 @@ def apply_gaussian_motion_fill(
         roles.constrained_variable_mask,
         roles.free_variable_mask,
         excluded_mask=roles.excluded_mask,
-        lsmr_atol=MOTION_FILL_LSMR_ATOL,
+        lsmr_atol=lsmr_atol,
         lsmr_btol=MOTION_FILL_LSMR_BTOL,
         lsmr_conlim=MOTION_FILL_LSMR_CONLIM,
     )
@@ -589,6 +695,9 @@ def apply_gaussian_motion_fill(
             "nullspace_operator_relative": MOTION_FILL_NULLSPACE_RTOL,
             "observation_drift_relative": MOTION_FILL_OBSERVATION_DRIFT_RTOL,
             "relative_denominator_epsilon": MOTION_FILL_EPSILON,
+            "lsmr_atol": float(lsmr_atol),
+            "lsmr_btol": MOTION_FILL_LSMR_BTOL,
+            "lsmr_conlim": MOTION_FILL_LSMR_CONLIM,
         },
         "system": {
             "row_count": int(motion.system_row_count),
@@ -596,8 +705,22 @@ def apply_gaussian_motion_fill(
             "active_edge_count": int(motion.active_edge_count),
             "eligible_edge_count": int(np.count_nonzero(active_edges)),
         },
+        "solver_scope": motion.solver_scope,
+        "parallel_channels": bool(motion.parallel_channels),
         "lsmr_real": _solver_diagnostics(motion.real_solver),
         "lsmr_imaginary": _solver_diagnostics(motion.imag_solver),
+        "components": [
+            {
+                "component_index": int(component.component_index),
+                "point_count": int(component.point_count),
+                "edge_count": int(component.edge_count),
+                "row_count": int(component.row_count),
+                "column_count": int(component.column_count),
+                "lsmr_real": _solver_diagnostics(component.real_solver),
+                "lsmr_imaginary": _solver_diagnostics(component.imag_solver),
+            }
+            for component in motion.component_solvers
+        ],
     }
     return GaussianMotionFillResult(
         motion=motion,
@@ -618,11 +741,12 @@ def write_motion_fill_graph(
     path: str | Path,
     points_world: np.ndarray,
     candidates: KnnCandidateSet,
-    graph: KnnGraph,
+    weighting: GaussianGraphWeightingResult,
 ) -> Path:
     """Write the shared Gaussian KNN topology once for every solved mode."""
 
     out = Path(path)
+    graph = weighting.graph
     points = np.asarray(points_world, dtype=np.float32)
     if points.shape != (graph.num_points, 3):
         raise ValueError(
@@ -642,6 +766,15 @@ def write_motion_fill_graph(
             "edge_index": np.asarray(graph.edge_index, dtype=np.int64),
             "edge_distance": np.asarray(graph.edge_distance, dtype=np.float64),
             "edge_weight": np.asarray(graph.edge_weight, dtype=np.float64),
+            "edge_weighting": np.array(weighting.edge_weighting),
+            "color_metric": np.array(weighting.color_metric),
+            "color_sigma": np.array(
+                weighting.resolved_color_sigma
+                if weighting.resolved_color_sigma is not None
+                else np.nan,
+                dtype=np.float64,
+            ),
+            "color_sigma_source": np.array(weighting.color_sigma_source),
             "degree": np.asarray(graph.degree, dtype=np.int32),
             "component_index": np.asarray(graph.component_index, dtype=np.int32),
             "component_sizes": np.asarray(graph.component_sizes, dtype=np.int32),

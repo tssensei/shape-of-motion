@@ -11,6 +11,8 @@ import numpy as np
 
 from modal_surface.gaussian_observations import build_gaussian_observation_graph
 from modal_surface.gaussian_motion_fill import (
+    MOTION_FILL_EDGE_WEIGHTING_SPATIAL,
+    MOTION_FILL_EDGE_WEIGHTING_SPATIAL_RGB,
     MOTION_FILL_EPSILON,
     MOTION_FILL_LSMR_ATOL,
     MOTION_FILL_LSMR_BTOL,
@@ -21,8 +23,10 @@ from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_METHOD,
     MOTION_FILL_ROLE_NAMES,
     MOTION_FILL_VERSION,
+    GaussianGraphWeightingResult,
     GaussianMotionFillResult,
     apply_gaussian_motion_fill,
+    weight_gaussian_motion_fill_graph,
     write_motion_fill_diagnostics,
     write_motion_fill_graph,
 )
@@ -213,6 +217,27 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Required maximum KNN edge distance in scene units when --motion-fill is enabled.",
     )
+    parser.add_argument(
+        "--motion-fill-lsmr-atol",
+        type=float,
+        default=MOTION_FILL_LSMR_ATOL,
+        help="LSMR normal-equation tolerance used by motion fill (default: 1e-8).",
+    )
+    parser.add_argument(
+        "--motion-fill-edge-weighting",
+        choices=(
+            MOTION_FILL_EDGE_WEIGHTING_SPATIAL,
+            MOTION_FILL_EDGE_WEIGHTING_SPATIAL_RGB,
+        ),
+        default=MOTION_FILL_EDGE_WEIGHTING_SPATIAL,
+        help="Use spatial inverse-distance weights or add activated-RGB affinity.",
+    )
+    parser.add_argument(
+        "--motion-fill-color-sigma",
+        type=float,
+        default=None,
+        help="Activated-RGB affinity sigma; spatial-rgb defaults to retained-edge median.",
+    )
     add_staged_solver_arguments(parser)
 
 
@@ -225,6 +250,14 @@ def _validate_motion_fill_arguments(
             raise ValueError("--motion-fill-max-distance requires --motion-fill.")
         if args.motion_fill_k != _DEFAULT_MOTION_FILL_K:
             raise ValueError("A custom --motion-fill-k requires --motion-fill.")
+        if args.motion_fill_lsmr_atol != MOTION_FILL_LSMR_ATOL:
+            raise ValueError("A custom --motion-fill-lsmr-atol requires --motion-fill.")
+        if args.motion_fill_edge_weighting != MOTION_FILL_EDGE_WEIGHTING_SPATIAL:
+            raise ValueError(
+                "Non-default --motion-fill-edge-weighting requires --motion-fill."
+            )
+        if args.motion_fill_color_sigma is not None:
+            raise ValueError("--motion-fill-color-sigma requires --motion-fill.")
         return
     if args.motion_fill_max_distance is None:
         raise ValueError("--motion-fill requires --motion-fill-max-distance in scene units.")
@@ -237,13 +270,50 @@ def _validate_motion_fill_arguments(
     max_distance = float(args.motion_fill_max_distance)
     if not np.isfinite(max_distance) or max_distance <= 0.0:
         raise ValueError("--motion-fill-max-distance must be finite and positive.")
+    if isinstance(args.motion_fill_lsmr_atol, (bool, np.bool_)):
+        raise ValueError("--motion-fill-lsmr-atol must be finite and positive.")
+    lsmr_atol = float(args.motion_fill_lsmr_atol)
+    if not np.isfinite(lsmr_atol) or lsmr_atol <= 0.0:
+        raise ValueError("--motion-fill-lsmr-atol must be finite and positive.")
+    if args.motion_fill_edge_weighting == MOTION_FILL_EDGE_WEIGHTING_SPATIAL:
+        if args.motion_fill_color_sigma is not None:
+            raise ValueError(
+                "--motion-fill-color-sigma requires "
+                "--motion-fill-edge-weighting spatial-rgb."
+            )
+    elif args.motion_fill_edge_weighting == MOTION_FILL_EDGE_WEIGHTING_SPATIAL_RGB:
+        if args.motion_fill_color_sigma is not None:
+            if isinstance(args.motion_fill_color_sigma, (bool, np.bool_)):
+                raise ValueError(
+                    "--motion-fill-color-sigma must be finite and positive."
+                )
+            color_sigma = float(args.motion_fill_color_sigma)
+            if not np.isfinite(color_sigma) or color_sigma <= 0.0:
+                raise ValueError(
+                    "--motion-fill-color-sigma must be finite and positive."
+                )
+    else:
+        raise ValueError(
+            "--motion-fill-edge-weighting must be 'spatial' or 'spatial-rgb'."
+        )
     if num_points is not None and int(args.motion_fill_k) >= int(num_points):
         raise ValueError(
             f"--motion-fill-k must be smaller than the foreground Gaussian count ({num_points})."
         )
 
 
-def _load_fg_pixel_candidate_inputs_from_checkpoint(path: str, view_config_paths: list[str],) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
+def _load_fg_pixel_candidate_inputs_from_checkpoint(
+    path: str,
+    view_config_paths: list[str],
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[np.ndarray],
+    list[np.ndarray],
+]:
     import torch
     from flow3d.scene_model import SceneModel
     ckpt_path = Path(path)
@@ -261,6 +331,7 @@ def _load_fg_pixel_candidate_inputs_from_checkpoint(path: str, view_config_paths
     fg_scales = sceneModel.fg.get_scales().detach().cpu().float().numpy().astype(np.float32)
     fg_quats = sceneModel.fg.get_quats().detach().cpu().float().numpy().astype(np.float32)
     fg_opacities = sceneModel.fg.get_opacities().detach().cpu().float().numpy().reshape(-1).astype(np.float32)
+    fg_colors = sceneModel.fg.get_colors().detach().cpu().float().numpy().astype(np.float32)
     if fg_means.ndim != 2 or fg_means.shape[1] != 3:
         raise ValueError(f"fg.params.means must have shape (N,3), got {fg_means.shape}")
     if fg_scales.shape != fg_means.shape:
@@ -269,8 +340,16 @@ def _load_fg_pixel_candidate_inputs_from_checkpoint(path: str, view_config_paths
         raise ValueError(f"activated foreground quats must have shape ({fg_means.shape[0]},4), got {fg_quats.shape}")
     if fg_opacities.shape != (fg_means.shape[0],):
         raise ValueError(f"activated foreground opacities must have shape ({fg_means.shape[0]},), got {fg_opacities.shape}")
+    if fg_colors.shape != fg_means.shape:
+        raise ValueError(
+            f"activated foreground colors must have shape {fg_means.shape}, got {fg_colors.shape}"
+        )
     if not np.all(np.isfinite(fg_means)):
         raise ValueError(f"{path} contains non-finite foreground Gaussian centers")
+    if not np.all(np.isfinite(fg_colors)):
+        raise ValueError(f"{path} contains non-finite activated foreground Gaussian colors")
+    if np.any((fg_colors < 0.0) | (fg_colors > 1.0)):
+        raise ValueError(f"{path} contains activated foreground Gaussian colors outside [0,1]")
 
     rendered_depths: list[np.ndarray] = []
     rendered_accs: list[np.ndarray] = []
@@ -299,7 +378,15 @@ def _load_fg_pixel_candidate_inputs_from_checkpoint(path: str, view_config_paths
                 raise ValueError(f"Rendered alpha for {cfg.view_id} has unexpected shape {acc.shape}.")
             rendered_depths.append(depth)
             rendered_accs.append(acc)
-    return fg_means, fg_scales, fg_quats, fg_opacities, rendered_depths, rendered_accs
+    return (
+        fg_means,
+        fg_scales,
+        fg_quats,
+        fg_opacities,
+        fg_colors,
+        rendered_depths,
+        rendered_accs,
+    )
 
 
 def _gaussian_latent_stats(
@@ -428,6 +515,9 @@ def _motion_fill_solver_arrays(prefix: str, metadata: Any) -> dict[str, np.ndarr
         f"{prefix}_converged": np.array(bool(metadata.converged)),
         f"{prefix}_stop_code": np.array(int(metadata.stop_code), dtype=np.int32),
         f"{prefix}_iterations": np.array(int(metadata.iterations), dtype=np.int32),
+        f"{prefix}_iterations_max": np.array(
+            int(metadata.iterations_max), dtype=np.int32
+        ),
         f"{prefix}_residual_norm": np.array(float(metadata.residual_norm), dtype=np.float64),
         f"{prefix}_normal_residual_norm": np.array(
             float(metadata.normal_residual_norm), dtype=np.float64
@@ -438,6 +528,64 @@ def _motion_fill_solver_arrays(prefix: str, metadata: Any) -> dict[str, np.ndarr
         ),
         f"{prefix}_solution_norm": np.array(float(metadata.solution_norm), dtype=np.float64),
     }
+
+
+def _motion_fill_component_arrays(motion: Any) -> dict[str, np.ndarray]:
+    components = motion.component_solvers
+    arrays: dict[str, np.ndarray] = {
+        "motion_fill_solver_scope": np.array(motion.solver_scope),
+        "motion_fill_parallel_channels": np.array(bool(motion.parallel_channels)),
+        "motion_fill_solver_component_index": np.asarray(
+            [component.component_index for component in components], dtype=np.int32
+        ),
+        "motion_fill_solver_component_point_count": np.asarray(
+            [component.point_count for component in components], dtype=np.int32
+        ),
+        "motion_fill_solver_component_edge_count": np.asarray(
+            [component.edge_count for component in components], dtype=np.int64
+        ),
+        "motion_fill_solver_component_row_count": np.asarray(
+            [component.row_count for component in components], dtype=np.int64
+        ),
+        "motion_fill_solver_component_column_count": np.asarray(
+            [component.column_count for component in components], dtype=np.int64
+        ),
+    }
+    for channel, attribute in (("real", "real_solver"), ("imaginary", "imag_solver")):
+        metadata = [getattr(component, attribute) for component in components]
+        prefix = f"motion_fill_lsmr_{channel}_component"
+        arrays.update(
+            {
+                f"{prefix}_performed": np.asarray(
+                    [item.performed for item in metadata], dtype=bool
+                ),
+                f"{prefix}_converged": np.asarray(
+                    [item.converged for item in metadata], dtype=bool
+                ),
+                f"{prefix}_stop_code": np.asarray(
+                    [item.stop_code for item in metadata], dtype=np.int32
+                ),
+                f"{prefix}_iterations": np.asarray(
+                    [item.iterations for item in metadata], dtype=np.int32
+                ),
+                f"{prefix}_residual_norm": np.asarray(
+                    [item.residual_norm for item in metadata], dtype=np.float64
+                ),
+                f"{prefix}_normal_residual_norm": np.asarray(
+                    [item.normal_residual_norm for item in metadata], dtype=np.float64
+                ),
+                f"{prefix}_matrix_norm": np.asarray(
+                    [item.matrix_norm for item in metadata], dtype=np.float64
+                ),
+                f"{prefix}_condition_estimate": np.asarray(
+                    [item.condition_estimate for item in metadata], dtype=np.float64
+                ),
+                f"{prefix}_solution_norm": np.asarray(
+                    [item.solution_norm for item in metadata], dtype=np.float64
+                ),
+            }
+        )
+    return arrays
 
 
 def _write_solver_diagnostics(
@@ -609,7 +757,7 @@ def _write_solver_diagnostics(
                     system["eligible_edge_count"], dtype=np.int64
                 ),
                 "motion_fill_lsmr_atol": np.array(
-                    MOTION_FILL_LSMR_ATOL, dtype=np.float64
+                    diagnostics["tolerances"]["lsmr_atol"], dtype=np.float64
                 ),
                 "motion_fill_lsmr_btol": np.array(
                     MOTION_FILL_LSMR_BTOL, dtype=np.float64
@@ -626,6 +774,7 @@ def _write_solver_diagnostics(
                 **_motion_fill_solver_arrays(
                     "motion_fill_lsmr_imaginary", motion.imag_solver
                 ),
+                **_motion_fill_component_arrays(motion),
             }
         )
     return save_npz_compressed_atomic(out_path, arrays)
@@ -667,6 +816,7 @@ def run(args: argparse.Namespace) -> None:
         fg_scales,
         fg_quats,
         fg_opacities,
+        fg_colors,
         rendered_depths,
         rendered_accs,
     ) = _load_fg_pixel_candidate_inputs_from_checkpoint(
@@ -698,6 +848,7 @@ def run(args: argparse.Namespace) -> None:
 
     # Build KNN graph from gaussian centers
     motion_fill_graph = None
+    motion_fill_graph_weighting: GaussianGraphWeightingResult | None = None
     motion_fill_graph_path: Path | None = None
     motion_fill_mode_diagnostics: dict[str, Any] = {}
     if args.motion_fill:
@@ -706,17 +857,24 @@ def run(args: argparse.Namespace) -> None:
             int(args.motion_fill_k),
             tree=gaussian_tree,
         )
-        motion_fill_graph = build_knn_graph(
+        spatial_graph = build_knn_graph(
             candidates,
             int(args.motion_fill_k),
             float(args.motion_fill_max_distance),
             MOTION_FILL_EPSILON,
         )
+        motion_fill_graph_weighting = weight_gaussian_motion_fill_graph(
+            spatial_graph,
+            fg_colors,
+            str(args.motion_fill_edge_weighting),
+            args.motion_fill_color_sigma,
+        )
+        motion_fill_graph = motion_fill_graph_weighting.graph
         motion_fill_graph_path = write_motion_fill_graph(
             out_dir / "motion_fill" / "graph.npz",
             fg_means,
             candidates,
-            motion_fill_graph,
+            motion_fill_graph_weighting,
         )
 
     modes: list[dict[str, Any]] = []
@@ -773,6 +931,7 @@ def run(args: argparse.Namespace) -> None:
                     staged,
                     motion_fill_graph,
                     graph_relative_path,
+                    lsmr_atol=float(args.motion_fill_lsmr_atol),
                 )
             except Exception:
                 _write_solver_diagnostics(diagnostics_path, staged, None)
@@ -847,28 +1006,41 @@ def run(args: argparse.Namespace) -> None:
     }
     if motion_fill_graph is not None:
         assert motion_fill_graph_path is not None
+        assert motion_fill_graph_weighting is not None
         manifest_parameters.update(
             {
                 "motion_fill_method": MOTION_FILL_METHOD,
+                "motion_fill_version": MOTION_FILL_VERSION,
                 "motion_fill_k": int(motion_fill_graph.k),
                 "motion_fill_max_distance": float(motion_fill_graph.max_distance),
                 "motion_fill_epsilon": float(motion_fill_graph.epsilon),
                 "motion_fill_nullspace_operator_rtol": MOTION_FILL_NULLSPACE_RTOL,
                 "motion_fill_observation_drift_rtol": MOTION_FILL_OBSERVATION_DRIFT_RTOL,
+                "motion_fill_lsmr_atol": float(args.motion_fill_lsmr_atol),
+                "motion_fill_solver_scope": "componentwise",
+                "motion_fill_parallel_channels": True,
                 "motion_fill_graph_path": relative_path(motion_fill_graph_path, out_dir),
                 "motion_fill_excluded_policy": "retain_observable_exclude_from_graph",
+                "edge_weighting": motion_fill_graph_weighting.edge_weighting,
+                "color_metric": motion_fill_graph_weighting.color_metric,
+                "color_sigma": motion_fill_graph_weighting.resolved_color_sigma,
+                "color_sigma_source": motion_fill_graph_weighting.color_sigma_source,
             }
         )
         write_motion_fill_diagnostics(
             out_dir / "motion_fill" / "diagnostics.json",
             {
-                "version": 1,
+                "version": MOTION_FILL_VERSION,
                 "method": MOTION_FILL_METHOD,
                 "graph_path": relative_path(motion_fill_graph_path, out_dir),
                 "graph": {
                     "k": int(motion_fill_graph.k),
                     "max_distance": float(motion_fill_graph.max_distance),
                     "epsilon": float(motion_fill_graph.epsilon),
+                    "edge_weighting": motion_fill_graph_weighting.edge_weighting,
+                    "color_metric": motion_fill_graph_weighting.color_metric,
+                    "color_sigma": motion_fill_graph_weighting.resolved_color_sigma,
+                    "color_sigma_source": motion_fill_graph_weighting.color_sigma_source,
                     "edge_count": int(motion_fill_graph.edge_index.shape[0]),
                     "zero_distance_edge_count": int(
                         np.count_nonzero(motion_fill_graph.edge_distance == 0.0)

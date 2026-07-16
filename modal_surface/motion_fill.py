@@ -8,6 +8,7 @@ artifacts and choose their own output contracts.
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -72,11 +73,25 @@ class SparseSolveMetadata:
     converged: bool
     stop_code: int
     iterations: int
+    iterations_max: int
     residual_norm: float
     normal_residual_norm: float
     matrix_norm: float
     condition_estimate: float
     solution_norm: float
+
+
+@dataclass(frozen=True)
+class ComponentSolveMetadata:
+    """Sparse-system and channel-solver metadata for one anchored component."""
+
+    component_index: int
+    point_count: int
+    edge_count: int
+    row_count: int
+    column_count: int
+    real_solver: SparseSolveMetadata
+    imag_solver: SparseSolveMetadata
 
 
 @dataclass(frozen=True)
@@ -107,6 +122,9 @@ class MotionFillResult:
     connectivity: AnchorConnectivity
     real_solver: SparseSolveMetadata
     imag_solver: SparseSolveMetadata
+    solver_scope: str
+    parallel_channels: bool
+    component_solvers: tuple[ComponentSolveMetadata, ...]
     system_row_count: int
     system_column_count: int
     active_edge_count: int
@@ -569,7 +587,7 @@ def _assemble_sparse_system(
     graph: KnnGraph,
     inputs: ValidatedMotionFillInputs,
     connectivity: AnchorConnectivity,
-) -> tuple[object, np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[Any, np.ndarray, np.ndarray, np.ndarray, int, np.ndarray]:
     coo_matrix, _ = _require_scipy_sparse()
     variable_mask = connectivity.connected_to_anchor & ~inputs.anchor_mask
     variable_dimensions = np.where(variable_mask, inputs.point_nullity, 0).astype(np.int64)
@@ -632,7 +650,14 @@ def _assemble_sparse_system(
         ).tocsr()
     else:
         matrix = coo_matrix((row_count, column_count), dtype=np.float64).tocsr()
-    return matrix, right_hand_side, coefficient_offsets, variable_mask, int(edges.shape[0])
+    return (
+        matrix,
+        right_hand_side,
+        coefficient_offsets,
+        variable_mask,
+        int(edges.shape[0]),
+        active_edge_indices,
+    )
 
 
 def _empty_solve_metadata(right_hand_side: np.ndarray) -> SparseSolveMetadata:
@@ -641,6 +666,7 @@ def _empty_solve_metadata(right_hand_side: np.ndarray) -> SparseSolveMetadata:
         converged=True,
         stop_code=0,
         iterations=0,
+        iterations_max=0,
         residual_norm=float(np.linalg.norm(right_hand_side)),
         normal_residual_norm=0.0,
         matrix_norm=0.0,
@@ -649,8 +675,37 @@ def _empty_solve_metadata(right_hand_side: np.ndarray) -> SparseSolveMetadata:
     )
 
 
+def _aggregate_solve_metadata(
+    metadata: list[SparseSolveMetadata],
+) -> SparseSolveMetadata:
+    """Aggregate independent component solves as one block-diagonal solve."""
+
+    if not metadata:
+        return _empty_solve_metadata(np.empty((0,), dtype=np.float64))
+    performed = [item for item in metadata if item.performed]
+    stop_codes = {item.stop_code for item in performed}
+    return SparseSolveMetadata(
+        performed=bool(performed),
+        converged=all(item.converged for item in metadata),
+        stop_code=(
+            next(iter(stop_codes))
+            if len(stop_codes) == 1
+            else (-1 if stop_codes else 0)
+        ),
+        iterations=sum(item.iterations for item in performed),
+        iterations_max=max((item.iterations for item in performed), default=0),
+        residual_norm=float(np.sqrt(sum(item.residual_norm**2 for item in metadata))),
+        normal_residual_norm=float(
+            np.sqrt(sum(item.normal_residual_norm**2 for item in metadata))
+        ),
+        matrix_norm=float(np.sqrt(sum(item.matrix_norm**2 for item in metadata))),
+        condition_estimate=max((item.condition_estimate for item in metadata), default=1.0),
+        solution_norm=float(np.sqrt(sum(item.solution_norm**2 for item in metadata))),
+    )
+
+
 def _run_lsmr(
-    matrix: object,
+    matrix: Any,
     right_hand_side: np.ndarray,
     *,
     atol: float,
@@ -673,6 +728,7 @@ def _run_lsmr(
         converged=stop_code in _CONVERGED_LSMR_STOP_CODES,
         stop_code=stop_code,
         iterations=int(solved[2]),
+        iterations_max=int(solved[2]),
         residual_norm=float(solved[3]),
         normal_residual_norm=float(solved[4]),
         matrix_norm=float(solved[5]),
@@ -680,6 +736,186 @@ def _run_lsmr(
         solution_norm=float(solved[7]),
     )
     return np.asarray(solved[0], dtype=np.float64), metadata
+
+
+def _solve_component_systems(
+    matrix: Any,
+    right_hand_side: np.ndarray,
+    graph: KnnGraph,
+    connectivity: AnchorConnectivity,
+    coefficient_offsets: np.ndarray,
+    active_edge_indices: np.ndarray,
+    *,
+    atol: float,
+    btol: float,
+    conlim: float,
+    maxiter: int | None,
+) -> tuple[
+    np.ndarray,
+    SparseSolveMetadata,
+    SparseSolveMetadata,
+    tuple[ComponentSolveMetadata, ...],
+]:
+    """Solve independent anchored graph components with parallel complex channels."""
+
+    column_count = int(matrix.shape[1])
+    active_edges = graph.edge_index[active_edge_indices]
+    edge_component_index = connectivity.component_index[active_edges[:, 0]]
+    if active_edges.size and not np.array_equal(
+        edge_component_index,
+        connectivity.component_index[active_edges[:, 1]],
+    ):
+        raise RuntimeError("An active motion-fill edge crosses component labels.")
+    row_component_index = np.repeat(edge_component_index, 3)
+    variable_dimensions = np.diff(coefficient_offsets)
+    column_component_index = np.repeat(
+        connectivity.component_index,
+        variable_dimensions,
+    )
+    if np.any(row_component_index < 0) or np.any(column_component_index < 0):
+        raise RuntimeError("Motion-fill system contains a row or column without a component.")
+
+    num_components = int(connectivity.component_sizes.shape[0])
+    row_counts = np.bincount(
+        row_component_index,
+        minlength=num_components,
+    ).astype(np.int64)
+    column_counts = np.bincount(
+        column_component_index,
+        minlength=num_components,
+    ).astype(np.int64)
+    row_offsets = np.zeros((num_components + 1,), dtype=np.int64)
+    column_offsets = np.zeros((num_components + 1,), dtype=np.int64)
+    row_offsets[1:] = np.cumsum(row_counts, dtype=np.int64)
+    column_offsets[1:] = np.cumsum(column_counts, dtype=np.int64)
+    row_order = np.argsort(row_component_index, kind="stable")
+    column_order = np.argsort(column_component_index, kind="stable")
+    if int(row_offsets[-1]) != int(matrix.shape[0]):
+        raise RuntimeError("Component row partition does not cover the motion-fill system.")
+    if int(column_offsets[-1]) != column_count:
+        raise RuntimeError("Component column partition does not cover the motion-fill system.")
+
+    component_ids = np.where(connectivity.component_has_anchor)[0].astype(np.int64)
+    coefficient_values = np.empty((column_count,), dtype=np.complex128)
+    component_solvers: list[ComponentSolveMetadata] = []
+    real_metadata: list[SparseSolveMetadata] = []
+    imaginary_metadata: list[SparseSolveMetadata] = []
+
+    executor = (
+        ThreadPoolExecutor(max_workers=2, thread_name_prefix="motion-fill-lsmr")
+        if column_count
+        else None
+    )
+    try:
+        for component_index in component_ids.tolist():
+            row_start = int(row_offsets[component_index])
+            row_end = int(row_offsets[component_index + 1])
+            column_start = int(column_offsets[component_index])
+            column_end = int(column_offsets[component_index + 1])
+            component_rows = row_order[row_start:row_end]
+            component_columns = column_order[column_start:column_end]
+            component_rhs = right_hand_side[component_rows]
+            component_matrix = matrix[component_rows][:, component_columns].tocsr()
+            component_column_count = int(component_columns.size)
+            component_edge_count = int(component_rows.size // 3)
+
+            if component_column_count:
+                if executor is None:
+                    raise RuntimeError("Motion-fill LSMR executor was not created.")
+                real_future = executor.submit(
+                    _run_lsmr,
+                    component_matrix,
+                    component_rhs.real,
+                    atol=atol,
+                    btol=btol,
+                    conlim=conlim,
+                    maxiter=maxiter,
+                )
+                imaginary_future = executor.submit(
+                    _run_lsmr,
+                    component_matrix,
+                    component_rhs.imag,
+                    atol=atol,
+                    btol=btol,
+                    conlim=conlim,
+                    maxiter=maxiter,
+                )
+                real_result = None
+                imaginary_result = None
+                real_error = None
+                imaginary_error = None
+                try:
+                    real_result = real_future.result()
+                except Exception as exc:
+                    real_error = exc
+                try:
+                    imaginary_result = imaginary_future.result()
+                except Exception as exc:
+                    imaginary_error = exc
+                if real_error is not None or imaginary_error is not None:
+                    real_stop_code = (
+                        "unavailable"
+                        if real_result is None
+                        else str(real_result[1].stop_code)
+                    )
+                    imaginary_stop_code = (
+                        "unavailable"
+                        if imaginary_result is None
+                        else str(imaginary_result[1].stop_code)
+                    )
+                    raise RuntimeError(
+                        "Motion-fill LSMR failed for component "
+                        f"{component_index}: points="
+                        f"{int(connectivity.component_sizes[component_index])}, "
+                        f"edges={component_edge_count}, "
+                        f"columns={component_column_count}, "
+                        f"real stop_code={real_stop_code}, "
+                        f"imaginary stop_code={imaginary_stop_code}."
+                    ) from (real_error if real_error is not None else imaginary_error)
+                if real_result is None or imaginary_result is None:
+                    raise RuntimeError("Motion-fill LSMR returned no channel result.")
+                real_coefficients, real_solver = real_result
+                imaginary_coefficients, imag_solver = imaginary_result
+                if not real_solver.converged or not imag_solver.converged:
+                    raise RuntimeError(
+                        "Motion-fill LSMR did not converge for component "
+                        f"{component_index}: points="
+                        f"{int(connectivity.component_sizes[component_index])}, "
+                        f"edges={component_edge_count}, "
+                        f"columns={component_column_count}, "
+                        f"real stop_code={real_solver.stop_code}, "
+                        f"imaginary stop_code={imag_solver.stop_code}."
+                    )
+                coefficient_values[component_columns] = (
+                    real_coefficients + 1j * imaginary_coefficients
+                )
+            else:
+                real_solver = _empty_solve_metadata(component_rhs.real)
+                imag_solver = _empty_solve_metadata(component_rhs.imag)
+
+            real_metadata.append(real_solver)
+            imaginary_metadata.append(imag_solver)
+            component_solvers.append(
+                ComponentSolveMetadata(
+                    component_index=int(component_index),
+                    point_count=int(connectivity.component_sizes[component_index]),
+                    edge_count=component_edge_count,
+                    row_count=int(component_rows.size),
+                    column_count=component_column_count,
+                    real_solver=real_solver,
+                    imag_solver=imag_solver,
+                )
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    return (
+        coefficient_values,
+        _aggregate_solve_metadata(real_metadata),
+        _aggregate_solve_metadata(imaginary_metadata),
+        tuple(component_solvers),
+    )
 
 
 def fill_nullspace_motion(
@@ -727,38 +963,29 @@ def fill_nullspace_motion(
         inputs.anchor_mask,
         inputs.excluded_mask,
     )
-    matrix, rhs, coefficient_offsets, variable_mask, active_edge_count = _assemble_sparse_system(
-        graph, inputs, connectivity
-    )
+    (
+        matrix,
+        rhs,
+        coefficient_offsets,
+        variable_mask,
+        active_edge_count,
+        active_edge_indices,
+    ) = _assemble_sparse_system(graph, inputs, connectivity)
     column_count = int(matrix.shape[1])
-    if column_count:
-        real_coefficients, real_solver = _run_lsmr(
+    coefficient_values, real_solver, imag_solver, component_solvers = (
+        _solve_component_systems(
             matrix,
-            rhs.real,
+            rhs,
+            graph,
+            connectivity,
+            coefficient_offsets,
+            active_edge_indices,
             atol=float(lsmr_atol),
             btol=float(lsmr_btol),
             conlim=float(lsmr_conlim),
             maxiter=lsmr_maxiter,
         )
-        imaginary_coefficients, imag_solver = _run_lsmr(
-            matrix,
-            rhs.imag,
-            atol=float(lsmr_atol),
-            btol=float(lsmr_btol),
-            conlim=float(lsmr_conlim),
-            maxiter=lsmr_maxiter,
-        )
-        if not real_solver.converged or not imag_solver.converged:
-            raise RuntimeError(
-                "Motion-fill LSMR did not converge: "
-                f"real stop_code={real_solver.stop_code}, "
-                f"imaginary stop_code={imag_solver.stop_code}."
-            )
-        coefficient_values = real_coefficients + 1j * imaginary_coefficients
-    else:
-        coefficient_values = np.empty((0,), dtype=np.complex128)
-        real_solver = _empty_solve_metadata(rhs.real)
-        imag_solver = _empty_solve_metadata(rhs.imag)
+    )
 
     phi_source = np.asarray(phi_observable)
     phi_filled = phi_source.astype(inputs.output_dtype, copy=True)
@@ -788,6 +1015,9 @@ def fill_nullspace_motion(
         connectivity=connectivity,
         real_solver=real_solver,
         imag_solver=imag_solver,
+        solver_scope="componentwise",
+        parallel_channels=True,
+        component_solvers=component_solvers,
         system_row_count=int(matrix.shape[0]),
         system_column_count=column_count,
         active_edge_count=active_edge_count,

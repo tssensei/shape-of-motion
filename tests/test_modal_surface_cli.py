@@ -52,6 +52,9 @@ class ModalSurfaceCliTests(unittest.TestCase):
         self.assertFalse(args.motion_fill)
         self.assertEqual(args.motion_fill_k, 8)
         self.assertIsNone(args.motion_fill_max_distance)
+        self.assertEqual(args.motion_fill_lsmr_atol, 1e-8)
+        self.assertEqual(args.motion_fill_edge_weighting, "spatial")
+        self.assertIsNone(args.motion_fill_color_sigma)
 
     def test_observation_filter_controls_are_not_registered(self) -> None:
         cli = importlib.import_module("modal_surface.__main__")
@@ -71,6 +74,9 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 "--motion-fill",
                 "--motion-fill-k",
                 "--motion-fill-max-distance",
+                "--motion-fill-lsmr-atol",
+                "--motion-fill-edge-weighting",
+                "--motion-fill-color-sigma",
             }.issubset(option_strings)
         )
 
@@ -80,6 +86,9 @@ class ModalSurfaceCliTests(unittest.TestCase):
             "motion_fill": True,
             "motion_fill_k": 8,
             "motion_fill_max_distance": 0.05,
+            "motion_fill_lsmr_atol": 1e-8,
+            "motion_fill_edge_weighting": "spatial",
+            "motion_fill_color_sigma": None,
         }
 
         app._validate_motion_fill_arguments(argparse.Namespace(**base), num_points=20)
@@ -101,6 +110,20 @@ class ModalSurfaceCliTests(unittest.TestCase):
                     motion_fill=False,
                     motion_fill_k=8,
                     motion_fill_max_distance=0.05,
+                    motion_fill_lsmr_atol=1e-8,
+                    motion_fill_edge_weighting="spatial",
+                    motion_fill_color_sigma=None,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "requires --motion-fill"):
+            app._validate_motion_fill_arguments(
+                argparse.Namespace(
+                    motion_fill=False,
+                    motion_fill_k=8,
+                    motion_fill_max_distance=None,
+                    motion_fill_lsmr_atol=1e-8,
+                    motion_fill_edge_weighting="spatial",
+                    motion_fill_color_sigma=0.25,
                 )
             )
         with self.assertRaisesRegex(ValueError, "requires --motion-fill"):
@@ -109,6 +132,110 @@ class ModalSurfaceCliTests(unittest.TestCase):
                     motion_fill=False,
                     motion_fill_k=4,
                     motion_fill_max_distance=None,
+                    motion_fill_lsmr_atol=1e-8,
+                    motion_fill_edge_weighting="spatial",
+                    motion_fill_color_sigma=None,
+                )
+            )
+
+    def test_motion_fill_lsmr_atol_accepts_positive_overrides(self) -> None:
+        app = importlib.import_module("modal_surface.apps.solve_gaussian_modes")
+        for atol in (1e-10, 1e-8, 1e-6):
+            with self.subTest(atol=atol):
+                app._validate_motion_fill_arguments(
+                    argparse.Namespace(
+                        motion_fill=True,
+                        motion_fill_k=8,
+                        motion_fill_max_distance=0.05,
+                        motion_fill_lsmr_atol=atol,
+                        motion_fill_edge_weighting="spatial",
+                        motion_fill_color_sigma=None,
+                    ),
+                    num_points=20,
+                )
+
+        for atol in (True, 0.0, -1e-8, float("inf"), float("nan")):
+            with self.subTest(atol=atol):
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    app._validate_motion_fill_arguments(
+                        argparse.Namespace(
+                            motion_fill=True,
+                            motion_fill_k=8,
+                            motion_fill_max_distance=0.05,
+                            motion_fill_lsmr_atol=atol,
+                            motion_fill_edge_weighting="spatial",
+                            motion_fill_color_sigma=None,
+                        ),
+                        num_points=20,
+                    )
+
+        with self.assertRaisesRegex(ValueError, "requires --motion-fill"):
+            app._validate_motion_fill_arguments(
+                argparse.Namespace(
+                    motion_fill=False,
+                    motion_fill_k=8,
+                    motion_fill_max_distance=None,
+                    motion_fill_lsmr_atol=1e-6,
+                    motion_fill_edge_weighting="spatial",
+                    motion_fill_color_sigma=None,
+                )
+            )
+
+    def test_rgb_motion_fill_accepts_auto_or_explicit_positive_sigma(self) -> None:
+        app = importlib.import_module("modal_surface.apps.solve_gaussian_modes")
+        for color_sigma in (None, 0.25):
+            with self.subTest(color_sigma=color_sigma):
+                app._validate_motion_fill_arguments(
+                    argparse.Namespace(
+                        motion_fill=True,
+                        motion_fill_k=8,
+                        motion_fill_max_distance=0.05,
+                        motion_fill_lsmr_atol=1e-8,
+                        motion_fill_edge_weighting="spatial-rgb",
+                        motion_fill_color_sigma=color_sigma,
+                    ),
+                    num_points=20,
+                )
+
+        for color_sigma in (True, 0.0, -0.25, float("inf"), float("nan")):
+            with self.subTest(color_sigma=color_sigma):
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    app._validate_motion_fill_arguments(
+                        argparse.Namespace(
+                            motion_fill=True,
+                            motion_fill_k=8,
+                            motion_fill_max_distance=0.05,
+                            motion_fill_lsmr_atol=1e-8,
+                            motion_fill_edge_weighting="spatial-rgb",
+                            motion_fill_color_sigma=color_sigma,
+                        ),
+                        num_points=20,
+                    )
+
+    def test_rgb_motion_fill_options_are_rejected_outside_rgb_fill(self) -> None:
+        app = importlib.import_module("modal_surface.apps.solve_gaussian_modes")
+        with self.assertRaisesRegex(ValueError, "spatial-rgb"):
+            app._validate_motion_fill_arguments(
+                argparse.Namespace(
+                    motion_fill=True,
+                    motion_fill_k=8,
+                    motion_fill_max_distance=0.05,
+                    motion_fill_lsmr_atol=1e-8,
+                    motion_fill_edge_weighting="spatial",
+                    motion_fill_color_sigma=0.25,
+                ),
+                num_points=20,
+            )
+
+        with self.assertRaisesRegex(ValueError, "requires --motion-fill"):
+            app._validate_motion_fill_arguments(
+                argparse.Namespace(
+                    motion_fill=False,
+                    motion_fill_k=8,
+                    motion_fill_max_distance=None,
+                    motion_fill_lsmr_atol=1e-8,
+                    motion_fill_edge_weighting="spatial-rgb",
+                    motion_fill_color_sigma=None,
                 )
             )
 

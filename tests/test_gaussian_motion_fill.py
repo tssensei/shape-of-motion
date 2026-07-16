@@ -16,8 +16,13 @@ from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_ROLE_FREE_VARIABLE,
     apply_gaussian_motion_fill,
     derive_gaussian_motion_fill_roles,
+    weight_gaussian_motion_fill_graph,
 )
-from modal_surface.motion_fill import build_knn_graph, query_knn_candidates
+from modal_surface.motion_fill import (
+    build_knn_graph,
+    fill_nullspace_motion,
+    query_knn_candidates,
+)
 from modal_surface.optimization_staged import (
     POINT_STATUS_COMPLETED_OBSERVED,
     POINT_STATUS_COMPLETED_UNOBSERVED,
@@ -248,6 +253,215 @@ def _staged_from_arrays(arrays: dict[str, np.ndarray]) -> StagedSolveResult:
 
 
 class GaussianMotionFillTests(unittest.TestCase):
+    def test_rgb_affinity_reweights_exactly_without_changing_topology(self) -> None:
+        points = np.asarray(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+            dtype=np.float32,
+        )
+        graph = build_knn_graph(
+            query_knn_candidates(points, max_k=2),
+            k=2,
+            max_distance=3.0,
+        )
+        colors = np.asarray(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        )
+        sigma = 2.0
+
+        weighted = weight_gaussian_motion_fill_graph(
+            graph,
+            colors,
+            method="spatial-rgb",
+            color_sigma=sigma,
+        )
+        color_delta = (
+            colors[graph.edge_index[:, 0]].astype(np.float64)
+            - colors[graph.edge_index[:, 1]].astype(np.float64)
+        )
+        expected_affinity = np.exp(
+            -np.sum(color_delta * color_delta, axis=1) / (2.0 * sigma * sigma)
+        )
+        np.testing.assert_allclose(
+            weighted.graph.edge_weight,
+            graph.edge_weight * expected_affinity,
+            rtol=1e-12,
+            atol=0.0,
+        )
+        self.assertEqual(weighted.edge_weighting, "spatial-rgb")
+        self.assertEqual(weighted.color_metric, "activated_rgb_l2")
+        self.assertEqual(weighted.resolved_color_sigma, sigma)
+        self.assertEqual(weighted.color_sigma_source, "explicit")
+
+        for field in (
+            "edge_index",
+            "edge_distance",
+            "degree",
+            "component_index",
+            "component_sizes",
+            "isolated_mask",
+        ):
+            np.testing.assert_array_equal(
+                getattr(weighted.graph, field), getattr(graph, field)
+            )
+        for field in (
+            "num_points",
+            "k",
+            "max_distance",
+            "epsilon",
+            "candidate_directed_count",
+            "retained_directed_count",
+            "pruned_directed_count",
+        ):
+            self.assertEqual(getattr(weighted.graph, field), getattr(graph, field))
+
+    def test_same_color_rgb_weighting_matches_spatial_weights(self) -> None:
+        points = np.asarray(
+            [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        graph = build_knn_graph(
+            query_knn_candidates(points, max_k=2),
+            k=2,
+            max_distance=1.1,
+        )
+        colors = np.full((points.shape[0], 3), 0.4, dtype=np.float32)
+
+        spatial = weight_gaussian_motion_fill_graph(
+            graph,
+            colors,
+            method="spatial",
+            color_sigma=None,
+        )
+        rgb = weight_gaussian_motion_fill_graph(
+            graph,
+            colors,
+            method="spatial-rgb",
+            color_sigma=0.25,
+        )
+
+        np.testing.assert_array_equal(spatial.graph.edge_weight, graph.edge_weight)
+        np.testing.assert_array_equal(rgb.graph.edge_weight, graph.edge_weight)
+        self.assertEqual(spatial.edge_weighting, "spatial")
+        self.assertEqual(spatial.color_metric, "none")
+        self.assertIsNone(spatial.resolved_color_sigma)
+        self.assertEqual(spatial.color_sigma_source, "none")
+
+    def test_auto_color_sigma_uses_edge_median_and_rejects_degenerate_graphs(
+        self,
+    ) -> None:
+        points = np.asarray(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+            dtype=np.float32,
+        )
+        candidates = query_knn_candidates(points, max_k=2)
+        graph = build_knn_graph(candidates, k=2, max_distance=3.0)
+        colors = np.asarray(
+            [[0.0, 0.0, 0.0], [0.25, 0.0, 0.0], [0.75, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+
+        weighted = weight_gaussian_motion_fill_graph(
+            graph,
+            colors,
+            method="spatial-rgb",
+            color_sigma=None,
+        )
+
+        edge_color_distance = np.linalg.norm(
+            colors[graph.edge_index[:, 0]].astype(np.float64)
+            - colors[graph.edge_index[:, 1]].astype(np.float64),
+            axis=1,
+        )
+        self.assertEqual(
+            weighted.resolved_color_sigma,
+            float(np.median(edge_color_distance)),
+        )
+        self.assertEqual(weighted.color_sigma_source, "auto_edge_median")
+
+        empty_graph = build_knn_graph(candidates, k=2, max_distance=0.1)
+        with self.assertRaises(ValueError):
+            weight_gaussian_motion_fill_graph(
+                empty_graph,
+                colors,
+                method="spatial-rgb",
+                color_sigma=None,
+            )
+        with self.assertRaises(ValueError):
+            weight_gaussian_motion_fill_graph(
+                graph,
+                np.zeros_like(colors),
+                method="spatial-rgb",
+                color_sigma=None,
+            )
+
+    def test_rgb_weights_resolve_conflicting_anchors_without_moving_them(
+        self,
+    ) -> None:
+        points = np.asarray(
+            [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        graph = build_knn_graph(
+            query_knn_candidates(points, max_k=2),
+            k=2,
+            max_distance=1.1,
+        )
+        colors = np.asarray(
+            [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        spatial_graph = weight_gaussian_motion_fill_graph(
+            graph,
+            colors,
+            method="spatial",
+            color_sigma=None,
+        ).graph
+        rgb_graph = weight_gaussian_motion_fill_graph(
+            graph,
+            colors,
+            method="spatial-rgb",
+            color_sigma=0.25,
+        ).graph
+        phi_observable = np.asarray(
+            [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            dtype=np.complex64,
+        )
+        basis = np.zeros((3, 3, 3), dtype=np.complex64)
+        basis[2] = np.eye(3, dtype=np.complex64)
+        nullity = np.asarray([0, 0, 3], dtype=np.int8)
+        anchors = np.asarray([True, True, False])
+        partial = np.zeros((3,), dtype=bool)
+        unobserved = np.asarray([False, False, True])
+
+        spatial_fill = fill_nullspace_motion(
+            spatial_graph,
+            phi_observable,
+            basis,
+            nullity,
+            anchors,
+            partial,
+            unobserved,
+        )
+        rgb_fill = fill_nullspace_motion(
+            rgb_graph,
+            phi_observable,
+            basis,
+            nullity,
+            anchors,
+            partial,
+            unobserved,
+        )
+
+        np.testing.assert_array_equal(spatial_fill.phi[:2], phi_observable[:2])
+        np.testing.assert_array_equal(rgb_fill.phi[:2], phi_observable[:2])
+        self.assertAlmostEqual(float(spatial_fill.phi[2, 0].real), 5.0, places=5)
+        self.assertLess(float(abs(rgb_fill.phi[2, 0])), 1e-4)
+        self.assertLess(
+            float(abs(rgb_fill.phi[2, 0])),
+            float(abs(spatial_fill.phi[2, 0])),
+        )
+
     def test_staged_states_map_to_four_explicit_roles(self) -> None:
         observable, nullity = _role_case()
         roles = derive_gaussian_motion_fill_roles(observable, nullity)
@@ -322,6 +536,15 @@ class GaussianMotionFillTests(unittest.TestCase):
         self.assertEqual(filled.diagnostics["completion_count"], 2)
         self.assertEqual(filled.diagnostics["role_counts"]["excluded"], 1)
         self.assertEqual(filled.diagnostics["system"]["eligible_edge_count"], 2)
+        self.assertEqual(filled.diagnostics["version"], 2)
+        self.assertEqual(filled.diagnostics["tolerances"]["lsmr_atol"], 1e-8)
+        self.assertEqual(filled.diagnostics["solver_scope"], "componentwise")
+        self.assertTrue(filled.diagnostics["parallel_channels"])
+        self.assertEqual(len(filled.diagnostics["components"]), 1)
+        self.assertEqual(
+            filled.diagnostics["lsmr_real"]["iterations_max"],
+            filled.motion.real_solver.iterations_max,
+        )
 
     def test_weak_full_rank_partial_is_excluded_without_blocking_exact_fill(self) -> None:
         arrays, target, excluded_value = _formal_staged_case()

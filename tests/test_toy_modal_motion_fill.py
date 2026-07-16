@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
+import modal_surface.motion_fill as motion_fill_module
 from modal_surface.motion_fill import (
+    SparseSolveMetadata,
     build_knn_graph,
     compute_anchor_connectivity,
     fill_nullspace_motion,
@@ -224,6 +228,303 @@ class MotionFillCoreTests(unittest.TestCase):
         self.assertGreater(result.real_solver.iterations, 0)
         self.assertGreater(result.imag_solver.iterations, 0)
         self.assertEqual(result.system_column_count, 4)
+
+    def test_real_and_imaginary_component_solves_overlap(self) -> None:
+        target = np.asarray(
+            [1.0 + 0.2j, -0.5 - 0.3j, 0.25 + 0.4j],
+            dtype=np.complex128,
+        )
+        case = _constant_field_case(target)
+        barrier = threading.Barrier(2)
+        original_run_lsmr = motion_fill_module._run_lsmr
+        validated = validate_motion_fill_inputs(*case[1:])
+        connectivity = compute_anchor_connectivity(_chain_graph(case[0]), case[4])
+        matrix, right_hand_side, *_ = motion_fill_module._assemble_sparse_system(
+            _chain_graph(case[0]),
+            validated,
+            connectivity,
+        )
+        serial_real, _ = original_run_lsmr(
+            matrix,
+            right_hand_side.real,
+            atol=1e-10,
+            btol=1e-10,
+            conlim=1e8,
+            maxiter=None,
+        )
+        serial_imaginary, _ = original_run_lsmr(
+            matrix,
+            right_hand_side.imag,
+            atol=1e-10,
+            btol=1e-10,
+            conlim=1e8,
+            maxiter=None,
+        )
+
+        def synchronized_run_lsmr(*args, **kwargs):
+            barrier.wait(timeout=5.0)
+            return original_run_lsmr(*args, **kwargs)
+
+        with patch.object(
+            motion_fill_module,
+            "_run_lsmr",
+            side_effect=synchronized_run_lsmr,
+        ):
+            result = fill_nullspace_motion(
+                _chain_graph(case[0]),
+                *case[1:],
+            )
+
+        np.testing.assert_allclose(
+            result.phi,
+            np.broadcast_to(target, result.phi.shape),
+            atol=1e-9,
+        )
+        self.assertTrue(result.parallel_channels)
+        self.assertEqual(result.solver_scope, "componentwise")
+        np.testing.assert_allclose(
+            result.coefficient_values,
+            serial_real + 1j * serial_imaginary,
+            atol=1e-12,
+        )
+
+    def test_two_components_preserve_global_coefficient_order(self) -> None:
+        points = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [0.07, 0.0, 0.0],
+                [10.09, 0.0, 0.0],
+                [0.2, 0.0, 0.0],
+                [10.2, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        graph = build_knn_graph(
+            query_knn_candidates(points, max_k=2),
+            k=2,
+            max_distance=0.21,
+        )
+        phi_observable = np.asarray(
+            [
+                [1.0 + 0.2j, -1.0 + 0.1j, 0.5 - 0.3j],
+                [-2.0 + 0.3j, 1.5 - 0.2j, 0.25 + 0.4j],
+                [0.4 + 0.1j, -0.2 + 0.3j, 0.0],
+                [0.75 - 0.1j, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=np.complex128,
+        )
+        basis = np.zeros((points.shape[0], 3, 3), dtype=np.float64)
+        basis[2, 2, 0] = 1.0
+        basis[3, 1, 0] = 1.0
+        basis[3, 2, 1] = 1.0
+        basis[[4, 5]] = np.eye(3, dtype=np.float64)
+        nullity = np.asarray([0, 0, 1, 2, 3, 3], dtype=np.int8)
+        anchor_mask = np.asarray([True, True, False, False, False, False])
+        partial_mask = np.asarray([False, False, True, True, False, False])
+        unobserved_mask = np.asarray([False, False, False, False, True, True])
+
+        validated = validate_motion_fill_inputs(
+            phi_observable,
+            basis,
+            nullity,
+            anchor_mask,
+            partial_mask,
+            unobserved_mask,
+        )
+        connectivity = compute_anchor_connectivity(graph, anchor_mask)
+        matrix, right_hand_side, coefficient_offsets, *_ = (
+            motion_fill_module._assemble_sparse_system(
+                graph,
+                validated,
+                connectivity,
+            )
+        )
+        dense_matrix = matrix.toarray()
+        self.assertEqual(np.linalg.matrix_rank(dense_matrix), dense_matrix.shape[1])
+        dense_coefficients = np.linalg.lstsq(
+            dense_matrix,
+            right_hand_side.real,
+            rcond=None,
+        )[0] + 1j * np.linalg.lstsq(
+            dense_matrix,
+            right_hand_side.imag,
+            rcond=None,
+        )[0]
+
+        result = fill_nullspace_motion(
+            graph,
+            phi_observable,
+            basis,
+            nullity,
+            anchor_mask,
+            partial_mask,
+            unobserved_mask,
+            lsmr_atol=1e-12,
+            lsmr_btol=1e-12,
+        )
+
+        expected = phi_observable.copy()
+        for point in (2, 3, 4, 5):
+            start = int(coefficient_offsets[point])
+            end = int(coefficient_offsets[point + 1])
+            expected[point] += (
+                basis[point, :, : end - start] @ dense_coefficients[start:end]
+            )
+        np.testing.assert_allclose(result.phi, expected, atol=1e-9)
+        np.testing.assert_allclose(
+            result.coefficient_values,
+            dense_coefficients,
+            atol=1e-9,
+        )
+        np.testing.assert_array_equal(
+            result.coefficient_offsets,
+            [0, 0, 0, 1, 3, 6, 9],
+        )
+        np.testing.assert_allclose(result.phi[2, :2], phi_observable[2, :2], atol=0.0)
+        np.testing.assert_allclose(result.phi[3, 0], phi_observable[3, 0], atol=0.0)
+        self.assertGreater(float(np.ptp(graph.edge_weight)), 0.0)
+        self.assertEqual(len(result.component_solvers), 2)
+        self.assertEqual(
+            [component.component_index for component in result.component_solvers],
+            [0, 1],
+        )
+        self.assertEqual(
+            result.real_solver.iterations,
+            sum(component.real_solver.iterations for component in result.component_solvers),
+        )
+        self.assertEqual(
+            result.imag_solver.iterations_max,
+            max(component.imag_solver.iterations for component in result.component_solvers),
+        )
+
+    def test_anchor_only_component_keeps_constant_residual_without_lsmr(self) -> None:
+        points = np.asarray([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]], dtype=np.float64)
+        phi_observable = np.asarray(
+            [[1.0 + 0.5j, 0.0, 0.0], [-1.0 - 0.25j, 0.0, 0.0]],
+            dtype=np.complex128,
+        )
+        result = fill_nullspace_motion(
+            _chain_graph(points),
+            phi_observable,
+            np.zeros((2, 3, 3), dtype=np.float64),
+            np.zeros((2,), dtype=np.int8),
+            np.ones((2,), dtype=bool),
+            np.zeros((2,), dtype=bool),
+            np.zeros((2,), dtype=bool),
+        )
+
+        np.testing.assert_array_equal(result.phi, phi_observable)
+        self.assertEqual(result.system_column_count, 0)
+        self.assertFalse(result.real_solver.performed)
+        self.assertFalse(result.imag_solver.performed)
+        self.assertGreater(result.real_solver.residual_norm, 0.0)
+        self.assertEqual(len(result.component_solvers), 1)
+        self.assertEqual(result.component_solvers[0].column_count, 0)
+
+    def test_component_metadata_aggregation_uses_explicit_mixed_stop_code(self) -> None:
+        first = SparseSolveMetadata(
+            performed=True,
+            converged=True,
+            stop_code=1,
+            iterations=4,
+            iterations_max=4,
+            residual_norm=3.0,
+            normal_residual_norm=4.0,
+            matrix_norm=5.0,
+            condition_estimate=2.0,
+            solution_norm=6.0,
+        )
+        second = SparseSolveMetadata(
+            performed=True,
+            converged=True,
+            stop_code=2,
+            iterations=7,
+            iterations_max=7,
+            residual_norm=4.0,
+            normal_residual_norm=3.0,
+            matrix_norm=12.0,
+            condition_estimate=8.0,
+            solution_norm=8.0,
+        )
+
+        aggregate = motion_fill_module._aggregate_solve_metadata([first, second])
+
+        self.assertEqual(aggregate.stop_code, -1)
+        self.assertEqual(aggregate.iterations, 11)
+        self.assertEqual(aggregate.iterations_max, 7)
+        self.assertEqual(aggregate.residual_norm, 5.0)
+        self.assertEqual(aggregate.normal_residual_norm, 5.0)
+        self.assertEqual(aggregate.matrix_norm, 13.0)
+        self.assertEqual(aggregate.condition_estimate, 8.0)
+        self.assertEqual(aggregate.solution_norm, 10.0)
+
+    def test_component_nonconvergence_reports_component_context(self) -> None:
+        target = np.asarray([1.0, -2.0, 3.0], dtype=np.complex128)
+        case = _constant_field_case(target)
+        failed = SparseSolveMetadata(
+            performed=True,
+            converged=False,
+            stop_code=7,
+            iterations=5,
+            iterations_max=5,
+            residual_norm=1.0,
+            normal_residual_norm=1.0,
+            matrix_norm=1.0,
+            condition_estimate=1.0,
+            solution_norm=1.0,
+        )
+
+        def failed_lsmr(matrix, _right_hand_side, **_kwargs):
+            return np.zeros((matrix.shape[1],), dtype=np.float64), failed
+
+        with (
+            patch.object(
+                motion_fill_module,
+                "_run_lsmr",
+                side_effect=failed_lsmr,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"component 0: points=.*real stop_code=7, imaginary stop_code=7",
+            ),
+        ):
+            fill_nullspace_motion(
+                _chain_graph(case[0]),
+                *case[1:],
+            )
+
+    def test_component_channel_exception_reports_both_channel_states(self) -> None:
+        target = np.asarray(
+            [1.0 + 0.25j, -2.0 - 0.5j, 3.0 + 0.75j],
+            dtype=np.complex128,
+        )
+        case = _constant_field_case(target)
+        original_run_lsmr = motion_fill_module._run_lsmr
+
+        def fail_real_channel(matrix, right_hand_side, **kwargs):
+            if float(np.max(np.abs(right_hand_side), initial=0.0)) > 1.0:
+                raise RuntimeError("synthetic real-channel failure")
+            return original_run_lsmr(matrix, right_hand_side, **kwargs)
+
+        with (
+            patch.object(
+                motion_fill_module,
+                "_run_lsmr",
+                side_effect=fail_real_channel,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"component 0: points=3, edges=2, columns=4, "
+                r"real stop_code=unavailable, imaginary stop_code=(?:0|1|2|4|5)",
+            ),
+        ):
+            fill_nullspace_motion(
+                _chain_graph(case[0]),
+                *case[1:],
+            )
 
     def test_partial_correction_stays_in_nullspace_and_preserves_observation(self) -> None:
         target = np.asarray([1.0, 2.0, 3.0], dtype=np.complex128)
