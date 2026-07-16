@@ -11,28 +11,18 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import hsv_to_rgb
 import numpy as np
 
-from modal_peak_pick.core.pipeline import run_modal_analysis_from_video
+from modal_peak_pick.core.cache import load_analysis_cache
 from modal_peak_pick.core.spectrum import amplitude_map
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--video", required=True, help="Input video path.")
+    parser.add_argument("--cache-dir", required=True, help="Modal-analysis cache directory.")
     parser.add_argument("--out-dir", required=True, help="Output directory for PNG/JSON inspection files.")
-    parser.add_argument("--mask", default=None, help="Optional binary ROI mask path (.npy or image).")
-    parser.add_argument("--t0", type=float, default=0.0, help="Clip start time in seconds.")
-    parser.add_argument("--t1", type=float, default=None, help="Clip end time in seconds.")
-    parser.add_argument("--resize", type=int, default=None, help="Resize max(H,W) before analysis.")
-    parser.add_argument("--max-frames", type=int, default=None, help="Optional maximum decoded frames.")
-    parser.add_argument("--flow-method", choices=["farneback", "tvl1"], default="farneback")
-    parser.add_argument("--no-smooth", action="store_true", help="Disable contrast-weighted flow smoothing.")
-    parser.add_argument("--sigma-b", type=float, default=3.0, help="Spatial smoothing sigma.")
-    parser.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
     parser.add_argument("--num-peaks", type=int, default=8, help="Number of candidate peaks to export.")
     parser.add_argument("--min-freq-hz", type=float, default=0.2, help="Ignore candidates below this frequency.")
     parser.add_argument("--max-freq-hz", type=float, default=None, help="Ignore candidates above this frequency.")
     parser.add_argument("--peak-window-hz", type=float, default=0.6, help="Minimum spacing between candidate peaks.")
     parser.add_argument("--preview-percentile", type=float, default=99.0, help="Display percentile for mode previews.")
-    parser.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
 
 
 def _phase_hsv(z: np.ndarray, lo: float, hi: float) -> np.ndarray:
@@ -192,23 +182,15 @@ def run(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    result = run_modal_analysis_from_video(
-        video_path=args.video,
-        t0=args.t0,
-        t1=args.t1,
-        resize=args.resize,
-        max_frames=args.max_frames,
-        flow_method=args.flow_method,
-        no_smooth=args.no_smooth,
-        sigma_b=args.sigma_b,
-        sigma_c=args.sigma_c,
-        mask_path=args.mask,
-        analysis_mask_dilate_iters=getattr(args, "analysis_mask_dilate_iters", 0),
-    )
+    cache = load_analysis_cache(args.cache_dir)
+    video_metadata = cache.metadata["video"]
+    analysis_metadata = cache.metadata["analysis"]
+    sources = cache.metadata["sources"]
+    smoothing_metadata = analysis_metadata["smoothing"]
 
     peak_indices = _choose_candidate_peaks(
-        freqs_hz=result.freqs_hz,
-        power=result.power_spectrum,
+        freqs_hz=cache.freqs_hz,
+        power=cache.power_spectrum,
         num_peaks=args.num_peaks,
         min_freq_hz=args.min_freq_hz,
         max_freq_hz=args.max_freq_hz,
@@ -217,8 +199,8 @@ def run(args: argparse.Namespace) -> None:
 
     _save_spectrum_plot(
         out_dir / "spectrum.png",
-        freqs_hz=result.freqs_hz,
-        power=result.power_spectrum,
+        freqs_hz=cache.freqs_hz,
+        power=cache.power_spectrum,
         peak_indices=peak_indices,
         min_freq_hz=args.min_freq_hz,
         max_freq_hz=args.max_freq_hz,
@@ -226,15 +208,15 @@ def run(args: argparse.Namespace) -> None:
 
     peaks = []
     for rank, idx in enumerate(peak_indices, start=1):
-        freq = float(result.freqs_hz[idx])
-        power = float(result.power_spectrum[idx])
+        freq = float(cache.freqs_hz[idx])
+        power = float(cache.power_spectrum[idx])
         preview_name = f"mode_{rank:03d}_{freq:.4f}hz.png"
         _save_mode_preview(
             out_dir / preview_name,
-            frame_ref=result.frame_ref,
-            mask=result.mask,
-            U_slice=result.U[idx],
-            V_slice=result.V[idx],
+            frame_ref=cache.reference_frame,
+            mask=cache.mask,
+            U_slice=cache.spectrum_u[idx],
+            V_slice=cache.spectrum_v[idx],
             freq_hz=freq,
             power=power,
             percentile=args.preview_percentile,
@@ -253,28 +235,28 @@ def run(args: argparse.Namespace) -> None:
     payload = {
         "selected_peaks_hz": peak_freqs,
         "peaks": peaks,
-        "source_video": str(args.video),
-        "source_mask": None if args.mask is None else str(args.mask),
-        "t0": float(args.t0),
-        "t1": None if args.t1 is None else float(args.t1),
-        "resize": args.resize,
+        "source_video": str(sources["video"]["path"]),
+        "source_mask": None if sources["mask"] is None else str(sources["mask"]["path"]),
+        "t0": float(video_metadata["frame_range"]["t0_s"]),
+        "t1": video_metadata["frame_range"]["t1_s"],
+        "resize": video_metadata["resize_max_side"],
         "num_peaks": int(args.num_peaks),
         "min_freq_hz": float(args.min_freq_hz),
         "max_freq_hz": None if args.max_freq_hz is None else float(args.max_freq_hz),
         "peak_window_hz": float(args.peak_window_hz),
-        "flow_method": str(args.flow_method),
-        "no_smooth": bool(args.no_smooth),
-        "sigma_b": float(args.sigma_b),
-        "sigma_c": float(args.sigma_c),
-        "analysis_mask_dilate_iters": int(getattr(args, "analysis_mask_dilate_iters", 0)),
+        "flow_method": str(analysis_metadata["flow_method"]),
+        "no_smooth": bool(smoothing_metadata["disabled"]),
+        "sigma_b": float(smoothing_metadata["sigma_b"]),
+        "sigma_c": float(smoothing_metadata["sigma_c"]),
+        "analysis_mask_dilate_iters": int(smoothing_metadata["analysis_mask_dilate_iters"]),
     }
     with (out_dir / "top_peaks.json").open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
     np.savez_compressed(
         out_dir / "spectrum_data.npz",
-        freqs_hz=result.freqs_hz.astype(np.float32, copy=False),
-        power_spectrum=result.power_spectrum.astype(np.float32, copy=False),
+        freqs_hz=cache.freqs_hz.astype(np.float32, copy=False),
+        power_spectrum=cache.power_spectrum.astype(np.float32, copy=False),
         top_peak_indices=np.asarray(peak_indices, dtype=np.int32),
         top_peak_freqs_hz=np.asarray(peak_freqs, dtype=np.float32),
         top_peak_power=np.asarray([p["power"] for p in peaks], dtype=np.float32),

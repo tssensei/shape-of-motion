@@ -7,24 +7,16 @@ from pathlib import Path
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
-from modal_peak_pick.core.pipeline import parse_freqs, run_modal_analysis_from_video, select_mode_slice
+from modal_peak_pick.core.cache import load_analysis_cache
+from modal_peak_pick.core.pipeline import parse_freqs
+from modal_peak_pick.core.spectrum import dft_at_frequencies
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--video", required=True, help="Input video path.")
+    parser.add_argument("--cache-dir", required=True, help="Modal-analysis cache directory.")
     parser.add_argument("--out", default="outputs/modal_analysis.npz", help="Output .npz path.")
     parser.add_argument("--freqs", default=None, help="Comma-separated selected frequencies in Hz.")
     parser.add_argument("--peaks-json", default=None, help="JSON file with selected_peaks_hz.")
-    parser.add_argument("--mask", default=None, help="Optional binary ROI mask path (.npy or image).")
-    parser.add_argument("--t0", type=float, default=0.0, help="Clip start time in seconds.")
-    parser.add_argument("--t1", type=float, default=None, help="Clip end time in seconds.")
-    parser.add_argument("--resize", type=int, default=None, help="Resize max(H,W) before analysis.")
-    parser.add_argument("--max-frames", type=int, default=None, help="Optional maximum decoded frames.")
-    parser.add_argument("--flow-method", choices=["farneback", "tvl1"], default="farneback")
-    parser.add_argument("--no-smooth", action="store_true", help="Disable contrast-weighted flow smoothing.")
-    parser.add_argument("--sigma-b", type=float, default=3.0, help="Spatial smoothing sigma.")
-    parser.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
-    parser.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
     parser.add_argument("--mode-amp-clamp", choices=["none", "local-ratio"], default="none", help="Optional robust amplitude clamp for exported complex modes.")
     parser.add_argument("--mode-amp-local-window", type=int, default=31, help="Odd local median window for --mode-amp-clamp local-ratio.")
     parser.add_argument("--mode-amp-ratio", type=float, default=5.0, help="Local median amplitude multiplier for --mode-amp-clamp local-ratio.")
@@ -145,30 +137,29 @@ def run(args: argparse.Namespace) -> None:
     _validate_amp_clamp_args(mode_amp_clamp, mode_amp_local_window, mode_amp_ratio, mode_amp_global_percentile)
 
     requested_freqs = _read_requested_freqs(args.freqs, args.peaks_json)
-    result = run_modal_analysis_from_video(
-        video_path=args.video,
-        t0=args.t0,
-        t1=args.t1,
-        resize=args.resize,
-        max_frames=args.max_frames,
-        flow_method=args.flow_method,
-        no_smooth=args.no_smooth,
-        sigma_b=args.sigma_b,
-        sigma_c=args.sigma_c,
-        mask_path=args.mask,
-        analysis_mask_dilate_iters=getattr(args, "analysis_mask_dilate_iters", 0),
+    cache = load_analysis_cache(args.cache_dir)
+    video_metadata = cache.metadata["video"]
+    analysis_metadata = cache.metadata["analysis"]
+    sources = cache.metadata["sources"]
+    smoothing_metadata = analysis_metadata["smoothing"]
+    fft_metadata = analysis_metadata["fft"]
+    selected_freqs_hz, exact_u, exact_v = dft_at_frequencies(
+        cache.flow_u,
+        cache.flow_v,
+        fps=cache.fps,
+        freqs_hz=requested_freqs,
+        detrend=bool(fft_metadata["detrend"]),
+        window=str(fft_metadata["window"]),
     )
 
     modes_u = []
     modes_v = []
-    selected_freqs = []
     clamp_stats: list[dict[str, float]] = []
-    for idx, freq in enumerate(requested_freqs, start=1):
-        mode = select_mode_slice(result, freq, mode_idx=idx)
+    for idx in range(len(requested_freqs)):
         mode_u, mode_v, stats = _clamp_mode_amplitude(
-            mode.U_slice,
-            mode.V_slice,
-            result.mask,
+            exact_u[idx],
+            exact_v[idx],
+            cache.mask,
             mode_amp_clamp,
             mode_amp_local_window,
             mode_amp_ratio,
@@ -176,35 +167,34 @@ def run(args: argparse.Namespace) -> None:
         )
         modes_u.append(mode_u)
         modes_v.append(mode_v)
-        selected_freqs.append(mode.freq_selected_hz)
         clamp_stats.append(stats)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    mask_arr = np.zeros((0, 0), dtype=np.uint8) if result.mask is None else result.mask.astype(np.uint8)
+    mask_arr = np.zeros((0, 0), dtype=np.uint8) if cache.mask is None else cache.mask.astype(np.uint8)
     np.savez_compressed(
         out_path,
-        freqs_hz=result.freqs_hz.astype(np.float32, copy=False),
-        power_spectrum=result.power_spectrum.astype(np.float32, copy=False),
+        freqs_hz=cache.freqs_hz.astype(np.float32, copy=False),
+        power_spectrum=cache.power_spectrum.astype(np.float32, copy=False),
         mode_u=np.stack(modes_u, axis=0).astype(np.complex64, copy=False),
         mode_v=np.stack(modes_v, axis=0).astype(np.complex64, copy=False),
         mask=mask_arr,
-        has_mask=np.array(result.mask is not None, dtype=np.uint8),
-        reference_frame=result.frame_ref.astype(np.float32, copy=False),
-        fps=np.array(result.fps, dtype=np.float32),
-        t0=np.array(args.t0, dtype=np.float32),
-        t1=np.array(-1.0 if args.t1 is None else args.t1, dtype=np.float32),
-        resize=_opt_int(args.resize),
-        source_video=np.array(str(args.video)),
-        source_mask=_opt_text(args.mask),
+        has_mask=np.array(cache.mask is not None, dtype=np.uint8),
+        reference_frame=cache.reference_frame.astype(np.float32, copy=False),
+        fps=np.array(cache.fps, dtype=np.float32),
+        t0=np.array(video_metadata["frame_range"]["t0_s"], dtype=np.float32),
+        t1=np.array(-1.0 if video_metadata["frame_range"]["t1_s"] is None else video_metadata["frame_range"]["t1_s"], dtype=np.float32),
+        resize=_opt_int(video_metadata["resize_max_side"]),
+        source_video=np.array(str(sources["video"]["path"])),
+        source_mask=_opt_text(None if sources["mask"] is None else str(sources["mask"]["path"])),
         requested_freqs_hz=np.asarray(requested_freqs, dtype=np.float32),
-        selected_freqs_hz=np.asarray(selected_freqs, dtype=np.float32),
+        selected_freqs_hz=selected_freqs_hz.astype(np.float32, copy=False),
         frequency_method=np.array("exact_dft"),
-        flow_method=np.array(str(args.flow_method)),
-        no_smooth=np.array(bool(args.no_smooth), dtype=np.uint8),
-        sigma_b=np.array(args.sigma_b, dtype=np.float32),
-        sigma_c=np.array(args.sigma_c, dtype=np.float32),
-        t_ref_s=np.array(result.t_ref_s, dtype=np.float32),
+        flow_method=np.array(str(analysis_metadata["flow_method"])),
+        no_smooth=np.array(bool(smoothing_metadata["disabled"]), dtype=np.uint8),
+        sigma_b=np.array(smoothing_metadata["sigma_b"], dtype=np.float32),
+        sigma_c=np.array(smoothing_metadata["sigma_c"], dtype=np.float32),
+        t_ref_s=np.array(cache.t_ref_s, dtype=np.float32),
         mode_amp_clamp_method=np.array(mode_amp_clamp),
         mode_amp_local_window=np.array(mode_amp_local_window, dtype=np.int32),
         mode_amp_ratio=np.array(mode_amp_ratio, dtype=np.float32),
@@ -219,7 +209,7 @@ def run(args: argparse.Namespace) -> None:
         mode_amp_clamped_max=np.asarray([s["clamped_max"] for s in clamp_stats], dtype=np.float32),
     )
     print(f"Saved modal analysis -> {out_path}")
-    print(f"Selected frequencies: {[round(float(f), 6) for f in selected_freqs]}")
+    print(f"Selected frequencies: {[round(float(f), 6) for f in selected_freqs_hz]}")
     if mode_amp_clamp != "none":
         print(f"Mode amplitude clamp fractions: {[round(float(s['clamped_fraction']), 6) for s in clamp_stats]}")
 

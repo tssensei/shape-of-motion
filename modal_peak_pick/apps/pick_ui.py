@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import hsv_to_rgb
 import numpy as np
 
-from modal_peak_pick.core.pipeline import run_modal_analysis_from_video
+from modal_peak_pick.core.cache import load_analysis_cache
 from modal_peak_pick.core.spectrum import snap_to_local_peak
 
 
@@ -259,48 +259,26 @@ class PeakPickingUI:
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--video", required=True, help="Input video path.")
-    parser.add_argument("--mask", default=None, help="Optional binary ROI mask path (.npy or image).")
-    parser.add_argument("--t0", type=float, default=0.0, help="Clip start time in seconds.")
-    parser.add_argument("--t1", type=float, default=None, help="Clip end time in seconds.")
-    parser.add_argument("--resize", type=int, default=None, help="Resize max(H,W) before analysis.")
-    parser.add_argument("--max-frames", type=int, default=None, help="Optional maximum decoded frames.")
-    parser.add_argument("--flow-method", choices=["farneback", "tvl1"], default="farneback")
-    parser.add_argument("--no-smooth", action="store_true", help="Disable contrast-weighted flow smoothing.")
-    parser.add_argument("--sigma-b", type=float, default=3.0, help="Spatial smoothing sigma.")
-    parser.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
+    parser.add_argument("--cache-dir", required=True, help="Modal-analysis cache directory.")
     parser.add_argument("--snap-window-hz", type=float, default=1.0, help="Peak snapping window.")
     parser.add_argument("--out-json", default="outputs/selected_peaks.json", help="Selected peaks JSON path.")
-    parser.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
 
 
 def run(args: argparse.Namespace) -> None:
-    result = run_modal_analysis_from_video(
-        video_path=args.video,
-        t0=args.t0,
-        t1=args.t1,
-        resize=args.resize,
-        max_frames=args.max_frames,
-        flow_method=args.flow_method,
-        no_smooth=args.no_smooth,
-        sigma_b=args.sigma_b,
-        sigma_c=args.sigma_c,
-        mask_path=args.mask,
-        analysis_mask_dilate_iters=getattr(args, "analysis_mask_dilate_iters", 0),
-    )
+    cache = load_analysis_cache(args.cache_dir)
     ui = PeakPickingUI(
-        frame_ref=result.frame_ref,
-        freqs_hz=result.freqs_hz,
-        U=result.U,
-        V=result.V,
-        power_spectrum=result.power_spectrum,
-        mask=result.mask,
+        frame_ref=cache.reference_frame,
+        freqs_hz=cache.freqs_hz,
+        U=cache.spectrum_u,
+        V=cache.spectrum_v,
+        power_spectrum=cache.power_spectrum,
+        mask=cache.mask,
         out_json=args.out_json,
         snap_window_hz=args.snap_window_hz,
     )
-    if len(result.freqs_hz) > 2:
-        strongest = 1 + int(np.argmax(result.power_spectrum[1:]))
-        ui.set_current_frequency(float(result.freqs_hz[strongest]))
+    if len(cache.freqs_hz) > 2:
+        strongest = 1 + int(np.argmax(cache.power_spectrum[1:]))
+        ui.set_current_frequency(float(cache.freqs_hz[strongest]))
     plt.show()
 
 

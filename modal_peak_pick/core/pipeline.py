@@ -9,7 +9,6 @@ import numpy as np
 
 from modal_peak_pick.core.flow import compute_dense_flow_to_reference, contrast_weighted_smooth
 from modal_peak_pick.core.spectrum import dft_at_frequencies, fft_over_time, global_power_spectrum
-from modal_peak_pick.core.video_io import load_video_clip
 
 
 @dataclass
@@ -124,41 +123,6 @@ def run_modal_analysis(
         U=U,
         V=V,
         power_spectrum=power_spectrum,
-    )
-
-
-def run_modal_analysis_from_video(
-    video_path: str,
-    t0: float = 0.0,
-    t1: Optional[float] = None,
-    resize: Optional[int] = None,
-    max_frames: Optional[int] = None,
-    flow_method: str = "farneback",
-    no_smooth: bool = False,
-    sigma_b: float = 3.0,
-    sigma_c: float = 0.0,
-    mask_path: Optional[str] = None,
-    analysis_mask_dilate_iters: int = 0,
-) -> ModalAnalysisResult:
-    frames_gray, fps = load_video_clip(
-        video_path,
-        t0=t0,
-        t1=t1,
-        resize=resize,
-        grayscale=True,
-        max_frames=max_frames,
-    )
-    h, w = int(frames_gray.shape[1]), int(frames_gray.shape[2])
-    mask = load_mask(mask_path, h, w, dilate_iters=int(analysis_mask_dilate_iters))
-    return run_modal_analysis(
-        frames_gray=frames_gray,
-        fps=fps,
-        mask=mask,
-        flow_method=flow_method,
-        no_smooth=no_smooth,
-        sigma_b=sigma_b,
-        sigma_c=sigma_c,
-        t0=t0,
     )
 
 
