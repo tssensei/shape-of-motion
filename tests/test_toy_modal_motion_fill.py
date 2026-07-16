@@ -76,6 +76,36 @@ def _chain_graph(points: np.ndarray):
     return build_knn_graph(candidates, k=1, max_distance=0.11)
 
 
+def _two_component_lsmr_budget_case():
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.1, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    phi_observable = np.zeros((5, 3), dtype=np.complex128)
+    basis = np.zeros((5, 3, 3), dtype=np.float64)
+    basis[1, 2, 0] = 1.0
+    basis[[2, 4]] = np.eye(3, dtype=np.float64)
+    return (
+        build_knn_graph(
+            query_knn_candidates(points, max_k=1),
+            k=1,
+            max_distance=0.11,
+        ),
+        phi_observable,
+        basis,
+        np.asarray([0, 1, 3, 0, 3], dtype=np.int8),
+        np.asarray([True, False, False, True, False]),
+        np.asarray([False, True, False, False, False]),
+        np.asarray([False, False, True, False, True]),
+    )
+
+
 def _toy_track_inputs(
     target: np.ndarray,
     mode_index: int,
@@ -288,6 +318,51 @@ class MotionFillCoreTests(unittest.TestCase):
             atol=1e-12,
         )
 
+    def test_default_maxiter_uses_global_system_dimension_for_every_component(
+        self,
+    ) -> None:
+        case = _two_component_lsmr_budget_case()
+        calls: list[tuple[tuple[int, int], int]] = []
+        original_run_lsmr = motion_fill_module._run_lsmr
+
+        def capture_maxiter(matrix, right_hand_side, **kwargs):
+            calls.append((matrix.shape, kwargs["maxiter"]))
+            return original_run_lsmr(matrix, right_hand_side, **kwargs)
+
+        with patch.object(
+            motion_fill_module,
+            "_run_lsmr",
+            side_effect=capture_maxiter,
+        ):
+            result = fill_nullspace_motion(*case)
+
+        self.assertEqual(result.system_row_count, 9)
+        self.assertEqual(result.system_column_count, 7)
+        self.assertEqual(result.lsmr_maxiter, 7)
+        self.assertEqual(
+            sorted(calls),
+            [((3, 3), 7), ((3, 3), 7), ((6, 4), 7), ((6, 4), 7)],
+        )
+
+    def test_explicit_maxiter_is_preserved_for_every_component(self) -> None:
+        case = _two_component_lsmr_budget_case()
+        captured_maxiter: list[int] = []
+        original_run_lsmr = motion_fill_module._run_lsmr
+
+        def capture_maxiter(matrix, right_hand_side, **kwargs):
+            captured_maxiter.append(kwargs["maxiter"])
+            return original_run_lsmr(matrix, right_hand_side, **kwargs)
+
+        with patch.object(
+            motion_fill_module,
+            "_run_lsmr",
+            side_effect=capture_maxiter,
+        ):
+            result = fill_nullspace_motion(*case, lsmr_maxiter=23)
+
+        self.assertEqual(result.lsmr_maxiter, 23)
+        self.assertEqual(captured_maxiter, [23, 23, 23, 23])
+
     def test_two_components_preserve_global_coefficient_order(self) -> None:
         points = np.asarray(
             [
@@ -418,6 +493,7 @@ class MotionFillCoreTests(unittest.TestCase):
 
         np.testing.assert_array_equal(result.phi, phi_observable)
         self.assertEqual(result.system_column_count, 0)
+        self.assertEqual(result.lsmr_maxiter, 0)
         self.assertFalse(result.real_solver.performed)
         self.assertFalse(result.imag_solver.performed)
         self.assertGreater(result.real_solver.residual_norm, 0.0)

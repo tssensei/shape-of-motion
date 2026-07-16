@@ -538,6 +538,10 @@ class GaussianMotionFillTests(unittest.TestCase):
         self.assertEqual(filled.diagnostics["system"]["eligible_edge_count"], 2)
         self.assertEqual(filled.diagnostics["version"], 2)
         self.assertEqual(filled.diagnostics["tolerances"]["lsmr_atol"], 1e-8)
+        self.assertEqual(
+            filled.diagnostics["tolerances"]["lsmr_maxiter"],
+            filled.motion.lsmr_maxiter,
+        )
         self.assertEqual(filled.diagnostics["solver_scope"], "componentwise")
         self.assertTrue(filled.diagnostics["parallel_channels"])
         self.assertEqual(len(filled.diagnostics["components"]), 1)

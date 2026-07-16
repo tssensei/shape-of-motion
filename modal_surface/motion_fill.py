@@ -124,6 +124,7 @@ class MotionFillResult:
     imag_solver: SparseSolveMetadata
     solver_scope: str
     parallel_channels: bool
+    lsmr_maxiter: int
     component_solvers: tuple[ComponentSolveMetadata, ...]
     system_row_count: int
     system_column_count: int
@@ -749,7 +750,7 @@ def _solve_component_systems(
     atol: float,
     btol: float,
     conlim: float,
-    maxiter: int | None,
+    maxiter: int,
 ) -> tuple[
     np.ndarray,
     SparseSolveMetadata,
@@ -870,7 +871,8 @@ def _solve_component_systems(
                         f"edges={component_edge_count}, "
                         f"columns={component_column_count}, "
                         f"real stop_code={real_stop_code}, "
-                        f"imaginary stop_code={imaginary_stop_code}."
+                        f"imaginary stop_code={imaginary_stop_code}, "
+                        f"maxiter={maxiter}."
                     ) from (real_error if real_error is not None else imaginary_error)
                 if real_result is None or imaginary_result is None:
                     raise RuntimeError("Motion-fill LSMR returned no channel result.")
@@ -884,7 +886,9 @@ def _solve_component_systems(
                         f"edges={component_edge_count}, "
                         f"columns={component_column_count}, "
                         f"real stop_code={real_solver.stop_code}, "
-                        f"imaginary stop_code={imag_solver.stop_code}."
+                        f"imaginary stop_code={imag_solver.stop_code}, "
+                        f"real iterations={real_solver.iterations}/{maxiter}, "
+                        f"imaginary iterations={imag_solver.iterations}/{maxiter}."
                     )
                 coefficient_values[component_columns] = (
                     real_coefficients + 1j * imaginary_coefficients
@@ -972,6 +976,15 @@ def fill_nullspace_motion(
         active_edge_indices,
     ) = _assemble_sparse_system(graph, inputs, connectivity)
     column_count = int(matrix.shape[1])
+    resolved_lsmr_maxiter = (
+        0
+        if column_count == 0
+        else (
+            lsmr_maxiter
+            if lsmr_maxiter is not None
+            else min(int(matrix.shape[0]), column_count)
+        )
+    )
     coefficient_values, real_solver, imag_solver, component_solvers = (
         _solve_component_systems(
             matrix,
@@ -983,7 +996,7 @@ def fill_nullspace_motion(
             atol=float(lsmr_atol),
             btol=float(lsmr_btol),
             conlim=float(lsmr_conlim),
-            maxiter=lsmr_maxiter,
+            maxiter=resolved_lsmr_maxiter,
         )
     )
 
@@ -1017,6 +1030,7 @@ def fill_nullspace_motion(
         imag_solver=imag_solver,
         solver_scope="componentwise",
         parallel_channels=True,
+        lsmr_maxiter=resolved_lsmr_maxiter,
         component_solvers=component_solvers,
         system_row_count=int(matrix.shape[0]),
         system_column_count=column_count,

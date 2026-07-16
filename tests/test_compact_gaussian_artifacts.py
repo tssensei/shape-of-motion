@@ -585,15 +585,31 @@ class CompactGaussianArtifactTests(unittest.TestCase):
         self.assertEqual(manifest["parameters"]["motion_fill_version"], 2)
         self.assertEqual(manifest["parameters"]["motion_fill_lsmr_atol"], 1e-6)
         self.assertEqual(
+            manifest["parameters"]["motion_fill_lsmr_maxiter_policy"],
+            "global_system_min_dimension",
+        )
+        self.assertEqual(
             manifest["parameters"]["motion_fill_solver_scope"], "componentwise"
         )
         self.assertTrue(manifest["parameters"]["motion_fill_parallel_channels"])
         self.assertEqual(motion_fill_diagnostics["version"], 2)
         mode_diagnostics = motion_fill_diagnostics["modes"]["mode_000_2p5hz"]
         self.assertEqual(mode_diagnostics["tolerances"]["lsmr_atol"], 1e-6)
+        self.assertEqual(
+            manifest["parameters"]["motion_fill_lsmr_maxiter_by_mode"],
+            {
+                "mode_000_2p5hz": mode_diagnostics["tolerances"][
+                    "lsmr_maxiter"
+                ]
+            },
+        )
         self.assertEqual(mode_diagnostics["solver_scope"], "componentwise")
         self.assertTrue(mode_diagnostics["parallel_channels"])
         self.assertEqual(float(diagnostics["motion_fill_lsmr_atol"].item()), 1e-6)
+        self.assertEqual(
+            int(diagnostics["motion_fill_lsmr_maxiter"].item()),
+            mode_diagnostics["tolerances"]["lsmr_maxiter"],
+        )
         self.assertEqual(
             str(diagnostics["motion_fill_solver_scope"].item()), "componentwise"
         )
@@ -737,6 +753,10 @@ class CompactGaussianArtifactTests(unittest.TestCase):
         self.assertTrue(bool(diagnostics["motion_fill_parallel_channels"].item()))
         self.assertEqual(
             float(diagnostics["motion_fill_lsmr_atol"].item()), 1e-8
+        )
+        self.assertEqual(
+            int(diagnostics["motion_fill_lsmr_maxiter"].item()),
+            filled.motion.lsmr_maxiter,
         )
         component_count = len(filled.motion.component_solvers)
         np.testing.assert_array_equal(

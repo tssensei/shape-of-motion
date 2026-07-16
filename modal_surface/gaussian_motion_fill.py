@@ -698,6 +698,7 @@ def apply_gaussian_motion_fill(
             "lsmr_atol": float(lsmr_atol),
             "lsmr_btol": MOTION_FILL_LSMR_BTOL,
             "lsmr_conlim": MOTION_FILL_LSMR_CONLIM,
+            "lsmr_maxiter": int(motion.lsmr_maxiter),
         },
         "system": {
             "row_count": int(motion.system_row_count),

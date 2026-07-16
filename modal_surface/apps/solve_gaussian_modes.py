@@ -765,6 +765,9 @@ def _write_solver_diagnostics(
                 "motion_fill_lsmr_conlim": np.array(
                     MOTION_FILL_LSMR_CONLIM, dtype=np.float64
                 ),
+                "motion_fill_lsmr_maxiter": np.array(
+                    diagnostics["tolerances"]["lsmr_maxiter"], dtype=np.int64
+                ),
                 "motion_fill_source_solver_method": np.array(
                     "staged_overlap_observable"
                 ),
@@ -1017,6 +1020,11 @@ def run(args: argparse.Namespace) -> None:
                 "motion_fill_nullspace_operator_rtol": MOTION_FILL_NULLSPACE_RTOL,
                 "motion_fill_observation_drift_rtol": MOTION_FILL_OBSERVATION_DRIFT_RTOL,
                 "motion_fill_lsmr_atol": float(args.motion_fill_lsmr_atol),
+                "motion_fill_lsmr_maxiter_by_mode": {
+                    mode_name: int(diagnostics["tolerances"]["lsmr_maxiter"])
+                    for mode_name, diagnostics in motion_fill_mode_diagnostics.items()
+                },
+                "motion_fill_lsmr_maxiter_policy": "global_system_min_dimension",
                 "motion_fill_solver_scope": "componentwise",
                 "motion_fill_parallel_channels": True,
                 "motion_fill_graph_path": relative_path(motion_fill_graph_path, out_dir),
