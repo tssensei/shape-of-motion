@@ -138,9 +138,7 @@ def classify_motion_fill_display_points(
     return display_class
 
 
-def motion_fill_display_colors(display_class: np.ndarray) -> np.ndarray:
-    """Map motion-fill display classes to deterministic float RGB colors."""
-
+def _validated_motion_fill_display_classes(display_class: np.ndarray) -> np.ndarray:
     classes = np.asarray(display_class)
     if not np.issubdtype(classes.dtype, np.integer):
         raise ValueError(
@@ -151,13 +149,53 @@ def motion_fill_display_colors(display_class: np.ndarray) -> np.ndarray:
             "motion-fill display classes must lie in "
             f"[0,{len(MOTION_FILL_DISPLAY_NAMES) - 1}]"
         )
+    return classes
+
+
+def motion_fill_display_colors(display_class: np.ndarray) -> np.ndarray:
+    """Map motion-fill display classes to deterministic float RGB colors."""
+
+    classes = _validated_motion_fill_display_classes(display_class)
     return MOTION_FILL_DISPLAY_COLORS[classes]
 
 
-def stack_modal_motion_fill_display_colors(
+def select_motion_fill_display_indices(
+    display_class: np.ndarray,
+    enabled_classes: np.ndarray,
+    max_count: int,
+) -> np.ndarray:
+    """Select up to one shared count from the enabled display-class union."""
+
+    classes = _validated_motion_fill_display_classes(display_class)
+    enabled = np.asarray(enabled_classes)
+    if classes.ndim != 1:
+        raise ValueError(
+            f"motion-fill display classes must be a 1-D array, got {classes.shape}"
+        )
+    if enabled.shape != (len(MOTION_FILL_DISPLAY_NAMES),):
+        raise ValueError(
+            "enabled_classes must have shape "
+            f"({len(MOTION_FILL_DISPLAY_NAMES)},), got {enabled.shape}"
+        )
+    if enabled.dtype != np.bool_:
+        raise ValueError(
+            f"enabled_classes must have boolean dtype, got {enabled.dtype}"
+        )
+    if isinstance(max_count, (bool, np.bool_)) or not isinstance(
+        max_count, (int, np.integer)
+    ):
+        raise ValueError(
+            f"max_count must be an integer, got {type(max_count).__name__}"
+        )
+    if max_count < 0:
+        raise ValueError(f"max_count must be non-negative, got {max_count}")
+    return np.flatnonzero(enabled[classes])[: int(max_count)]
+
+
+def stack_modal_motion_fill_display_classes(
     modes: list[ModalModeData],
 ) -> np.ndarray | None:
-    """Stack per-mode role colors, preserving legacy manifests without role metadata."""
+    """Stack per-mode display classes, preserving manifests without role metadata."""
 
     has_metadata = [mode.motion_fill_display_class is not None for mode in modes]
     if not any(has_metadata):
@@ -170,7 +208,9 @@ def stack_modal_motion_fill_display_colors(
     classes = np.stack(
         [np.asarray(mode.motion_fill_display_class) for mode in modes], axis=0
     )
-    return motion_fill_display_colors(classes)
+    return _validated_motion_fill_display_classes(classes).astype(
+        np.int8, copy=False
+    )
 
 
 def _load_motion_fill_display_class(

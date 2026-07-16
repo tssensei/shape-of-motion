@@ -18,7 +18,8 @@ from flow3d.modal_utils import (
     load_gaussian_modal_fields,
     load_modal_modes,
     motion_fill_display_colors,
-    stack_modal_motion_fill_display_colors,
+    select_motion_fill_display_indices,
+    stack_modal_motion_fill_display_classes,
 )
 from modal_surface.gaussian_motion_fill import MOTION_FILL_ROLE_NAMES
 
@@ -368,14 +369,53 @@ class MotionFillRoleDisplayTests(unittest.TestCase):
             )
 
         self.assertIsNone(legacy_modes[0].motion_fill_display_class)
-        self.assertIsNone(stack_modal_motion_fill_display_colors(legacy_modes))
+        self.assertIsNone(stack_modal_motion_fill_display_classes(legacy_modes))
         np.testing.assert_array_equal(
             role_modes[0].motion_fill_display_class,
             [MOTION_FILL_DISPLAY_ANCHOR, MOTION_FILL_DISPLAY_FILLED],
         )
-        np.testing.assert_allclose(
-            stack_modal_motion_fill_display_colors(role_modes),
-            [[[0.05, 0.55, 1.0], [0.1, 0.85, 0.3]]],
+        np.testing.assert_array_equal(
+            stack_modal_motion_fill_display_classes(role_modes),
+            [[MOTION_FILL_DISPLAY_ANCHOR, MOTION_FILL_DISPLAY_FILLED]],
+        )
+
+    def test_selects_enabled_roles_with_one_shared_count_limit(self) -> None:
+        classes = np.asarray(
+            [
+                MOTION_FILL_DISPLAY_ANCHOR,
+                MOTION_FILL_DISPLAY_PARTIAL,
+                MOTION_FILL_DISPLAY_FILLED,
+                MOTION_FILL_DISPLAY_ANCHOR,
+                MOTION_FILL_DISPLAY_FILLED,
+                MOTION_FILL_DISPLAY_UNOBSERVED,
+                MOTION_FILL_DISPLAY_EXCLUDED,
+                MOTION_FILL_DISPLAY_ANCHOR,
+            ],
+            dtype=np.int8,
+        )
+
+        anchor_only = np.asarray([True, False, False, False, False])
+        np.testing.assert_array_equal(
+            select_motion_fill_display_indices(classes, anchor_only, 2),
+            [0, 3],
+        )
+
+        anchor_and_filled = np.asarray([True, False, True, False, False])
+        np.testing.assert_array_equal(
+            select_motion_fill_display_indices(classes, anchor_and_filled, 4),
+            [0, 2, 3, 4],
+        )
+
+        none_enabled = np.zeros(5, dtype=bool)
+        np.testing.assert_array_equal(
+            select_motion_fill_display_indices(classes, none_enabled, 4),
+            [],
+        )
+
+        filled_only = np.asarray([False, False, True, False, False])
+        np.testing.assert_array_equal(
+            select_motion_fill_display_indices(classes, filled_only, 20),
+            [2, 4],
         )
 
     def test_rejects_mixed_multi_mode_role_metadata(self) -> None:

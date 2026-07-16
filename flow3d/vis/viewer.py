@@ -8,6 +8,11 @@ from nerfview import CameraState, Viewer
 from viser import Icon, ViserServer
 import viser.transforms as vtf
 
+from flow3d.modal_utils import (
+    MOTION_FILL_DISPLAY_NAMES,
+    motion_fill_display_colors,
+    select_motion_fill_display_indices,
+)
 from flow3d.vis.playback_panel import add_gui_playback_group
 from flow3d.vis.render_panel import populate_render_tab
 
@@ -88,9 +93,8 @@ class DynamicViewer(Viewer):
         playback_groups: tuple[ViewerPlaybackGroup, ...] = (),
         modal_freqs_hz: tuple[float, ...] = (),
         has_modal_obs_count: bool = False,
-        gaussian_center_count: int = 0,
         modal_anchor_count: int = 0,
-        modal_anchor_role_colors: np.ndarray | None = None,
+        modal_anchor_role_classes: np.ndarray | None = None,
         modal_anchor_role_mode_labels: tuple[str, ...] = (),
     ):
         self.num_frames = num_frames
@@ -101,38 +105,45 @@ class DynamicViewer(Viewer):
         self.playback_groups = tuple(playback_groups)
         self.modal_freqs_hz = tuple(float(freq) for freq in modal_freqs_hz)
         self.has_modal_obs_count = bool(has_modal_obs_count)
-        self.gaussian_center_count = int(gaussian_center_count)
+        self._enable_hide_gaussian_render = mode == "rendering"
         self.modal_anchor_count = int(modal_anchor_count)
         self.modal_anchor_role_mode_labels = tuple(modal_anchor_role_mode_labels)
-        self.modal_anchor_role_colors = None
-        if modal_anchor_role_colors is not None:
-            role_colors = np.asarray(modal_anchor_role_colors, dtype=np.float32)
+        self.modal_anchor_role_classes = None
+        if modal_anchor_role_classes is not None:
+            role_classes = np.asarray(modal_anchor_role_classes)
             expected_shape = (
                 len(self.modal_anchor_role_mode_labels),
                 self.modal_anchor_count,
-                3,
             )
-            if role_colors.shape != expected_shape:
+            if role_classes.shape != expected_shape:
                 raise ValueError(
-                    "Modal anchor role colors must have shape "
-                    f"{expected_shape}, got {role_colors.shape}"
+                    "Modal anchor role classes must have shape "
+                    f"{expected_shape}, got {role_classes.shape}"
+                )
+            if not np.issubdtype(role_classes.dtype, np.integer):
+                raise ValueError(
+                    "Modal anchor role classes must have integer dtype, "
+                    f"got {role_classes.dtype}"
                 )
             if len(set(self.modal_anchor_role_mode_labels)) != len(
                 self.modal_anchor_role_mode_labels
             ):
                 raise ValueError("Modal anchor role mode labels must be unique")
-            if not np.isfinite(role_colors).all():
-                raise ValueError("Modal anchor role colors must be finite")
-            if np.any(role_colors < 0.0) or np.any(role_colors > 1.0):
-                raise ValueError("Modal anchor role colors must lie in [0,1]")
-            self.modal_anchor_role_colors = role_colors
+            if np.any(role_classes < 0) or np.any(
+                role_classes >= len(MOTION_FILL_DISPLAY_NAMES)
+            ):
+                raise ValueError(
+                    "Modal anchor role classes must lie in "
+                    f"[0,{len(MOTION_FILL_DISPLAY_NAMES) - 1}]"
+                )
+            self.modal_anchor_role_classes = role_classes.astype(
+                np.int8, copy=False
+            )
         elif self.modal_anchor_role_mode_labels:
             raise ValueError(
-                "Modal anchor role mode labels require modal anchor role colors"
+                "Modal anchor role mode labels require modal anchor role classes"
             )
-        self._gaussian_center_handle = None
         self._modal_anchor_handle = None
-        self._gaussian_center_cache_key = None
         self._modal_anchor_cache_key = None
         for group in self.playback_groups:
             if len(group.global_timestamps) == 0:
@@ -343,36 +354,23 @@ class DynamicViewer(Viewer):
 
     def _define_debug_point_guis(self) -> None:
         self._debug_point_handles = None
-        if self.gaussian_center_count <= 0 and self.modal_anchor_count <= 0:
+        if not self._enable_hide_gaussian_render and self.modal_anchor_count <= 0:
             return
-        max_gaussian_count = max(int(self.gaussian_center_count), 1)
-        gaussian_step = max(max_gaussian_count // 200, 1)
         max_anchor_count = max(int(self.modal_anchor_count), 1)
         anchor_step = max(max_anchor_count // 200, 1)
         with self.server.gui.add_folder("Debug points"):
-            hide_render = self.server.gui.add_checkbox("Hide Gaussian render", False)
-            show_centers = self.server.gui.add_checkbox("Show Gaussian centers", False)
-            fg_only = self.server.gui.add_checkbox("Foreground only", True)
-            center_count = self.server.gui.add_slider(
-                "Center visible count",
-                min=0,
-                max=max_gaussian_count,
-                step=gaussian_step,
-                initial_value=min(2000, max_gaussian_count),
-            )
-            center_point_size = self.server.gui.add_slider(
-                "Center point size",
-                min=0.0002,
-                max=0.008,
-                step=0.0001,
-                initial_value=0.002,
+            hide_render = (
+                self.server.gui.add_checkbox("Hide Gaussian render", False)
+                if self._enable_hide_gaussian_render
+                else None
             )
             show_anchors = None
             anchor_count = None
             anchor_point_size = None
             anchor_role_mode = None
+            anchor_role_filters = ()
             if self.modal_anchor_count > 0:
-                role_coloring = self.modal_anchor_role_colors is not None
+                role_coloring = self.modal_anchor_role_classes is not None
                 show_anchors = self.server.gui.add_checkbox(
                     (
                         "Show modal points by role"
@@ -410,30 +408,26 @@ class DynamicViewer(Viewer):
                             options=self.modal_anchor_role_mode_labels,
                             initial_value=self.modal_anchor_role_mode_labels[0],
                         )
+                    anchor_role_filters = tuple(
+                        self.server.gui.add_checkbox(name.capitalize(), True)
+                        for name in MOTION_FILL_DISPLAY_NAMES
+                    )
         self._debug_point_handles = {
             "hide_render": hide_render,
-            "show_centers": show_centers,
-            "fg_only": fg_only,
-            "center_count": center_count,
-            "center_point_size": center_point_size,
             "show_anchors": show_anchors,
             "anchor_count": anchor_count,
             "anchor_point_size": anchor_point_size,
             "anchor_role_mode": anchor_role_mode,
+            "anchor_role_filters": anchor_role_filters,
         }
 
         def _on_update(event) -> None:
-            if not bool(show_centers.value):
-                self._remove_gaussian_center_cloud()
             if show_anchors is not None and not bool(show_anchors.value):
                 self._remove_modal_anchor_cloud()
             self.rerender(event)
 
-        hide_render.on_update(_on_update)
-        show_centers.on_update(_on_update)
-        fg_only.on_update(_on_update)
-        center_count.on_update(_on_update)
-        center_point_size.on_update(_on_update)
+        if hide_render is not None:
+            hide_render.on_update(_on_update)
         if show_anchors is not None:
             show_anchors.on_update(_on_update)
         if anchor_count is not None:
@@ -442,12 +436,8 @@ class DynamicViewer(Viewer):
             anchor_point_size.on_update(_on_update)
         if anchor_role_mode is not None:
             anchor_role_mode.on_update(_on_update)
-
-    def _remove_gaussian_center_cloud(self) -> None:
-        if self._gaussian_center_handle is not None:
-            self._gaussian_center_handle.remove()
-            self._gaussian_center_handle = None
-        self._gaussian_center_cache_key = None
+        for role_filter in anchor_role_filters:
+            role_filter.on_update(_on_update)
 
     def _remove_modal_anchor_cloud(self) -> None:
         if self._modal_anchor_handle is not None:
@@ -457,11 +447,11 @@ class DynamicViewer(Viewer):
 
     def hide_gaussian_render(self) -> bool:
         handles = getattr(self, "_debug_point_handles", None)
-        return handles is not None and bool(handles["hide_render"].value)
-
-    def wants_gaussian_centers(self) -> bool:
-        handles = getattr(self, "_debug_point_handles", None)
-        return handles is not None and bool(handles["show_centers"].value)
+        return (
+            handles is not None
+            and handles["hide_render"] is not None
+            and bool(handles["hide_render"].value)
+        )
 
     def wants_modal_anchors(self) -> bool:
         handles = getattr(self, "_debug_point_handles", None)
@@ -472,7 +462,7 @@ class DynamicViewer(Viewer):
         )
 
     def _modal_anchor_role_mode_index(self) -> int:
-        if self.modal_anchor_role_colors is None:
+        if self.modal_anchor_role_classes is None:
             return 0
         handles = self._debug_point_handles
         assert handles is not None
@@ -501,61 +491,6 @@ class DynamicViewer(Viewer):
         flat_index = options.index(selected)
         return flat_index // 2, flat_index % 2
 
-    def update_gaussian_centers(
-        self, points: np.ndarray, fg_count: int, update_key
-    ) -> None:
-        if not self.wants_gaussian_centers():
-            return
-        handles = self._debug_point_handles
-        assert handles is not None
-
-        points = np.asarray(points, dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] != 3:
-            raise ValueError(
-                f"Gaussian centers must have shape (N,3), got {points.shape}"
-            )
-
-        fg_count = min(max(int(fg_count), 0), points.shape[0])
-        if bool(handles["fg_only"].value):
-            selectable = np.arange(fg_count, dtype=np.int64)
-        else:
-            selectable = np.arange(points.shape[0], dtype=np.int64)
-
-        visible_count = min(
-            max(int(handles["center_count"].value), 0), selectable.shape[0]
-        )
-        if visible_count == 0:
-            self._remove_gaussian_center_cloud()
-            return
-
-        selected = selectable[:visible_count]
-        point_size = float(handles["center_point_size"].value)
-        cache_key = (
-            visible_count,
-            bool(handles["fg_only"].value),
-            fg_count,
-            point_size,
-            update_key,
-        )
-        if (
-            self._gaussian_center_handle is not None
-            and self._gaussian_center_cache_key == cache_key
-        ):
-            return
-
-        self._remove_gaussian_center_cloud()
-        colors = np.empty((visible_count, 3), dtype=np.float32)
-        fg_mask = selected < fg_count
-        colors[fg_mask] = np.asarray([0.05, 0.85, 0.20], dtype=np.float32)
-        colors[~fg_mask] = np.asarray([0.55, 0.55, 0.55], dtype=np.float32)
-        self._gaussian_center_handle = self.server.scene.add_point_cloud(
-            "/debug/gaussian_centers",
-            points=points[selected],
-            colors=colors,
-            point_size=point_size,
-        )
-        self._gaussian_center_cache_key = cache_key
-
     def update_modal_anchors(self, points: np.ndarray, update_key) -> None:
         if not self.wants_modal_anchors():
             return
@@ -568,15 +503,37 @@ class DynamicViewer(Viewer):
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError(f"Modal anchors must have shape (N,3), got {points.shape}")
 
-        visible_count = min(max(int(handles["anchor_count"].value), 0), points.shape[0])
+        requested_count = max(int(handles["anchor_count"].value), 0)
+        role_mode_index = self._modal_anchor_role_mode_index()
+        role_filter_key = ()
+        if self.modal_anchor_role_classes is None:
+            visible_count = min(requested_count, points.shape[0])
+            selected = np.arange(visible_count, dtype=np.int64)
+        else:
+            role_filters = handles["anchor_role_filters"]
+            enabled_classes = np.asarray(
+                [bool(role_filter.value) for role_filter in role_filters],
+                dtype=bool,
+            )
+            role_filter_key = tuple(bool(value) for value in enabled_classes)
+            selected = select_motion_fill_display_indices(
+                self.modal_anchor_role_classes[role_mode_index],
+                enabled_classes,
+                requested_count,
+            )
+            visible_count = int(selected.shape[0])
         if visible_count == 0:
             self._remove_modal_anchor_cloud()
             return
 
-        selected = np.arange(visible_count, dtype=np.int64)
         point_size = float(handles["anchor_point_size"].value)
-        role_mode_index = self._modal_anchor_role_mode_index()
-        cache_key = (visible_count, point_size, role_mode_index, update_key)
+        cache_key = (
+            visible_count,
+            point_size,
+            role_mode_index,
+            role_filter_key,
+            update_key,
+        )
         if (
             self._modal_anchor_handle is not None
             and self._modal_anchor_cache_key == cache_key
@@ -584,12 +541,14 @@ class DynamicViewer(Viewer):
             return
 
         self._remove_modal_anchor_cloud()
-        if self.modal_anchor_role_colors is None:
+        if self.modal_anchor_role_classes is None:
             colors = np.full(
                 (visible_count, 3), [0.05, 0.55, 1.0], dtype=np.float32
             )
         else:
-            colors = self.modal_anchor_role_colors[role_mode_index, selected]
+            colors = motion_fill_display_colors(
+                self.modal_anchor_role_classes[role_mode_index, selected]
+            )
         self._modal_anchor_handle = self.server.scene.add_point_cloud(
             "/debug/modal_anchors",
             points=points[selected],

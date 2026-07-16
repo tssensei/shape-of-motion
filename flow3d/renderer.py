@@ -6,7 +6,7 @@ from nerfview import CameraState
 
 from flow3d.modal_utils import (
     load_modal_modes,
-    stack_modal_motion_fill_display_colors,
+    stack_modal_motion_fill_display_classes,
 )
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import draw_tracks_2d_th, get_server
@@ -42,7 +42,7 @@ class Renderer:
             self.modal_anchor_phi_real,
             self.modal_anchor_phi_imag,
             modal_anchor_freqs_hz,
-            self.modal_anchor_role_colors,
+            self.modal_anchor_role_classes,
             modal_anchor_role_mode_labels,
         ) = self._load_modal_anchor_data(modal_anchor_manifest)
 
@@ -76,13 +76,12 @@ class Renderer:
                 playback_groups=playback_groups,
                 modal_freqs_hz=modal_freqs_hz,
                 has_modal_obs_count=model.has_modal_obs_count,
-                gaussian_center_count=model.num_gaussians,
                 modal_anchor_count=(
                     0
                     if self.modal_anchor_points is None
                     else int(self.modal_anchor_points.shape[0])
                 ),
-                modal_anchor_role_colors=self.modal_anchor_role_colors,
+                modal_anchor_role_classes=self.modal_anchor_role_classes,
                 modal_anchor_role_mode_labels=modal_anchor_role_mode_labels,
             )
 
@@ -181,12 +180,12 @@ class Renderer:
         phi_real = torch.as_tensor(phi.real, device=self.device, dtype=torch.float32)
         phi_imag = torch.as_tensor(phi.imag, device=self.device, dtype=torch.float32)
         freqs_hz = tuple(float(mode.freq_hz) for mode in modes)
-        role_colors = stack_modal_motion_fill_display_colors(modes)
+        role_classes = stack_modal_motion_fill_display_classes(modes)
         role_mode_labels = (
             tuple(
                 f"Mode {mode.mode_index}: {mode.freq_hz:.3f} Hz" for mode in modes
             )
-            if role_colors is not None
+            if role_classes is not None
             else ()
         )
         guru.info(
@@ -197,7 +196,7 @@ class Renderer:
             phi_real,
             phi_imag,
             freqs_hz,
-            role_colors,
+            role_classes,
             role_mode_labels,
         )
 
@@ -417,18 +416,6 @@ class Renderer:
                 "oscillator",
                 round(float(motion_scale), 6),
                 q_key,
-            )
-        if self.viewer.wants_gaussian_centers():
-            center_means = means
-            if center_means is None:
-                center_ts = (
-                    torch.tensor([t], device=self.device) if t is not None else None
-                )
-                center_means = self.model.compute_poses_all(center_ts)[0][:, 0]
-            self.viewer.update_gaussian_centers(
-                center_means.detach().cpu().numpy(),
-                self.model.num_fg_gaussians,
-                debug_points_update_key,
             )
         if self.viewer.wants_modal_anchors():
             anchor_points = self._current_modal_anchor_points(modal_oscillator)
