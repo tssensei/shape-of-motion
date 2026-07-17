@@ -39,6 +39,8 @@ from flow3d.init_utils import (
 )
 from flow3d.modal_utils import (
     GaussianModalRefinementData,
+    ModalEnvelopeLayout,
+    build_modal_envelope_layout,
     load_gaussian_modal_refinement_data,
     load_gaussian_modal_fields,
     load_modal_frame_map,
@@ -47,7 +49,7 @@ from flow3d.modal_utils import (
 from flow3d.params import (
     CameraScales,
     GaussianParams,
-    ModalActivations,
+    ModalHarmonicEnvelope,
     ModalShapeRefinement,
 )
 from flow3d.scene_model import SceneModel, TRAJECTORY_TYPE_TO_ID
@@ -96,14 +98,15 @@ class TrainConfig:
     modal_frame_map: str | None = None
     modal_carrier_points: str | None = None
     vggt_view_configs: tuple[str, ...] = ()
-    modal_warmup_epochs: int = 5
+    modal_warmup_epochs: int = 0
     modal_train_base_means: bool = False
     modal_stage1_data_dir: str | None = None
     modal_stage1_frame_map: str | None = None
     modal_stage1_epochs: int = 0
     modal_stage1_init_ckpt: str | None = None
     modal_shape_refinement: Literal["fixed", "anchor_delta"] = "fixed"
-    modal_harmonic_init_ckpt: str | None = None
+    modal_envelope_init_ckpt: str | None = None
+    modal_envelope_knot_interval_sec: float = 0.5
     modal_stage2_train_base_means: bool = False
     modal_stage2_train_colors: bool = False
     modal_stage2_train_opacities: bool = False
@@ -382,6 +385,11 @@ def initialize_and_checkpoint_model(
     modal_frame_view_indices = None
     modal_frame_local_indices = None
     modal_frame_times_sec = None
+    modal_envelope_knot_offsets = None
+    modal_envelope_knot_times_sec = None
+    modal_frame_envelope_left = None
+    modal_frame_envelope_right = None
+    modal_frame_envelope_lerp = None
     modal_refinement = None
     modal_anchor_mask = None
     if cfg.trajectory_type == "modal_activation":
@@ -406,6 +414,15 @@ def initialize_and_checkpoint_model(
         modal_frame_view_indices = frame_map.frame_view_indices
         modal_frame_local_indices = frame_map.frame_local_indices
         modal_frame_times_sec = frame_map.frame_times_sec
+        envelope_layout = build_modal_envelope_layout(
+            frame_map,
+            cfg.modal_envelope_knot_interval_sec,
+        )
+        modal_envelope_knot_offsets = envelope_layout.knot_offsets
+        modal_envelope_knot_times_sec = envelope_layout.knot_times_sec
+        modal_frame_envelope_left = envelope_layout.frame_left_indices
+        modal_frame_envelope_right = envelope_layout.frame_right_indices
+        modal_frame_envelope_lerp = envelope_layout.frame_lerp_weights
         if cfg.modal_shape_refinement == "anchor_delta":
             refinement_data = load_gaussian_modal_refinement_data(
                 cfg.modal_manifest,
@@ -428,9 +445,11 @@ def initialize_and_checkpoint_model(
                 f"anchor_counts={anchor_counts}, "
                 f"delta_shape={tuple(modal_refinement.params['delta_phi'].shape)}"
             )
-            modal = _load_harmonic_activations_from_checkpoint(
-                cfg.modal_harmonic_init_ckpt,
+            modal = _load_harmonic_envelope_from_checkpoint(
+                cfg.modal_envelope_init_ckpt,
                 frame_map.view_ids,
+                envelope_layout,
+                cfg.modal_envelope_knot_interval_sec,
                 modal_phi_real,
                 modal_phi_imag,
                 modal_freqs_hz,
@@ -440,8 +459,8 @@ def initialize_and_checkpoint_model(
                 device,
             )
         else:
-            modal = _zero_harmonic_activations(
-                len(frame_map.view_ids),
+            modal = _zero_harmonic_envelope(
+                int(envelope_layout.knot_times_sec.shape[0]),
                 len(modal_modes),
                 device,
                 fg_params.params["means"].dtype,
@@ -483,8 +502,9 @@ def initialize_and_checkpoint_model(
             f"Initialized modal_activation: modes={len(modal_modes)} "
             f"[{mode_summary}], per_view_frames=[{', '.join(view_summaries)}], "
             f"active_views={active_views}, unused_views={unused_views}, "
-            f"activation_shape={tuple(modal.params['activations'].shape)}, "
-            "parameterization=per_view_harmonic_v1, "
+            f"envelope_shape={tuple(modal.params['envelope_knots'].shape)}, "
+            f"knot_counts={torch.diff(envelope_layout.knot_offsets).tolist()}, "
+            "parameterization=per_view_harmonic_envelope_v1, "
             f"shape_refinement={cfg.modal_shape_refinement}"
         )
 
@@ -507,6 +527,16 @@ def initialize_and_checkpoint_model(
         modal_frame_view_indices=modal_frame_view_indices,
         modal_frame_local_indices=modal_frame_local_indices,
         modal_frame_times_sec=modal_frame_times_sec,
+        modal_envelope_knot_offsets=modal_envelope_knot_offsets,
+        modal_envelope_knot_times_sec=modal_envelope_knot_times_sec,
+        modal_envelope_knot_interval_sec=(
+            cfg.modal_envelope_knot_interval_sec
+            if cfg.trajectory_type == "modal_activation"
+            else None
+        ),
+        modal_frame_envelope_left=modal_frame_envelope_left,
+        modal_frame_envelope_right=modal_frame_envelope_right,
+        modal_frame_envelope_lerp=modal_frame_envelope_lerp,
         modal_refinement=modal_refinement,
         modal_anchor_mask=modal_anchor_mask,
     )
@@ -567,16 +597,16 @@ def _log_trainable_parameters(model: SceneModel) -> None:
     )
 
 
-def _zero_harmonic_activations(
-    num_views: int,
+def _zero_harmonic_envelope(
+    num_total_knots: int,
     num_modes: int,
     device: torch.device,
     dtype: torch.dtype,
-) -> ModalActivations:
-    if num_views <= 0 or num_modes <= 0:
-        raise ValueError("Harmonic activation initialization requires views and modes")
-    return ModalActivations(
-        torch.zeros(num_views, num_modes, 2, device=device, dtype=dtype)
+) -> ModalHarmonicEnvelope:
+    if num_total_knots <= 0 or num_modes <= 0:
+        raise ValueError("Harmonic envelope initialization requires knots and modes")
+    return ModalHarmonicEnvelope(
+        torch.zeros(num_total_knots, num_modes, 2, device=device, dtype=dtype)
     )
 
 
@@ -587,23 +617,23 @@ def _require_equal_checkpoint_tensor(
     checkpoint_path: str,
 ) -> None:
     if key not in state_dict:
-        raise ValueError(f"Harmonic source checkpoint is missing {key}: {checkpoint_path}")
+        raise ValueError(f"Envelope source checkpoint is missing {key}: {checkpoint_path}")
     actual = state_dict[key].detach().cpu()
     expected_cpu = expected.detach().cpu()
     if actual.shape != expected_cpu.shape or actual.dtype != expected_cpu.dtype:
         raise ValueError(
-            f"Harmonic source {key} shape/dtype does not match the current "
+            f"Envelope source {key} shape/dtype does not match the current "
             f"initialization: {tuple(actual.shape)}/{actual.dtype} versus "
             f"{tuple(expected_cpu.shape)}/{expected_cpu.dtype}"
         )
     if not torch.equal(actual, expected_cpu):
         raise ValueError(
-            f"Harmonic source {key} differs from the current static checkpoint "
+            f"Envelope source {key} differs from the current static checkpoint "
             "or staged manifest"
         )
 
 
-def _validate_harmonic_source_gaussians(
+def _validate_envelope_source_gaussians(
     state_dict: dict[str, torch.Tensor],
     part_name: str,
     params: GaussianParams | None,
@@ -618,7 +648,7 @@ def _validate_harmonic_source_gaussians(
     )
     if actual_keys != expected_keys:
         raise ValueError(
-            f"Harmonic source {part_name} Gaussian fields do not match the "
+            f"Envelope source {part_name} Gaussian fields do not match the "
             f"current static checkpoint: {checkpoint_path}"
         )
     if params is None:
@@ -632,9 +662,11 @@ def _validate_harmonic_source_gaussians(
         )
 
 
-def _load_harmonic_activations_from_checkpoint(
+def _load_harmonic_envelope_from_checkpoint(
     path: str | None,
     view_ids: list[str],
+    envelope_layout: ModalEnvelopeLayout,
+    knot_interval_sec: float,
     modal_phi_real: torch.Tensor,
     modal_phi_imag: torch.Tensor,
     modal_freqs_hz: torch.Tensor,
@@ -642,25 +674,48 @@ def _load_harmonic_activations_from_checkpoint(
     fg_params: GaussianParams,
     bg_params: GaussianParams | None,
     device: torch.device,
-) -> ModalActivations:
+) -> ModalHarmonicEnvelope:
     if path is None:
-        raise ValueError("anchor_delta refinement requires --modal-harmonic-init-ckpt")
+        raise ValueError("anchor_delta refinement requires --modal-envelope-init-ckpt")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Harmonic source checkpoint does not exist: {path}")
+        raise FileNotFoundError(f"Envelope source checkpoint does not exist: {path}")
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     state_dict = checkpoint.get("model")
     if not isinstance(state_dict, dict):
-        raise ValueError(f"Harmonic source checkpoint has no model state: {path}")
+        raise ValueError(f"Envelope source checkpoint has no model state: {path}")
     metadata = checkpoint.get("init_metadata")
     if not isinstance(metadata, dict):
-        raise ValueError(f"Harmonic source checkpoint has no init_metadata: {path}")
-    if metadata.get("modal_parameterization") != "per_view_harmonic_v1":
+        raise ValueError(f"Envelope source checkpoint has no init_metadata: {path}")
+    if (
+        metadata.get("modal_parameterization")
+        != "per_view_harmonic_envelope_v1"
+    ):
         raise ValueError(
-            "Harmonic source checkpoint must use per_view_harmonic_v1"
+            "Envelope source checkpoint must use "
+            "per_view_harmonic_envelope_v1"
+        )
+    if metadata.get("modal_envelope_interpolation") != "linear_complex":
+        raise ValueError(
+            "Envelope source checkpoint must use linear_complex interpolation"
+        )
+    source_interval = metadata.get("modal_envelope_knot_interval_sec")
+    if (
+        isinstance(source_interval, bool)
+        or not isinstance(source_interval, (int, float))
+        or not np.isfinite(float(source_interval))
+        or not np.isclose(
+            float(source_interval),
+            float(knot_interval_sec),
+            rtol=1.0e-6,
+            atol=1.0e-8,
+        )
+    ):
+        raise ValueError(
+            "Envelope source knot interval does not match the current run"
         )
     if metadata.get("modal_shape_parameterization") is not None:
         raise ValueError(
-            "Harmonic source checkpoint must be a fixed-shape Stage 2 checkpoint"
+            "Envelope source checkpoint must be a fixed-shape Stage 2B checkpoint"
         )
     refinement_keys = {
         "modal_refinement.params.delta_phi",
@@ -669,17 +724,17 @@ def _load_harmonic_activations_from_checkpoint(
     present_refinement_keys = sorted(refinement_keys & set(state_dict))
     if present_refinement_keys:
         raise ValueError(
-            "Harmonic source checkpoint already contains shape refinement: "
+            "Envelope source checkpoint already contains shape refinement: "
             f"{present_refinement_keys}"
         )
 
     source_frame_map = metadata.get("modal_frame_map")
     if not isinstance(source_frame_map, str) or not source_frame_map:
-        raise ValueError("Harmonic source metadata is missing modal_frame_map")
+        raise ValueError("Envelope source metadata is missing modal_frame_map")
     source_frame_map_path = Path(source_frame_map).expanduser()
     if not source_frame_map_path.exists():
         raise FileNotFoundError(
-            f"Harmonic source frame map does not exist: {source_frame_map_path}"
+            f"Envelope source frame map does not exist: {source_frame_map_path}"
         )
     with source_frame_map_path.open("r", encoding="utf-8") as f:
         source_frame_payload = json.load(f)
@@ -687,57 +742,77 @@ def _load_harmonic_activations_from_checkpoint(
         "version"
     ) != 1:
         raise ValueError(
-            f"Harmonic source frame map must use version 1: {source_frame_map_path}"
+            f"Envelope source frame map must use version 1: {source_frame_map_path}"
         )
     source_view_ids = source_frame_payload.get("views")
     if source_view_ids != view_ids:
         raise ValueError(
-            "Harmonic source view order does not match the current frame map: "
+            "Envelope source view order does not match the current frame map: "
             f"{source_view_ids!r} versus {view_ids!r}"
         )
 
-    _validate_harmonic_source_gaussians(state_dict, "fg", fg_params, path)
-    _validate_harmonic_source_gaussians(state_dict, "bg", bg_params, path)
+    _validate_envelope_source_gaussians(state_dict, "fg", fg_params, path)
+    _validate_envelope_source_gaussians(state_dict, "bg", bg_params, path)
     for key, expected in (
         ("modal_phi_real", modal_phi_real),
         ("modal_phi_imag", modal_phi_imag),
         ("modal_freqs_hz", modal_freqs_hz),
         ("modal_obs_count_per_point", modal_obs_count_per_point),
+        ("modal_envelope_knot_offsets", envelope_layout.knot_offsets),
+        ("modal_envelope_knot_times_sec", envelope_layout.knot_times_sec),
+        ("modal_frame_envelope_left", envelope_layout.frame_left_indices),
+        ("modal_frame_envelope_right", envelope_layout.frame_right_indices),
+        ("modal_frame_envelope_lerp", envelope_layout.frame_lerp_weights),
     ):
         _require_equal_checkpoint_tensor(state_dict, key, expected, path)
 
-    activation_key = "modal.params.activations"
-    if activation_key not in state_dict:
-        raise ValueError(f"Harmonic source checkpoint is missing {activation_key}")
-    activations = state_dict[activation_key]
-    expected_shape = (len(view_ids), modal_phi_real.shape[0], 2)
-    if activations.shape != expected_shape:
-        raise ValueError(
-            f"Harmonic source activations must have shape {expected_shape}, "
-            f"got {tuple(activations.shape)}"
-        )
-    if not torch.is_floating_point(activations) or not bool(
-        torch.isfinite(activations).all().item()
+    interval_key = "modal_envelope_knot_interval_sec"
+    if interval_key not in state_dict or not np.isclose(
+        float(state_dict[interval_key].item()),
+        float(knot_interval_sec),
+        rtol=1.0e-6,
+        atol=1.0e-8,
     ):
-        raise ValueError("Harmonic source activations must be finite floating point")
-    if activations.dtype != modal_phi_real.dtype:
+        raise ValueError("Envelope source checkpoint has a mismatched knot interval")
+
+    envelope_key = "modal.params.envelope_knots"
+    if envelope_key not in state_dict:
+        raise ValueError(f"Envelope source checkpoint is missing {envelope_key}")
+    envelope_knots = state_dict[envelope_key]
+    expected_shape = (
+        int(envelope_layout.knot_times_sec.shape[0]),
+        modal_phi_real.shape[0],
+        2,
+    )
+    if envelope_knots.shape != expected_shape:
         raise ValueError(
-            "Harmonic source activation dtype must match staged modal phi: "
-            f"{activations.dtype} versus {modal_phi_real.dtype}"
+            f"Envelope source knots must have shape {expected_shape}, "
+            f"got {tuple(envelope_knots.shape)}"
         )
-    mode_has_activation = torch.linalg.vector_norm(activations, dim=-1).gt(0).any(dim=0)
-    if not bool(mode_has_activation.all().item()):
-        missing_modes = torch.nonzero(~mode_has_activation).flatten().tolist()
+    if not torch.is_floating_point(envelope_knots) or not bool(
+        torch.isfinite(envelope_knots).all().item()
+    ):
+        raise ValueError("Envelope source knots must be finite floating point")
+    if envelope_knots.dtype != modal_phi_real.dtype:
         raise ValueError(
-            "Each mode requires at least one nonzero source activation; zero modes: "
+            "Envelope source knot dtype must match staged modal phi: "
+            f"{envelope_knots.dtype} versus {modal_phi_real.dtype}"
+        )
+    mode_has_envelope = (
+        torch.linalg.vector_norm(envelope_knots, dim=-1).gt(0).any(dim=0)
+    )
+    if not bool(mode_has_envelope.all().item()):
+        missing_modes = torch.nonzero(~mode_has_envelope).flatten().tolist()
+        raise ValueError(
+            "Each mode requires at least one nonzero source envelope knot; zero modes: "
             f"{missing_modes}"
         )
     guru.info(
-        f"Loaded fixed harmonic activations from {path}: "
-        f"shape={tuple(activations.shape)}"
+        f"Loaded fixed harmonic envelope from {path}: "
+        f"shape={tuple(envelope_knots.shape)}"
     )
-    return ModalActivations(
-        activations.to(
+    return ModalHarmonicEnvelope(
+        envelope_knots.to(
             device=device,
             dtype=modal_phi_real.dtype,
         ).clone()
@@ -754,10 +829,13 @@ def _load_stage1_gaussians_from_checkpoint(
     state_dict = ckpt.get("model")
     if not isinstance(state_dict, dict):
         raise ValueError(f"Stage 1 init checkpoint has no model state: {path}")
-    if "modal.params.activations" in state_dict:
+    if (
+        "modal.params.activations" in state_dict
+        or "modal.params.envelope_knots" in state_dict
+    ):
         raise ValueError(
             "Stage 1 init checkpoint must be the original static checkpoint, "
-            "not a Phase 0 modal activation checkpoint"
+            "not a modal trajectory checkpoint"
         )
     trajectory_type_id = state_dict.get("trajectory_type_id")
     if trajectory_type_id is not None and int(trajectory_type_id.item()) != (
@@ -866,16 +944,26 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_stage2_lr_fg_scales": cfg.modal_stage2_lr_fg_scales,
         "modal_stage2_lr_fg_quats": cfg.modal_stage2_lr_fg_quats,
         "w_act_mag": cfg.loss.w_act_mag,
+        "w_envelope_smooth": cfg.loss.w_envelope_smooth,
         "data": data_metadata,
     }
     if cfg.trajectory_type == "modal_activation":
-        metadata["modal_parameterization"] = "per_view_harmonic_v1"
+        metadata.update(
+            {
+                "modal_parameterization": "per_view_harmonic_envelope_v1",
+                "modal_envelope_knot_interval_sec": (
+                    cfg.modal_envelope_knot_interval_sec
+                ),
+                "modal_envelope_interpolation": "linear_complex",
+                "lr_modal_envelope_knots": cfg.lr.modal.envelope_knots,
+            }
+        )
     if cfg.modal_shape_refinement == "anchor_delta":
         metadata.update(
             {
                 "modal_shape_parameterization": "anchor_delta_phi_v1",
-                "modal_harmonic_init_ckpt": cfg.modal_harmonic_init_ckpt,
-                "modal_activation_frozen": True,
+                "modal_envelope_init_ckpt": cfg.modal_envelope_init_ckpt,
+                "modal_envelope_frozen": True,
                 "w_modal_2d": cfg.loss.w_modal_2d,
                 "w_delta_phi_prior": cfg.loss.w_delta_phi_prior,
                 "w_delta_phi_spatial": cfg.loss.w_delta_phi_spatial,
@@ -924,13 +1012,13 @@ def _validate_checkpoint_policy(
     expected_parameterization = expected_metadata.get("modal_parameterization")
     actual_parameterization = actual_metadata.get("modal_parameterization")
     if (
-        expected_parameterization == "per_view_harmonic_v1"
+        expected_parameterization == "per_view_harmonic_envelope_v1"
         and actual_parameterization != expected_parameterization
     ):
         raise ValueError(
             "Checkpoint uses an incompatible modal parameterization "
             f"({actual_parameterization!r}); expected "
-            "'per_view_harmonic_v1'. Start a new work_dir from the static "
+            "'per_view_harmonic_envelope_v1'. Start a new work_dir from the static "
             "checkpoint and staged modal manifest."
         )
     expected_shape_parameterization = expected_metadata.get(
@@ -1213,6 +1301,67 @@ def _sample_colmap_points(
 
 
 def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
+    if cfg.trajectory_type == "modal_activation":
+        if cfg.modal_warmup_epochs != 0:
+            raise ValueError(
+                "Harmonic-envelope training requires --modal-warmup-epochs 0"
+            )
+        if (
+            not np.isfinite(cfg.modal_envelope_knot_interval_sec)
+            or cfg.modal_envelope_knot_interval_sec <= 0.0
+        ):
+            raise ValueError(
+                "--modal-envelope-knot-interval-sec must be finite and positive"
+            )
+        if (
+            not np.isfinite(cfg.lr.modal.envelope_knots)
+            or cfg.lr.modal.envelope_knots <= 0.0
+        ):
+            raise ValueError(
+                "--lr.modal.envelope-knots must be finite and positive"
+            )
+        envelope_loss_weights = {
+            "w_act_mag": cfg.loss.w_act_mag,
+            "w_envelope_smooth": cfg.loss.w_envelope_smooth,
+        }
+        invalid_envelope_weights = [
+            name
+            for name, weight in envelope_loss_weights.items()
+            if not np.isfinite(weight) or weight < 0.0
+        ]
+        if invalid_envelope_weights:
+            raise ValueError(
+                "Modal envelope loss weights must be finite and non-negative: "
+                f"{invalid_envelope_weights}"
+            )
+        gaussian_training_options = {
+            "modal_train_base_means": cfg.modal_train_base_means,
+            "modal_stage2_train_base_means": cfg.modal_stage2_train_base_means,
+            "modal_stage2_train_colors": cfg.modal_stage2_train_colors,
+            "modal_stage2_train_opacities": cfg.modal_stage2_train_opacities,
+            "modal_stage2_train_scales": cfg.modal_stage2_train_scales,
+            "modal_stage2_train_quats": cfg.modal_stage2_train_quats,
+            "modal_stage2_train_bg_means": cfg.modal_stage2_train_bg_means,
+            "modal_stage2_train_bg_colors": cfg.modal_stage2_train_bg_colors,
+            "modal_stage2_train_bg_opacities": cfg.modal_stage2_train_bg_opacities,
+            "modal_stage2_train_bg_scales": cfg.modal_stage2_train_bg_scales,
+            "modal_stage2_train_bg_quats": cfg.modal_stage2_train_bg_quats,
+        }
+        enabled_gaussian_options = [
+            name for name, enabled in gaussian_training_options.items() if enabled
+        ]
+        if enabled_gaussian_options:
+            raise ValueError(
+                "Harmonic-envelope training freezes every Gaussian parameter; "
+                f"enabled options: {enabled_gaussian_options}"
+            )
+        if (
+            cfg.modal_stage2_lr_fg_scales is not None
+            or cfg.modal_stage2_lr_fg_quats is not None
+        ):
+            raise ValueError(
+                "Harmonic-envelope training does not accept Gaussian LR overrides"
+            )
     is_anchor_delta = cfg.modal_shape_refinement == "anchor_delta"
     refinement_weights = (
         cfg.loss.w_modal_2d,
@@ -1220,9 +1369,9 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
         cfg.loss.w_delta_phi_spatial,
     )
     if not is_anchor_delta:
-        if cfg.modal_harmonic_init_ckpt is not None:
+        if cfg.modal_envelope_init_ckpt is not None:
             raise ValueError(
-                "--modal-harmonic-init-ckpt requires "
+                "--modal-envelope-init-ckpt requires "
                 "--modal-shape-refinement anchor_delta"
             )
         if any(weight != 0.0 for weight in refinement_weights):
@@ -1238,14 +1387,14 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
         raise ValueError(
             "anchor_delta refinement requires --modal-stage1-init-ckpt"
         )
-    if cfg.modal_harmonic_init_ckpt is None:
+    if cfg.modal_envelope_init_ckpt is None:
         raise ValueError(
-            "anchor_delta refinement requires --modal-harmonic-init-ckpt"
+            "anchor_delta refinement requires --modal-envelope-init-ckpt"
         )
-    if not os.path.exists(cfg.modal_harmonic_init_ckpt):
+    if not os.path.exists(cfg.modal_envelope_init_ckpt):
         raise FileNotFoundError(
-            "Harmonic source checkpoint does not exist: "
-            f"{cfg.modal_harmonic_init_ckpt}"
+            "Envelope source checkpoint does not exist: "
+            f"{cfg.modal_envelope_init_ckpt}"
         )
     if cfg.modal_manifest is None or cfg.modal_frame_map is None:
         raise ValueError(
@@ -1260,33 +1409,6 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
             "--vis-debug, then use run_modal_reconstruction.py"
         )
 
-    gaussian_training_options = {
-        "modal_train_base_means": cfg.modal_train_base_means,
-        "modal_stage2_train_base_means": cfg.modal_stage2_train_base_means,
-        "modal_stage2_train_colors": cfg.modal_stage2_train_colors,
-        "modal_stage2_train_opacities": cfg.modal_stage2_train_opacities,
-        "modal_stage2_train_scales": cfg.modal_stage2_train_scales,
-        "modal_stage2_train_quats": cfg.modal_stage2_train_quats,
-        "modal_stage2_train_bg_means": cfg.modal_stage2_train_bg_means,
-        "modal_stage2_train_bg_colors": cfg.modal_stage2_train_bg_colors,
-        "modal_stage2_train_bg_opacities": cfg.modal_stage2_train_bg_opacities,
-        "modal_stage2_train_bg_scales": cfg.modal_stage2_train_bg_scales,
-        "modal_stage2_train_bg_quats": cfg.modal_stage2_train_bg_quats,
-    }
-    enabled_gaussian_options = [
-        name for name, enabled in gaussian_training_options.items() if enabled
-    ]
-    if enabled_gaussian_options:
-        raise ValueError(
-            "anchor_delta refinement freezes every Gaussian parameter; enabled "
-            f"options: {enabled_gaussian_options}"
-        )
-    if (
-        cfg.modal_stage2_lr_fg_scales is not None
-        or cfg.modal_stage2_lr_fg_quats is not None
-    ):
-        raise ValueError("anchor_delta refinement does not accept Gaussian LR overrides")
-
     unrelated_loss_weights = {
         "w_depth_reg": cfg.loss.w_depth_reg,
         "w_depth_const": cfg.loss.w_depth_const,
@@ -1298,6 +1420,7 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
         "w_z_accel": cfg.loss.w_z_accel,
         "w_dct_coef": cfg.loss.w_dct_coef,
         "w_act_mag": cfg.loss.w_act_mag,
+        "w_envelope_smooth": cfg.loss.w_envelope_smooth,
         "w_local_iso_ray": cfg.loss.w_local_iso_ray,
         "w_local_iso_perp": cfg.loss.w_local_iso_perp,
         "w_local_iso_dist": cfg.loss.w_local_iso_dist,

@@ -111,12 +111,12 @@ class Renderer:
         )
         has_delta_phi = MODAL_DELTA_PHI_STATE_KEY in state_dict
         has_anchor_mask = MODAL_ANCHOR_MASK_STATE_KEY in state_dict
-        has_frozen_activation = (
+        has_frozen_envelope = (
             isinstance(init_metadata, dict)
-            and init_metadata.get("modal_activation_frozen") is True
+            and init_metadata.get("modal_envelope_frozen") is True
         )
-        harmonic_source = (
-            init_metadata.get("modal_harmonic_init_ckpt")
+        envelope_source = (
+            init_metadata.get("modal_envelope_init_ckpt")
             if isinstance(init_metadata, dict)
             else None
         )
@@ -128,9 +128,9 @@ class Renderer:
             shape_parameterization == MODAL_SHAPE_PARAMETERIZATION
             and has_delta_phi
             and has_anchor_mask
-            and has_frozen_activation
-            and isinstance(harmonic_source, str)
-            and bool(harmonic_source)
+            and has_frozen_envelope
+            and isinstance(envelope_source, str)
+            and bool(envelope_source)
         ):
             raise ValueError(
                 "Viser rendering does not yet support Stage 3A refined modal "
@@ -143,20 +143,63 @@ class Renderer:
                 "shape-refinement contract"
             )
         if "modal.params.activations" in state_dict:
-            if "modal_frame_times_sec" not in state_dict:
+            raise ValueError(
+                "Constant per-view harmonic activation checkpoints are not "
+                "supported; render a harmonic-envelope checkpoint"
+            )
+        if "modal.params.envelope_knots" in state_dict:
+            if not isinstance(init_metadata, dict):
+                raise ValueError("Envelope checkpoint metadata must be a mapping")
+            required_envelope_keys = {
+                "modal_frame_times_sec",
+                "modal_envelope_knot_offsets",
+                "modal_envelope_knot_times_sec",
+                "modal_envelope_knot_interval_sec",
+                "modal_frame_envelope_left",
+                "modal_frame_envelope_right",
+                "modal_frame_envelope_lerp",
+            }
+            missing_envelope_keys = sorted(required_envelope_keys - set(state_dict))
+            if missing_envelope_keys:
                 raise ValueError(
-                    "Legacy per-frame modal activation checkpoints are not "
-                    "supported; render a per-view harmonic checkpoint"
+                    "Harmonic-envelope checkpoint is missing required state: "
+                    f"{missing_envelope_keys}"
                 )
             parameterization = (
                 init_metadata.get("modal_parameterization")
                 if isinstance(init_metadata, dict)
                 else None
             )
-            if parameterization != "per_view_harmonic_v1":
+            if parameterization != "per_view_harmonic_envelope_v1":
                 raise ValueError(
                     "Checkpoint uses an incompatible modal parameterization "
-                    f"({parameterization!r}); expected 'per_view_harmonic_v1'"
+                    f"({parameterization!r}); expected "
+                    "'per_view_harmonic_envelope_v1'"
+                )
+            if init_metadata.get("modal_envelope_interpolation") != "linear_complex":
+                raise ValueError(
+                    "Checkpoint must use linear_complex modal envelope interpolation"
+                )
+            metadata_interval = init_metadata.get(
+                "modal_envelope_knot_interval_sec"
+            )
+            state_interval = state_dict["modal_envelope_knot_interval_sec"]
+            if (
+                isinstance(metadata_interval, bool)
+                or not isinstance(metadata_interval, (int, float))
+                or not np.isfinite(float(metadata_interval))
+                or float(metadata_interval) <= 0.0
+                or not isinstance(state_interval, torch.Tensor)
+                or state_interval.ndim != 0
+                or not np.isclose(
+                    float(state_interval.item()),
+                    float(metadata_interval),
+                    rtol=1.0e-6,
+                    atol=1.0e-8,
+                )
+            ):
+                raise ValueError(
+                    "Checkpoint envelope interval state/metadata is invalid"
                 )
         model = SceneModel.init_from_state_dict(state_dict)
         model.use_2dgs = use_2dgs

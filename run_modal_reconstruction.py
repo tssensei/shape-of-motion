@@ -18,6 +18,7 @@ from loguru import logger as guru
 
 from flow3d.data.casual_dataset import CasualDataset
 from flow3d.metrics import mSSIM
+from flow3d.modal_utils import ModalFrameMap, build_modal_envelope_layout
 from flow3d.scene_model import SceneModel
 
 
@@ -60,7 +61,7 @@ class _ViewMetricAccumulator:
         target: torch.Tensor,
         valid_mask: torch.Tensor,
         foreground_mask: torch.Tensor,
-    ) -> None:
+    ) -> dict[str, float | int | None]:
         if (
             rendered.shape != target.shape
             or rendered.ndim != 3
@@ -91,17 +92,32 @@ class _ViewMetricAccumulator:
         self.frame_count += 1
         self.valid_pixel_count += valid_count
         self.foreground_pixel_count += int(foreground.sum().item())
-        self.absolute_error_sum += float(
+        absolute_error_sum = float(
             (diff.abs() * valid_channels).sum().detach().cpu().item()
         )
-        self.squared_error_sum += float(
+        squared_error_sum = float(
             (diff.square() * valid_channels).sum().detach().cpu().item()
         )
+        self.absolute_error_sum += absolute_error_sum
+        self.squared_error_sum += squared_error_sum
         self.ssim.update(
             rendered[None],
             target[None],
             valid[None].to(rendered.dtype),
         )
+        channel_count = 3 * valid_count
+        mean_squared_error = squared_error_sum / channel_count
+        return {
+            "valid_pixel_count": valid_count,
+            "foreground_pixel_count": int(foreground.sum().item()),
+            "rgb_l1": absolute_error_sum / channel_count,
+            "psnr_db": (
+                None
+                if mean_squared_error == 0.0
+                else -10.0 * math.log10(mean_squared_error)
+            ),
+            "ssim": float(self.ssim.similarity[-1].detach().cpu().item()),
+        }
 
     def summary(self) -> dict[str, Any]:
         if self.frame_count == 0 or self.valid_pixel_count == 0:
@@ -139,21 +155,21 @@ def _validate_modal_shape_checkpoint_contract(
 
     if marker is None and not has_any_shape_state:
         return False
-    has_frozen_activation = (
+    has_frozen_envelope = (
         isinstance(init_metadata, dict)
-        and init_metadata.get("modal_activation_frozen") is True
+        and init_metadata.get("modal_envelope_frozen") is True
     )
-    harmonic_source = (
-        init_metadata.get("modal_harmonic_init_ckpt")
+    envelope_source = (
+        init_metadata.get("modal_envelope_init_ckpt")
         if isinstance(init_metadata, dict)
         else None
     )
     if (
         marker == MODAL_SHAPE_PARAMETERIZATION
         and has_complete_shape_state
-        and has_frozen_activation
-        and isinstance(harmonic_source, str)
-        and bool(harmonic_source)
+        and has_frozen_envelope
+        and isinstance(envelope_source, str)
+        and bool(envelope_source)
     ):
         return True
     raise ValueError(
@@ -161,8 +177,8 @@ def _validate_modal_shape_checkpoint_contract(
         "contract: expected no shape marker/state for Stage 2, or "
         f"modal_shape_parameterization={MODAL_SHAPE_PARAMETERIZATION!r} with "
         f"both {MODAL_DELTA_PHI_STATE_KEY!r} and "
-        f"{MODAL_ANCHOR_MASK_STATE_KEY!r}, frozen activation metadata, and "
-        "a harmonic source checkpoint"
+        f"{MODAL_ANCHOR_MASK_STATE_KEY!r}, frozen envelope metadata, and "
+        "an envelope source checkpoint"
     )
 
 
@@ -275,21 +291,18 @@ def _load_checkpoint_model(
     state_dict = checkpoint.get("model")
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint has no model state: {checkpoint_path}")
-    if (
-        "modal.params.activations" in state_dict
-        and "modal_frame_times_sec" not in state_dict
-    ):
+    if "modal.params.activations" in state_dict:
         raise ValueError(
-            "Checkpoint contains obsolete per-frame modal activations and has no "
-            "modal_frame_times_sec; reconstruct from a per-view harmonic checkpoint"
+            "Constant per-view harmonic activation checkpoints are not supported; "
+            "reconstruct from a harmonic-envelope checkpoint"
         )
     init_metadata = checkpoint.get("init_metadata")
     if (
-        "modal.params.activations" in state_dict
+        "modal.params.envelope_knots" in state_dict
         and (
             not isinstance(init_metadata, dict)
             or init_metadata.get("modal_parameterization")
-            != "per_view_harmonic_v1"
+            != "per_view_harmonic_envelope_v1"
         )
     ):
         parameterization = (
@@ -299,8 +312,38 @@ def _load_checkpoint_model(
         )
         raise ValueError(
             "Checkpoint uses an incompatible modal parameterization "
-            f"({parameterization!r}); expected 'per_view_harmonic_v1'"
+            f"({parameterization!r}); expected "
+            "'per_view_harmonic_envelope_v1'"
         )
+    if "modal.params.envelope_knots" in state_dict:
+        if not isinstance(init_metadata, dict):
+            raise ValueError("Envelope checkpoint metadata must be a mapping")
+        if init_metadata.get("modal_envelope_interpolation") != "linear_complex":
+            raise ValueError(
+                "Checkpoint must use linear_complex modal envelope interpolation"
+            )
+        metadata_interval = init_metadata.get("modal_envelope_knot_interval_sec")
+        if (
+            isinstance(metadata_interval, bool)
+            or not isinstance(metadata_interval, (int, float))
+            or not math.isfinite(float(metadata_interval))
+            or float(metadata_interval) <= 0.0
+        ):
+            raise ValueError("Checkpoint metadata has an invalid envelope interval")
+        state_interval = state_dict.get("modal_envelope_knot_interval_sec")
+        if (
+            not isinstance(state_interval, torch.Tensor)
+            or state_interval.ndim != 0
+            or not np.isclose(
+                float(state_interval.item()),
+                float(metadata_interval),
+                rtol=1.0e-6,
+                atol=1.0e-8,
+            )
+        ):
+            raise ValueError(
+                "Checkpoint envelope interval state does not match metadata"
+            )
     _validate_modal_shape_checkpoint_contract(state_dict, init_metadata)
     try:
         model = SceneModel.init_from_state_dict(state_dict)
@@ -466,29 +509,19 @@ def _validate_model_alignment(
             f"Checkpoint has {model.num_frames} frames but dataset has {frame_count}"
         )
     if model.modal is None:
-        raise ValueError("Checkpoint has no modal activations")
-    activations = model.modal.params["activations"]
+        raise ValueError("Checkpoint has no modal envelope")
+    envelope_knots = model.modal.params["envelope_knots"]
     num_modes = int(model.modal_phi_real.shape[0])
-    expected_activation_shape = (len(view_ids), num_modes, 2)
-    if activations.ndim == 3 and activations.shape == (
-        frame_count,
+    if envelope_knots.ndim != 3 or tuple(envelope_knots.shape[1:]) != (
         num_modes,
         2,
-    ) and activations.shape != expected_activation_shape:
-        raise ValueError(
-            "Checkpoint contains obsolete per-frame modal activations; "
-            "expected per-view harmonic activations"
-        )
-    if (
-        activations.ndim != 3
-        or tuple(activations.shape) != expected_activation_shape
     ):
         raise ValueError(
-            "Checkpoint harmonic activation shape is inconsistent: expected "
-            f"{expected_activation_shape}, got {tuple(activations.shape)}"
+            "Checkpoint harmonic envelope shape is inconsistent: expected "
+            f"(N, {num_modes}, 2), got {tuple(envelope_knots.shape)}"
         )
-    if not bool(torch.isfinite(activations).all()):
-        raise ValueError("Checkpoint harmonic activations contain non-finite values")
+    if not bool(torch.isfinite(envelope_knots).all()):
+        raise ValueError("Checkpoint harmonic envelope contains non-finite values")
     if num_modes == 0:
         raise ValueError("Checkpoint contains no modal modes")
     frequencies_hz = model.modal_freqs_hz.detach().cpu()
@@ -536,8 +569,8 @@ def _validate_model_alignment(
         raise ValueError("Modal frame local indices do not match checkpoint")
     if not hasattr(model, "modal_frame_times_sec"):
         raise ValueError(
-            "Checkpoint has no modal_frame_times_sec and is not a per-view "
-            "harmonic checkpoint"
+            "Checkpoint has no modal_frame_times_sec and is not a harmonic-envelope "
+            "checkpoint"
         )
     actual_times_sec = model.modal_frame_times_sec.detach().cpu()
     if actual_times_sec.shape != expected_times_sec.shape:
@@ -549,24 +582,51 @@ def _validate_model_alignment(
     ):
         raise ValueError("Modal frame times do not match checkpoint")
 
+    interval_tensor = model.modal_envelope_knot_interval_sec.detach().cpu()
+    if interval_tensor.ndim != 0 or not bool(torch.isfinite(interval_tensor)) or float(
+        interval_tensor.item()
+    ) <= 0.0:
+        raise ValueError("Checkpoint modal envelope knot interval is invalid")
+    expected_layout = build_modal_envelope_layout(
+        ModalFrameMap(
+            view_ids=list(view_ids),
+            frame_view_indices=expected_view_indices,
+            frame_local_indices=expected_local_indices,
+            frame_times_sec=expected_times_sec,
+        ),
+        float(interval_tensor.item()),
+    )
+    expected_envelope_state = {
+        "modal_envelope_knot_offsets": expected_layout.knot_offsets,
+        "modal_envelope_knot_times_sec": expected_layout.knot_times_sec,
+        "modal_frame_envelope_left": expected_layout.frame_left_indices,
+        "modal_frame_envelope_right": expected_layout.frame_right_indices,
+        "modal_frame_envelope_lerp": expected_layout.frame_lerp_weights,
+    }
+    for name, expected in expected_envelope_state.items():
+        actual = getattr(model, name).detach().cpu()
+        if actual.shape != expected.shape or actual.dtype != expected.dtype:
+            raise ValueError(f"Checkpoint {name} shape/dtype is inconsistent")
+        if not torch.equal(actual, expected.detach().cpu()):
+            raise ValueError(f"Checkpoint {name} does not match the frame map")
+    expected_knot_shape = (
+        int(expected_layout.knot_times_sec.shape[0]),
+        num_modes,
+        2,
+    )
+    if tuple(envelope_knots.shape) != expected_knot_shape:
+        raise ValueError(
+            "Checkpoint harmonic envelope shape is inconsistent: expected "
+            f"{expected_knot_shape}, got {tuple(envelope_knots.shape)}"
+        )
 
-def _activation_stats(
-    activations: torch.Tensor,
-    view_indices: Sequence[int],
-) -> dict[str, float]:
-    if activations.ndim != 3 or activations.shape[-1] != 2:
-        raise ValueError("Modal activations must have shape (V, K, 2)")
-    if not view_indices:
-        raise ValueError("Activation statistics require at least one view")
-    indices = np.asarray(view_indices, dtype=np.int64)
-    if indices.min() < 0 or indices.max() >= activations.shape[0]:
-        raise ValueError("Activation statistics contain an out-of-range view index")
-    if np.unique(indices).shape[0] != indices.shape[0]:
-        raise ValueError("Activation statistics contain duplicate view indices")
-    selected = activations.detach().cpu().numpy()[indices]
-    if not np.isfinite(selected).all():
-        raise ValueError("Modal activations contain non-finite values")
-    magnitudes = np.linalg.norm(selected, axis=-1).reshape(-1).astype(np.float64)
+
+def _magnitude_stats(magnitudes: np.ndarray) -> dict[str, float]:
+    magnitudes = np.asarray(magnitudes, dtype=np.float64).reshape(-1)
+    if magnitudes.size == 0:
+        raise ValueError("Envelope magnitude statistics require non-empty values")
+    if not np.isfinite(magnitudes).all() or np.any(magnitudes < 0.0):
+        raise ValueError("Envelope magnitudes must be finite and non-negative")
     return {
         "rms": float(np.sqrt(np.mean(np.square(magnitudes)))),
         "p50": float(np.percentile(magnitudes, 50)),
@@ -575,46 +635,40 @@ def _activation_stats(
     }
 
 
-def _harmonic_modes(
-    activations: torch.Tensor,
+def _harmonic_envelope_modes(
+    frame_envelopes: torch.Tensor,
     frequencies_hz: torch.Tensor,
-    view_index: int,
-) -> list[dict[str, float | int | None]]:
-    if activations.ndim != 3 or activations.shape[-1] != 2:
-        raise ValueError("Modal activations must have shape (V, K, 2)")
-    if view_index < 0 or view_index >= activations.shape[0]:
-        raise ValueError("Harmonic mode view index is out of range")
-    if frequencies_hz.shape != (activations.shape[1],):
-        raise ValueError("Modal frequency shape does not match harmonic activations")
-    amplitudes = activations[view_index].detach().cpu().numpy()
+    knot_count: int,
+) -> list[dict[str, float | int]]:
+    if frame_envelopes.ndim != 3 or frame_envelopes.shape[-1] != 2:
+        raise ValueError("Frame envelopes must have shape (T, K, 2)")
+    if frame_envelopes.shape[0] <= 0:
+        raise ValueError("Frame envelope summary requires at least one frame")
+    if frequencies_hz.shape != (frame_envelopes.shape[1],):
+        raise ValueError("Modal frequency shape does not match harmonic envelope")
+    if knot_count <= 0:
+        raise ValueError("Harmonic envelope mode summary requires positive knot count")
+    envelopes = frame_envelopes.detach().cpu().numpy()
     frequencies = frequencies_hz.detach().cpu().numpy()
     if (
-        not np.isfinite(amplitudes).all()
+        not np.isfinite(envelopes).all()
         or not np.isfinite(frequencies).all()
         or np.any(frequencies <= 0.0)
     ):
-        raise ValueError(
-            "Harmonic mode values contain invalid amplitudes or frequencies"
-        )
-    modes: list[dict[str, float | int | None]] = []
-    for mode_slot, (amplitude, frequency_hz) in enumerate(
-        zip(amplitudes, frequencies, strict=True)
-    ):
-        real = float(amplitude[0])
-        imaginary = float(amplitude[1])
-        magnitude = math.hypot(real, imaginary)
+        raise ValueError("Harmonic envelope contains invalid values")
+    modes: list[dict[str, float | int]] = []
+    for mode_slot, frequency_hz in enumerate(frequencies):
+        magnitudes = np.linalg.norm(envelopes[:, mode_slot], axis=-1)
+        stats = _magnitude_stats(magnitudes)
         modes.append(
             {
                 "mode_slot": mode_slot,
                 "frequency_hz": float(frequency_hz),
-                "real": real,
-                "imaginary": imaginary,
-                "magnitude": magnitude,
-                "phase_rad": (
-                    None
-                    if magnitude <= 1.0e-12
-                    else math.atan2(imaginary, real)
-                ),
+                "knot_count": knot_count,
+                "magnitude_rms": stats["rms"],
+                "magnitude_p50": stats["p50"],
+                "magnitude_p90": stats["p90"],
+                "magnitude_max": stats["max"],
             }
         )
     return modes
@@ -795,6 +849,83 @@ def _write_metrics(path: Path, payload: Mapping[str, Any]) -> None:
         f.write("\n")
 
 
+def _write_envelope_knots(
+    path: Path,
+    model: SceneModel,
+    view_ids: Sequence[str],
+) -> None:
+    if model.modal is None:
+        raise ValueError("Cannot write envelope knots without modal parameters")
+    knots = model.modal.params["envelope_knots"].detach().cpu().numpy()
+    if knots.ndim != 3 or knots.shape[-1] != 2 or not np.isfinite(knots).all():
+        raise ValueError("Checkpoint envelope knots are invalid")
+    real = knots[..., 0]
+    imaginary = knots[..., 1]
+    magnitude = np.hypot(real, imaginary)
+    phase = np.arctan2(imaginary, real)
+    phase = np.where(magnitude <= 1.0e-12, np.nan, phase)
+    np.savez_compressed(
+        path,
+        view_ids=np.asarray(view_ids),
+        frequencies_hz=model.modal_freqs_hz.detach().cpu().numpy(),
+        knot_offsets=model.modal_envelope_knot_offsets.detach().cpu().numpy(),
+        knot_times_sec=(
+            model.modal_envelope_knot_times_sec.detach().cpu().numpy()
+        ),
+        knot_real=real,
+        knot_imag=imaginary,
+        knot_magnitude=magnitude,
+        knot_phase_rad=phase,
+    )
+
+
+def _write_temporal_metrics(
+    path: Path,
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    if not records:
+        raise ValueError("Cannot write empty temporal reconstruction metrics")
+    ordered = sorted(records, key=lambda record: int(record["ts"]))
+    expected_ts = list(range(len(ordered)))
+    actual_ts = [int(record["ts"]) for record in ordered]
+    if actual_ts != expected_ts:
+        raise ValueError("Temporal reconstruction records do not cover global ts order")
+    envelope_magnitude = np.stack(
+        [np.asarray(record["envelope_magnitude"]) for record in ordered],
+        axis=0,
+    )
+    if not np.isfinite(envelope_magnitude).all():
+        raise ValueError("Temporal envelope magnitudes contain non-finite values")
+    psnr_db = np.asarray(
+        [
+            np.inf if record["psnr_db"] is None else float(record["psnr_db"])
+            for record in ordered
+        ],
+        dtype=np.float64,
+    )
+    np.savez_compressed(
+        path,
+        frame_name=np.asarray([str(record["frame_name"]) for record in ordered]),
+        view_index=np.asarray(
+            [int(record["view_index"]) for record in ordered], dtype=np.int64
+        ),
+        local_index=np.asarray(
+            [int(record["local_index"]) for record in ordered], dtype=np.int64
+        ),
+        time_sec=np.asarray(
+            [float(record["time_sec"]) for record in ordered], dtype=np.float64
+        ),
+        rgb_l1=np.asarray(
+            [float(record["rgb_l1"]) for record in ordered], dtype=np.float64
+        ),
+        psnr_db=psnr_db,
+        ssim=np.asarray(
+            [float(record["ssim"]) for record in ordered], dtype=np.float64
+        ),
+        envelope_magnitude=envelope_magnitude,
+    )
+
+
 def _resolve_checkpoint_path(work_dir: Path, ckpt_path: str | None) -> Path:
     return (
         Path(ckpt_path).expanduser()
@@ -831,7 +962,7 @@ def run(cfg: ModalReconstructionConfig) -> None:
     _validate_model_alignment(model, dataset, view_ids, frames_by_view)
     modal = model.modal
     if modal is None:
-        raise ValueError("Checkpoint has no modal activations")
+        raise ValueError("Checkpoint has no modal envelope")
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir = Path(
@@ -843,24 +974,38 @@ def run(cfg: ModalReconstructionConfig) -> None:
     try:
         dataset_Ks = dataset.get_Ks()
         dataset_w2cs = dataset.get_w2cs()
-        activations = modal.params["activations"]
         view_metrics: dict[str, dict[str, Any]] = {}
         accumulators = []
         summaries = []
+        temporal_records: list[dict[str, Any]] = []
+        active_envelope_magnitudes: list[np.ndarray] = []
         active_view_ids = [
             view_id for view_id in view_ids if frames_by_view[view_id]
-        ]
-        active_view_indices = [
-            view_ids.index(view_id) for view_id in active_view_ids
         ]
 
         for view_id in active_view_ids:
             frames = frames_by_view[view_id]
+            frame_ts = torch.as_tensor(
+                [frame.ts for frame in frames],
+                device=device,
+                dtype=torch.long,
+            )
+            with torch.inference_mode():
+                envelope_real, envelope_imag = model.compute_modal_envelopes(frame_ts)
+            frame_envelopes = torch.stack(
+                [envelope_real, envelope_imag],
+                dim=-1,
+            )
+            frame_envelope_magnitudes = torch.linalg.vector_norm(
+                frame_envelopes,
+                dim=-1,
+            ).detach().cpu().numpy()
+            active_envelope_magnitudes.append(frame_envelope_magnitudes)
             accumulator = _ViewMetricAccumulator(device)
             video_path = temporary_dir / f"{view_id}_comparison.mp4"
             writer = imageio.get_writer(str(video_path), fps=float(cfg.fps))
             try:
-                for frame in frames:
+                for frame_position, frame in enumerate(frames):
                     observed = dataset.load_image(frame.dataset_index).to(device)
                     tri_mask = dataset.load_mask(frame.dataset_index).to(device)
                     if observed.ndim != 3 or observed.shape[-1] != 3:
@@ -898,11 +1043,26 @@ def run(cfg: ModalReconstructionConfig) -> None:
                         foreground_mask,
                         model.has_bg,
                     )
-                    accumulator.update(
+                    frame_metrics = accumulator.update(
                         rendered,
                         target,
                         valid_mask,
                         foreground_mask,
+                    )
+                    temporal_records.append(
+                        {
+                            "ts": frame.ts,
+                            "frame_name": frame.frame_name,
+                            "view_index": frame.view_index,
+                            "local_index": frame.local_index,
+                            "time_sec": frame.time_sec,
+                            "rgb_l1": frame_metrics["rgb_l1"],
+                            "psnr_db": frame_metrics["psnr_db"],
+                            "ssim": frame_metrics["ssim"],
+                            "envelope_magnitude": (
+                                frame_envelope_magnitudes[frame_position]
+                            ),
+                        }
                     )
                     writer.append_data(
                         _comparison_frame(observed, rendered, target)
@@ -912,14 +1072,17 @@ def run(cfg: ModalReconstructionConfig) -> None:
 
             summary = accumulator.summary()
             view_index = frames[0].view_index
-            summary["activation_magnitude"] = _activation_stats(
-                activations,
-                [view_index],
+            summary["activation_magnitude"] = _magnitude_stats(
+                frame_envelope_magnitudes,
             )
-            summary["harmonic_modes"] = _harmonic_modes(
-                activations,
+            knot_start = int(model.modal_envelope_knot_offsets[view_index].item())
+            knot_end = int(
+                model.modal_envelope_knot_offsets[view_index + 1].item()
+            )
+            summary["harmonic_envelope_modes"] = _harmonic_envelope_modes(
+                frame_envelopes,
                 model.modal_freqs_hz,
-                view_index,
+                knot_end - knot_start,
             )
             view_metrics[view_id] = summary
             accumulators.append(accumulator)
@@ -929,12 +1092,13 @@ def run(cfg: ModalReconstructionConfig) -> None:
             )
 
         overall = _combined_summary(accumulators, summaries)
-        overall["activation_magnitude"] = _activation_stats(
-            activations,
-            active_view_indices,
+        overall["activation_magnitude"] = _magnitude_stats(
+            np.concatenate(
+                [values.reshape(-1) for values in active_envelope_magnitudes]
+            ),
         )
         metrics = {
-            "version": 1,
+            "version": 2,
             "work_dir": str(work_dir.resolve()),
             "checkpoint": str(checkpoint_path.resolve()),
             "frame_map": str(frame_map_path.resolve()),
@@ -943,12 +1107,27 @@ def run(cfg: ModalReconstructionConfig) -> None:
             "declared_views": view_ids,
             "active_views": active_view_ids,
             "num_modes": int(model.modal_phi_real.shape[0]),
+            "modal_parameterization": "per_view_harmonic_envelope_v1",
+            "modal_envelope_knot_interval_sec": float(
+                model.modal_envelope_knot_interval_sec.detach().cpu().item()
+            ),
+            "envelope_knots_path": "envelope_knots.npz",
+            "temporal_metrics_path": "temporal_metrics.npz",
             "views": view_metrics,
             "overall": overall,
         }
         shape_refinement = _shape_refinement_metrics(model)
         if shape_refinement is not None:
             metrics["shape_refinement"] = shape_refinement
+        _write_envelope_knots(
+            temporary_dir / "envelope_knots.npz",
+            model,
+            view_ids,
+        )
+        _write_temporal_metrics(
+            temporary_dir / "temporal_metrics.npz",
+            temporal_records,
+        )
         _write_metrics(temporary_dir / "metrics.json", metrics)
         os.replace(temporary_dir, output_dir)
     except BaseException:

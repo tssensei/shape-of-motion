@@ -27,7 +27,7 @@ from flow3d.vis.viewer import DynamicViewer, build_modal_playback_groups
 from flow3d.normal_utils import depth_to_normal
 
 
-def _harmonic_activation_gradient_norm(
+def _harmonic_envelope_gradient_norm(
     model: SceneModel,
     global_step: int,
 ) -> float:
@@ -35,13 +35,13 @@ def _harmonic_activation_gradient_norm(
         return 0.0
     if model.modal is None:
         raise ValueError("modal_activation trajectory requires modal parameters")
-    activation_grad = model.modal.params["activations"].grad
-    if activation_grad is None:
+    envelope_grad = model.modal.params["envelope_knots"].grad
+    if envelope_grad is None:
         return 0.0
-    grad_norm = torch.linalg.vector_norm(activation_grad)
+    grad_norm = torch.linalg.vector_norm(envelope_grad)
     if not torch.isfinite(grad_norm):
         raise FloatingPointError(
-            "Harmonic activation gradient norm is not finite at "
+            "Harmonic envelope gradient norm is not finite at "
             f"step {global_step}: {grad_norm.item()}"
         )
     return float(grad_norm.item())
@@ -228,7 +228,7 @@ class Trainer:
                 )
             elif name.startswith("motion_bases."):
                 trainable = False
-            elif name == "modal.params.activations":
+            elif name == "modal.params.envelope_knots":
                 trainable = dynamic_stage
             elif dynamic_stage:
                 trainable = self._modal_stage2_param_trainable(name)
@@ -514,6 +514,12 @@ class Trainer:
             self.viewer.lock.acquire()
 
         loss, stats, num_rays_per_step, num_rays_per_sec = self.compute_losses(batch)
+        if self.model.trajectory_type == "modal_activation" and not bool(
+            torch.isfinite(loss).item()
+        ):
+            raise FloatingPointError(
+                f"Modal training loss is not finite at step {self.global_step}"
+            )
         if loss.isnan():
             guru.info(f"Loss is NaN at step {self.global_step}!!")
             import ipdb
@@ -527,13 +533,25 @@ class Trainer:
             stats["train/modal_delta_phi_grad_norm"] = delta_grad_norm
             self.modal_delta_gradient_seen |= delta_grad_norm > 0.0
         elif self.model.trajectory_type == "modal_activation":
-            stats["train/harmonic_activation_grad_norm"] = (
-                _harmonic_activation_gradient_norm(self.model, self.global_step)
+            stats["train/harmonic_envelope_grad_norm"] = (
+                _harmonic_envelope_gradient_norm(self.model, self.global_step)
             )
 
         for opt in self.optimizers.values():
             opt.step()
             opt.zero_grad(set_to_none=True)
+        if (
+            self.model.trajectory_type == "modal_activation"
+            and self.model.modal is not None
+            and not bool(
+                torch.isfinite(
+                    self.model.modal.params["envelope_knots"]
+                ).all().item()
+            )
+        ):
+            raise FloatingPointError(
+                f"Modal envelope became non-finite at step {self.global_step}"
+            )
         _require_zero_nonanchor_delta(self.model)
         for sched in self.scheduler.values():
             sched.step()
@@ -921,6 +939,9 @@ class Trainer:
         loss += self.losses_cfg.w_z_accel * z_accel_loss
         if self.model.has_modal_refinement:
             act_mag_loss = torch.zeros((), device=self.device)
+            envelope_smoothness_loss = torch.zeros((), device=self.device)
+            envelope_rms = torch.zeros((), device=self.device)
+            envelope_max_knot_jump = torch.zeros((), device=self.device)
             (
                 modal_2d_loss,
                 delta_phi_prior_loss,
@@ -932,8 +953,19 @@ class Trainer:
             loss += self.losses_cfg.w_delta_phi_prior * delta_phi_prior_loss
             loss += self.losses_cfg.w_delta_phi_spatial * delta_phi_spatial_loss
         elif is_modal_activation:
-            act_mag_loss = self.model.compute_activation_magnitude_loss()
+            act_mag_loss = self.model.compute_envelope_magnitude_loss()
+            envelope_smoothness_loss = (
+                self.model.compute_envelope_smoothness_loss()
+            )
+            envelope_rms = torch.sqrt(act_mag_loss)
+            envelope_max_knot_jump = (
+                self.model.compute_envelope_max_knot_jump()
+            )
             loss += self.losses_cfg.w_act_mag * act_mag_loss
+            loss += (
+                self.losses_cfg.w_envelope_smooth
+                * envelope_smoothness_loss
+            )
             modal_2d_loss = torch.zeros((), device=self.device)
             delta_phi_prior_loss = torch.zeros((), device=self.device)
             delta_phi_spatial_loss = torch.zeros((), device=self.device)
@@ -941,6 +973,9 @@ class Trainer:
             modal_2d_group_loss = torch.empty((0,), device=self.device)
         else:
             act_mag_loss = torch.zeros((), device=self.device)
+            envelope_smoothness_loss = torch.zeros((), device=self.device)
+            envelope_rms = torch.zeros((), device=self.device)
+            envelope_max_knot_jump = torch.zeros((), device=self.device)
             modal_2d_loss = torch.zeros((), device=self.device)
             delta_phi_prior_loss = torch.zeros((), device=self.device)
             delta_phi_spatial_loss = torch.zeros((), device=self.device)
@@ -958,7 +993,10 @@ class Trainer:
             "train/track_2d_loss": track_2d_loss.item(),
             "train/small_accel_loss": small_accel_loss.item(),
             "train/dct_coef_loss": dct_coef_loss.item(),
-            "train/act_mag_loss": act_mag_loss.item(),
+            "train/envelope_magnitude_loss": act_mag_loss.item(),
+            "train/envelope_smoothness_loss": envelope_smoothness_loss.item(),
+            "train/envelope_rms": envelope_rms.item(),
+            "train/envelope_max_knot_jump": envelope_max_knot_jump.item(),
             "train/modal_2d_loss": modal_2d_loss.item(),
             "train/delta_phi_prior_loss": delta_phi_prior_loss.item(),
             "train/delta_phi_spatial_loss": delta_phi_spatial_loss.item(),

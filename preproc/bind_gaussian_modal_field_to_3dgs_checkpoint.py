@@ -35,7 +35,10 @@ def _load_checkpoint(path: Path) -> tuple[dict, dict, torch.Tensor]:
     trajectory_type_id = int(state["trajectory_type_id"].item())
     if trajectory_type_id != 3:
         raise ValueError(f"{path} trajectory_type_id={trajectory_type_id}; expected 3 for static")
-    if "modal.params.activations" in state:
+    if (
+        "modal.params.activations" in state
+        or "modal.params.envelope_knots" in state
+    ):
         raise ValueError("Refusing to bind synthetic modal fields to a learned activation checkpoint")
     for key in ("modal_phi_real", "modal_phi_imag", "modal_freqs_hz"):
         if key in state and state[key].numel() > 0:

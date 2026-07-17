@@ -91,6 +91,144 @@ class ModalFrameMap:
     frame_times_sec: torch.Tensor
 
 
+@dataclass(frozen=True)
+class ModalEnvelopeLayout:
+    knot_offsets: torch.Tensor
+    knot_times_sec: torch.Tensor
+    frame_left_indices: torch.Tensor
+    frame_right_indices: torch.Tensor
+    frame_lerp_weights: torch.Tensor
+
+
+def build_modal_envelope_layout(
+    frame_map: ModalFrameMap,
+    knot_interval_sec: float,
+) -> ModalEnvelopeLayout:
+    interval = float(knot_interval_sec)
+    if not np.isfinite(interval) or interval <= 0.0:
+        raise ValueError("modal envelope knot interval must be finite and positive")
+    if not frame_map.view_ids:
+        raise ValueError("modal envelope layout requires at least one view")
+
+    frame_view_indices = frame_map.frame_view_indices.detach().cpu().numpy()
+    frame_times_sec = frame_map.frame_times_sec.detach().cpu().numpy().astype(
+        np.float64,
+        copy=False,
+    )
+    if frame_view_indices.ndim != 1 or frame_times_sec.shape != frame_view_indices.shape:
+        raise ValueError("modal envelope frame view/time arrays must be matching 1-D arrays")
+    if not np.issubdtype(frame_view_indices.dtype, np.integer):
+        raise ValueError("modal envelope frame view indices must have integer dtype")
+    if not np.isfinite(frame_times_sec).all() or np.any(frame_times_sec < 0.0):
+        raise ValueError("modal envelope frame times must be finite and non-negative")
+
+    num_views = len(frame_map.view_ids)
+    if np.any(frame_view_indices < 0) or np.any(frame_view_indices >= num_views):
+        raise ValueError("modal envelope frame view indices are out of range")
+
+    knot_offsets = [0]
+    knot_times_by_view: list[np.ndarray] = []
+    frame_left_indices = np.full(frame_times_sec.shape, -1, dtype=np.int64)
+    frame_right_indices = np.full(frame_times_sec.shape, -1, dtype=np.int64)
+    frame_lerp_weights = np.full(frame_times_sec.shape, np.nan, dtype=np.float32)
+
+    for view_index, view_id in enumerate(frame_map.view_ids):
+        frame_indices = np.flatnonzero(frame_view_indices == view_index)
+        view_times = frame_times_sec[frame_indices]
+        if view_times.size == 0:
+            knot_times = np.asarray([0.0], dtype=np.float64)
+        else:
+            min_time = float(view_times.min())
+            max_time = float(view_times.max())
+            if abs(min_time) > 1.0e-9:
+                raise ValueError(
+                    f"modal envelope view {view_id!r} must include its t=0 frame"
+                )
+            if max_time == 0.0:
+                knot_times = np.asarray([0.0], dtype=np.float64)
+            else:
+                knot_count = int(np.ceil(max_time / interval)) + 1
+                knot_times = np.linspace(
+                    0.0,
+                    max_time,
+                    knot_count,
+                    dtype=np.float64,
+                )
+
+        view_offset = knot_offsets[-1]
+        knot_offsets.append(view_offset + int(knot_times.shape[0]))
+        knot_times_by_view.append(knot_times)
+        if view_times.size == 0:
+            continue
+
+        if knot_times.shape[0] == 1:
+            frame_left_indices[frame_indices] = view_offset
+            frame_right_indices[frame_indices] = view_offset
+            frame_lerp_weights[frame_indices] = 0.0
+            continue
+
+        for frame_index, time_sec in zip(frame_indices, view_times, strict=True):
+            upper = int(np.searchsorted(knot_times, time_sec, side="right"))
+            if upper >= knot_times.shape[0]:
+                if time_sec > knot_times[-1] + 1.0e-9:
+                    raise ValueError(
+                        f"modal envelope frame time {time_sec:.12g} for view "
+                        f"{view_id!r} exceeds its knot range"
+                    )
+                left_local = knot_times.shape[0] - 1
+                right_local = left_local
+                lerp = 0.0
+            else:
+                left_local = upper - 1
+                right_local = upper
+                if left_local < 0:
+                    raise ValueError(
+                        f"modal envelope frame time {time_sec:.12g} for view "
+                        f"{view_id!r} precedes its knot range"
+                    )
+                left_time = float(knot_times[left_local])
+                right_time = float(knot_times[right_local])
+                if right_time <= left_time:
+                    raise ValueError("modal envelope knot times must be increasing")
+                lerp = (float(time_sec) - left_time) / (right_time - left_time)
+                if lerp < -1.0e-6 or lerp > 1.0 + 1.0e-6:
+                    raise ValueError("modal envelope interpolation weight is out of range")
+                lerp = float(np.clip(lerp, 0.0, 1.0))
+            frame_left_indices[frame_index] = view_offset + left_local
+            frame_right_indices[frame_index] = view_offset + right_local
+            frame_lerp_weights[frame_index] = lerp
+
+    if np.any(frame_left_indices < 0) or np.any(frame_right_indices < 0):
+        raise ValueError("modal envelope layout did not assign every frame")
+    if not np.isfinite(frame_lerp_weights).all():
+        raise ValueError("modal envelope layout produced non-finite interpolation weights")
+
+    device = frame_map.frame_times_sec.device
+    return ModalEnvelopeLayout(
+        knot_offsets=torch.as_tensor(knot_offsets, dtype=torch.long, device=device),
+        knot_times_sec=torch.as_tensor(
+            np.concatenate(knot_times_by_view),
+            dtype=frame_map.frame_times_sec.dtype,
+            device=device,
+        ),
+        frame_left_indices=torch.as_tensor(
+            frame_left_indices,
+            dtype=torch.long,
+            device=device,
+        ),
+        frame_right_indices=torch.as_tensor(
+            frame_right_indices,
+            dtype=torch.long,
+            device=device,
+        ),
+        frame_lerp_weights=torch.as_tensor(
+            frame_lerp_weights,
+            dtype=frame_map.frame_times_sec.dtype,
+            device=device,
+        ),
+    )
+
+
 def classify_motion_fill_display_points(
     motion_fill_role: np.ndarray,
     completion_mask: np.ndarray,

@@ -8,7 +8,7 @@ from torch import Tensor
 
 from flow3d.params import (
     GaussianParams,
-    ModalActivations,
+    ModalHarmonicEnvelope,
     ModalShapeRefinement,
     MotionBases,
     CameraScales,
@@ -38,7 +38,7 @@ class SceneModel(nn.Module):
         trajectory_type: str = "som_basis",
         cano_t: int | None = None,
         num_dct_bases: int | None = None,
-        modal: ModalActivations | None = None,
+        modal: ModalHarmonicEnvelope | None = None,
         modal_phi_real: Tensor | None = None,
         modal_phi_imag: Tensor | None = None,
         modal_freqs_hz: Tensor | None = None,
@@ -46,6 +46,12 @@ class SceneModel(nn.Module):
         modal_frame_view_indices: Tensor | None = None,
         modal_frame_local_indices: Tensor | None = None,
         modal_frame_times_sec: Tensor | None = None,
+        modal_envelope_knot_offsets: Tensor | None = None,
+        modal_envelope_knot_times_sec: Tensor | None = None,
+        modal_envelope_knot_interval_sec: float | Tensor | None = None,
+        modal_frame_envelope_left: Tensor | None = None,
+        modal_frame_envelope_right: Tensor | None = None,
+        modal_frame_envelope_lerp: Tensor | None = None,
         modal_synthetic_enabled: bool | Tensor = False,
         modal_refinement: ModalShapeRefinement | None = None,
         modal_anchor_mask: Tensor | None = None,
@@ -99,7 +105,7 @@ class SceneModel(nn.Module):
 
         if trajectory_type == "modal_activation":
             if modal is None:
-                raise ValueError("modal_activation requires modal activations")
+                raise ValueError("modal_activation requires a modal envelope")
             if modal_phi_real is None or modal_phi_imag is None:
                 raise ValueError("modal_activation requires modal phi real/imag tensors")
             if modal_phi_real.shape != modal_phi_imag.shape:
@@ -109,7 +115,7 @@ class SceneModel(nn.Module):
             if modal_phi_real.shape[1] != self.num_fg_gaussians:
                 raise ValueError("modal phi Gaussian dimension does not match foreground")
             if modal_phi_real.shape[0] != modal.num_modes:
-                raise ValueError("modal phi mode count does not match activations")
+                raise ValueError("modal phi mode count does not match envelope modes")
         else:
             if modal_phi_real is None:
                 modal_phi_real = torch.empty(
@@ -218,15 +224,25 @@ class SceneModel(nn.Module):
                 f"({modal_phi_real.shape[0]}, {self.num_fg_gaussians}), "
                 f"got {tuple(modal_obs_count_per_point.shape)}"
             )
-        if trajectory_type == "modal_activation" and (
-            modal_frame_view_indices is None
-            or modal_frame_local_indices is None
-            or modal_frame_times_sec is None
+        if trajectory_type == "modal_activation" and any(
+            value is None
+            for value in (
+                modal_frame_view_indices,
+                modal_frame_local_indices,
+                modal_frame_times_sec,
+                modal_envelope_knot_offsets,
+                modal_envelope_knot_times_sec,
+                modal_envelope_knot_interval_sec,
+                modal_frame_envelope_left,
+                modal_frame_envelope_right,
+                modal_frame_envelope_lerp,
+            )
         ):
             raise ValueError(
-                "modal_activation requires frame view, local-index, and time buffers"
+                "modal_activation requires frame-map and envelope-layout buffers"
             )
         frame_device = self.fg.params["means"].device
+        frame_dtype = self.fg.params["means"].dtype
         if modal_frame_view_indices is None:
             modal_frame_view_indices = torch.full(
                 (self.num_frames,), -1, device=frame_device, dtype=torch.long
@@ -240,7 +256,29 @@ class SceneModel(nn.Module):
                 (self.num_frames,),
                 -1.0,
                 device=frame_device,
-                dtype=self.fg.params["means"].dtype,
+                dtype=frame_dtype,
+            )
+        if modal_envelope_knot_offsets is None:
+            modal_envelope_knot_offsets = torch.zeros(
+                1, device=frame_device, dtype=torch.long
+            )
+        if modal_envelope_knot_times_sec is None:
+            modal_envelope_knot_times_sec = torch.empty(
+                0, device=frame_device, dtype=frame_dtype
+            )
+        if modal_envelope_knot_interval_sec is None:
+            modal_envelope_knot_interval_sec = 0.0
+        if modal_frame_envelope_left is None:
+            modal_frame_envelope_left = torch.full(
+                (self.num_frames,), -1, device=frame_device, dtype=torch.long
+            )
+        if modal_frame_envelope_right is None:
+            modal_frame_envelope_right = torch.full(
+                (self.num_frames,), -1, device=frame_device, dtype=torch.long
+            )
+        if modal_frame_envelope_lerp is None:
+            modal_frame_envelope_lerp = torch.zeros(
+                self.num_frames, device=frame_device, dtype=frame_dtype
             )
         integer_dtypes = {
             torch.uint8,
@@ -253,22 +291,125 @@ class SceneModel(nn.Module):
             raise ValueError("modal frame view indices must have integer dtype")
         if modal_frame_local_indices.dtype not in integer_dtypes:
             raise ValueError("modal frame local indices must have integer dtype")
+        for name, values in (
+            ("modal envelope knot offsets", modal_envelope_knot_offsets),
+            ("modal frame envelope left indices", modal_frame_envelope_left),
+            ("modal frame envelope right indices", modal_frame_envelope_right),
+        ):
+            if values.dtype not in integer_dtypes:
+                raise ValueError(f"{name} must have integer dtype")
         if not torch.is_floating_point(modal_frame_times_sec):
             raise ValueError("modal frame times_sec must have floating-point dtype")
+        if not torch.is_floating_point(modal_envelope_knot_times_sec):
+            raise ValueError("modal envelope knot times must have floating-point dtype")
+        if not torch.is_floating_point(modal_frame_envelope_lerp):
+            raise ValueError("modal frame envelope lerp must have floating-point dtype")
         for name, values in (
             ("modal frame view indices", modal_frame_view_indices),
             ("modal frame local indices", modal_frame_local_indices),
             ("modal frame times_sec", modal_frame_times_sec),
+            ("modal frame envelope left indices", modal_frame_envelope_left),
+            ("modal frame envelope right indices", modal_frame_envelope_right),
+            ("modal frame envelope lerp", modal_frame_envelope_lerp),
         ):
             if values.ndim != 1 or values.shape[0] != self.num_frames:
                 raise ValueError(
                     f"{name} must have shape ({self.num_frames},), "
                     f"got {tuple(values.shape)}"
                 )
+
+        modal_frame_view_indices = modal_frame_view_indices.to(
+            device=frame_device, dtype=torch.long
+        )
+        modal_frame_local_indices = modal_frame_local_indices.to(
+            device=frame_device, dtype=torch.long
+        )
+        modal_frame_times_sec = modal_frame_times_sec.to(
+            device=frame_device, dtype=frame_dtype
+        )
+        modal_envelope_knot_offsets = modal_envelope_knot_offsets.to(
+            device=frame_device, dtype=torch.long
+        )
+        modal_envelope_knot_times_sec = modal_envelope_knot_times_sec.to(
+            device=frame_device, dtype=frame_dtype
+        )
+        modal_envelope_knot_interval_sec = torch.as_tensor(
+            modal_envelope_knot_interval_sec,
+            device=frame_device,
+            dtype=frame_dtype,
+        )
+        modal_frame_envelope_left = modal_frame_envelope_left.to(
+            device=frame_device, dtype=torch.long
+        )
+        modal_frame_envelope_right = modal_frame_envelope_right.to(
+            device=frame_device, dtype=torch.long
+        )
+        modal_frame_envelope_lerp = modal_frame_envelope_lerp.to(
+            device=frame_device, dtype=frame_dtype
+        )
         if trajectory_type == "modal_activation":
             if modal is None:
-                raise ValueError("modal_activation requires modal activations")
-            modal_num_views = modal.num_views
+                raise ValueError("modal_activation requires a modal envelope")
+            envelope_knots = modal.params["envelope_knots"]
+            if modal_envelope_knot_interval_sec.ndim != 0 or not bool(
+                torch.isfinite(modal_envelope_knot_interval_sec).item()
+            ) or float(modal_envelope_knot_interval_sec.item()) <= 0.0:
+                raise ValueError(
+                    "modal envelope knot interval must be a finite positive scalar"
+                )
+            if envelope_knots.device != frame_device:
+                raise ValueError("modal envelope knots must share the Gaussian device")
+            if envelope_knots.dtype != modal_phi_real.dtype:
+                raise ValueError("modal envelope knot dtype must match staged modal phi")
+            if modal_envelope_knot_offsets.ndim != 1 or (
+                modal_envelope_knot_offsets.shape[0] < 2
+            ):
+                raise ValueError(
+                    "modal envelope knot offsets must have shape (num_views + 1,)"
+                )
+            modal_num_views = int(modal_envelope_knot_offsets.shape[0] - 1)
+            total_knots = modal.num_total_knots
+            if int(modal_envelope_knot_offsets[0].item()) != 0 or int(
+                modal_envelope_knot_offsets[-1].item()
+            ) != total_knots:
+                raise ValueError(
+                    "modal envelope knot offsets must start at zero and end at "
+                    "the total knot count"
+                )
+            if bool(
+                (modal_envelope_knot_offsets[1:] <= modal_envelope_knot_offsets[:-1])
+                .any()
+                .item()
+            ):
+                raise ValueError(
+                    "modal envelope knot offsets must allocate at least one knot "
+                    "per view"
+                )
+            if modal_envelope_knot_times_sec.shape != (total_knots,):
+                raise ValueError(
+                    "modal envelope knot times must have shape "
+                    f"({total_knots},), got "
+                    f"{tuple(modal_envelope_knot_times_sec.shape)}"
+                )
+            if not bool(torch.isfinite(modal_envelope_knot_times_sec).all().item()) or bool(
+                (modal_envelope_knot_times_sec < 0.0).any().item()
+            ):
+                raise ValueError(
+                    "modal envelope knot times must be finite and non-negative"
+                )
+            for view_index in range(modal_num_views):
+                start = int(modal_envelope_knot_offsets[view_index].item())
+                end = int(modal_envelope_knot_offsets[view_index + 1].item())
+                view_knot_times = modal_envelope_knot_times_sec[start:end]
+                if float(view_knot_times[0].item()) != 0.0:
+                    raise ValueError("each modal envelope view must start at t=0")
+                if view_knot_times.numel() > 1 and bool(
+                    (view_knot_times[1:] <= view_knot_times[:-1]).any().item()
+                ):
+                    raise ValueError(
+                        "modal envelope knot times must be strictly increasing "
+                        "within each view"
+                    )
             if bool((modal_frame_view_indices < 0).any().item()) or bool(
                 (modal_frame_view_indices >= modal_num_views).any().item()
             ):
@@ -282,6 +423,51 @@ class SceneModel(nn.Module):
             ):
                 raise ValueError(
                     "modal frame times_sec must be finite and non-negative"
+                )
+            if bool((modal_frame_envelope_left < 0).any().item()) or bool(
+                (modal_frame_envelope_left >= total_knots).any().item()
+            ):
+                raise ValueError("modal frame envelope left indices are out of range")
+            if bool((modal_frame_envelope_right < 0).any().item()) or bool(
+                (modal_frame_envelope_right >= total_knots).any().item()
+            ):
+                raise ValueError("modal frame envelope right indices are out of range")
+            if bool(
+                (modal_frame_envelope_right < modal_frame_envelope_left).any().item()
+            ):
+                raise ValueError("modal frame envelope right index precedes left index")
+            if not bool(torch.isfinite(modal_frame_envelope_lerp).all().item()) or bool(
+                ((modal_frame_envelope_lerp < 0.0) | (modal_frame_envelope_lerp > 1.0))
+                .any()
+                .item()
+            ):
+                raise ValueError("modal frame envelope lerp must lie in [0, 1]")
+            view_starts = modal_envelope_knot_offsets[modal_frame_view_indices]
+            view_ends = modal_envelope_knot_offsets[modal_frame_view_indices + 1]
+            if bool(
+                (
+                    (modal_frame_envelope_left < view_starts)
+                    | (modal_frame_envelope_left >= view_ends)
+                    | (modal_frame_envelope_right < view_starts)
+                    | (modal_frame_envelope_right >= view_ends)
+                )
+                .any()
+                .item()
+            ):
+                raise ValueError("modal envelope interpolation crosses view boundaries")
+            left_times = modal_envelope_knot_times_sec[modal_frame_envelope_left]
+            right_times = modal_envelope_knot_times_sec[modal_frame_envelope_right]
+            reconstructed_times = left_times + modal_frame_envelope_lerp * (
+                right_times - left_times
+            )
+            if not torch.allclose(
+                reconstructed_times,
+                modal_frame_times_sec,
+                rtol=1.0e-5,
+                atol=1.0e-6,
+            ):
+                raise ValueError(
+                    "modal envelope interpolation does not reproduce frame times"
                 )
         self.register_buffer("modal_phi_real", modal_phi_real)
         self.register_buffer("modal_phi_imag", modal_phi_imag)
@@ -304,9 +490,31 @@ class SceneModel(nn.Module):
         )
         self.register_buffer(
             "modal_frame_times_sec",
-            modal_frame_times_sec.to(
-                device=frame_device, dtype=self.fg.params["means"].dtype
-            ),
+            modal_frame_times_sec,
+        )
+        self.register_buffer(
+            "modal_envelope_knot_offsets",
+            modal_envelope_knot_offsets,
+        )
+        self.register_buffer(
+            "modal_envelope_knot_times_sec",
+            modal_envelope_knot_times_sec,
+        )
+        self.register_buffer(
+            "modal_envelope_knot_interval_sec",
+            modal_envelope_knot_interval_sec,
+        )
+        self.register_buffer(
+            "modal_frame_envelope_left",
+            modal_frame_envelope_left,
+        )
+        self.register_buffer(
+            "modal_frame_envelope_right",
+            modal_frame_envelope_right,
+        )
+        self.register_buffer(
+            "modal_frame_envelope_lerp",
+            modal_frame_envelope_lerp,
         )
 
     @property
@@ -374,11 +582,11 @@ class SceneModel(nn.Module):
         basis = self.dct_basis[ts].to(dtype=traj_coefs.dtype, device=traj_coefs.device)
         return torch.einsum("bk,gkc->gbc", basis, traj_coefs)
 
-    def compute_modal_coefficients(
+    def compute_modal_envelopes(
         self, ts: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.modal is None:
-            raise RuntimeError("compute_modal_coefficients requires modal activations")
+            raise RuntimeError("compute_modal_envelopes requires a modal envelope")
         if ts.ndim != 1:
             raise ValueError(f"ts must be a 1-D tensor, got shape {tuple(ts.shape)}")
         if ts.dtype not in {
@@ -396,20 +604,33 @@ class SceneModel(nn.Module):
             raise ValueError(f"ts values must lie in [0, {self.num_frames})")
         ts = ts.to(dtype=torch.long)
 
-        view_indices = self.modal_frame_view_indices[ts]
-        amplitudes = self.modal.params["activations"][view_indices]
-        times_sec = self.modal_frame_times_sec[ts].to(dtype=amplitudes.dtype)
-        freqs_hz = self.modal_freqs_hz.to(dtype=amplitudes.dtype)
+        envelope_knots = self.modal.params["envelope_knots"]
+        left = envelope_knots[self.modal_frame_envelope_left[ts]]
+        right = envelope_knots[self.modal_frame_envelope_right[ts]]
+        lerp = self.modal_frame_envelope_lerp[ts].to(
+            dtype=envelope_knots.dtype
+        )[:, None, None]
+        envelopes = left + lerp * (right - left)
+        if not bool(torch.isfinite(envelopes).all().item()):
+            raise FloatingPointError("interpolated modal envelope is not finite")
+        return envelopes[..., 0], envelopes[..., 1]
+
+    def compute_modal_coefficients(
+        self, ts: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        envelope_real, envelope_imag = self.compute_modal_envelopes(ts)
+        times_sec = self.modal_frame_times_sec[ts.to(dtype=torch.long)].to(
+            dtype=envelope_real.dtype
+        )
+        freqs_hz = self.modal_freqs_hz.to(dtype=envelope_real.dtype)
         theta = 2.0 * torch.pi * times_sec[:, None] * freqs_hz[None, :]
         cos_theta = torch.cos(theta)
         sin_theta = torch.sin(theta)
-        amplitude_real = amplitudes[..., 0]
-        amplitude_imag = amplitudes[..., 1]
         coefficient_real = (
-            amplitude_real * cos_theta - amplitude_imag * sin_theta
+            envelope_real * cos_theta - envelope_imag * sin_theta
         )
         coefficient_imag = (
-            amplitude_real * sin_theta + amplitude_imag * cos_theta
+            envelope_real * sin_theta + envelope_imag * cos_theta
         )
         return coefficient_real, coefficient_imag
 
@@ -471,10 +692,65 @@ class SceneModel(nn.Module):
             motion_scale, device=offsets.device, dtype=offsets.dtype
         )
 
-    def compute_activation_magnitude_loss(self) -> torch.Tensor:
+    def compute_envelope_magnitude_loss(self) -> torch.Tensor:
         if self.modal is None:
             return self.fg.params["means"].new_zeros(())
-        return self.modal.params["activations"].pow(2).sum(dim=-1).mean()
+        ts = torch.arange(self.num_frames, device=self.modal_phi_real.device)
+        envelope_real, envelope_imag = self.compute_modal_envelopes(ts)
+        return (envelope_real.square() + envelope_imag.square()).mean()
+
+    def compute_envelope_smoothness_loss(self) -> torch.Tensor:
+        if self.modal is None:
+            return self.fg.params["means"].new_zeros(())
+        knots = self.modal.params["envelope_knots"]
+        reference_interval = self.modal_envelope_knot_interval_sec.to(
+            dtype=knots.dtype
+        )
+        group_losses = []
+        for view_index in range(self.modal_envelope_knot_offsets.shape[0] - 1):
+            start = int(self.modal_envelope_knot_offsets[view_index].item())
+            end = int(self.modal_envelope_knot_offsets[view_index + 1].item())
+            if end - start <= 1:
+                continue
+            view_knots = knots[start:end]
+            delta = view_knots[1:] - view_knots[:-1]
+            delta_time = (
+                self.modal_envelope_knot_times_sec[start + 1 : end]
+                - self.modal_envelope_knot_times_sec[start : end - 1]
+            ).to(dtype=knots.dtype)
+            if not bool(torch.isfinite(delta_time).all().item()) or bool(
+                (delta_time <= 0.0).any().item()
+            ):
+                raise ValueError("modal envelope knot intervals must be positive")
+            scaled_square = delta.square().sum(dim=-1) / (
+                delta_time[:, None] / reference_interval
+            ).square()
+            group_losses.append(scaled_square.mean(dim=0))
+        if not group_losses:
+            return knots.new_zeros(())
+        loss = torch.stack(group_losses, dim=0).mean()
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError("modal envelope smoothness loss is not finite")
+        return loss
+
+    def compute_envelope_max_knot_jump(self) -> torch.Tensor:
+        if self.modal is None:
+            return self.fg.params["means"].new_zeros(())
+        knots = self.modal.params["envelope_knots"]
+        max_jumps = []
+        for view_index in range(self.modal_envelope_knot_offsets.shape[0] - 1):
+            start = int(self.modal_envelope_knot_offsets[view_index].item())
+            end = int(self.modal_envelope_knot_offsets[view_index + 1].item())
+            if end - start <= 1:
+                continue
+            delta = knots[start + 1 : end] - knots[start : end - 1]
+            max_jumps.append(torch.linalg.vector_norm(delta, dim=-1).max())
+        if not max_jumps:
+            return knots.new_zeros(())
+        value = torch.stack(max_jumps).max()
+        if not bool(torch.isfinite(value).item()):
+            raise FloatingPointError("modal envelope maximum knot jump is not finite")
+        return value
 
     @torch.no_grad()
     def densify_modal_fields(self, should_split: torch.Tensor, should_dup: torch.Tensor):
@@ -587,6 +863,13 @@ class SceneModel(nn.Module):
 
     @staticmethod
     def init_from_state_dict(state_dict, prefix=""):
+        legacy_activation_key = f"{prefix}modal.params.activations"
+        if legacy_activation_key in state_dict:
+            raise ValueError(
+                "Constant per-view harmonic activation checkpoints are not "
+                "supported; start a new harmonic-envelope run from the static "
+                "checkpoint and staged modal manifest."
+            )
         fg = GaussianParams.init_from_state_dict(
             state_dict, prefix=f"{prefix}fg.params."
         )
@@ -612,7 +895,7 @@ class SceneModel(nn.Module):
                 raise ValueError(f"Unknown trajectory type id: {trajectory_type_id}")
             trajectory_type = TRAJECTORY_ID_TO_TYPE[trajectory_type_id]
         else:
-            if f"{prefix}modal.params.activations" in state_dict:
+            if f"{prefix}modal.params.envelope_knots" in state_dict:
                 trajectory_type = "modal_activation"
             elif f"{prefix}fg.params.traj_coefs" in state_dict:
                 trajectory_type = "dct_center"
@@ -633,6 +916,12 @@ class SceneModel(nn.Module):
         modal_frame_view_indices = None
         modal_frame_local_indices = None
         modal_frame_times_sec = None
+        modal_envelope_knot_offsets = None
+        modal_envelope_knot_times_sec = None
+        modal_envelope_knot_interval_sec = None
+        modal_frame_envelope_left = None
+        modal_frame_envelope_right = None
+        modal_frame_envelope_lerp = None
         modal_refinement = None
         modal_anchor_mask = None
         if f"{prefix}modal_phi_real" in state_dict:
@@ -644,30 +933,49 @@ class SceneModel(nn.Module):
 
         if trajectory_type == "modal_activation":
             required_frame_keys = (
+                f"{prefix}modal.params.envelope_knots",
                 f"{prefix}modal_frame_view_indices",
                 f"{prefix}modal_frame_local_indices",
                 f"{prefix}modal_frame_times_sec",
+                f"{prefix}modal_envelope_knot_offsets",
+                f"{prefix}modal_envelope_knot_times_sec",
+                f"{prefix}modal_envelope_knot_interval_sec",
+                f"{prefix}modal_frame_envelope_left",
+                f"{prefix}modal_frame_envelope_right",
+                f"{prefix}modal_frame_envelope_lerp",
             )
             missing_frame_keys = [
                 key for key in required_frame_keys if key not in state_dict
             ]
             if missing_frame_keys:
-                if f"{prefix}modal_smooth_triplets" in state_dict:
-                    raise ValueError(
-                        "Legacy per-frame modal activation checkpoints are not "
-                        "supported; initialize per-view harmonic activation from "
-                        "the static checkpoint and staged modal manifest."
-                    )
                 raise ValueError(
-                    "Harmonic modal checkpoint is missing required frame buffers: "
+                    "Harmonic-envelope checkpoint is missing required state: "
                     f"{missing_frame_keys}"
                 )
-            modal = ModalActivations.init_from_state_dict(
+            modal = ModalHarmonicEnvelope.init_from_state_dict(
                 state_dict, prefix=f"{prefix}modal.params."
             )
             modal_frame_view_indices = state_dict[f"{prefix}modal_frame_view_indices"]
             modal_frame_local_indices = state_dict[f"{prefix}modal_frame_local_indices"]
             modal_frame_times_sec = state_dict[f"{prefix}modal_frame_times_sec"]
+            modal_envelope_knot_offsets = state_dict[
+                f"{prefix}modal_envelope_knot_offsets"
+            ]
+            modal_envelope_knot_times_sec = state_dict[
+                f"{prefix}modal_envelope_knot_times_sec"
+            ]
+            modal_envelope_knot_interval_sec = state_dict[
+                f"{prefix}modal_envelope_knot_interval_sec"
+            ]
+            modal_frame_envelope_left = state_dict[
+                f"{prefix}modal_frame_envelope_left"
+            ]
+            modal_frame_envelope_right = state_dict[
+                f"{prefix}modal_frame_envelope_right"
+            ]
+            modal_frame_envelope_lerp = state_dict[
+                f"{prefix}modal_frame_envelope_lerp"
+            ]
         refinement_key = f"{prefix}modal_refinement.params.delta_phi"
         anchor_mask_key = f"{prefix}modal_anchor_mask"
         if (refinement_key in state_dict) != (anchor_mask_key in state_dict):
@@ -703,6 +1011,12 @@ class SceneModel(nn.Module):
             modal_frame_view_indices=modal_frame_view_indices,
             modal_frame_local_indices=modal_frame_local_indices,
             modal_frame_times_sec=modal_frame_times_sec,
+            modal_envelope_knot_offsets=modal_envelope_knot_offsets,
+            modal_envelope_knot_times_sec=modal_envelope_knot_times_sec,
+            modal_envelope_knot_interval_sec=modal_envelope_knot_interval_sec,
+            modal_frame_envelope_left=modal_frame_envelope_left,
+            modal_frame_envelope_right=modal_frame_envelope_right,
+            modal_frame_envelope_lerp=modal_frame_envelope_lerp,
             modal_synthetic_enabled=modal_synthetic_enabled,
             modal_refinement=modal_refinement,
             modal_anchor_mask=modal_anchor_mask,

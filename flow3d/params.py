@@ -121,40 +121,43 @@ class CameraPoses(nn.Module):
         return self(R_new, t_new)
 
 
-class ModalActivations(nn.Module):
-    def __init__(self, activations: torch.Tensor):
+class ModalHarmonicEnvelope(nn.Module):
+    def __init__(self, envelope_knots: torch.Tensor):
         super().__init__()
-        if activations.ndim != 3 or activations.shape[-1] != 2:
+        if envelope_knots.ndim != 3 or envelope_knots.shape[-1] != 2:
             raise ValueError(
-                "modal activations must have shape (num_views, num_modes, 2)"
+                "modal envelope_knots must have shape "
+                "(num_total_knots, num_modes, 2)"
             )
-        if activations.shape[0] <= 0:
-            raise ValueError("modal activations must contain at least one view")
-        if activations.shape[1] <= 0:
-            raise ValueError("modal activations must contain at least one mode")
-        if not torch.is_floating_point(activations):
-            raise ValueError("modal activations must have floating-point dtype")
-        if not bool(torch.isfinite(activations).all().item()):
-            raise ValueError("modal activations must contain only finite values")
-        self.params = nn.ParameterDict({"activations": nn.Parameter(activations)})
+        if envelope_knots.shape[0] <= 0:
+            raise ValueError("modal envelope_knots must contain at least one knot")
+        if envelope_knots.shape[1] <= 0:
+            raise ValueError("modal envelope_knots must contain at least one mode")
+        if not torch.is_floating_point(envelope_knots):
+            raise ValueError("modal envelope_knots must have floating-point dtype")
+        if not bool(torch.isfinite(envelope_knots).all().item()):
+            raise ValueError("modal envelope_knots must contain only finite values")
+        self.params = nn.ParameterDict(
+            {"envelope_knots": nn.Parameter(envelope_knots)}
+        )
 
     @staticmethod
     def init_from_state_dict(
         state_dict: dict[str, Tensor],
         prefix: str,
     ):
-        key = f"{prefix}activations"
+        key = f"{prefix}envelope_knots"
         if key not in state_dict:
-            raise ValueError(f"Missing modal activation parameter {key}")
-        return ModalActivations(state_dict[key])
+            raise ValueError(f"Missing modal envelope parameter {key}")
+        return ModalHarmonicEnvelope(state_dict[key])
 
     @property
-    def num_views(self) -> int:
-        return self.params["activations"].shape[0]
+    def num_total_knots(self) -> int:
+        return self.params["envelope_knots"].shape[0]
 
     @property
     def num_modes(self) -> int:
-        return self.params["activations"].shape[1]
+        return self.params["envelope_knots"].shape[1]
 
 
 class ModalShapeRefinement(nn.Module):
