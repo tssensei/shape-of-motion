@@ -42,7 +42,7 @@ from flow3d.modal_utils import (
     resolve_required_modal_paths,
 )
 from flow3d.params import CameraScales, GaussianParams, ModalActivations
-from flow3d.scene_model import SceneModel
+from flow3d.scene_model import SceneModel, TRAJECTORY_TYPE_TO_ID
 from flow3d.tensor_dataclass import StaticObservations, TrackObservations
 from flow3d.trainer import Trainer
 from flow3d.validator import Validator
@@ -94,30 +94,20 @@ class TrainConfig:
     modal_stage1_frame_map: str | None = None
     modal_stage1_epochs: int = 0
     modal_stage1_init_ckpt: str | None = None
-    modal_stage2_train_base_means: bool = True
-    modal_stage2_train_colors: bool = True
-    modal_stage2_train_opacities: bool = True
+    modal_stage2_train_base_means: bool = False
+    modal_stage2_train_colors: bool = False
+    modal_stage2_train_opacities: bool = False
     modal_stage2_train_scales: bool = False
     modal_stage2_train_quats: bool = False
     modal_stage2_train_bg_means: bool = False
-    modal_stage2_train_bg_colors: bool = True
-    modal_stage2_train_bg_opacities: bool = True
+    modal_stage2_train_bg_colors: bool = False
+    modal_stage2_train_bg_opacities: bool = False
     modal_stage2_train_bg_scales: bool = False
     modal_stage2_train_bg_quats: bool = False
     modal_stage2_lr_fg_scales: float | None = None
     modal_stage2_lr_fg_quats: float | None = None
     modal_train_view_id: str | None = None
     modal_max_local_frames_per_view: int | None = None
-    modal_consistency_target_view_id: str | None = None
-    modal_consistency_fps: float = 0.0
-    modal_consistency_view_configs: tuple[str, ...] = ()
-    modal_consistency_modal_npzs: tuple[str, ...] = ()
-    modal_consistency_freq_tolerance_hz: float = 0.1
-    modal_consistency_mask_erode_iters: int = 1
-    modal_consistency_zbuffer_radius: int = 5
-    modal_consistency_front_percentile: float = 10.0
-    modal_consistency_zbuffer_tau: float = 0.05
-    modal_consistency_min_zbuffer_samples: int = 5
     num_epochs: int = 200
     port: int | None = None
     vis_debug: bool = False 
@@ -202,17 +192,6 @@ def main(cfg: TrainConfig):
         modal_stage2_train_bg_quats=cfg.modal_stage2_train_bg_quats,
         modal_stage2_lr_fg_scales=cfg.modal_stage2_lr_fg_scales,
         modal_stage2_lr_fg_quats=cfg.modal_stage2_lr_fg_quats,
-        modal_manifest=cfg.modal_manifest,
-        modal_consistency_view_configs=cfg.modal_consistency_view_configs,
-        modal_consistency_modal_npzs=cfg.modal_consistency_modal_npzs,
-        modal_consistency_freq_tolerance_hz=cfg.modal_consistency_freq_tolerance_hz,
-        modal_consistency_mask_erode_iters=cfg.modal_consistency_mask_erode_iters,
-        modal_consistency_zbuffer_radius=cfg.modal_consistency_zbuffer_radius,
-        modal_consistency_front_percentile=cfg.modal_consistency_front_percentile,
-        modal_consistency_zbuffer_tau=cfg.modal_consistency_zbuffer_tau,
-        modal_consistency_min_zbuffer_samples=(
-            cfg.modal_consistency_min_zbuffer_samples
-        ),
     )
     if cfg.trajectory_type == "modal_activation":
         _log_trainable_parameters(trainer.model)
@@ -366,16 +345,7 @@ def initialize_and_checkpoint_model(
     modal_obs_count_per_point = None
     modal_frame_view_indices = None
     modal_frame_local_indices = None
-    modal_smooth_triplets = None
-    modal_consistency_y_real = None
-    modal_consistency_y_imag = None
-    modal_consistency_J = None
-    modal_consistency_gaussian_indices = None
-    modal_consistency_mode_indices = None
-    modal_consistency_group_indices = None
-    modal_consistency_group_count = 0
-    modal_consistency_target_view_index = -1
-    modal_consistency_fps = 0.0
+    modal_frame_times_sec = None
     if cfg.trajectory_type == "modal_activation":
         resolve_required_modal_paths(cfg.modal_manifest, cfg.modal_frame_map)
         modal_fields = load_gaussian_modal_fields(
@@ -395,75 +365,52 @@ def initialize_and_checkpoint_model(
         )
         modal_frame_view_indices = frame_map.frame_view_indices
         modal_frame_local_indices = frame_map.frame_local_indices
-        modal_smooth_triplets = frame_map.smooth_triplets
-        use_modal_consistency = bool(
-            cfg.modal_consistency_view_configs or cfg.modal_consistency_modal_npzs
-        )
-        if use_modal_consistency:
-            if len(cfg.modal_consistency_view_configs) != len(
-                cfg.modal_consistency_modal_npzs
-            ):
-                raise ValueError(
-                    "modal consistency view configs and modal npzs must have "
-                    "the same length"
-                )
-            if cfg.modal_consistency_target_view_id is None:
-                raise ValueError(
-                    "modal consistency requires --modal-consistency-target-view-id"
-                )
-            if cfg.modal_consistency_target_view_id not in frame_map.view_ids:
-                raise ValueError(
-                    f"modal consistency target view {cfg.modal_consistency_target_view_id!r} "
-                    f"is not in modal frame map views {frame_map.view_ids}"
-                )
-            if cfg.modal_consistency_fps <= 0:
-                raise ValueError("modal consistency requires --modal-consistency-fps > 0")
-            if cfg.modal_consistency_zbuffer_radius < 0:
-                raise ValueError(
-                    "modal consistency zbuffer radius must be non-negative"
-                )
-            if not (0.0 <= cfg.modal_consistency_front_percentile <= 100.0):
-                raise ValueError(
-                    "modal consistency front percentile must be in [0, 100]"
-                )
-            if cfg.modal_consistency_zbuffer_tau <= 0:
-                raise ValueError(
-                    "modal consistency zbuffer tau must be positive"
-                )
-            if cfg.modal_consistency_min_zbuffer_samples < 1:
-                raise ValueError(
-                    "modal consistency min zbuffer samples must be at least 1"
-                )
-            modal_consistency_target_view_index = frame_map.view_ids.index(
-                cfg.modal_consistency_target_view_id
-            )
-            modal_consistency_fps = cfg.modal_consistency_fps
-        modal = ModalActivations(
-            torch.zeros(
-                motion_bases.num_frames,
-                len(modal_modes),
-                2,
-                device=device,
-                dtype=fg_params.params["means"].dtype,
-            )
+        modal_frame_times_sec = frame_map.frame_times_sec
+        modal = _zero_harmonic_activations(
+            len(frame_map.view_ids),
+            len(modal_modes),
+            device,
+            fg_params.params["means"].dtype,
         )
         view_counts = torch.bincount(
             frame_map.frame_view_indices.detach().cpu(),
             minlength=len(frame_map.view_ids),
         )
+        frame_view_indices_cpu = frame_map.frame_view_indices.detach().cpu()
+        frame_times_sec_cpu = frame_map.frame_times_sec.detach().cpu()
         mode_summary = ", ".join(
             f"index={mode.mode_index}, freq={mode.freq_hz:.9g}Hz"
             for mode in modal_modes
         )
-        view_summary = ", ".join(
-            f"{view_id}={int(view_counts[view_index].item())}"
-            for view_index, view_id in enumerate(frame_map.view_ids)
-        )
+        view_summaries = []
+        active_views = []
+        unused_views = []
+        for view_index, view_id in enumerate(frame_map.view_ids):
+            view_count = int(view_counts[view_index].item())
+            if view_count > 0:
+                view_times = frame_times_sec_cpu[
+                    frame_view_indices_cpu == view_index
+                ]
+                active_views.append(view_id)
+                view_summaries.append(
+                    f"{view_id}=count:{view_count},"
+                    f"time:[{float(view_times.min().item()):.9g},"
+                    f"{float(view_times.max().item()):.9g}]s"
+                )
+            else:
+                unused_views.append(view_id)
+                view_summaries.append(f"{view_id}=count:0,time:<unused>")
+        if cfg.modal_train_view_id is None and unused_views:
+            raise ValueError(
+                "Joint modal training requires frames from every declared view; "
+                f"views without training frames: {unused_views}"
+            )
         guru.info(
             f"Initialized modal_activation: modes={len(modal_modes)} "
-            f"[{mode_summary}], per_view_frames=[{view_summary}], "
+            f"[{mode_summary}], per_view_frames=[{', '.join(view_summaries)}], "
+            f"active_views={active_views}, unused_views={unused_views}, "
             f"activation_shape={tuple(modal.params['activations'].shape)}, "
-            f"smoothness_triplets={modal_smooth_triplets.shape[0]}"
+            "parameterization=per_view_harmonic_v1"
         )
 
     model = SceneModel(
@@ -484,16 +431,7 @@ def initialize_and_checkpoint_model(
         modal_obs_count_per_point=modal_obs_count_per_point,
         modal_frame_view_indices=modal_frame_view_indices,
         modal_frame_local_indices=modal_frame_local_indices,
-        modal_smooth_triplets=modal_smooth_triplets,
-        modal_consistency_y_real=modal_consistency_y_real,
-        modal_consistency_y_imag=modal_consistency_y_imag,
-        modal_consistency_J=modal_consistency_J,
-        modal_consistency_gaussian_indices=modal_consistency_gaussian_indices,
-        modal_consistency_mode_indices=modal_consistency_mode_indices,
-        modal_consistency_group_indices=modal_consistency_group_indices,
-        modal_consistency_group_count=modal_consistency_group_count,
-        modal_consistency_target_view_index=modal_consistency_target_view_index,
-        modal_consistency_fps=modal_consistency_fps,
+        modal_frame_times_sec=modal_frame_times_sec,
     )
 
     checkpoint = {
@@ -550,6 +488,19 @@ def _log_trainable_parameters(model: SceneModel) -> None:
     )
 
 
+def _zero_harmonic_activations(
+    num_views: int,
+    num_modes: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> ModalActivations:
+    if num_views <= 0 or num_modes <= 0:
+        raise ValueError("Harmonic activation initialization requires views and modes")
+    return ModalActivations(
+        torch.zeros(num_views, num_modes, 2, device=device, dtype=dtype)
+    )
+
+
 def _load_stage1_gaussians_from_checkpoint(
     path: str,
     device: torch.device,
@@ -560,6 +511,18 @@ def _load_stage1_gaussians_from_checkpoint(
     state_dict = ckpt.get("model")
     if not isinstance(state_dict, dict):
         raise ValueError(f"Stage 1 init checkpoint has no model state: {path}")
+    if "modal.params.activations" in state_dict:
+        raise ValueError(
+            "Stage 1 init checkpoint must be the original static checkpoint, "
+            "not a Phase 0 modal activation checkpoint"
+        )
+    trajectory_type_id = state_dict.get("trajectory_type_id")
+    if trajectory_type_id is not None and int(trajectory_type_id.item()) != (
+        TRAJECTORY_TYPE_TO_ID["static"]
+    ):
+        raise ValueError(
+            "Stage 1 init checkpoint must have trajectory_type='static'"
+        )
     try:
         fg_params = GaussianParams.init_from_state_dict(
             state_dict,
@@ -659,28 +622,11 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         "modal_stage2_train_bg_quats": cfg.modal_stage2_train_bg_quats,
         "modal_stage2_lr_fg_scales": cfg.modal_stage2_lr_fg_scales,
         "modal_stage2_lr_fg_quats": cfg.modal_stage2_lr_fg_quats,
-        "modal_consistency_target_view_id": cfg.modal_consistency_target_view_id,
-        "modal_consistency_fps": cfg.modal_consistency_fps,
-        "modal_consistency_view_configs": cfg.modal_consistency_view_configs,
-        "modal_consistency_modal_npzs": cfg.modal_consistency_modal_npzs,
-        "modal_consistency_freq_tolerance_hz": cfg.modal_consistency_freq_tolerance_hz,
-        "modal_consistency_mask_erode_iters": cfg.modal_consistency_mask_erode_iters,
-        "modal_consistency_zbuffer_radius": cfg.modal_consistency_zbuffer_radius,
-        "modal_consistency_front_percentile": cfg.modal_consistency_front_percentile,
-        "modal_consistency_zbuffer_tau": cfg.modal_consistency_zbuffer_tau,
-        "modal_consistency_min_zbuffer_samples": (
-            cfg.modal_consistency_min_zbuffer_samples
-        ),
-        "modal_consistency_loss_type": cfg.loss.modal_consistency_loss_type,
-        "modal_consistency_beta_abs_max": cfg.loss.modal_consistency_beta_abs_max,
-        "modal_consistency_pred_energy_eps": (
-            cfg.loss.modal_consistency_pred_energy_eps
-        ),
-        "w_act_smooth": cfg.loss.w_act_smooth,
         "w_act_mag": cfg.loss.w_act_mag,
-        "w_act_modal_consistency": cfg.loss.w_act_modal_consistency,
         "data": data_metadata,
     }
+    if cfg.trajectory_type == "modal_activation":
+        metadata["modal_parameterization"] = "per_view_harmonic_v1"
     return {key: _metadata_value(value) for key, value in metadata.items()}
 
 
@@ -717,6 +663,18 @@ def _validate_checkpoint_policy(
         raise ValueError(
             f"Checkpoint {ckpt_path} has no init_metadata; "
             "use a new work_dir for this run."
+        )
+    expected_parameterization = expected_metadata.get("modal_parameterization")
+    actual_parameterization = actual_metadata.get("modal_parameterization")
+    if (
+        expected_parameterization == "per_view_harmonic_v1"
+        and actual_parameterization != expected_parameterization
+    ):
+        raise ValueError(
+            "Checkpoint uses an incompatible modal parameterization "
+            f"({actual_parameterization!r}); expected "
+            "'per_view_harmonic_v1'. Start a new work_dir from the static "
+            "checkpoint and staged modal manifest."
         )
     if actual_metadata != expected_metadata:
         keys = sorted(set(actual_metadata) | set(expected_metadata))

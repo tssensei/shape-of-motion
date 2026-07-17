@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,6 +52,7 @@ class _FakeModel:
         self.Ks = dataset.get_Ks().clone()
         self.w2cs = dataset.get_w2cs().clone()
         self.modal_phi_real = torch.zeros((1, 2, 3))
+        self.modal_freqs_hz = torch.tensor([1.5])
         view_ids: list[str] = []
         frame_view_indices = []
         frame_local_indices = []
@@ -62,12 +64,16 @@ class _FakeModel:
             frame_local_indices.append(int(local_index_text))
         self.modal_frame_view_indices = torch.tensor(frame_view_indices)
         self.modal_frame_local_indices = torch.tensor(frame_local_indices)
+        self.modal_frame_times_sec = torch.tensor(
+            [local_index / 30.0 for local_index in frame_local_indices],
+            dtype=torch.float32,
+        )
         self.modal = SimpleNamespace(
             params={
                 "activations": torch.arange(
-                    dataset.num_frames * 2,
+                    len(view_ids) * 2,
                     dtype=torch.float32,
-                ).reshape(dataset.num_frames, 1, 2)
+                ).reshape(len(view_ids), 1, 2)
             }
         )
         self.has_bg = True
@@ -112,26 +118,31 @@ def _write_frame_map(path: Path) -> None:
             {
                 "version": 1,
                 "views": ["view1", "view2"],
+                "view_fps_hz": {"view1": 30.0, "view2": 30.0},
                 "frames": [
                     {
                         "frame_name": "view2_000001",
                         "view_id": "view2",
                         "local_index": 1,
+                        "time_sec": 1.0 / 30.0,
                     },
                     {
                         "frame_name": "view1_000001",
                         "view_id": "view1",
                         "local_index": 1,
+                        "time_sec": 1.0 / 30.0,
                     },
                     {
                         "frame_name": "view2_000000",
                         "view_id": "view2",
                         "local_index": 0,
+                        "time_sec": 0.0,
                     },
                     {
                         "frame_name": "view1_000000",
                         "view_id": "view1",
                         "local_index": 0,
+                        "time_sec": 0.0,
                     },
                 ],
             },
@@ -145,11 +156,17 @@ def _write_three_view_frame_map(path: Path) -> None:
             {
                 "version": 1,
                 "views": ["view1", "view2", "view3"],
+                "view_fps_hz": {
+                    "view1": 30.0,
+                    "view2": 30.0,
+                    "view3": 30.0,
+                },
                 "frames": [
                     {
                         "frame_name": f"view{view_index}_{local_index:06d}",
                         "view_id": f"view{view_index}",
                         "local_index": local_index,
+                        "time_sec": local_index / 30.0,
                     }
                     for view_index in range(1, 4)
                     for local_index in range(2)
@@ -183,6 +200,26 @@ class ModalReconstructionFrameTests(unittest.TestCase):
             [frame.ts for frame in frames_by_view["view2"]],
             [2, 3],
         )
+        self.assertEqual(
+            [frame.time_sec for frame in frames_by_view["view2"]],
+            [0.0, 1.0 / 30.0],
+        )
+
+    def test_retains_declared_views_for_single_view_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            frame_map = Path(tmp) / "modal_frame_map.json"
+            _write_frame_map(frame_map)
+            view_ids, frames_by_view = reconstruction._load_reconstruction_frames(
+                frame_map,
+                ["view2_000000", "view2_000001"],
+            )
+
+        self.assertEqual(view_ids, ["view1", "view2"])
+        self.assertEqual(frames_by_view["view1"], [])
+        self.assertEqual(
+            [frame.frame_name for frame in frames_by_view["view2"]],
+            ["view2_000000", "view2_000001"],
+        )
 
     def test_rejects_duplicate_local_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,17 +227,21 @@ class ModalReconstructionFrameTests(unittest.TestCase):
             with frame_map.open("w", encoding="utf-8") as f:
                 json.dump(
                     {
+                        "version": 1,
                         "views": ["view1"],
+                        "view_fps_hz": {"view1": 30.0},
                         "frames": [
                             {
                                 "frame_name": "frame0",
                                 "view_id": "view1",
                                 "local_index": 0,
+                                "time_sec": 0.0,
                             },
                             {
                                 "frame_name": "frame1",
                                 "view_id": "view1",
                                 "local_index": 0,
+                                "time_sec": 0.0,
                             },
                         ],
                     },
@@ -218,12 +259,15 @@ class ModalReconstructionFrameTests(unittest.TestCase):
             with frame_map.open("w", encoding="utf-8") as f:
                 json.dump(
                     {
+                        "version": 1,
                         "views": ["view1"],
+                        "view_fps_hz": {"view1": 30.0},
                         "frames": [
                             {
                                 "frame_name": "frame0",
                                 "view_id": "view1",
                                 "local_index": 0,
+                                "time_sec": 0.0,
                             }
                         ],
                     },
@@ -233,6 +277,25 @@ class ModalReconstructionFrameTests(unittest.TestCase):
                 reconstruction._load_reconstruction_frames(
                     frame_map,
                     ["frame0", "frame1"],
+                )
+
+    def test_rejects_time_inconsistent_with_view_fps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            frame_map = Path(tmp) / "modal_frame_map.json"
+            _write_frame_map(frame_map)
+            payload = json.loads(frame_map.read_text(encoding="utf-8"))
+            payload["frames"][0]["time_sec"] = 1.0
+            frame_map.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "time_sec is inconsistent"):
+                reconstruction._load_reconstruction_frames(
+                    frame_map,
+                    [
+                        "view1_000000",
+                        "view1_000001",
+                        "view2_000000",
+                        "view2_000001",
+                    ],
                 )
 
 
@@ -294,6 +357,47 @@ class ModalReconstructionValidationTests(unittest.TestCase):
                         False,
                     )
 
+    def test_rejects_obsolete_checkpoint_without_frame_times(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "phase0.ckpt"
+            checkpoint.touch()
+            state_dict = {
+                "modal.params.activations": torch.zeros((4, 1, 2)),
+            }
+            with mock.patch.object(
+                reconstruction.torch,
+                "load",
+                return_value={"model": state_dict},
+            ):
+                with self.assertRaisesRegex(ValueError, "obsolete per-frame"):
+                    reconstruction._load_checkpoint_model(
+                        checkpoint,
+                        torch.device("cpu"),
+                        False,
+                    )
+
+    def test_rejects_checkpoint_without_harmonic_parameterization_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "unmarked.ckpt"
+            checkpoint.touch()
+            state_dict = {
+                "modal.params.activations": torch.zeros((2, 1, 2)),
+                "modal_frame_times_sec": torch.zeros(2),
+            }
+            with mock.patch.object(
+                reconstruction.torch,
+                "load",
+                return_value={"model": state_dict, "init_metadata": {}},
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "incompatible modal parameterization"
+                ):
+                    reconstruction._load_checkpoint_model(
+                        checkpoint,
+                        torch.device("cpu"),
+                        False,
+                    )
+
     def test_rejects_checkpoint_frame_count_mismatch(self) -> None:
         dataset = _FakeDataset(
             [
@@ -308,18 +412,18 @@ class ModalReconstructionValidationTests(unittest.TestCase):
         frames_by_view = {
             "view1": [
                 reconstruction.ReconstructionFrame(
-                    0, 0, "view1_000000", "view1", 0, 0
+                    0, 0, "view1_000000", "view1", 0, 0, 0.0
                 ),
                 reconstruction.ReconstructionFrame(
-                    1, 1, "view1_000001", "view1", 0, 1
+                    1, 1, "view1_000001", "view1", 0, 1, 1.0 / 30.0
                 ),
             ],
             "view2": [
                 reconstruction.ReconstructionFrame(
-                    2, 2, "view2_000000", "view2", 1, 0
+                    2, 2, "view2_000000", "view2", 1, 0, 0.0
                 ),
                 reconstruction.ReconstructionFrame(
-                    3, 3, "view2_000001", "view2", 1, 1
+                    3, 3, "view2_000001", "view2", 1, 1, 1.0 / 30.0
                 ),
             ],
         }
@@ -345,18 +449,18 @@ class ModalReconstructionValidationTests(unittest.TestCase):
         frames_by_view = {
             "view1": [
                 reconstruction.ReconstructionFrame(
-                    0, 0, "view1_000000", "view1", 0, 0
+                    0, 0, "view1_000000", "view1", 0, 0, 0.0
                 ),
                 reconstruction.ReconstructionFrame(
-                    1, 1, "view1_000001", "view1", 0, 1
+                    1, 1, "view1_000001", "view1", 0, 1, 1.0 / 30.0
                 ),
             ],
             "view2": [
                 reconstruction.ReconstructionFrame(
-                    2, 2, "view2_000000", "view2", 1, 0
+                    2, 2, "view2_000000", "view2", 1, 0, 0.0
                 ),
                 reconstruction.ReconstructionFrame(
-                    3, 3, "view2_000001", "view2", 1, 1
+                    3, 3, "view2_000001", "view2", 1, 1, 1.0 / 30.0
                 ),
             ],
         }
@@ -365,6 +469,70 @@ class ModalReconstructionValidationTests(unittest.TestCase):
                 model,
                 dataset,
                 ["view1", "view2"],
+                frames_by_view,
+            )
+
+    def test_rejects_checkpoint_frame_time_mismatch(self) -> None:
+        dataset = _FakeDataset(
+            [
+                "view1_000000",
+                "view1_000001",
+                "view2_000000",
+                "view2_000001",
+            ]
+        )
+        model = _FakeModel(dataset)
+        model.modal_frame_times_sec[1] = 0.5
+        frames_by_view = {
+            "view1": [
+                reconstruction.ReconstructionFrame(
+                    0, 0, "view1_000000", "view1", 0, 0, 0.0
+                ),
+                reconstruction.ReconstructionFrame(
+                    1, 1, "view1_000001", "view1", 0, 1, 1.0 / 30.0
+                ),
+            ],
+            "view2": [
+                reconstruction.ReconstructionFrame(
+                    2, 2, "view2_000000", "view2", 1, 0, 0.0
+                ),
+                reconstruction.ReconstructionFrame(
+                    3, 3, "view2_000001", "view2", 1, 1, 1.0 / 30.0
+                ),
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "frame times do not match"):
+            reconstruction._validate_model_alignment(
+                model,
+                dataset,
+                ["view1", "view2"],
+                frames_by_view,
+            )
+
+    def test_rejects_obsolete_per_frame_activation_shape(self) -> None:
+        dataset = _FakeDataset(
+            [
+                "view1_000000",
+                "view1_000001",
+                "view2_000000",
+                "view2_000001",
+            ]
+        )
+        model = _FakeModel(dataset)
+        model.modal.params["activations"] = torch.zeros((4, 1, 2))
+        with tempfile.TemporaryDirectory() as tmp:
+            frame_map = Path(tmp) / "modal_frame_map.json"
+            _write_frame_map(frame_map)
+            view_ids, frames_by_view = reconstruction._load_reconstruction_frames(
+                frame_map,
+                dataset.frame_names,
+            )
+
+        with self.assertRaisesRegex(ValueError, "obsolete per-frame"):
+            reconstruction._validate_model_alignment(
+                model,
+                dataset,
+                view_ids,
                 frames_by_view,
             )
 
@@ -380,6 +548,25 @@ class ModalReconstructionValidationTests(unittest.TestCase):
         self.assertAlmostEqual(stats["p50"], 2.5)
         self.assertAlmostEqual(stats["p90"], 4.5)
         self.assertAlmostEqual(stats["max"], 5.0)
+
+    def test_harmonic_mode_statistics(self) -> None:
+        activations = torch.tensor(
+            [
+                [[0.0, 0.0], [3.0, 4.0]],
+                [[1.0, -1.0], [0.0, 0.0]],
+            ]
+        )
+        modes = reconstruction._harmonic_modes(
+            activations,
+            torch.tensor([1.5, 2.5]),
+            0,
+        )
+
+        self.assertEqual(modes[0]["mode_slot"], 0)
+        self.assertEqual(modes[0]["frequency_hz"], 1.5)
+        self.assertEqual(modes[0]["phase_rad"], None)
+        self.assertEqual(modes[1]["magnitude"], 5.0)
+        self.assertAlmostEqual(modes[1]["phase_rad"], math.atan2(4.0, 3.0))
 
     def test_comparison_frame_pads_without_cropping(self) -> None:
         observed = torch.ones((17, 17, 3))
@@ -455,6 +642,7 @@ class ModalReconstructionRunTests(unittest.TestCase):
                     reconstruction.ModalReconstructionConfig(
                         work_dir=str(work_dir),
                         out_dir=str(output_dir),
+                        fps=12.0,
                     )
                 )
 
@@ -468,6 +656,11 @@ class ModalReconstructionRunTests(unittest.TestCase):
             self.assertTrue((output_dir / "view3_comparison.mp4").is_file())
             self.assertEqual([len(writer.frames) for writer in writers], [2, 2, 2])
             self.assertTrue(all(writer.closed for writer in writers))
+            self.assertTrue(all(writer.fps == 12.0 for writer in writers))
+            self.assertAlmostEqual(
+                float(model.modal_frame_times_sec[1]),
+                1.0 / 30.0,
+            )
             self.assertTrue(
                 all(
                     frame.shape == (16, 48, 3)
@@ -487,6 +680,14 @@ class ModalReconstructionRunTests(unittest.TestCase):
                 metrics = json.load(f)
             self.assertEqual(metrics["version"], 1)
             self.assertEqual(metrics["view_order"], ["view1", "view2", "view3"])
+            self.assertEqual(
+                metrics["declared_views"],
+                ["view1", "view2", "view3"],
+            )
+            self.assertEqual(
+                metrics["active_views"],
+                ["view1", "view2", "view3"],
+            )
             self.assertEqual(metrics["num_modes"], 1)
             self.assertEqual(
                 set(metrics["views"]),
@@ -497,6 +698,19 @@ class ModalReconstructionRunTests(unittest.TestCase):
             self.assertEqual(
                 set(metrics["overall"]["activation_magnitude"]),
                 {"rms", "p50", "p90", "max"},
+            )
+            self.assertEqual(
+                metrics["views"]["view1"]["harmonic_modes"],
+                [
+                    {
+                        "mode_slot": 0,
+                        "frequency_hz": 1.5,
+                        "real": 0.0,
+                        "imaginary": 1.0,
+                        "magnitude": 1.0,
+                        "phase_rad": math.pi / 2.0,
+                    }
+                ],
             )
             self.assertEqual(list(root.glob(".reconstruction.tmp-*")), [])
 

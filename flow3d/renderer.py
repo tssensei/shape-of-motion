@@ -98,6 +98,23 @@ class Renderer:
         guru.info(f"Loading checkpoint from {path}")
         ckpt = torch.load(path, weights_only=False)
         state_dict = ckpt["model"]
+        if "modal.params.activations" in state_dict:
+            if "modal_frame_times_sec" not in state_dict:
+                raise ValueError(
+                    "Legacy per-frame modal activation checkpoints are not "
+                    "supported; render a per-view harmonic checkpoint"
+                )
+            init_metadata = ckpt.get("init_metadata")
+            parameterization = (
+                init_metadata.get("modal_parameterization")
+                if isinstance(init_metadata, dict)
+                else None
+            )
+            if parameterization != "per_view_harmonic_v1":
+                raise ValueError(
+                    "Checkpoint uses an incompatible modal parameterization "
+                    f"({parameterization!r}); expected 'per_view_harmonic_v1'"
+                )
         model = SceneModel.init_from_state_dict(state_dict)
         model.use_2dgs = use_2dgs
         model = model.to(device)

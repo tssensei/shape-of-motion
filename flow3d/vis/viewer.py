@@ -263,8 +263,8 @@ class DynamicViewer(Viewer):
         with self.server.gui.add_folder("Modal playback"):
             drive = self.server.gui.add_dropdown(
                 "Drive",
-                options=("static", "oscillator"),
-                initial_value="static",
+                options=("trained harmonic", "manual oscillator"),
+                initial_value="trained harmonic",
             )
             motion_scale = self.server.gui.add_slider(
                 "Motion scale",
@@ -559,7 +559,7 @@ class DynamicViewer(Viewer):
 
     def current_modal_oscillator(self) -> tuple[np.ndarray, float] | None:
         handles = getattr(self, "_modal_playback_handles", None)
-        if handles is None or str(handles["drive"].value) != "oscillator":
+        if handles is None or str(handles["drive"].value) != "manual oscillator":
             return None
         if not hasattr(self, "_playback_guis"):
             timestep = 0

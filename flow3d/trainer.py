@@ -20,14 +20,31 @@ from flow3d.loss_utils import (
     masked_l1_loss,
 )
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
-from flow3d.modal_utils import (
-    load_modal_consistency_data,
-    load_modal_modes,
-)
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import get_server
 from flow3d.vis.viewer import DynamicViewer, build_modal_playback_groups
 from flow3d.normal_utils import depth_to_normal
+
+
+def _harmonic_activation_gradient_norm(
+    model: SceneModel,
+    global_step: int,
+) -> float:
+    if model.trajectory_type != "modal_activation":
+        return 0.0
+    if model.modal is None:
+        raise ValueError("modal_activation trajectory requires modal parameters")
+    activation_grad = model.modal.params["activations"].grad
+    if activation_grad is None:
+        return 0.0
+    grad_norm = torch.linalg.vector_norm(activation_grad)
+    if not torch.isfinite(grad_norm):
+        raise FloatingPointError(
+            "Harmonic activation gradient norm is not finite at "
+            f"step {global_step}: {grad_norm.item()}"
+        )
+    return float(grad_norm.item())
+
 
 class Trainer:
     def __init__(
@@ -48,27 +65,18 @@ class Trainer:
         modal_warmup_epochs: int = 0,
         modal_train_base_means: bool = False,
         modal_stage2_train_base_means: bool = False,
-        modal_stage2_train_colors: bool = True,
-        modal_stage2_train_opacities: bool = True,
+        modal_stage2_train_colors: bool = False,
+        modal_stage2_train_opacities: bool = False,
         modal_stage2_train_scales: bool = False,
         modal_stage2_train_quats: bool = False,
         modal_stage2_train_bg_means: bool = False,
-        modal_stage2_train_bg_colors: bool = True,
-        modal_stage2_train_bg_opacities: bool = True,
+        modal_stage2_train_bg_colors: bool = False,
+        modal_stage2_train_bg_opacities: bool = False,
         modal_stage2_train_bg_scales: bool = False,
         modal_stage2_train_bg_quats: bool = False,
         modal_stage2_lr_fg_scales: float | None = None,
         modal_stage2_lr_fg_quats: float | None = None,
         init_metadata: dict[str, Any] | None = None,
-        modal_manifest: str | None = None,
-        modal_consistency_view_configs: tuple[str, ...] = (),
-        modal_consistency_modal_npzs: tuple[str, ...] = (),
-        modal_consistency_freq_tolerance_hz: float = 0.1,
-        modal_consistency_mask_erode_iters: int = 1,
-        modal_consistency_zbuffer_radius: int = 5,
-        modal_consistency_front_percentile: float = 10.0,
-        modal_consistency_zbuffer_tau: float = 0.05,
-        modal_consistency_min_zbuffer_samples: int = 5,
     ):
         self.device = device
         self.log_every = log_every
@@ -100,18 +108,6 @@ class Trainer:
         self.modal_stage2_lr_fg_scales = modal_stage2_lr_fg_scales
         self.modal_stage2_lr_fg_quats = modal_stage2_lr_fg_quats
         self.init_metadata = init_metadata
-        self.modal_manifest = modal_manifest
-        self.modal_consistency_view_configs = modal_consistency_view_configs
-        self.modal_consistency_modal_npzs = modal_consistency_modal_npzs
-        self.modal_consistency_freq_tolerance_hz = modal_consistency_freq_tolerance_hz
-        self.modal_consistency_mask_erode_iters = modal_consistency_mask_erode_iters
-        self.modal_consistency_zbuffer_radius = modal_consistency_zbuffer_radius
-        self.modal_consistency_front_percentile = modal_consistency_front_percentile
-        self.modal_consistency_zbuffer_tau = modal_consistency_zbuffer_tau
-        self.modal_consistency_min_zbuffer_samples = (
-            modal_consistency_min_zbuffer_samples
-        )
-        self._modal_consistency_cache_refreshed = False
 
         self.reset_opacity_every = (
             self.optim_cfg.reset_opacity_every_n_controls * self.optim_cfg.control_every
@@ -170,7 +166,6 @@ class Trainer:
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
-        self._refresh_modal_consistency_post_warmup_if_needed()
         self._apply_modal_trainability()
         self._apply_modal_stage2_lr_overrides()
 
@@ -224,70 +219,6 @@ class Trainer:
                 raise ValueError(f"Missing optimizer for modal Stage 2 LR override: {name}")
             for group in self.optimizers[name].param_groups:
                 group["lr"] = float(lr)
-
-    @torch.no_grad()
-    def _refresh_modal_consistency_post_warmup_if_needed(self):
-        if self.model.trajectory_type != "modal_activation":
-            return
-        if self._modal_consistency_cache_refreshed:
-            return
-        if not self._modal_in_dynamic_stage():
-            return
-
-        modal_modes = []
-        if self.modal_consistency_view_configs or self.modal_consistency_modal_npzs:
-            if self.modal_manifest is None:
-                raise ValueError("modal consistency refresh requires modal_manifest")
-            modal_modes = load_modal_modes(self.modal_manifest)
-        self._refresh_modal_consistency_cache(modal_modes)
-        self._modal_consistency_cache_refreshed = True
-
-    @torch.no_grad()
-    def _refresh_modal_consistency_cache(self, modal_modes):
-        use_modal_consistency = bool(
-            self.modal_consistency_view_configs or self.modal_consistency_modal_npzs
-        )
-        if use_modal_consistency:
-            target_view_index = int(
-                self.model.modal_consistency_target_view_index.item()
-            )
-            fps = float(self.model.modal_consistency_fps.item())
-            if target_view_index < 0:
-                raise ValueError(
-                    "modal consistency refresh requires target view index"
-                )
-            if fps <= 0:
-                raise ValueError("modal consistency refresh requires positive fps")
-            modal_consistency = load_modal_consistency_data(
-                self.model.fg.params["means"],
-                modal_modes,
-                self.modal_consistency_view_configs,
-                self.modal_consistency_modal_npzs,
-                self.modal_consistency_freq_tolerance_hz,
-                self.modal_consistency_mask_erode_iters,
-                self.modal_consistency_zbuffer_radius,
-                self.modal_consistency_front_percentile,
-                self.modal_consistency_zbuffer_tau,
-                self.modal_consistency_min_zbuffer_samples,
-            )
-            self.model.set_modal_consistency_data(
-                modal_consistency.y_real,
-                modal_consistency.y_imag,
-                modal_consistency.J,
-                modal_consistency.gaussian_indices,
-                modal_consistency.mode_indices,
-                modal_consistency.group_indices,
-                modal_consistency.group_count,
-                target_view_index=target_view_index,
-                fps=fps,
-            )
-            guru.info(
-                "Refreshed modal consistency cache with "
-                f"{modal_consistency.y_real.shape[0]} observations across "
-                f"{modal_consistency.group_count} view-frequency groups"
-            )
-        else:
-            self.model.set_modal_consistency_data()
 
     def save_checkpoint(self, path: str):
         model_dict = self.model.state_dict()
@@ -395,6 +326,10 @@ class Trainer:
 
             ipdb.set_trace()
         loss.backward()
+        if self.model.trajectory_type == "modal_activation":
+            stats["train/harmonic_activation_grad_norm"] = (
+                _harmonic_activation_gradient_norm(self.model, self.global_step)
+            )
 
         for opt in self.optimizers.values():
             opt.step()
@@ -784,27 +719,10 @@ class Trainer:
 
         loss += self.losses_cfg.w_z_accel * z_accel_loss
         if is_modal_activation:
-            act_smooth_loss = self.model.compute_activation_smoothness_loss()
-            loss += self.losses_cfg.w_act_smooth * act_smooth_loss
             act_mag_loss = self.model.compute_activation_magnitude_loss()
             loss += self.losses_cfg.w_act_mag * act_mag_loss
-            (
-                act_modal_consistency_loss,
-                act_modal_consistency_count,
-            ) = self.model.compute_activation_modal_consistency_loss(
-                self.losses_cfg.modal_consistency_loss_type,
-                self.losses_cfg.modal_consistency_beta_abs_max,
-                self.losses_cfg.modal_consistency_pred_energy_eps,
-            )
-            loss += (
-                self.losses_cfg.w_act_modal_consistency
-                * act_modal_consistency_loss
-            )
         else:
-            act_smooth_loss = torch.zeros((), device=self.device)
             act_mag_loss = torch.zeros((), device=self.device)
-            act_modal_consistency_loss = torch.zeros((), device=self.device)
-            act_modal_consistency_count = torch.zeros((), device=self.device)
 
         # Prepare stats for logging.
         stats = {
@@ -817,10 +735,7 @@ class Trainer:
             "train/track_2d_loss": track_2d_loss.item(),
             "train/small_accel_loss": small_accel_loss.item(),
             "train/dct_coef_loss": dct_coef_loss.item(),
-            "train/act_smooth_loss": act_smooth_loss.item(),
             "train/act_mag_loss": act_mag_loss.item(),
-            "train/act_modal_consistency_loss": act_modal_consistency_loss.item(),
-            "train/act_modal_consistency_count": act_modal_consistency_count.item(),
             "train/z_acc_loss": z_accel_loss.item(),
             "train/local_iso_ray_loss": local_iso_ray_loss.item(),
             "train/local_iso_perp_loss": local_iso_perp_loss.item(),
@@ -861,7 +776,7 @@ class Trainer:
             self.writer.add_scalar(k, v, self.global_step)
 
     def run_control_steps(self):
-        if self._modal_in_dynamic_stage():
+        if self.model.trajectory_type == "modal_activation":
             return
         global_step = self.global_step
         # Adaptive gaussian control.

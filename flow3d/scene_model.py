@@ -44,16 +44,7 @@ class SceneModel(nn.Module):
         modal_obs_count_per_point: Tensor | None = None,
         modal_frame_view_indices: Tensor | None = None,
         modal_frame_local_indices: Tensor | None = None,
-        modal_smooth_triplets: Tensor | None = None,
-        modal_consistency_y_real: Tensor | None = None,
-        modal_consistency_y_imag: Tensor | None = None,
-        modal_consistency_J: Tensor | None = None,
-        modal_consistency_gaussian_indices: Tensor | None = None,
-        modal_consistency_mode_indices: Tensor | None = None,
-        modal_consistency_group_indices: Tensor | None = None,
-        modal_consistency_group_count: int = 0,
-        modal_consistency_target_view_index: int = -1,
-        modal_consistency_fps: float = 0.0,
+        modal_frame_times_sec: Tensor | None = None,
         modal_synthetic_enabled: bool | Tensor = False,
     ):
         super().__init__()
@@ -115,8 +106,6 @@ class SceneModel(nn.Module):
                 raise ValueError("modal phi Gaussian dimension does not match foreground")
             if modal_phi_real.shape[0] != modal.num_modes:
                 raise ValueError("modal phi mode count does not match activations")
-            if modal.num_frames != self.num_frames:
-                raise ValueError("modal activation frame count does not match model")
         else:
             if modal_phi_real is None:
                 modal_phi_real = torch.empty(
@@ -140,12 +129,36 @@ class SceneModel(nn.Module):
             if modal_phi_real.shape[1] != self.num_fg_gaussians:
                 raise ValueError("modal phi Gaussian dimension does not match foreground")
 
+        if not torch.is_floating_point(modal_phi_real) or not torch.is_floating_point(
+            modal_phi_imag
+        ):
+            raise ValueError("modal phi real/imag tensors must have floating-point dtype")
+        if modal_phi_real.dtype != modal_phi_imag.dtype:
+            raise ValueError("modal phi real/imag tensors must have matching dtypes")
+        if not bool(torch.isfinite(modal_phi_real).all().item()) or not bool(
+            torch.isfinite(modal_phi_imag).all().item()
+        ):
+            raise ValueError("modal phi real/imag tensors must contain only finite values")
+
         if modal_freqs_hz is None:
+            if modal_phi_real.shape[0] > 0:
+                raise ValueError("modal fields require modal freqs_hz")
             modal_freqs_hz = torch.empty(
                 modal_phi_real.shape[0],
                 device=self.fg.params["means"].device,
                 dtype=self.fg.params["means"].dtype,
             )
+        if modal_freqs_hz.ndim != 1 or modal_freqs_hz.shape[0] != modal_phi_real.shape[0]:
+            raise ValueError(
+                "modal freqs_hz must have shape "
+                f"({modal_phi_real.shape[0]},), got {tuple(modal_freqs_hz.shape)}"
+            )
+        if not torch.is_floating_point(modal_freqs_hz):
+            raise ValueError("modal freqs_hz must have floating-point dtype")
+        if not bool(torch.isfinite(modal_freqs_hz).all().item()):
+            raise ValueError("modal freqs_hz must contain only finite values")
+        if modal_freqs_hz.numel() > 0 and bool((modal_freqs_hz <= 0).any().item()):
+            raise ValueError("modal freqs_hz must be strictly positive")
         if modal_obs_count_per_point is None:
             modal_obs_count_per_point = torch.empty(
                 modal_phi_real.shape[0],
@@ -162,18 +175,71 @@ class SceneModel(nn.Module):
                 f"({modal_phi_real.shape[0]}, {self.num_fg_gaussians}), "
                 f"got {tuple(modal_obs_count_per_point.shape)}"
             )
+        if trajectory_type == "modal_activation" and (
+            modal_frame_view_indices is None
+            or modal_frame_local_indices is None
+            or modal_frame_times_sec is None
+        ):
+            raise ValueError(
+                "modal_activation requires frame view, local-index, and time buffers"
+            )
+        frame_device = self.fg.params["means"].device
         if modal_frame_view_indices is None:
             modal_frame_view_indices = torch.full(
-                (self.num_frames,), -1, device=self.fg.params["means"].device
+                (self.num_frames,), -1, device=frame_device, dtype=torch.long
             )
         if modal_frame_local_indices is None:
             modal_frame_local_indices = torch.full(
-                (self.num_frames,), -1, device=self.fg.params["means"].device
+                (self.num_frames,), -1, device=frame_device, dtype=torch.long
             )
-        if modal_smooth_triplets is None:
-            modal_smooth_triplets = torch.empty(
-                0, 3, device=self.fg.params["means"].device, dtype=torch.long
+        if modal_frame_times_sec is None:
+            modal_frame_times_sec = torch.full(
+                (self.num_frames,),
+                -1.0,
+                device=frame_device,
+                dtype=self.fg.params["means"].dtype,
             )
+        integer_dtypes = {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }
+        if modal_frame_view_indices.dtype not in integer_dtypes:
+            raise ValueError("modal frame view indices must have integer dtype")
+        if modal_frame_local_indices.dtype not in integer_dtypes:
+            raise ValueError("modal frame local indices must have integer dtype")
+        if not torch.is_floating_point(modal_frame_times_sec):
+            raise ValueError("modal frame times_sec must have floating-point dtype")
+        for name, values in (
+            ("modal frame view indices", modal_frame_view_indices),
+            ("modal frame local indices", modal_frame_local_indices),
+            ("modal frame times_sec", modal_frame_times_sec),
+        ):
+            if values.ndim != 1 or values.shape[0] != self.num_frames:
+                raise ValueError(
+                    f"{name} must have shape ({self.num_frames},), "
+                    f"got {tuple(values.shape)}"
+                )
+        if trajectory_type == "modal_activation":
+            if modal is None:
+                raise ValueError("modal_activation requires modal activations")
+            modal_num_views = modal.num_views
+            if bool((modal_frame_view_indices < 0).any().item()) or bool(
+                (modal_frame_view_indices >= modal_num_views).any().item()
+            ):
+                raise ValueError(
+                    f"modal frame view indices must lie in [0, {modal_num_views})"
+                )
+            if bool((modal_frame_local_indices < 0).any().item()):
+                raise ValueError("modal frame local indices must be non-negative")
+            if not bool(torch.isfinite(modal_frame_times_sec).all().item()) or bool(
+                (modal_frame_times_sec < 0).any().item()
+            ):
+                raise ValueError(
+                    "modal frame times_sec must be finite and non-negative"
+                )
         self.register_buffer("modal_phi_real", modal_phi_real)
         self.register_buffer("modal_phi_imag", modal_phi_imag)
         self.register_buffer("modal_freqs_hz", modal_freqs_hz)
@@ -184,68 +250,18 @@ class SceneModel(nn.Module):
             "modal_synthetic_enabled",
             torch.tensor(bool(modal_synthetic_enabled), dtype=torch.bool),
         )
-        self.register_buffer("modal_frame_view_indices", modal_frame_view_indices.long())
-        self.register_buffer("modal_frame_local_indices", modal_frame_local_indices.long())
-        self.register_buffer("modal_smooth_triplets", modal_smooth_triplets.long())
-        if modal_consistency_y_real is None:
-            modal_consistency_y_real = torch.empty(
-                0, 2, device=self.fg.params["means"].device, dtype=self.fg.params["means"].dtype
-            )
-        if modal_consistency_y_imag is None:
-            modal_consistency_y_imag = torch.empty_like(modal_consistency_y_real)
-        if modal_consistency_J is None:
-            modal_consistency_J = torch.empty(
-                0, 2, 3, device=self.fg.params["means"].device, dtype=self.fg.params["means"].dtype
-            )
-        if modal_consistency_gaussian_indices is None:
-            modal_consistency_gaussian_indices = torch.empty(
-                0, device=self.fg.params["means"].device, dtype=torch.long
-            )
-        if modal_consistency_mode_indices is None:
-            modal_consistency_mode_indices = torch.empty(
-                0, device=self.fg.params["means"].device, dtype=torch.long
-            )
-        if modal_consistency_group_indices is None:
-            modal_consistency_group_indices = torch.empty(
-                0, device=self.fg.params["means"].device, dtype=torch.long
-            )
-        self.register_buffer("modal_consistency_y_real", modal_consistency_y_real)
-        self.register_buffer("modal_consistency_y_imag", modal_consistency_y_imag)
-        self.register_buffer("modal_consistency_J", modal_consistency_J)
         self.register_buffer(
-            "modal_consistency_gaussian_indices",
-            modal_consistency_gaussian_indices.long(),
+            "modal_frame_view_indices",
+            modal_frame_view_indices.to(device=frame_device, dtype=torch.long),
         )
         self.register_buffer(
-            "modal_consistency_mode_indices",
-            modal_consistency_mode_indices.long(),
+            "modal_frame_local_indices",
+            modal_frame_local_indices.to(device=frame_device, dtype=torch.long),
         )
         self.register_buffer(
-            "modal_consistency_group_indices",
-            modal_consistency_group_indices.long(),
-        )
-        self.register_buffer(
-            "modal_consistency_group_count",
-            torch.tensor(
-                int(modal_consistency_group_count),
-                device=self.fg.params["means"].device,
-                dtype=torch.long,
-            ),
-        )
-        self.register_buffer(
-            "modal_consistency_target_view_index",
-            torch.tensor(
-                int(modal_consistency_target_view_index),
-                device=self.fg.params["means"].device,
-                dtype=torch.long,
-            ),
-        )
-        self.register_buffer(
-            "modal_consistency_fps",
-            torch.tensor(
-                float(modal_consistency_fps),
-                device=self.fg.params["means"].device,
-                dtype=self.fg.params["means"].dtype,
+            "modal_frame_times_sec",
+            modal_frame_times_sec.to(
+                device=frame_device, dtype=self.fg.params["means"].dtype
             ),
         )
 
@@ -281,62 +297,6 @@ class SceneModel(nn.Module):
     def has_modal_obs_count(self) -> bool:
         return self.modal_obs_count_per_point.numel() > 0
 
-    @property
-    def has_modal_consistency(self) -> bool:
-        return int(self.modal_consistency_group_count.item()) > 0
-
-    @torch.no_grad()
-    def set_modal_consistency_data(
-        self,
-        y_real: Tensor | None = None,
-        y_imag: Tensor | None = None,
-        J: Tensor | None = None,
-        gaussian_indices: Tensor | None = None,
-        mode_indices: Tensor | None = None,
-        group_indices: Tensor | None = None,
-        group_count: int = 0,
-        target_view_index: int | None = None,
-        fps: float | None = None,
-    ):
-        device = self.fg.params["means"].device
-        dtype = self.fg.params["means"].dtype
-        if y_real is None:
-            y_real = torch.empty(0, 2, device=device, dtype=dtype)
-        if y_imag is None:
-            y_imag = torch.empty_like(y_real)
-        if J is None:
-            J = torch.empty(0, 2, 3, device=device, dtype=dtype)
-        if gaussian_indices is None:
-            gaussian_indices = torch.empty(0, device=device, dtype=torch.long)
-        if mode_indices is None:
-            mode_indices = torch.empty(0, device=device, dtype=torch.long)
-        if group_indices is None:
-            group_indices = torch.empty(0, device=device, dtype=torch.long)
-
-        self.modal_consistency_y_real = y_real.to(device=device, dtype=dtype)
-        self.modal_consistency_y_imag = y_imag.to(device=device, dtype=dtype)
-        self.modal_consistency_J = J.to(device=device, dtype=dtype)
-        self.modal_consistency_gaussian_indices = gaussian_indices.to(
-            device=device, dtype=torch.long
-        )
-        self.modal_consistency_mode_indices = mode_indices.to(
-            device=device, dtype=torch.long
-        )
-        self.modal_consistency_group_indices = group_indices.to(
-            device=device, dtype=torch.long
-        )
-        self.modal_consistency_group_count = torch.tensor(
-            int(group_count), device=device, dtype=torch.long
-        )
-        if target_view_index is not None:
-            self.modal_consistency_target_view_index = torch.tensor(
-                int(target_view_index), device=device, dtype=torch.long
-            )
-        if fps is not None:
-            self.modal_consistency_fps = torch.tensor(
-                float(fps), device=device, dtype=dtype
-            )
-
     def compute_poses_bg(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -366,19 +326,54 @@ class SceneModel(nn.Module):
         basis = self.dct_basis[ts].to(dtype=traj_coefs.dtype, device=traj_coefs.device)
         return torch.einsum("bk,gkc->gbc", basis, traj_coefs)
 
+    def compute_modal_coefficients(
+        self, ts: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.modal is None:
+            raise RuntimeError("compute_modal_coefficients requires modal activations")
+        if ts.ndim != 1:
+            raise ValueError(f"ts must be a 1-D tensor, got shape {tuple(ts.shape)}")
+        if ts.dtype not in {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }:
+            raise ValueError("ts must have integer dtype")
+        if ts.numel() > 0 and (
+            bool((ts < 0).any().item())
+            or bool((ts >= self.num_frames).any().item())
+        ):
+            raise ValueError(f"ts values must lie in [0, {self.num_frames})")
+        ts = ts.to(dtype=torch.long)
+
+        view_indices = self.modal_frame_view_indices[ts]
+        amplitudes = self.modal.params["activations"][view_indices]
+        times_sec = self.modal_frame_times_sec[ts].to(dtype=amplitudes.dtype)
+        freqs_hz = self.modal_freqs_hz.to(dtype=amplitudes.dtype)
+        theta = 2.0 * torch.pi * times_sec[:, None] * freqs_hz[None, :]
+        cos_theta = torch.cos(theta)
+        sin_theta = torch.sin(theta)
+        amplitude_real = amplitudes[..., 0]
+        amplitude_imag = amplitudes[..., 1]
+        coefficient_real = (
+            amplitude_real * cos_theta - amplitude_imag * sin_theta
+        )
+        coefficient_imag = (
+            amplitude_real * sin_theta + amplitude_imag * cos_theta
+        )
+        return coefficient_real, coefficient_imag
+
     def compute_modal_offsets(
         self, ts: torch.Tensor, inds: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if self.modal is None:
-            raise RuntimeError("compute_modal_offsets requires modal activations")
-        activations = self.modal.params["activations"][ts]
+        real, imag = self.compute_modal_coefficients(ts)
         phi_real = self.modal_phi_real
         phi_imag = self.modal_phi_imag
         if inds is not None:
             phi_real = phi_real[:, inds]
             phi_imag = phi_imag[:, inds]
-        real = activations[..., 0]
-        imag = activations[..., 1]
         return torch.einsum("bk,kgc->gbc", real, phi_real) - torch.einsum(
             "bk,kgc->gbc", imag, phi_imag
         )
@@ -410,120 +405,10 @@ class SceneModel(nn.Module):
             motion_scale, device=offsets.device, dtype=offsets.dtype
         )
 
-    def compute_activation_smoothness_loss(self) -> torch.Tensor:
-        if self.modal is None:
-            return self.fg.params["means"].new_zeros(())
-        if self.modal_smooth_triplets.numel() == 0:
-            return self.modal.params["activations"].sum() * 0.0
-        activations = self.modal.params["activations"]
-        prev = activations[self.modal_smooth_triplets[:, 0]]
-        center = activations[self.modal_smooth_triplets[:, 1]]
-        nxt = activations[self.modal_smooth_triplets[:, 2]]
-        accel = nxt - 2.0 * center + prev
-        return accel.pow(2).sum(dim=-1).mean()
-
     def compute_activation_magnitude_loss(self) -> torch.Tensor:
         if self.modal is None:
             return self.fg.params["means"].new_zeros(())
         return self.modal.params["activations"].pow(2).sum(dim=-1).mean()
-
-    def compute_activation_modal_consistency_loss(
-        self,
-        loss_type: str = "aligned_l2",
-        beta_abs_max: float = 10.0,
-        pred_energy_eps: float = 1e-8,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.modal is None or not self.has_modal_consistency:
-            zero = self.fg.params["means"].new_zeros(())
-            return zero, zero
-        if loss_type not in {"corr", "aligned_l2"}:
-            raise ValueError(
-                f"Unknown modal consistency loss type {loss_type!r}"
-            )
-        if beta_abs_max <= 0:
-            raise ValueError("modal consistency beta_abs_max must be positive")
-        if pred_energy_eps <= 0:
-            raise ValueError("modal consistency pred_energy_eps must be positive")
-        if float(self.modal_consistency_fps.item()) <= 0:
-            raise ValueError("modal consistency requires positive fps")
-
-        target_view_index = int(self.modal_consistency_target_view_index.item())
-        target_mask = self.modal_frame_view_indices == target_view_index
-        if int(target_mask.sum().item()) == 0:
-            raise ValueError(
-                f"modal consistency target view index {target_view_index} has no frames"
-            )
-        target_ts = torch.where(target_mask)[0]
-        local_indices = self.modal_frame_local_indices[target_ts]
-        order = torch.argsort(local_indices)
-        target_ts = target_ts[order]
-        local_indices = local_indices[order]
-
-        activations = self.modal.params["activations"][target_ts]
-        act_complex = torch.complex(activations[..., 0], activations[..., 1])
-        dtype = activations.dtype
-        times = local_indices.to(device=activations.device, dtype=dtype) / self.modal_consistency_fps
-        freqs = self.modal_freqs_hz.to(device=activations.device, dtype=dtype)
-        phase_arg = -2.0 * torch.pi * freqs[:, None] * times[None, :]
-        phase = torch.complex(torch.cos(phase_arg), torch.sin(phase_arg))
-        activation_spectrum = torch.einsum("ft,tm->fm", phase, act_complex)
-        activation_spectrum = activation_spectrum / max(int(target_ts.numel()), 1)
-
-        phi = torch.complex(self.modal_phi_real, self.modal_phi_imag)
-        xhat = torch.einsum("fm,mgc->fgc", activation_spectrum, phi)
-        obs_xhat = xhat[
-            self.modal_consistency_mode_indices,
-            self.modal_consistency_gaussian_indices,
-        ]
-        J = self.modal_consistency_J.to(dtype=obs_xhat.dtype)
-        pred_y = torch.einsum("oij,oj->oi", J, obs_xhat)
-        target_y = torch.complex(
-            self.modal_consistency_y_real,
-            self.modal_consistency_y_imag,
-        )
-
-        eps = torch.as_tensor(
-            float(pred_energy_eps), device=activations.device, dtype=dtype
-        )
-        losses = []
-        for group_idx in range(int(self.modal_consistency_group_count.item())):
-            rows = self.modal_consistency_group_indices == group_idx
-            if int(rows.sum().item()) == 0:
-                continue
-            pred_group = pred_y[rows].reshape(-1)
-            target_group = target_y[rows].reshape(-1)
-            target_energy = (target_group.conj() * target_group).real.sum()
-            if float(target_energy.detach().item()) <= float(eps):
-                continue
-            pred_energy = (pred_group.conj() * pred_group).real.sum()
-            dot = (pred_group.conj() * target_group).sum()
-            if loss_type == "corr":
-                denom = (pred_energy + eps) * (target_energy + eps)
-                corr = dot.abs().pow(2) / denom
-                losses.append(1.0 - corr.clamp(0.0, 1.0))
-            else:
-                if float(pred_energy.detach().item()) <= float(eps):
-                    beta = torch.ones((), device=pred_y.device, dtype=pred_y.dtype)
-                else:
-                    beta = dot / (pred_energy + eps)
-                    beta_abs = beta.abs()
-                    max_abs = torch.as_tensor(
-                        float(beta_abs_max),
-                        device=pred_y.device,
-                        dtype=beta_abs.dtype,
-                    )
-                    scale = torch.clamp(max_abs / beta_abs.clamp_min(eps), max=1.0)
-                    beta = beta * scale.to(dtype=beta.dtype)
-                residual = beta * pred_group - target_group
-                residual_energy = (residual.conj() * residual).real.sum()
-                losses.append(residual_energy / (target_energy + eps))
-
-        if not losses:
-            zero = self.fg.params["means"].new_zeros(())
-            return zero, zero
-        return torch.stack(losses).mean(), torch.tensor(
-            float(len(losses)), device=activations.device, dtype=dtype
-        )
 
     @torch.no_grad()
     def densify_modal_fields(self, should_split: torch.Tensor, should_dup: torch.Tensor):
@@ -677,16 +562,7 @@ class SceneModel(nn.Module):
         modal_obs_count_per_point = None
         modal_frame_view_indices = None
         modal_frame_local_indices = None
-        modal_smooth_triplets = None
-        modal_consistency_y_real = None
-        modal_consistency_y_imag = None
-        modal_consistency_J = None
-        modal_consistency_gaussian_indices = None
-        modal_consistency_mode_indices = None
-        modal_consistency_group_indices = None
-        modal_consistency_group_count = 0
-        modal_consistency_target_view_index = -1
-        modal_consistency_fps = 0.0
+        modal_frame_times_sec = None
         if f"{prefix}modal_phi_real" in state_dict:
             modal_phi_real = state_dict[f"{prefix}modal_phi_real"]
             modal_phi_imag = state_dict[f"{prefix}modal_phi_imag"]
@@ -695,34 +571,31 @@ class SceneModel(nn.Module):
                 modal_obs_count_per_point = state_dict[f"{prefix}modal_obs_count_per_point"]
 
         if trajectory_type == "modal_activation":
+            required_frame_keys = (
+                f"{prefix}modal_frame_view_indices",
+                f"{prefix}modal_frame_local_indices",
+                f"{prefix}modal_frame_times_sec",
+            )
+            missing_frame_keys = [
+                key for key in required_frame_keys if key not in state_dict
+            ]
+            if missing_frame_keys:
+                if f"{prefix}modal_smooth_triplets" in state_dict:
+                    raise ValueError(
+                        "Legacy per-frame modal activation checkpoints are not "
+                        "supported; initialize per-view harmonic activation from "
+                        "the static checkpoint and staged modal manifest."
+                    )
+                raise ValueError(
+                    "Harmonic modal checkpoint is missing required frame buffers: "
+                    f"{missing_frame_keys}"
+                )
             modal = ModalActivations.init_from_state_dict(
                 state_dict, prefix=f"{prefix}modal.params."
             )
             modal_frame_view_indices = state_dict[f"{prefix}modal_frame_view_indices"]
             modal_frame_local_indices = state_dict[f"{prefix}modal_frame_local_indices"]
-            modal_smooth_triplets = state_dict[f"{prefix}modal_smooth_triplets"]
-            if f"{prefix}modal_consistency_y_real" in state_dict:
-                modal_consistency_y_real = state_dict[f"{prefix}modal_consistency_y_real"]
-                modal_consistency_y_imag = state_dict[f"{prefix}modal_consistency_y_imag"]
-                modal_consistency_J = state_dict[f"{prefix}modal_consistency_J"]
-                modal_consistency_gaussian_indices = state_dict[
-                    f"{prefix}modal_consistency_gaussian_indices"
-                ]
-                modal_consistency_mode_indices = state_dict[
-                    f"{prefix}modal_consistency_mode_indices"
-                ]
-                modal_consistency_group_indices = state_dict[
-                    f"{prefix}modal_consistency_group_indices"
-                ]
-                modal_consistency_group_count = int(
-                    state_dict[f"{prefix}modal_consistency_group_count"].item()
-                )
-                modal_consistency_target_view_index = int(
-                    state_dict[f"{prefix}modal_consistency_target_view_index"].item()
-                )
-                modal_consistency_fps = float(
-                    state_dict[f"{prefix}modal_consistency_fps"].item()
-                )
+            modal_frame_times_sec = state_dict[f"{prefix}modal_frame_times_sec"]
         modal_synthetic_enabled = state_dict.get(
             f"{prefix}modal_synthetic_enabled",
             torch.tensor(False),
@@ -745,16 +618,7 @@ class SceneModel(nn.Module):
             modal_obs_count_per_point=modal_obs_count_per_point,
             modal_frame_view_indices=modal_frame_view_indices,
             modal_frame_local_indices=modal_frame_local_indices,
-            modal_smooth_triplets=modal_smooth_triplets,
-            modal_consistency_y_real=modal_consistency_y_real,
-            modal_consistency_y_imag=modal_consistency_y_imag,
-            modal_consistency_J=modal_consistency_J,
-            modal_consistency_gaussian_indices=modal_consistency_gaussian_indices,
-            modal_consistency_mode_indices=modal_consistency_mode_indices,
-            modal_consistency_group_indices=modal_consistency_group_indices,
-            modal_consistency_group_count=modal_consistency_group_count,
-            modal_consistency_target_view_index=modal_consistency_target_view_index,
-            modal_consistency_fps=modal_consistency_fps,
+            modal_frame_times_sec=modal_frame_times_sec,
             modal_synthetic_enabled=modal_synthetic_enabled,
         )
 

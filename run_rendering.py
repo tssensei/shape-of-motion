@@ -6,11 +6,11 @@ from pathlib import Path
 
 import torch
 import tyro
+import yaml
 from loguru import logger as guru
 
 from flow3d.renderer import Renderer
-
-import yaml
+from modal_surface.io import load_view_config
 
 torch.set_float32_matmul_precision("high")
 
@@ -22,6 +22,55 @@ class RenderConfig:
     ckpt_path: str | None = None
     vggt_view_config: tuple[str, ...] = ()
     modal_anchor_manifest: str | None = None
+
+
+def _ordered_vggt_view_configs(
+    view_config_paths: tuple[str, ...],
+    frame_map_path: str,
+) -> tuple[str, ...]:
+    path = Path(frame_map_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Modal frame map does not exist: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError(f"Modal frame map must use version 1: {path}")
+    view_ids = payload.get("views")
+    if (
+        not isinstance(view_ids, list)
+        or not view_ids
+        or any(not isinstance(view_id, str) or not view_id for view_id in view_ids)
+        or len(set(view_ids)) != len(view_ids)
+    ):
+        raise ValueError(f"Modal frame map has invalid views: {path}")
+
+    config_by_view_id: dict[str, str] = {}
+    for config_path in view_config_paths:
+        view_id = load_view_config(config_path).view_id
+        if view_id in config_by_view_id:
+            raise ValueError(f"Duplicate VGGT view config for view_id={view_id!r}")
+        config_by_view_id[view_id] = config_path
+    if set(config_by_view_id) != set(view_ids):
+        raise ValueError(
+            "VGGT view config IDs must exactly match modal frame-map views"
+        )
+    return tuple(config_by_view_id[view_id] for view_id in view_ids)
+
+
+def _modal_frame_map_from_training_config(train_cfg: dict) -> str:
+    data_cfg = train_cfg.get("data")
+    data_value = data_cfg.get("modal_frame_map") if isinstance(data_cfg, dict) else None
+    top_value = train_cfg.get("modal_frame_map")
+    if top_value and data_value and os.path.normpath(str(top_value)) != os.path.normpath(
+        str(data_value)
+    ):
+        raise ValueError(
+            "Training config has conflicting top-level and data.modal_frame_map values"
+        )
+    frame_map = data_value or top_value
+    if not isinstance(frame_map, str) or not frame_map:
+        raise ValueError("Modal rendering requires modal_frame_map in cfg.yaml")
+    return frame_map
 
 
 def main(cfg: RenderConfig):
@@ -37,6 +86,11 @@ def main(cfg: RenderConfig):
     vggt_view_configs = cfg.vggt_view_config or tuple(
         train_cfg.get("vggt_view_configs") or ()
     )
+    if train_cfg.get("trajectory_type") == "modal_activation":
+        vggt_view_configs = _ordered_vggt_view_configs(
+            tuple(vggt_view_configs),
+            _modal_frame_map_from_training_config(train_cfg),
+        )
     modal_anchor_manifest = cfg.modal_anchor_manifest
     if modal_anchor_manifest is None:
         binding_diag_path = Path(ckpt_path).with_suffix(".modal_binding.json")

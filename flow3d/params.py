@@ -126,8 +126,16 @@ class ModalActivations(nn.Module):
         super().__init__()
         if activations.ndim != 3 or activations.shape[-1] != 2:
             raise ValueError(
-                "modal activations must have shape (num_frames, num_modes, 2)"
+                "modal activations must have shape (num_views, num_modes, 2)"
             )
+        if activations.shape[0] <= 0:
+            raise ValueError("modal activations must contain at least one view")
+        if activations.shape[1] <= 0:
+            raise ValueError("modal activations must contain at least one mode")
+        if not torch.is_floating_point(activations):
+            raise ValueError("modal activations must have floating-point dtype")
+        if not bool(torch.isfinite(activations).all().item()):
+            raise ValueError("modal activations must contain only finite values")
         self.params = nn.ParameterDict({"activations": nn.Parameter(activations)})
 
     @staticmethod
@@ -141,7 +149,7 @@ class ModalActivations(nn.Module):
         return ModalActivations(state_dict[key])
 
     @property
-    def num_frames(self) -> int:
+    def num_views(self) -> int:
         return self.params["activations"].shape[0]
 
     @property

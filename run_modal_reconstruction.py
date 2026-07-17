@@ -37,6 +37,7 @@ class ReconstructionFrame:
     view_id: str
     view_index: int
     local_index: int
+    time_sec: float
 
 
 class _ViewMetricAccumulator:
@@ -226,6 +227,32 @@ def _load_checkpoint_model(
     state_dict = checkpoint.get("model")
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint has no model state: {checkpoint_path}")
+    if (
+        "modal.params.activations" in state_dict
+        and "modal_frame_times_sec" not in state_dict
+    ):
+        raise ValueError(
+            "Checkpoint contains obsolete per-frame modal activations and has no "
+            "modal_frame_times_sec; reconstruct from a per-view harmonic checkpoint"
+        )
+    init_metadata = checkpoint.get("init_metadata")
+    if (
+        "modal.params.activations" in state_dict
+        and (
+            not isinstance(init_metadata, dict)
+            or init_metadata.get("modal_parameterization")
+            != "per_view_harmonic_v1"
+        )
+    ):
+        parameterization = (
+            init_metadata.get("modal_parameterization")
+            if isinstance(init_metadata, dict)
+            else None
+        )
+        raise ValueError(
+            "Checkpoint uses an incompatible modal parameterization "
+            f"({parameterization!r}); expected 'per_view_harmonic_v1'"
+        )
     try:
         model = SceneModel.init_from_state_dict(state_dict)
     except (AssertionError, KeyError, RuntimeError, ValueError) as exc:
@@ -249,9 +276,10 @@ def _load_reconstruction_frames(
     if not isinstance(payload, dict):
         raise ValueError(f"Modal frame map must contain a mapping: {frame_map_path}")
     version = payload.get("version")
-    if version is not None and version != 1:
+    if version != 1:
         raise ValueError(f"Unsupported modal frame map version: {version!r}")
     view_ids = payload.get("views")
+    view_fps_hz = payload.get("view_fps_hz")
     records = payload.get("frames")
     if (
         not isinstance(view_ids, list)
@@ -266,12 +294,26 @@ def _load_reconstruction_frames(
         for view_id in view_ids
     ):
         raise ValueError(f"{frame_map_path} contains a path-unsafe view id")
+    if not isinstance(view_fps_hz, dict) or set(view_fps_hz) != set(view_ids):
+        raise ValueError(
+            f"{frame_map_path} view_fps_hz keys must exactly match views"
+        )
+    validated_view_fps_hz: dict[str, float] = {}
+    for view_id in view_ids:
+        value = view_fps_hz[view_id]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Invalid FPS for view_id={view_id!r}")
+        fps_hz = float(value)
+        if not math.isfinite(fps_hz) or fps_hz <= 0.0:
+            raise ValueError(f"Invalid FPS for view_id={view_id!r}")
+        validated_view_fps_hz[view_id] = fps_hz
     if not isinstance(records, list) or not records:
         raise ValueError(f"{frame_map_path} must contain non-empty frames")
     if len(set(frame_names)) != len(frame_names):
         raise ValueError("Training dataset contains duplicate frame names")
 
-    by_name: dict[str, Mapping[str, Any]] = {}
+    by_name: dict[str, tuple[str, int, float]] = {}
+    all_local_indices = {view_id: set() for view_id in view_ids}
     for record in records:
         if not isinstance(record, dict):
             raise ValueError("Modal frame records must be mappings")
@@ -280,35 +322,63 @@ def _load_reconstruction_frames(
             raise ValueError("Modal frame record is missing a non-empty frame_name")
         if frame_name in by_name:
             raise ValueError(f"Duplicate frame_name in modal frame map: {frame_name}")
-        by_name[frame_name] = record
-
-    view_to_index = {view_id: index for index, view_id in enumerate(view_ids)}
-    frames_by_view = {view_id: [] for view_id in view_ids}
-    used_local_indices = {view_id: set() for view_id in view_ids}
-    missing = []
-    for dataset_index, frame_name in enumerate(frame_names):
-        record = by_name.get(frame_name)
-        if record is None:
-            missing.append(frame_name)
-            continue
-        view_id = record.get("view_id")
-        if view_id not in view_to_index:
-            raise ValueError(f"Unknown view_id {view_id!r} for frame {frame_name}")
-        if "local_index" not in record:
-            raise ValueError(f"Frame record {frame_name} is missing local_index")
-        try:
-            local_index = int(record["local_index"])
-        except (TypeError, ValueError) as exc:
+        view_id_value = record.get("view_id")
+        if (
+            not isinstance(view_id_value, str)
+            or view_id_value not in validated_view_fps_hz
+        ):
             raise ValueError(
-                f"Frame record {frame_name} has invalid local_index"
-            ) from exc
+                f"Unknown view_id {view_id_value!r} for frame {frame_name}"
+            )
+        view_id = view_id_value
+        local_index_value = record.get("local_index")
+        if isinstance(local_index_value, bool) or not isinstance(
+            local_index_value, int
+        ):
+            raise ValueError(f"Frame record {frame_name} has invalid local_index")
+        local_index = int(local_index_value)
         if local_index < 0:
             raise ValueError(f"Frame record {frame_name} has negative local_index")
-        if local_index in used_local_indices[view_id]:
+        if local_index in all_local_indices[view_id]:
             raise ValueError(
                 f"Duplicate local_index={local_index} for view_id={view_id!r}"
             )
-        used_local_indices[view_id].add(local_index)
+        time_sec_value = record.get("time_sec")
+        if isinstance(time_sec_value, bool) or not isinstance(
+            time_sec_value, (int, float)
+        ):
+            raise ValueError(f"Frame record {frame_name} has invalid time_sec")
+        time_sec = float(time_sec_value)
+        if not math.isfinite(time_sec) or time_sec < 0.0:
+            raise ValueError(f"Frame record {frame_name} has invalid time_sec")
+        expected_time_sec = local_index / validated_view_fps_hz[view_id]
+        if abs(time_sec - expected_time_sec) > 1.0e-9:
+            raise ValueError(
+                f"Frame record {frame_name} time_sec is inconsistent with "
+                "local_index/view_fps_hz"
+            )
+        all_local_indices[view_id].add(local_index)
+        by_name[frame_name] = (view_id, local_index, time_sec)
+    for view_id, local_indices in all_local_indices.items():
+        if not local_indices:
+            raise ValueError(
+                f"Modal frame map view {view_id!r} has no frame records"
+            )
+        if local_indices != set(range(len(local_indices))):
+            raise ValueError(
+                f"Modal frame map view {view_id!r} local_index values must be "
+                "contiguous from zero"
+            )
+
+    view_to_index = {view_id: index for index, view_id in enumerate(view_ids)}
+    frames_by_view = {view_id: [] for view_id in view_ids}
+    missing = []
+    for dataset_index, frame_name in enumerate(frame_names):
+        frame_record = by_name.get(frame_name)
+        if frame_record is None:
+            missing.append(frame_name)
+            continue
+        view_id, local_index, time_sec = frame_record
         frames_by_view[view_id].append(
             ReconstructionFrame(
                 dataset_index=dataset_index,
@@ -317,6 +387,7 @@ def _load_reconstruction_frames(
                 view_id=view_id,
                 view_index=view_to_index[view_id],
                 local_index=local_index,
+                time_sec=time_sec,
             )
         )
     if missing:
@@ -326,9 +397,9 @@ def _load_reconstruction_frames(
             f"first missing: {preview}"
         )
     for view_id, frames in frames_by_view.items():
-        if not frames:
-            raise ValueError(f"Modal frame map view {view_id!r} has no dataset frames")
         frames.sort(key=lambda frame: frame.local_index)
+    if not any(frames_by_view.values()):
+        raise ValueError("Modal frame map contains no frames selected by the dataset")
     return list(view_ids), frames_by_view
 
 
@@ -348,14 +419,36 @@ def _validate_model_alignment(
     if model.modal is None:
         raise ValueError("Checkpoint has no modal activations")
     activations = model.modal.params["activations"]
-    if activations.ndim != 3 or activations.shape != (
+    num_modes = int(model.modal_phi_real.shape[0])
+    expected_activation_shape = (len(view_ids), num_modes, 2)
+    if activations.ndim == 3 and activations.shape == (
         frame_count,
-        model.modal_phi_real.shape[0],
+        num_modes,
         2,
+    ) and activations.shape != expected_activation_shape:
+        raise ValueError(
+            "Checkpoint contains obsolete per-frame modal activations; "
+            "expected per-view harmonic activations"
+        )
+    if (
+        activations.ndim != 3
+        or tuple(activations.shape) != expected_activation_shape
     ):
-        raise ValueError("Checkpoint modal activation shape is inconsistent")
-    if model.modal_phi_real.shape[0] == 0:
+        raise ValueError(
+            "Checkpoint harmonic activation shape is inconsistent: expected "
+            f"{expected_activation_shape}, got {tuple(activations.shape)}"
+        )
+    if not bool(torch.isfinite(activations).all()):
+        raise ValueError("Checkpoint harmonic activations contain non-finite values")
+    if num_modes == 0:
         raise ValueError("Checkpoint contains no modal modes")
+    frequencies_hz = model.modal_freqs_hz.detach().cpu()
+    if frequencies_hz.shape != (num_modes,):
+        raise ValueError("Checkpoint modal frequency shape is inconsistent")
+    if not bool(torch.isfinite(frequencies_hz).all()) or bool(
+        (frequencies_hz <= 0.0).any()
+    ):
+        raise ValueError("Checkpoint modal frequencies must be finite and positive")
 
     dataset_Ks = dataset.get_Ks().detach().cpu()
     dataset_w2cs = dataset.get_w2cs().detach().cpu()
@@ -372,10 +465,14 @@ def _validate_model_alignment(
 
     expected_view_indices = torch.full((frame_count,), -1, dtype=torch.long)
     expected_local_indices = torch.full((frame_count,), -1, dtype=torch.long)
+    expected_times_sec = torch.full(
+        (frame_count,), float("nan"), dtype=torch.float32
+    )
     for view_id in view_ids:
         for frame in frames_by_view[view_id]:
             expected_view_indices[frame.ts] = frame.view_index
             expected_local_indices[frame.ts] = frame.local_index
+            expected_times_sec[frame.ts] = frame.time_sec
     if bool((expected_view_indices < 0).any()) or bool(
         (expected_local_indices < 0).any()
     ):
@@ -388,19 +485,35 @@ def _validate_model_alignment(
         model.modal_frame_local_indices.detach().cpu(), expected_local_indices
     ):
         raise ValueError("Modal frame local indices do not match checkpoint")
+    if not hasattr(model, "modal_frame_times_sec"):
+        raise ValueError(
+            "Checkpoint has no modal_frame_times_sec and is not a per-view "
+            "harmonic checkpoint"
+        )
+    actual_times_sec = model.modal_frame_times_sec.detach().cpu()
+    if actual_times_sec.shape != expected_times_sec.shape:
+        raise ValueError("Modal frame times shape does not match checkpoint")
+    if not bool(torch.isfinite(actual_times_sec).all()):
+        raise ValueError("Modal frame times contain non-finite values")
+    if not torch.equal(
+        actual_times_sec.to(dtype=torch.float32), expected_times_sec
+    ):
+        raise ValueError("Modal frame times do not match checkpoint")
 
 
 def _activation_stats(
     activations: torch.Tensor,
-    time_indices: Sequence[int],
+    view_indices: Sequence[int],
 ) -> dict[str, float]:
     if activations.ndim != 3 or activations.shape[-1] != 2:
-        raise ValueError("Modal activations must have shape (T, K, 2)")
-    if not time_indices:
-        raise ValueError("Activation statistics require at least one frame")
-    indices = np.asarray(time_indices, dtype=np.int64)
+        raise ValueError("Modal activations must have shape (V, K, 2)")
+    if not view_indices:
+        raise ValueError("Activation statistics require at least one view")
+    indices = np.asarray(view_indices, dtype=np.int64)
     if indices.min() < 0 or indices.max() >= activations.shape[0]:
-        raise ValueError("Activation statistics contain an out-of-range frame index")
+        raise ValueError("Activation statistics contain an out-of-range view index")
+    if np.unique(indices).shape[0] != indices.shape[0]:
+        raise ValueError("Activation statistics contain duplicate view indices")
     selected = activations.detach().cpu().numpy()[indices]
     if not np.isfinite(selected).all():
         raise ValueError("Modal activations contain non-finite values")
@@ -411,6 +524,51 @@ def _activation_stats(
         "p90": float(np.percentile(magnitudes, 90)),
         "max": float(magnitudes.max()),
     }
+
+
+def _harmonic_modes(
+    activations: torch.Tensor,
+    frequencies_hz: torch.Tensor,
+    view_index: int,
+) -> list[dict[str, float | int | None]]:
+    if activations.ndim != 3 or activations.shape[-1] != 2:
+        raise ValueError("Modal activations must have shape (V, K, 2)")
+    if view_index < 0 or view_index >= activations.shape[0]:
+        raise ValueError("Harmonic mode view index is out of range")
+    if frequencies_hz.shape != (activations.shape[1],):
+        raise ValueError("Modal frequency shape does not match harmonic activations")
+    amplitudes = activations[view_index].detach().cpu().numpy()
+    frequencies = frequencies_hz.detach().cpu().numpy()
+    if (
+        not np.isfinite(amplitudes).all()
+        or not np.isfinite(frequencies).all()
+        or np.any(frequencies <= 0.0)
+    ):
+        raise ValueError(
+            "Harmonic mode values contain invalid amplitudes or frequencies"
+        )
+    modes: list[dict[str, float | int | None]] = []
+    for mode_slot, (amplitude, frequency_hz) in enumerate(
+        zip(amplitudes, frequencies, strict=True)
+    ):
+        real = float(amplitude[0])
+        imaginary = float(amplitude[1])
+        magnitude = math.hypot(real, imaginary)
+        modes.append(
+            {
+                "mode_slot": mode_slot,
+                "frequency_hz": float(frequency_hz),
+                "real": real,
+                "imaginary": imaginary,
+                "magnitude": magnitude,
+                "phase_rad": (
+                    None
+                    if magnitude <= 1.0e-12
+                    else math.atan2(imaginary, real)
+                ),
+            }
+        )
+    return modes
 
 
 def _training_target(
@@ -556,9 +714,14 @@ def run(cfg: ModalReconstructionConfig) -> None:
         view_metrics: dict[str, dict[str, Any]] = {}
         accumulators = []
         summaries = []
-        all_time_indices = []
+        active_view_ids = [
+            view_id for view_id in view_ids if frames_by_view[view_id]
+        ]
+        active_view_indices = [
+            view_ids.index(view_id) for view_id in active_view_ids
+        ]
 
-        for view_id in view_ids:
+        for view_id in active_view_ids:
             frames = frames_by_view[view_id]
             accumulator = _ViewMetricAccumulator(device)
             video_path = temporary_dir / f"{view_id}_comparison.mp4"
@@ -615,15 +778,19 @@ def run(cfg: ModalReconstructionConfig) -> None:
                 writer.close()
 
             summary = accumulator.summary()
-            time_indices = [frame.ts for frame in frames]
+            view_index = frames[0].view_index
             summary["activation_magnitude"] = _activation_stats(
                 activations,
-                time_indices,
+                [view_index],
+            )
+            summary["harmonic_modes"] = _harmonic_modes(
+                activations,
+                model.modal_freqs_hz,
+                view_index,
             )
             view_metrics[view_id] = summary
             accumulators.append(accumulator)
             summaries.append(summary)
-            all_time_indices.extend(time_indices)
             guru.info(
                 f"Rendered {len(frames)} frames for {view_id} -> {video_path.name}"
             )
@@ -631,7 +798,7 @@ def run(cfg: ModalReconstructionConfig) -> None:
         overall = _combined_summary(accumulators, summaries)
         overall["activation_magnitude"] = _activation_stats(
             activations,
-            all_time_indices,
+            active_view_indices,
         )
         metrics = {
             "version": 1,
@@ -640,6 +807,8 @@ def run(cfg: ModalReconstructionConfig) -> None:
             "frame_map": str(frame_map_path.resolve()),
             "fps": float(cfg.fps),
             "view_order": view_ids,
+            "declared_views": view_ids,
+            "active_views": active_view_ids,
             "num_modes": int(model.modal_phi_real.shape[0]),
             "views": view_metrics,
             "overall": overall,

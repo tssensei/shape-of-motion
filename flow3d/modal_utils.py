@@ -6,7 +6,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from loguru import logger as guru
 
 from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_ROLE_CONSTRAINED_VARIABLE,
@@ -15,13 +14,6 @@ from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_ROLE_FREE_VARIABLE,
     MOTION_FILL_ROLE_NAMES,
 )
-from modal_surface.geometry import (
-    bilinear_sample,
-    erode_mask,
-    project_points,
-    projection_jacobian,
-)
-from modal_surface.io import load_view_config
 
 
 MOTION_FILL_DISPLAY_ANCHOR = 0
@@ -72,18 +64,7 @@ class ModalFrameMap:
     view_ids: list[str]
     frame_view_indices: torch.Tensor
     frame_local_indices: torch.Tensor
-    smooth_triplets: torch.Tensor
-
-
-@dataclass(frozen=True)
-class ModalConsistencyData:
-    y_real: torch.Tensor
-    y_imag: torch.Tensor
-    J: torch.Tensor
-    gaussian_indices: torch.Tensor
-    mode_indices: torch.Tensor
-    group_indices: torch.Tensor
-    group_count: int
+    frame_times_sec: torch.Tensor
 
 
 def classify_motion_fill_display_points(
@@ -508,273 +489,6 @@ def load_gaussian_modal_fields(
     )
 
 
-def _modal_mask_from_npz(modal: Any, shape: tuple[int, int]) -> np.ndarray:
-    if "mask" not in modal.files:
-        return np.ones(shape, dtype=bool)
-    mask = np.asarray(modal["mask"])
-    if mask.ndim != 2:
-        raise ValueError(f"modal mask must be 2D, got {mask.shape}")
-    if mask.shape != shape:
-        raise ValueError(f"modal mask shape {mask.shape} does not match {shape}")
-    if np.issubdtype(mask.dtype, np.floating):
-        return mask > 0.5
-    return mask > 0
-
-
-def _build_pixel_buckets(
-    point_indices: np.ndarray,
-    rounded_x: np.ndarray,
-    rounded_y: np.ndarray,
-    width: int,
-) -> dict[int, np.ndarray]:
-    if point_indices.size == 0:
-        return {}
-    linear = (
-        rounded_y[point_indices].astype(np.int64) * int(width)
-        + rounded_x[point_indices].astype(np.int64)
-    )
-    order = np.argsort(linear)
-    linear_sorted = linear[order]
-    point_sorted = point_indices[order]
-    keys, starts, counts = np.unique(
-        linear_sorted, return_index=True, return_counts=True
-    )
-    return {
-        int(k): point_sorted[int(s) : int(s + c)]
-        for k, s, c in zip(keys, starts, counts)
-    }
-
-
-def _local_depth_stats(
-    buckets: dict[int, np.ndarray],
-    z: np.ndarray,
-    x: int,
-    y: int,
-    width: int,
-    height: int,
-    radius: int,
-    front_percentile: float,
-    min_samples: int,
-) -> tuple[float, float] | None:
-    parts: list[np.ndarray] = []
-    x0 = max(0, x - radius)
-    x1 = min(width, x + radius + 1)
-    y0 = max(0, y - radius)
-    y1 = min(height, y + radius + 1)
-    for yy in range(y0, y1):
-        base = yy * width
-        for xx in range(x0, x1):
-            idx = buckets.get(base + xx)
-            if idx is not None:
-                parts.append(idx)
-    if not parts:
-        return None
-    indices = parts[0] if len(parts) == 1 else np.concatenate(parts)
-    vals = z[indices]
-    vals = vals[np.isfinite(vals) & (vals > 0)]
-    if vals.size < min_samples:
-        return None
-    z_front, z_med = np.percentile(vals, [front_percentile, 50])
-    return float(z_front), float(z_med)
-
-
-def _zbuffer_visible_indices(
-    candidate_indices: np.ndarray,
-    rounded_x: np.ndarray,
-    rounded_y: np.ndarray,
-    z: np.ndarray,
-    width: int,
-    height: int,
-    zbuffer_radius: int,
-    front_percentile: float,
-    zbuffer_tau: float,
-    min_zbuffer_samples: int,
-) -> np.ndarray:
-    buckets = _build_pixel_buckets(candidate_indices, rounded_x, rounded_y, width)
-    keep = []
-    for point_idx in candidate_indices.tolist():
-        stats = _local_depth_stats(
-            buckets,
-            z,
-            int(rounded_x[point_idx]),
-            int(rounded_y[point_idx]),
-            width,
-            height,
-            zbuffer_radius,
-            front_percentile,
-            min_zbuffer_samples,
-        )
-        if stats is None:
-            continue
-        z_front, z_med = stats
-        if z_med <= 0:
-            continue
-        rel = abs(float(z[point_idx]) - z_front) / max(abs(z_med), 1e-6)
-        if rel < zbuffer_tau:
-            keep.append(point_idx)
-    return np.asarray(keep, dtype=np.int64)
-
-
-def load_modal_consistency_data(
-    gaussian_means: torch.Tensor,
-    modes: list[ModalModeData],
-    view_config_paths: tuple[str, ...],
-    modal_npz_paths: tuple[str, ...],
-    freq_tolerance_hz: float,
-    mask_erode_iters: int,
-    zbuffer_radius: int = 5,
-    front_percentile: float = 10.0,
-    zbuffer_tau: float = 0.05,
-    min_zbuffer_samples: int = 5,
-) -> ModalConsistencyData | None:
-    if not view_config_paths and not modal_npz_paths:
-        return None
-    if len(view_config_paths) != len(modal_npz_paths):
-        raise ValueError(
-            "modal consistency view configs and modal npzs must have the same length"
-        )
-    if not modes:
-        raise ValueError("modal consistency requires at least one modal mode")
-    if freq_tolerance_hz < 0:
-        raise ValueError("modal consistency freq tolerance must be non-negative")
-    if mask_erode_iters < 0:
-        raise ValueError("modal consistency mask_erode_iters must be non-negative")
-    if zbuffer_radius < 0:
-        raise ValueError("modal consistency zbuffer_radius must be non-negative")
-    if not (0.0 <= front_percentile <= 100.0):
-        raise ValueError("modal consistency front_percentile must be in [0, 100]")
-    if zbuffer_tau <= 0:
-        raise ValueError("modal consistency zbuffer_tau must be positive")
-    if min_zbuffer_samples < 1:
-        raise ValueError(
-            "modal consistency min_zbuffer_samples must be at least 1"
-        )
-
-    device = gaussian_means.device
-    dtype = gaussian_means.dtype
-    points_world = gaussian_means.detach().cpu().numpy().astype(np.float32)
-    obs_y: list[np.ndarray] = []
-    obs_J: list[np.ndarray] = []
-    gaussian_indices: list[np.ndarray] = []
-    mode_indices: list[np.ndarray] = []
-    group_indices: list[np.ndarray] = []
-    group_count = 0
-
-    for view_cfg_path, modal_path in zip(view_config_paths, modal_npz_paths):
-        cfg = load_view_config(view_cfg_path)
-        modal = np.load(str(modal_path), allow_pickle=False)
-        required = ["mode_u", "mode_v", "selected_freqs_hz"]
-        missing = [key for key in required if key not in modal.files]
-        if missing:
-            raise ValueError(f"{modal_path} missing required modal arrays: {missing}")
-        mode_u_all = modal["mode_u"]
-        mode_v_all = modal["mode_v"]
-        selected_freqs = modal["selected_freqs_hz"].astype(np.float32).reshape(-1)
-        if mode_u_all.ndim != 3 or mode_v_all.shape != mode_u_all.shape:
-            raise ValueError(f"{modal_path} mode_u/mode_v must have matching shape (K,H,W)")
-        height, width = int(mode_u_all.shape[1]), int(mode_u_all.shape[2])
-        if (height, width) != (cfg.image_height, cfg.image_width):
-            raise ValueError(
-                f"{modal_path} modal image shape {(height, width)} does not match "
-                f"view config {(cfg.image_height, cfg.image_width)}"
-            )
-        mask = erode_mask(_modal_mask_from_npz(modal, (height, width)), mask_erode_iters)
-        pixels_xy, z = project_points(points_world, cfg.K, cfg.world_to_camera)
-        finite_pixels = np.isfinite(pixels_xy).all(axis=1)
-        rounded_x = np.full((pixels_xy.shape[0],), -1, dtype=np.int64)
-        rounded_y = np.full((pixels_xy.shape[0],), -1, dtype=np.int64)
-        rounded_x[finite_pixels] = np.rint(pixels_xy[finite_pixels, 0]).astype(np.int64)
-        rounded_y[finite_pixels] = np.rint(pixels_xy[finite_pixels, 1]).astype(np.int64)
-        valid = (
-            finite_pixels
-            & np.isfinite(z)
-            & (z > 0)
-            & (pixels_xy[:, 0] >= 0)
-            & (pixels_xy[:, 0] < width - 1)
-            & (pixels_xy[:, 1] >= 0)
-            & (pixels_xy[:, 1] < height - 1)
-            & (rounded_x >= 0)
-            & (rounded_x < width)
-            & (rounded_y >= 0)
-            & (rounded_y < height)
-        )
-        valid_indices = np.where(valid)[0]
-        if valid_indices.size == 0:
-            raise ValueError(f"No modal consistency Gaussian projections survived for {cfg.view_id}")
-        valid_indices = valid_indices[mask[rounded_y[valid_indices], rounded_x[valid_indices]]]
-        if valid_indices.size == 0:
-            raise ValueError(f"No modal consistency Gaussian projections survived mask for {cfg.view_id}")
-        mask_valid_count = int(valid_indices.size)
-        valid_indices = _zbuffer_visible_indices(
-            valid_indices,
-            rounded_x,
-            rounded_y,
-            z,
-            width,
-            height,
-            zbuffer_radius,
-            front_percentile,
-            zbuffer_tau,
-            min_zbuffer_samples,
-        )
-        if valid_indices.size == 0:
-            raise ValueError(
-                f"No modal consistency Gaussian projections survived z-buffer for {cfg.view_id}"
-            )
-        guru.info(
-            f"Modal consistency view {cfg.view_id}: z-buffer kept "
-            f"{valid_indices.size}/{mask_valid_count} masked projections"
-        )
-        jacobians = projection_jacobian(points_world[valid_indices], cfg.K, cfg.world_to_camera)
-        sample_xy = pixels_xy[valid_indices]
-
-        for internal_mode_idx, mode in enumerate(modes):
-            source_mode_idx = int(mode.mode_index)
-            if source_mode_idx < 0 or source_mode_idx >= mode_u_all.shape[0]:
-                raise ValueError(
-                    f"{modal_path} does not contain mode_index={source_mode_idx}"
-                )
-            view_freq = float(selected_freqs[source_mode_idx])
-            if abs(view_freq - float(mode.freq_hz)) > freq_tolerance_hz:
-                raise ValueError(
-                    f"{modal_path} mode_index={source_mode_idx} frequency {view_freq:.6f} Hz "
-                    f"does not match manifest frequency {mode.freq_hz:.6f} Hz"
-                )
-            y_u = bilinear_sample(mode_u_all[source_mode_idx].astype(np.complex64), sample_xy)
-            y_v = bilinear_sample(mode_v_all[source_mode_idx].astype(np.complex64), sample_xy)
-            obs_y.append(np.stack([y_u, y_v], axis=1).astype(np.complex64))
-            obs_J.append(jacobians.astype(np.float32))
-            gaussian_indices.append(valid_indices.astype(np.int64))
-            mode_indices.append(
-                np.full((valid_indices.size,), internal_mode_idx, dtype=np.int64)
-            )
-            group_indices.append(
-                np.full((valid_indices.size,), group_count, dtype=np.int64)
-            )
-            group_count += 1
-
-    if not obs_y:
-        raise ValueError("No modal consistency observations were created")
-    obs_y_arr = np.concatenate(obs_y, axis=0)
-    obs_J_arr = np.concatenate(obs_J, axis=0)
-    gaussian_idx_arr = np.concatenate(gaussian_indices, axis=0)
-    mode_idx_arr = np.concatenate(mode_indices, axis=0)
-    group_idx_arr = np.concatenate(group_indices, axis=0)
-    guru.info(
-        f"Loaded {obs_y_arr.shape[0]} activation modal consistency observations "
-        f"across {group_count} view-frequency groups"
-    )
-    return ModalConsistencyData(
-        y_real=torch.as_tensor(obs_y_arr.real, device=device, dtype=dtype),
-        y_imag=torch.as_tensor(obs_y_arr.imag, device=device, dtype=dtype),
-        J=torch.as_tensor(obs_J_arr, device=device, dtype=dtype),
-        gaussian_indices=torch.as_tensor(gaussian_idx_arr, device=device, dtype=torch.long),
-        mode_indices=torch.as_tensor(mode_idx_arr, device=device, dtype=torch.long),
-        group_indices=torch.as_tensor(group_idx_arr, device=device, dtype=torch.long),
-        group_count=group_count,
-    )
-
-
 def load_modal_frame_map(
     frame_map_path: str,
     train_dataset: Any,
@@ -784,68 +498,148 @@ def load_modal_frame_map(
     with open(frame_map_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
+    version = payload.get("version")
+    if isinstance(version, bool) or version != 1:
+        raise ValueError(f"{frame_map_path} must use modal frame map version 1")
     view_ids = payload.get("views")
+    view_fps_hz = payload.get("view_fps_hz")
     frames = payload.get("frames")
     if not isinstance(view_ids, list) or not view_ids:
         raise ValueError(f"{frame_map_path} must contain non-empty views list")
+    if any(not isinstance(view_id, str) or not view_id for view_id in view_ids):
+        raise ValueError(f"{frame_map_path} views must be non-empty strings")
+    if len(set(view_ids)) != len(view_ids):
+        raise ValueError(f"{frame_map_path} views must be unique")
+    if not isinstance(view_fps_hz, dict):
+        raise ValueError(f"{frame_map_path} must contain view_fps_hz object")
+    if set(view_fps_hz) != set(view_ids):
+        raise ValueError(
+            f"{frame_map_path} view_fps_hz keys must exactly match views"
+        )
     if not isinstance(frames, list) or not frames:
         raise ValueError(f"{frame_map_path} must contain non-empty frames list")
+
+    fps_by_view: dict[str, float] = {}
+    for view_id in view_ids:
+        value = view_fps_hz[view_id]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"FPS for view {view_id!r} must be numeric")
+        fps = float(value)
+        if not np.isfinite(fps) or fps <= 0:
+            raise ValueError(f"FPS for view {view_id!r} must be finite and positive")
+        fps_by_view[view_id] = fps
 
     frame_names = getattr(train_dataset, "frame_names", None)
     if frame_names is None:
         raise ValueError("modal_activation requires train_dataset.frame_names")
     if len(frame_names) != train_dataset.num_frames:
         raise ValueError("train_dataset.frame_names length does not match num_frames")
+    if train_dataset.num_frames != num_frames:
+        raise ValueError(
+            "modal_activation model frame count does not match train dataset"
+        )
+    if num_frames <= 0:
+        raise ValueError("modal_activation requires at least one training frame")
+    if len(set(frame_names)) != len(frame_names):
+        raise ValueError("modal_activation requires unique train_dataset.frame_names")
 
     if hasattr(train_dataset, "time_ids"):
-        time_ids = torch.as_tensor(train_dataset.time_ids).to(torch.long).cpu()
+        time_ids = torch.as_tensor(train_dataset.time_ids).cpu()
     else:
         time_ids = torch.arange(train_dataset.num_frames, dtype=torch.long)
-    if len(time_ids) != len(frame_names):
+    if time_ids.ndim != 1 or len(time_ids) != len(frame_names):
         raise ValueError("train_dataset.time_ids length does not match frame_names")
+    if time_ids.dtype not in {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }:
+        raise ValueError("train_dataset.time_ids must have integer dtype")
+    time_ids = time_ids.to(torch.long)
     if int(torch.unique(time_ids).numel()) != int(time_ids.numel()):
         raise ValueError("modal_activation requires unique global ts per frame")
-
-    by_name = {}
-    for record in frames:
-        frame_name = record.get("frame_name")
-        if frame_name is None:
-            raise ValueError(f"Frame record in {frame_map_path} is missing frame_name")
-        if frame_name in by_name:
-            raise ValueError(f"Duplicate frame_name in modal frame map: {frame_name}")
-        by_name[frame_name] = record
+    expected_time_ids = torch.arange(num_frames, dtype=torch.long)
+    if not torch.equal(torch.sort(time_ids).values, expected_time_ids):
+        raise ValueError(
+            f"modal_activation global ts must be a permutation of [0, {num_frames})"
+        )
 
     view_to_index = {view_id: idx for idx, view_id in enumerate(view_ids)}
+    by_name: dict[str, tuple[int, int, float]] = {}
+    per_view_full_local_indices: list[set[int]] = [set() for _ in view_ids]
+    for record in frames:
+        if not isinstance(record, dict):
+            raise ValueError(f"Frame records in {frame_map_path} must be objects")
+        frame_name = record.get("frame_name")
+        if not isinstance(frame_name, str) or not frame_name:
+            raise ValueError(
+                f"Frame record in {frame_map_path} has invalid frame_name"
+            )
+        if frame_name in by_name:
+            raise ValueError(f"Duplicate frame_name in modal frame map: {frame_name}")
+        view_id = record.get("view_id")
+        if not isinstance(view_id, str):
+            raise ValueError(f"view_id must be a string for frame {frame_name}")
+        if view_id not in view_to_index:
+            raise ValueError(f"Unknown view_id {view_id!r} for frame {frame_name}")
+        local_index_value = record.get("local_index")
+        if isinstance(local_index_value, bool) or not isinstance(
+            local_index_value, int
+        ):
+            raise ValueError(f"local_index must be an integer for {frame_name}")
+        local_index = int(local_index_value)
+        if local_index < 0:
+            raise ValueError(f"local_index must be non-negative for {frame_name}")
+        time_sec_value = record.get("time_sec")
+        if isinstance(time_sec_value, bool) or not isinstance(
+            time_sec_value, (int, float)
+        ):
+            raise ValueError(f"time_sec must be numeric for {frame_name}")
+        time_sec = float(time_sec_value)
+        if not np.isfinite(time_sec) or time_sec < 0:
+            raise ValueError(f"time_sec must be finite and non-negative for {frame_name}")
+        expected_time_sec = local_index / fps_by_view[view_id]
+        if abs(time_sec - expected_time_sec) > 1e-9:
+            raise ValueError(
+                f"time_sec={time_sec:.12g} for {frame_name} does not match "
+                f"local_index/fps={expected_time_sec:.12g}"
+            )
+
+        view_index = view_to_index[view_id]
+        if local_index in per_view_full_local_indices[view_index]:
+            raise ValueError(
+                f"Duplicate local_index={local_index} for view_id={view_id!r}"
+            )
+        per_view_full_local_indices[view_index].add(local_index)
+        by_name[frame_name] = (view_index, local_index, time_sec)
+
+    for view_index, view_id in enumerate(view_ids):
+        local_indices = per_view_full_local_indices[view_index]
+        if not local_indices:
+            raise ValueError(f"Modal frame map view {view_id!r} has no frames")
+        expected = set(range(len(local_indices)))
+        if local_indices != expected:
+            raise ValueError(
+                f"Modal frame map local_index values for view {view_id!r} "
+                f"must be contiguous from 0 to {len(local_indices) - 1}"
+            )
+
     frame_view_indices = torch.full((num_frames,), -1, dtype=torch.long)
     frame_local_indices = torch.full((num_frames,), -1, dtype=torch.long)
-    per_view_local_to_ts: list[dict[int, int]] = [dict() for _ in view_ids]
-    missing = []
+    frame_times_sec = torch.full((num_frames,), float("nan"), dtype=torch.float32)
+    missing: list[str] = []
 
     for dataset_index, frame_name in enumerate(frame_names):
         if frame_name not in by_name:
             missing.append(frame_name)
             continue
-        record = by_name[frame_name]
-        view_id = record.get("view_id")
-        if view_id not in view_to_index:
-            raise ValueError(f"Unknown view_id {view_id!r} for frame {frame_name}")
-        if "local_index" not in record:
-            raise ValueError(f"Frame record {frame_name} is missing local_index")
-        local_index = int(record["local_index"])
-        if local_index < 0:
-            raise ValueError(f"local_index must be non-negative for {frame_name}")
-
+        view_index, local_index, time_sec = by_name[frame_name]
         ts = int(time_ids[dataset_index].item())
-        if not 0 <= ts < num_frames:
-            raise ValueError(f"Frame {frame_name} has ts={ts}, outside [0, {num_frames})")
-        view_index = view_to_index[view_id]
-        if local_index in per_view_local_to_ts[view_index]:
-            raise ValueError(
-                f"Duplicate local_index={local_index} for view_id={view_id!r}"
-            )
-        per_view_local_to_ts[view_index][local_index] = ts
         frame_view_indices[ts] = view_index
         frame_local_indices[ts] = local_index
+        frame_times_sec[ts] = time_sec
 
     if missing:
         preview = ", ".join(missing[:5])
@@ -853,25 +647,18 @@ def load_modal_frame_map(
             f"{frame_map_path} is missing {len(missing)} training frames, "
             f"first missing: {preview}"
         )
-    smooth_triplets = []
-    for local_to_ts in per_view_local_to_ts:
-        for local_index, center_ts in sorted(local_to_ts.items()):
-            prev_ts = local_to_ts.get(local_index - 1)
-            next_ts = local_to_ts.get(local_index + 1)
-            if prev_ts is not None and next_ts is not None:
-                smooth_triplets.append([prev_ts, center_ts, next_ts])
-
-    if smooth_triplets:
-        triplets_tensor = torch.tensor(smooth_triplets, dtype=torch.long, device=device)
-    else:
-        triplets_tensor = torch.empty((0, 3), dtype=torch.long, device=device)
-        guru.warning("Modal frame map produced no activation smoothness triplets")
+    if bool((frame_view_indices < 0).any().item()):
+        raise ValueError("Modal frame map did not assign every model frame to a view")
+    if bool((frame_local_indices < 0).any().item()):
+        raise ValueError("Modal frame map did not assign every model frame a local index")
+    if not bool(torch.isfinite(frame_times_sec).all().item()):
+        raise ValueError("Modal frame map did not assign every model frame a time_sec")
 
     return ModalFrameMap(
         view_ids=list(view_ids),
         frame_view_indices=frame_view_indices.to(device),
         frame_local_indices=frame_local_indices.to(device),
-        smooth_triplets=triplets_tensor,
+        frame_times_sec=frame_times_sec.to(device),
     )
 
 
