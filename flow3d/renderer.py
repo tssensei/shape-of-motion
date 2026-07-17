@@ -170,15 +170,19 @@ class Renderer:
                 if isinstance(init_metadata, dict)
                 else None
             )
-            if parameterization != "per_view_harmonic_envelope_v1":
+            if parameterization != "per_view_harmonic_envelope_v2":
                 raise ValueError(
                     "Checkpoint uses an incompatible modal parameterization "
                     f"({parameterization!r}); expected "
-                    "'per_view_harmonic_envelope_v1'"
+                    "'per_view_harmonic_envelope_v2'"
                 )
-            if init_metadata.get("modal_envelope_interpolation") != "linear_complex":
+            if (
+                init_metadata.get("modal_envelope_interpolation")
+                != "cubic_hermite_complex"
+            ):
                 raise ValueError(
-                    "Checkpoint must use linear_complex modal envelope interpolation"
+                    "Checkpoint must use cubic_hermite_complex modal envelope "
+                    "interpolation"
                 )
             metadata_interval = init_metadata.get(
                 "modal_envelope_knot_interval_sec"

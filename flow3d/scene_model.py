@@ -605,12 +605,67 @@ class SceneModel(nn.Module):
         ts = ts.to(dtype=torch.long)
 
         envelope_knots = self.modal.params["envelope_knots"]
-        left = envelope_knots[self.modal_frame_envelope_left[ts]]
-        right = envelope_knots[self.modal_frame_envelope_right[ts]]
-        lerp = self.modal_frame_envelope_lerp[ts].to(
+        view_knot_tangents = []
+        for view_index in range(self.modal_envelope_knot_offsets.shape[0] - 1):
+            start = int(self.modal_envelope_knot_offsets[view_index].item())
+            end = int(self.modal_envelope_knot_offsets[view_index + 1].item())
+            view_knots = envelope_knots[start:end]
+            if end - start <= 1:
+                view_knot_tangents.append(torch.zeros_like(view_knots))
+                continue
+            view_times = self.modal_envelope_knot_times_sec[start:end].to(
+                dtype=envelope_knots.dtype
+            )
+            delta_time = view_times[1:] - view_times[:-1]
+            secants = (view_knots[1:] - view_knots[:-1]) / delta_time[
+                :, None, None
+            ]
+            if end - start == 2:
+                view_knot_tangents.append(
+                    torch.cat([secants[:1], secants[:1]], dim=0)
+                )
+            else:
+                previous_interval = delta_time[:-1]
+                next_interval = delta_time[1:]
+                interior_tangents = (
+                    next_interval[:, None, None] * secants[:-1]
+                    + previous_interval[:, None, None] * secants[1:]
+                ) / (previous_interval + next_interval)[:, None, None]
+                view_knot_tangents.append(
+                    torch.cat(
+                        [secants[:1], interior_tangents, secants[-1:]],
+                        dim=0,
+                    )
+                )
+        knot_tangents = torch.cat(view_knot_tangents, dim=0)
+
+        left_indices = self.modal_frame_envelope_left[ts]
+        right_indices = self.modal_frame_envelope_right[ts]
+        left = envelope_knots[left_indices]
+        right = envelope_knots[right_indices]
+        left_tangent = knot_tangents[left_indices]
+        right_tangent = knot_tangents[right_indices]
+        interpolation_coordinate = self.modal_frame_envelope_lerp[ts].to(
             dtype=envelope_knots.dtype
         )[:, None, None]
-        envelopes = left + lerp * (right - left)
+        coordinate_square = interpolation_coordinate.square()
+        coordinate_cube = coordinate_square * interpolation_coordinate
+        h00 = 2.0 * coordinate_cube - 3.0 * coordinate_square + 1.0
+        h10 = coordinate_cube - 2.0 * coordinate_square + interpolation_coordinate
+        h01 = -2.0 * coordinate_cube + 3.0 * coordinate_square
+        h11 = coordinate_cube - coordinate_square
+        segment_duration = (
+            self.modal_envelope_knot_times_sec[right_indices]
+            - self.modal_envelope_knot_times_sec[left_indices]
+        ).to(dtype=envelope_knots.dtype)[:, None, None]
+        envelopes = (
+            h00 * left
+            + h10 * segment_duration * left_tangent
+            + h01 * right
+            + h11 * segment_duration * right_tangent
+        )
+        same_knot = (left_indices == right_indices)[:, None, None]
+        envelopes = torch.where(same_knot, left, envelopes)
         if not bool(torch.isfinite(envelopes).all().item()):
             raise FloatingPointError("interpolated modal envelope is not finite")
         return envelopes[..., 0], envelopes[..., 1]
@@ -732,6 +787,73 @@ class SceneModel(nn.Module):
         if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError("modal envelope smoothness loss is not finite")
         return loss
+
+    def compute_envelope_curvature_loss(self) -> torch.Tensor:
+        if self.modal is None:
+            return self.fg.params["means"].new_zeros(())
+        knots = self.modal.params["envelope_knots"]
+        reference_interval = self.modal_envelope_knot_interval_sec.to(
+            dtype=knots.dtype
+        )
+        group_losses = []
+        for view_index in range(self.modal_envelope_knot_offsets.shape[0] - 1):
+            start = int(self.modal_envelope_knot_offsets[view_index].item())
+            end = int(self.modal_envelope_knot_offsets[view_index + 1].item())
+            if end - start <= 2:
+                continue
+            view_knots = knots[start:end]
+            delta_time = (
+                self.modal_envelope_knot_times_sec[start + 1 : end]
+                - self.modal_envelope_knot_times_sec[start : end - 1]
+            ).to(dtype=knots.dtype)
+            if not bool(torch.isfinite(delta_time).all().item()) or bool(
+                (delta_time <= 0.0).any().item()
+            ):
+                raise ValueError("modal envelope knot intervals must be positive")
+            normalized_secants = (view_knots[1:] - view_knots[:-1]) / (
+                delta_time[:, None, None] / reference_interval
+            )
+            curvature = normalized_secants[1:] - normalized_secants[:-1]
+            group_losses.append(curvature.square().sum(dim=-1).mean(dim=0))
+        if not group_losses:
+            return knots.new_zeros(())
+        loss = torch.stack(group_losses, dim=0).mean()
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError("modal envelope curvature loss is not finite")
+        return loss
+
+    def compute_envelope_max_slope_change(self) -> torch.Tensor:
+        if self.modal is None:
+            return self.fg.params["means"].new_zeros(())
+        knots = self.modal.params["envelope_knots"]
+        reference_interval = self.modal_envelope_knot_interval_sec.to(
+            dtype=knots.dtype
+        )
+        max_changes = []
+        for view_index in range(self.modal_envelope_knot_offsets.shape[0] - 1):
+            start = int(self.modal_envelope_knot_offsets[view_index].item())
+            end = int(self.modal_envelope_knot_offsets[view_index + 1].item())
+            if end - start <= 2:
+                continue
+            delta_time = (
+                self.modal_envelope_knot_times_sec[start + 1 : end]
+                - self.modal_envelope_knot_times_sec[start : end - 1]
+            ).to(dtype=knots.dtype)
+            normalized_secants = (
+                knots[start + 1 : end] - knots[start : end - 1]
+            ) / (delta_time[:, None, None] / reference_interval)
+            slope_change = normalized_secants[1:] - normalized_secants[:-1]
+            max_changes.append(
+                torch.linalg.vector_norm(slope_change, dim=-1).max()
+            )
+        if not max_changes:
+            return knots.new_zeros(())
+        value = torch.stack(max_changes).max()
+        if not bool(torch.isfinite(value).item()):
+            raise FloatingPointError(
+                "modal envelope maximum slope change is not finite"
+            )
+        return value
 
     def compute_envelope_max_knot_jump(self) -> torch.Tensor:
         if self.modal is None:

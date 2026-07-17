@@ -302,7 +302,7 @@ def _load_checkpoint_model(
         and (
             not isinstance(init_metadata, dict)
             or init_metadata.get("modal_parameterization")
-            != "per_view_harmonic_envelope_v1"
+            != "per_view_harmonic_envelope_v2"
         )
     ):
         parameterization = (
@@ -313,14 +313,18 @@ def _load_checkpoint_model(
         raise ValueError(
             "Checkpoint uses an incompatible modal parameterization "
             f"({parameterization!r}); expected "
-            "'per_view_harmonic_envelope_v1'"
+            "'per_view_harmonic_envelope_v2'"
         )
     if "modal.params.envelope_knots" in state_dict:
         if not isinstance(init_metadata, dict):
             raise ValueError("Envelope checkpoint metadata must be a mapping")
-        if init_metadata.get("modal_envelope_interpolation") != "linear_complex":
+        if (
+            init_metadata.get("modal_envelope_interpolation")
+            != "cubic_hermite_complex"
+        ):
             raise ValueError(
-                "Checkpoint must use linear_complex modal envelope interpolation"
+                "Checkpoint must use cubic_hermite_complex modal envelope "
+                "interpolation"
             )
         metadata_interval = init_metadata.get("modal_envelope_knot_interval_sec")
         if (
@@ -1107,7 +1111,8 @@ def run(cfg: ModalReconstructionConfig) -> None:
             "declared_views": view_ids,
             "active_views": active_view_ids,
             "num_modes": int(model.modal_phi_real.shape[0]),
-            "modal_parameterization": "per_view_harmonic_envelope_v1",
+            "modal_parameterization": "per_view_harmonic_envelope_v2",
+            "modal_envelope_interpolation": "cubic_hermite_complex",
             "modal_envelope_knot_interval_sec": float(
                 model.modal_envelope_knot_interval_sec.detach().cpu().item()
             ),

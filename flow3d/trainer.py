@@ -940,8 +940,10 @@ class Trainer:
         if self.model.has_modal_refinement:
             act_mag_loss = torch.zeros((), device=self.device)
             envelope_smoothness_loss = torch.zeros((), device=self.device)
+            envelope_curvature_loss = torch.zeros((), device=self.device)
             envelope_rms = torch.zeros((), device=self.device)
             envelope_max_knot_jump = torch.zeros((), device=self.device)
+            envelope_max_slope_change = torch.zeros((), device=self.device)
             (
                 modal_2d_loss,
                 delta_phi_prior_loss,
@@ -957,14 +959,24 @@ class Trainer:
             envelope_smoothness_loss = (
                 self.model.compute_envelope_smoothness_loss()
             )
+            envelope_curvature_loss = (
+                self.model.compute_envelope_curvature_loss()
+            )
             envelope_rms = torch.sqrt(act_mag_loss)
             envelope_max_knot_jump = (
                 self.model.compute_envelope_max_knot_jump()
+            )
+            envelope_max_slope_change = (
+                self.model.compute_envelope_max_slope_change()
             )
             loss += self.losses_cfg.w_act_mag * act_mag_loss
             loss += (
                 self.losses_cfg.w_envelope_smooth
                 * envelope_smoothness_loss
+            )
+            loss += (
+                self.losses_cfg.w_envelope_curvature
+                * envelope_curvature_loss
             )
             modal_2d_loss = torch.zeros((), device=self.device)
             delta_phi_prior_loss = torch.zeros((), device=self.device)
@@ -974,8 +986,10 @@ class Trainer:
         else:
             act_mag_loss = torch.zeros((), device=self.device)
             envelope_smoothness_loss = torch.zeros((), device=self.device)
+            envelope_curvature_loss = torch.zeros((), device=self.device)
             envelope_rms = torch.zeros((), device=self.device)
             envelope_max_knot_jump = torch.zeros((), device=self.device)
+            envelope_max_slope_change = torch.zeros((), device=self.device)
             modal_2d_loss = torch.zeros((), device=self.device)
             delta_phi_prior_loss = torch.zeros((), device=self.device)
             delta_phi_spatial_loss = torch.zeros((), device=self.device)
@@ -995,8 +1009,10 @@ class Trainer:
             "train/dct_coef_loss": dct_coef_loss.item(),
             "train/envelope_magnitude_loss": act_mag_loss.item(),
             "train/envelope_smoothness_loss": envelope_smoothness_loss.item(),
+            "train/envelope_curvature_loss": envelope_curvature_loss.item(),
             "train/envelope_rms": envelope_rms.item(),
             "train/envelope_max_knot_jump": envelope_max_knot_jump.item(),
+            "train/envelope_max_slope_change": envelope_max_slope_change.item(),
             "train/modal_2d_loss": modal_2d_loss.item(),
             "train/delta_phi_prior_loss": delta_phi_prior_loss.item(),
             "train/delta_phi_spatial_loss": delta_phi_spatial_loss.item(),

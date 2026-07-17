@@ -504,7 +504,7 @@ def initialize_and_checkpoint_model(
             f"active_views={active_views}, unused_views={unused_views}, "
             f"envelope_shape={tuple(modal.params['envelope_knots'].shape)}, "
             f"knot_counts={torch.diff(envelope_layout.knot_offsets).tolist()}, "
-            "parameterization=per_view_harmonic_envelope_v1, "
+            "parameterization=per_view_harmonic_envelope_v2, "
             f"shape_refinement={cfg.modal_shape_refinement}"
         )
 
@@ -688,15 +688,15 @@ def _load_harmonic_envelope_from_checkpoint(
         raise ValueError(f"Envelope source checkpoint has no init_metadata: {path}")
     if (
         metadata.get("modal_parameterization")
-        != "per_view_harmonic_envelope_v1"
+        != "per_view_harmonic_envelope_v2"
     ):
         raise ValueError(
             "Envelope source checkpoint must use "
-            "per_view_harmonic_envelope_v1"
+            "per_view_harmonic_envelope_v2"
         )
-    if metadata.get("modal_envelope_interpolation") != "linear_complex":
+    if metadata.get("modal_envelope_interpolation") != "cubic_hermite_complex":
         raise ValueError(
-            "Envelope source checkpoint must use linear_complex interpolation"
+            "Envelope source checkpoint must use cubic_hermite_complex interpolation"
         )
     source_interval = metadata.get("modal_envelope_knot_interval_sec")
     if (
@@ -950,12 +950,13 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
     if cfg.trajectory_type == "modal_activation":
         metadata.update(
             {
-                "modal_parameterization": "per_view_harmonic_envelope_v1",
+                "modal_parameterization": "per_view_harmonic_envelope_v2",
                 "modal_envelope_knot_interval_sec": (
                     cfg.modal_envelope_knot_interval_sec
                 ),
-                "modal_envelope_interpolation": "linear_complex",
+                "modal_envelope_interpolation": "cubic_hermite_complex",
                 "lr_modal_envelope_knots": cfg.lr.modal.envelope_knots,
+                "w_envelope_curvature": cfg.loss.w_envelope_curvature,
             }
         )
     if cfg.modal_shape_refinement == "anchor_delta":
@@ -1012,13 +1013,13 @@ def _validate_checkpoint_policy(
     expected_parameterization = expected_metadata.get("modal_parameterization")
     actual_parameterization = actual_metadata.get("modal_parameterization")
     if (
-        expected_parameterization == "per_view_harmonic_envelope_v1"
+        expected_parameterization == "per_view_harmonic_envelope_v2"
         and actual_parameterization != expected_parameterization
     ):
         raise ValueError(
             "Checkpoint uses an incompatible modal parameterization "
             f"({actual_parameterization!r}); expected "
-            "'per_view_harmonic_envelope_v1'. Start a new work_dir from the static "
+            "'per_view_harmonic_envelope_v2'. Start a new work_dir from the static "
             "checkpoint and staged modal manifest."
         )
     expected_shape_parameterization = expected_metadata.get(
@@ -1323,6 +1324,7 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
         envelope_loss_weights = {
             "w_act_mag": cfg.loss.w_act_mag,
             "w_envelope_smooth": cfg.loss.w_envelope_smooth,
+            "w_envelope_curvature": cfg.loss.w_envelope_curvature,
         }
         invalid_envelope_weights = [
             name
@@ -1421,6 +1423,7 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
         "w_dct_coef": cfg.loss.w_dct_coef,
         "w_act_mag": cfg.loss.w_act_mag,
         "w_envelope_smooth": cfg.loss.w_envelope_smooth,
+        "w_envelope_curvature": cfg.loss.w_envelope_curvature,
         "w_local_iso_ray": cfg.loss.w_local_iso_ray,
         "w_local_iso_perp": cfg.loss.w_local_iso_perp,
         "w_local_iso_dist": cfg.loss.w_local_iso_dist,
