@@ -21,6 +21,11 @@ from flow3d.metrics import mSSIM
 from flow3d.scene_model import SceneModel
 
 
+MODAL_SHAPE_PARAMETERIZATION = "anchor_delta_phi_v1"
+MODAL_DELTA_PHI_STATE_KEY = "modal_refinement.params.delta_phi"
+MODAL_ANCHOR_MASK_STATE_KEY = "modal_anchor_mask"
+
+
 @dataclass
 class ModalReconstructionConfig:
     work_dir: str
@@ -116,6 +121,49 @@ class _ViewMetricAccumulator:
             "psnr_db": psnr_db,
             "ssim": float(self.ssim.compute().detach().cpu().item()),
         }
+
+
+def _validate_modal_shape_checkpoint_contract(
+    state_dict: Mapping[str, Any],
+    init_metadata: Any,
+) -> bool:
+    marker = (
+        init_metadata.get("modal_shape_parameterization")
+        if isinstance(init_metadata, dict)
+        else None
+    )
+    has_delta_phi = MODAL_DELTA_PHI_STATE_KEY in state_dict
+    has_anchor_mask = MODAL_ANCHOR_MASK_STATE_KEY in state_dict
+    has_any_shape_state = has_delta_phi or has_anchor_mask
+    has_complete_shape_state = has_delta_phi and has_anchor_mask
+
+    if marker is None and not has_any_shape_state:
+        return False
+    has_frozen_activation = (
+        isinstance(init_metadata, dict)
+        and init_metadata.get("modal_activation_frozen") is True
+    )
+    harmonic_source = (
+        init_metadata.get("modal_harmonic_init_ckpt")
+        if isinstance(init_metadata, dict)
+        else None
+    )
+    if (
+        marker == MODAL_SHAPE_PARAMETERIZATION
+        and has_complete_shape_state
+        and has_frozen_activation
+        and isinstance(harmonic_source, str)
+        and bool(harmonic_source)
+    ):
+        return True
+    raise ValueError(
+        "Checkpoint has an incomplete or incompatible modal shape-refinement "
+        "contract: expected no shape marker/state for Stage 2, or "
+        f"modal_shape_parameterization={MODAL_SHAPE_PARAMETERIZATION!r} with "
+        f"both {MODAL_DELTA_PHI_STATE_KEY!r} and "
+        f"{MODAL_ANCHOR_MASK_STATE_KEY!r}, frozen activation metadata, and "
+        "a harmonic source checkpoint"
+    )
 
 
 def _load_training_config(work_dir: Path) -> dict[str, Any]:
@@ -253,6 +301,7 @@ def _load_checkpoint_model(
             "Checkpoint uses an incompatible modal parameterization "
             f"({parameterization!r}); expected 'per_view_harmonic_v1'"
         )
+    _validate_modal_shape_checkpoint_contract(state_dict, init_metadata)
     try:
         model = SceneModel.init_from_state_dict(state_dict)
     except (AssertionError, KeyError, RuntimeError, ValueError) as exc:
@@ -571,6 +620,90 @@ def _harmonic_modes(
     return modes
 
 
+def _shape_refinement_metrics(
+    model: SceneModel,
+) -> list[dict[str, float | int]] | None:
+    if not model.has_modal_refinement:
+        return None
+    if model.modal_refinement is None or model.modal_anchor_mask is None:
+        raise ValueError("Stage 3A model has incomplete modal refinement state")
+
+    delta_phi = model.modal_refinement.params["delta_phi"].detach()
+    anchor_mask = model.modal_anchor_mask.detach()
+    expected_shape = tuple(model.modal_phi_real.shape) + (2,)
+    if tuple(delta_phi.shape) != expected_shape:
+        raise ValueError(
+            "Stage 3A delta_phi shape is inconsistent: expected "
+            f"{expected_shape}, got {tuple(delta_phi.shape)}"
+        )
+    if anchor_mask.dtype != torch.bool or tuple(anchor_mask.shape) != tuple(
+        model.modal_phi_real.shape[:2]
+    ):
+        raise ValueError("Stage 3A modal anchor mask is inconsistent")
+    if not bool(torch.isfinite(delta_phi).all()):
+        raise ValueError("Stage 3A delta_phi contains non-finite values")
+
+    effective_real, effective_imag = model.get_effective_modal_phi()
+    staged_real = model.modal_phi_real.detach()
+    staged_imag = model.modal_phi_imag.detach()
+    metrics: list[dict[str, float | int]] = []
+    for mode_slot in range(delta_phi.shape[0]):
+        mode_anchor_mask = anchor_mask[mode_slot]
+        anchor_count = int(mode_anchor_mask.sum().item())
+        if anchor_count == 0:
+            raise ValueError(
+                f"Stage 3A mode slot {mode_slot} has no fixed-anchor Gaussians"
+            )
+
+        mode_delta = delta_phi[mode_slot]
+        delta_norm = torch.sqrt(mode_delta.square().sum(dim=(-1, -2)))
+        staged_norm = torch.sqrt(
+            staged_real[mode_slot].square().sum(dim=-1)
+            + staged_imag[mode_slot].square().sum(dim=-1)
+        )
+        refined_norm = torch.sqrt(
+            effective_real[mode_slot].square().sum(dim=-1)
+            + effective_imag[mode_slot].square().sum(dim=-1)
+        )
+        anchor_delta_norm = delta_norm[mode_anchor_mask]
+        anchor_staged_norm = staged_norm[mode_anchor_mask]
+        anchor_refined_norm = refined_norm[mode_anchor_mask]
+        delta_rms = torch.sqrt(anchor_delta_norm.square().mean())
+        staged_anchor_rms = torch.sqrt(anchor_staged_norm.square().mean())
+        refined_anchor_rms = torch.sqrt(anchor_refined_norm.square().mean())
+        if not bool(torch.isfinite(staged_anchor_rms)) or float(
+            staged_anchor_rms.item()
+        ) <= 0.0:
+            raise ValueError(
+                f"Stage 3A mode slot {mode_slot} has invalid staged anchor RMS"
+            )
+
+        nonanchor_delta_norm = delta_norm[~mode_anchor_mask]
+        nonanchor_delta_count = int((nonanchor_delta_norm != 0).sum().item())
+        nonanchor_delta_max = (
+            0.0
+            if nonanchor_delta_norm.numel() == 0
+            else float(nonanchor_delta_norm.max().cpu().item())
+        )
+        metrics.append(
+            {
+                "mode_slot": mode_slot,
+                "frequency_hz": float(model.modal_freqs_hz[mode_slot].cpu().item()),
+                "anchor_count": anchor_count,
+                "delta_rms": float(delta_rms.cpu().item()),
+                "delta_max": float(anchor_delta_norm.max().cpu().item()),
+                "staged_anchor_rms": float(staged_anchor_rms.cpu().item()),
+                "refined_anchor_rms": float(refined_anchor_rms.cpu().item()),
+                "relative_delta_rms": float(
+                    (delta_rms / staged_anchor_rms).cpu().item()
+                ),
+                "nonanchor_delta_max": nonanchor_delta_max,
+                "nonanchor_delta_count": nonanchor_delta_count,
+            }
+        )
+    return metrics
+
+
 def _training_target(
     observed: torch.Tensor,
     valid_mask: torch.Tensor,
@@ -813,6 +946,9 @@ def run(cfg: ModalReconstructionConfig) -> None:
             "views": view_metrics,
             "overall": overall,
         }
+        shape_refinement = _shape_refinement_metrics(model)
+        if shape_refinement is not None:
+            metrics["shape_refinement"] = shape_refinement
         _write_metrics(temporary_dir / "metrics.json", metrics)
         os.replace(temporary_dir, output_dir)
     except BaseException:

@@ -157,6 +157,42 @@ class ModalActivations(nn.Module):
         return self.params["activations"].shape[1]
 
 
+class ModalShapeRefinement(nn.Module):
+    def __init__(self, delta_phi: torch.Tensor):
+        super().__init__()
+        if delta_phi.ndim != 4 or delta_phi.shape[-2:] != (3, 2):
+            raise ValueError(
+                "modal delta_phi must have shape (num_modes, num_gaussians, 3, 2)"
+            )
+        if delta_phi.shape[0] <= 0:
+            raise ValueError("modal delta_phi must contain at least one mode")
+        if delta_phi.shape[1] <= 0:
+            raise ValueError("modal delta_phi must contain at least one Gaussian")
+        if not torch.is_floating_point(delta_phi):
+            raise ValueError("modal delta_phi must have floating-point dtype")
+        if not bool(torch.isfinite(delta_phi).all().item()):
+            raise ValueError("modal delta_phi must contain only finite values")
+        self.params = nn.ParameterDict({"delta_phi": nn.Parameter(delta_phi)})
+
+    @staticmethod
+    def init_from_state_dict(
+        state_dict: dict[str, Tensor],
+        prefix: str,
+    ):
+        key = f"{prefix}delta_phi"
+        if key not in state_dict:
+            raise ValueError(f"Missing modal shape-refinement parameter {key}")
+        return ModalShapeRefinement(state_dict[key])
+
+    @property
+    def num_modes(self) -> int:
+        return self.params["delta_phi"].shape[0]
+
+    @property
+    def num_gaussians(self) -> int:
+        return self.params["delta_phi"].shape[1]
+
+
 class GaussianParams(nn.Module):
     def __init__(
         self,

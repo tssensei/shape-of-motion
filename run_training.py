@@ -1,3 +1,4 @@
+import json
 import os
 import os.path as osp
 import shutil
@@ -37,11 +38,18 @@ from flow3d.init_utils import (
     init_trainable_poses,
 )
 from flow3d.modal_utils import (
+    GaussianModalRefinementData,
+    load_gaussian_modal_refinement_data,
     load_gaussian_modal_fields,
     load_modal_frame_map,
     resolve_required_modal_paths,
 )
-from flow3d.params import CameraScales, GaussianParams, ModalActivations
+from flow3d.params import (
+    CameraScales,
+    GaussianParams,
+    ModalActivations,
+    ModalShapeRefinement,
+)
 from flow3d.scene_model import SceneModel, TRAJECTORY_TYPE_TO_ID
 from flow3d.tensor_dataclass import StaticObservations, TrackObservations
 from flow3d.trainer import Trainer
@@ -94,6 +102,8 @@ class TrainConfig:
     modal_stage1_frame_map: str | None = None
     modal_stage1_epochs: int = 0
     modal_stage1_init_ckpt: str | None = None
+    modal_shape_refinement: Literal["fixed", "anchor_delta"] = "fixed"
+    modal_harmonic_init_ckpt: str | None = None
     modal_stage2_train_base_means: bool = False
     modal_stage2_train_colors: bool = False
     modal_stage2_train_opacities: bool = False
@@ -121,6 +131,7 @@ class TrainConfig:
 
 def main(cfg: TrainConfig):
     _inject_vggt_static_view_config(cfg)
+    _validate_modal_shape_refinement_config(cfg)
     stage1_data_cfg = _make_modal_stage1_data_config(cfg)
     effective_modal_warmup_epochs = (
         0
@@ -141,6 +152,8 @@ def main(cfg: TrainConfig):
     )
     if cfg.trajectory_type == "static":
         guru.info(f"Static sweep dataset has {train_dataset.num_frames} frames")
+    elif cfg.modal_shape_refinement == "anchor_delta":
+        guru.info(f"Stage 3A dynamic dataset has {train_dataset.num_frames} frames")
     else:
         guru.info(f"Stage 2 dynamic dataset has {train_dataset.num_frames} frames")
     stage1_dataset = None
@@ -159,7 +172,7 @@ def main(cfg: TrainConfig):
     with open(f"{cfg.work_dir}/cfg.yaml", "w") as f:
         yaml.dump(asdict(cfg), f, default_flow_style=False)
 
-    initialize_and_checkpoint_model(
+    initial_refinement_data = initialize_and_checkpoint_model(
         cfg,
         train_dataset,
         device,
@@ -193,6 +206,25 @@ def main(cfg: TrainConfig):
         modal_stage2_lr_fg_scales=cfg.modal_stage2_lr_fg_scales,
         modal_stage2_lr_fg_quats=cfg.modal_stage2_lr_fg_quats,
     )
+    if cfg.modal_shape_refinement == "anchor_delta":
+        assert cfg.modal_manifest is not None
+        assert cfg.modal_frame_map is not None
+        frame_map = load_modal_frame_map(
+            cfg.modal_frame_map,
+            train_dataset,
+            trainer.model.num_frames,
+            device,
+        )
+        refinement_data = initial_refinement_data
+        if refinement_data is None:
+            refinement_data = load_gaussian_modal_refinement_data(
+                cfg.modal_manifest,
+                trainer.model.fg.params["means"],
+                frame_map.view_ids,
+                device,
+                trainer.model.fg.params["means"].dtype,
+            )
+        trainer.set_modal_refinement_data(refinement_data)
     if cfg.trajectory_type == "modal_activation":
         _log_trainable_parameters(trainer.model)
 
@@ -249,7 +281,11 @@ def main(cfg: TrainConfig):
             stage_name = "stage1"
         else:
             active_loader = train_loader
-            stage_name = "stage2"
+            stage_name = (
+                "stage3a"
+                if cfg.modal_shape_refinement == "anchor_delta"
+                else "stage2"
+            )
         for batch in active_loader:
             batch = to_device(batch, device)
             loss = trainer.train_step(batch)
@@ -284,10 +320,10 @@ def initialize_and_checkpoint_model(
     init_metadata: dict[str, Any],
     vis: bool = False,
     port: int | None = None,
-):
+) -> GaussianModalRefinementData | None:
     if os.path.exists(ckpt_path):
         guru.info(f"model checkpoint exists at {ckpt_path}")
-        return
+        return None
     init_ckpt_path = os.path.join(os.path.dirname(ckpt_path), "init.ckpt")
     if cfg.trajectory_type == "modal_activation" and os.path.exists(init_ckpt_path):
         raise ValueError(
@@ -346,8 +382,12 @@ def initialize_and_checkpoint_model(
     modal_frame_view_indices = None
     modal_frame_local_indices = None
     modal_frame_times_sec = None
+    modal_refinement = None
+    modal_anchor_mask = None
     if cfg.trajectory_type == "modal_activation":
         resolve_required_modal_paths(cfg.modal_manifest, cfg.modal_frame_map)
+        assert cfg.modal_manifest is not None
+        assert cfg.modal_frame_map is not None
         modal_fields = load_gaussian_modal_fields(
             cfg.modal_manifest,
             fg_params.params["means"],
@@ -366,12 +406,46 @@ def initialize_and_checkpoint_model(
         modal_frame_view_indices = frame_map.frame_view_indices
         modal_frame_local_indices = frame_map.frame_local_indices
         modal_frame_times_sec = frame_map.frame_times_sec
-        modal = _zero_harmonic_activations(
-            len(frame_map.view_ids),
-            len(modal_modes),
-            device,
-            fg_params.params["means"].dtype,
-        )
+        if cfg.modal_shape_refinement == "anchor_delta":
+            refinement_data = load_gaussian_modal_refinement_data(
+                cfg.modal_manifest,
+                fg_params.params["means"],
+                frame_map.view_ids,
+                device,
+                fg_params.params["means"].dtype,
+            )
+            modal_anchor_mask = refinement_data.anchor_mask
+            modal_refinement = ModalShapeRefinement(
+                torch.zeros(
+                    (*modal_phi_real.shape, 2),
+                    device=device,
+                    dtype=modal_phi_real.dtype,
+                )
+            )
+            anchor_counts = refinement_data.anchor_mask.sum(dim=1).tolist()
+            guru.info(
+                "Initialized anchor-only modal shape refinement: "
+                f"anchor_counts={anchor_counts}, "
+                f"delta_shape={tuple(modal_refinement.params['delta_phi'].shape)}"
+            )
+            modal = _load_harmonic_activations_from_checkpoint(
+                cfg.modal_harmonic_init_ckpt,
+                frame_map.view_ids,
+                modal_phi_real,
+                modal_phi_imag,
+                modal_freqs_hz,
+                modal_obs_count_per_point,
+                fg_params,
+                bg_params,
+                device,
+            )
+        else:
+            modal = _zero_harmonic_activations(
+                len(frame_map.view_ids),
+                len(modal_modes),
+                device,
+                fg_params.params["means"].dtype,
+            )
         view_counts = torch.bincount(
             frame_map.frame_view_indices.detach().cpu(),
             minlength=len(frame_map.view_ids),
@@ -410,7 +484,8 @@ def initialize_and_checkpoint_model(
             f"[{mode_summary}], per_view_frames=[{', '.join(view_summaries)}], "
             f"active_views={active_views}, unused_views={unused_views}, "
             f"activation_shape={tuple(modal.params['activations'].shape)}, "
-            "parameterization=per_view_harmonic_v1"
+            "parameterization=per_view_harmonic_v1, "
+            f"shape_refinement={cfg.modal_shape_refinement}"
         )
 
     model = SceneModel(
@@ -432,6 +507,8 @@ def initialize_and_checkpoint_model(
         modal_frame_view_indices=modal_frame_view_indices,
         modal_frame_local_indices=modal_frame_local_indices,
         modal_frame_times_sec=modal_frame_times_sec,
+        modal_refinement=modal_refinement,
+        modal_anchor_mask=modal_anchor_mask,
     )
 
     checkpoint = {
@@ -450,6 +527,7 @@ def initialize_and_checkpoint_model(
         guru.info(f"Saving initialization to {ckpt_path}")
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         torch.save(checkpoint, ckpt_path)
+    return refinement_data if cfg.modal_shape_refinement == "anchor_delta" else None
 
 
 def _save_new_initial_checkpoints(
@@ -475,6 +553,7 @@ def _save_new_initial_checkpoints(
 
 
 def _save_training_completion_checkpoint(trainer: Trainer, ckpt_path: str) -> None:
+    trainer.require_modal_delta_gradient_observed()
     trainer.save_checkpoint(ckpt_path)
 
 
@@ -498,6 +577,170 @@ def _zero_harmonic_activations(
         raise ValueError("Harmonic activation initialization requires views and modes")
     return ModalActivations(
         torch.zeros(num_views, num_modes, 2, device=device, dtype=dtype)
+    )
+
+
+def _require_equal_checkpoint_tensor(
+    state_dict: dict[str, torch.Tensor],
+    key: str,
+    expected: torch.Tensor,
+    checkpoint_path: str,
+) -> None:
+    if key not in state_dict:
+        raise ValueError(f"Harmonic source checkpoint is missing {key}: {checkpoint_path}")
+    actual = state_dict[key].detach().cpu()
+    expected_cpu = expected.detach().cpu()
+    if actual.shape != expected_cpu.shape or actual.dtype != expected_cpu.dtype:
+        raise ValueError(
+            f"Harmonic source {key} shape/dtype does not match the current "
+            f"initialization: {tuple(actual.shape)}/{actual.dtype} versus "
+            f"{tuple(expected_cpu.shape)}/{expected_cpu.dtype}"
+        )
+    if not torch.equal(actual, expected_cpu):
+        raise ValueError(
+            f"Harmonic source {key} differs from the current static checkpoint "
+            "or staged manifest"
+        )
+
+
+def _validate_harmonic_source_gaussians(
+    state_dict: dict[str, torch.Tensor],
+    part_name: str,
+    params: GaussianParams | None,
+    checkpoint_path: str,
+) -> None:
+    prefix = f"{part_name}.params."
+    actual_keys = {key for key in state_dict if key.startswith(prefix)}
+    expected_keys = (
+        set()
+        if params is None
+        else {f"{prefix}{name}" for name in params.params.keys()}
+    )
+    if actual_keys != expected_keys:
+        raise ValueError(
+            f"Harmonic source {part_name} Gaussian fields do not match the "
+            f"current static checkpoint: {checkpoint_path}"
+        )
+    if params is None:
+        return
+    for name, value in params.params.items():
+        _require_equal_checkpoint_tensor(
+            state_dict,
+            f"{prefix}{name}",
+            value,
+            checkpoint_path,
+        )
+
+
+def _load_harmonic_activations_from_checkpoint(
+    path: str | None,
+    view_ids: list[str],
+    modal_phi_real: torch.Tensor,
+    modal_phi_imag: torch.Tensor,
+    modal_freqs_hz: torch.Tensor,
+    modal_obs_count_per_point: torch.Tensor,
+    fg_params: GaussianParams,
+    bg_params: GaussianParams | None,
+    device: torch.device,
+) -> ModalActivations:
+    if path is None:
+        raise ValueError("anchor_delta refinement requires --modal-harmonic-init-ckpt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Harmonic source checkpoint does not exist: {path}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    state_dict = checkpoint.get("model")
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Harmonic source checkpoint has no model state: {path}")
+    metadata = checkpoint.get("init_metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Harmonic source checkpoint has no init_metadata: {path}")
+    if metadata.get("modal_parameterization") != "per_view_harmonic_v1":
+        raise ValueError(
+            "Harmonic source checkpoint must use per_view_harmonic_v1"
+        )
+    if metadata.get("modal_shape_parameterization") is not None:
+        raise ValueError(
+            "Harmonic source checkpoint must be a fixed-shape Stage 2 checkpoint"
+        )
+    refinement_keys = {
+        "modal_refinement.params.delta_phi",
+        "modal_anchor_mask",
+    }
+    present_refinement_keys = sorted(refinement_keys & set(state_dict))
+    if present_refinement_keys:
+        raise ValueError(
+            "Harmonic source checkpoint already contains shape refinement: "
+            f"{present_refinement_keys}"
+        )
+
+    source_frame_map = metadata.get("modal_frame_map")
+    if not isinstance(source_frame_map, str) or not source_frame_map:
+        raise ValueError("Harmonic source metadata is missing modal_frame_map")
+    source_frame_map_path = Path(source_frame_map).expanduser()
+    if not source_frame_map_path.exists():
+        raise FileNotFoundError(
+            f"Harmonic source frame map does not exist: {source_frame_map_path}"
+        )
+    with source_frame_map_path.open("r", encoding="utf-8") as f:
+        source_frame_payload = json.load(f)
+    if not isinstance(source_frame_payload, dict) or source_frame_payload.get(
+        "version"
+    ) != 1:
+        raise ValueError(
+            f"Harmonic source frame map must use version 1: {source_frame_map_path}"
+        )
+    source_view_ids = source_frame_payload.get("views")
+    if source_view_ids != view_ids:
+        raise ValueError(
+            "Harmonic source view order does not match the current frame map: "
+            f"{source_view_ids!r} versus {view_ids!r}"
+        )
+
+    _validate_harmonic_source_gaussians(state_dict, "fg", fg_params, path)
+    _validate_harmonic_source_gaussians(state_dict, "bg", bg_params, path)
+    for key, expected in (
+        ("modal_phi_real", modal_phi_real),
+        ("modal_phi_imag", modal_phi_imag),
+        ("modal_freqs_hz", modal_freqs_hz),
+        ("modal_obs_count_per_point", modal_obs_count_per_point),
+    ):
+        _require_equal_checkpoint_tensor(state_dict, key, expected, path)
+
+    activation_key = "modal.params.activations"
+    if activation_key not in state_dict:
+        raise ValueError(f"Harmonic source checkpoint is missing {activation_key}")
+    activations = state_dict[activation_key]
+    expected_shape = (len(view_ids), modal_phi_real.shape[0], 2)
+    if activations.shape != expected_shape:
+        raise ValueError(
+            f"Harmonic source activations must have shape {expected_shape}, "
+            f"got {tuple(activations.shape)}"
+        )
+    if not torch.is_floating_point(activations) or not bool(
+        torch.isfinite(activations).all().item()
+    ):
+        raise ValueError("Harmonic source activations must be finite floating point")
+    if activations.dtype != modal_phi_real.dtype:
+        raise ValueError(
+            "Harmonic source activation dtype must match staged modal phi: "
+            f"{activations.dtype} versus {modal_phi_real.dtype}"
+        )
+    mode_has_activation = torch.linalg.vector_norm(activations, dim=-1).gt(0).any(dim=0)
+    if not bool(mode_has_activation.all().item()):
+        missing_modes = torch.nonzero(~mode_has_activation).flatten().tolist()
+        raise ValueError(
+            "Each mode requires at least one nonzero source activation; zero modes: "
+            f"{missing_modes}"
+        )
+    guru.info(
+        f"Loaded fixed harmonic activations from {path}: "
+        f"shape={tuple(activations.shape)}"
+    )
+    return ModalActivations(
+        activations.to(
+            device=device,
+            dtype=modal_phi_real.dtype,
+        ).clone()
     )
 
 
@@ -627,6 +870,20 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
     }
     if cfg.trajectory_type == "modal_activation":
         metadata["modal_parameterization"] = "per_view_harmonic_v1"
+    if cfg.modal_shape_refinement == "anchor_delta":
+        metadata.update(
+            {
+                "modal_shape_parameterization": "anchor_delta_phi_v1",
+                "modal_harmonic_init_ckpt": cfg.modal_harmonic_init_ckpt,
+                "modal_activation_frozen": True,
+                "w_modal_2d": cfg.loss.w_modal_2d,
+                "w_delta_phi_prior": cfg.loss.w_delta_phi_prior,
+                "w_delta_phi_spatial": cfg.loss.w_delta_phi_spatial,
+                "lr_modal_refinement_delta_phi": (
+                    cfg.lr.modal_refinement.delta_phi
+                ),
+            }
+        )
     return {key: _metadata_value(value) for key, value in metadata.items()}
 
 
@@ -675,6 +932,18 @@ def _validate_checkpoint_policy(
             f"({actual_parameterization!r}); expected "
             "'per_view_harmonic_v1'. Start a new work_dir from the static "
             "checkpoint and staged modal manifest."
+        )
+    expected_shape_parameterization = expected_metadata.get(
+        "modal_shape_parameterization"
+    )
+    actual_shape_parameterization = actual_metadata.get(
+        "modal_shape_parameterization"
+    )
+    if actual_shape_parameterization != expected_shape_parameterization:
+        raise ValueError(
+            "Checkpoint uses an incompatible modal shape parameterization "
+            f"({actual_shape_parameterization!r}); expected "
+            f"{expected_shape_parameterization!r}. Use a new work_dir."
         )
     if actual_metadata != expected_metadata:
         keys = sorted(set(actual_metadata) | set(expected_metadata))
@@ -941,6 +1210,133 @@ def _sample_colmap_points(
         points = points[sel]
         colors = colors[sel]
     return points.astype(np.float32), colors.astype(np.float32)
+
+
+def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
+    is_anchor_delta = cfg.modal_shape_refinement == "anchor_delta"
+    refinement_weights = (
+        cfg.loss.w_modal_2d,
+        cfg.loss.w_delta_phi_prior,
+        cfg.loss.w_delta_phi_spatial,
+    )
+    if not is_anchor_delta:
+        if cfg.modal_harmonic_init_ckpt is not None:
+            raise ValueError(
+                "--modal-harmonic-init-ckpt requires "
+                "--modal-shape-refinement anchor_delta"
+            )
+        if any(weight != 0.0 for weight in refinement_weights):
+            raise ValueError(
+                "Stage 3A loss weights require "
+                "--modal-shape-refinement anchor_delta"
+            )
+        return
+
+    if cfg.trajectory_type != "modal_activation":
+        raise ValueError("anchor_delta refinement requires modal_activation")
+    if cfg.modal_stage1_init_ckpt is None:
+        raise ValueError(
+            "anchor_delta refinement requires --modal-stage1-init-ckpt"
+        )
+    if cfg.modal_harmonic_init_ckpt is None:
+        raise ValueError(
+            "anchor_delta refinement requires --modal-harmonic-init-ckpt"
+        )
+    if not os.path.exists(cfg.modal_harmonic_init_ckpt):
+        raise FileNotFoundError(
+            "Harmonic source checkpoint does not exist: "
+            f"{cfg.modal_harmonic_init_ckpt}"
+        )
+    if cfg.modal_manifest is None or cfg.modal_frame_map is None:
+        raise ValueError(
+            "anchor_delta refinement requires --modal-manifest and "
+            "--modal-frame-map"
+        )
+    if cfg.modal_train_view_id is not None:
+        raise ValueError("anchor_delta refinement requires joint all-view training")
+    if cfg.port is not None or cfg.vis_debug:
+        raise ValueError(
+            "Stage 3A Viser integration is deferred; run without --port and "
+            "--vis-debug, then use run_modal_reconstruction.py"
+        )
+
+    gaussian_training_options = {
+        "modal_train_base_means": cfg.modal_train_base_means,
+        "modal_stage2_train_base_means": cfg.modal_stage2_train_base_means,
+        "modal_stage2_train_colors": cfg.modal_stage2_train_colors,
+        "modal_stage2_train_opacities": cfg.modal_stage2_train_opacities,
+        "modal_stage2_train_scales": cfg.modal_stage2_train_scales,
+        "modal_stage2_train_quats": cfg.modal_stage2_train_quats,
+        "modal_stage2_train_bg_means": cfg.modal_stage2_train_bg_means,
+        "modal_stage2_train_bg_colors": cfg.modal_stage2_train_bg_colors,
+        "modal_stage2_train_bg_opacities": cfg.modal_stage2_train_bg_opacities,
+        "modal_stage2_train_bg_scales": cfg.modal_stage2_train_bg_scales,
+        "modal_stage2_train_bg_quats": cfg.modal_stage2_train_bg_quats,
+    }
+    enabled_gaussian_options = [
+        name for name, enabled in gaussian_training_options.items() if enabled
+    ]
+    if enabled_gaussian_options:
+        raise ValueError(
+            "anchor_delta refinement freezes every Gaussian parameter; enabled "
+            f"options: {enabled_gaussian_options}"
+        )
+    if (
+        cfg.modal_stage2_lr_fg_scales is not None
+        or cfg.modal_stage2_lr_fg_quats is not None
+    ):
+        raise ValueError("anchor_delta refinement does not accept Gaussian LR overrides")
+
+    unrelated_loss_weights = {
+        "w_depth_reg": cfg.loss.w_depth_reg,
+        "w_depth_const": cfg.loss.w_depth_const,
+        "w_depth_grad": cfg.loss.w_depth_grad,
+        "w_track": cfg.loss.w_track,
+        "w_smooth_bases": cfg.loss.w_smooth_bases,
+        "w_smooth_tracks": cfg.loss.w_smooth_tracks,
+        "w_scale_var": cfg.loss.w_scale_var,
+        "w_z_accel": cfg.loss.w_z_accel,
+        "w_dct_coef": cfg.loss.w_dct_coef,
+        "w_act_mag": cfg.loss.w_act_mag,
+        "w_local_iso_ray": cfg.loss.w_local_iso_ray,
+        "w_local_iso_perp": cfg.loss.w_local_iso_perp,
+        "w_local_iso_dist": cfg.loss.w_local_iso_dist,
+    }
+    nonzero_unrelated = [
+        name for name, weight in unrelated_loss_weights.items() if weight != 0.0
+    ]
+    if nonzero_unrelated:
+        raise ValueError(
+            "anchor_delta refinement only uses RGB, mask, and Stage 3A losses; "
+            f"set these weights to zero: {nonzero_unrelated}"
+        )
+    named_refinement_weights = {
+        "w_rgb": cfg.loss.w_rgb,
+        "w_mask": cfg.loss.w_mask,
+        "w_modal_2d": cfg.loss.w_modal_2d,
+        "w_delta_phi_prior": cfg.loss.w_delta_phi_prior,
+        "w_delta_phi_spatial": cfg.loss.w_delta_phi_spatial,
+    }
+    invalid_weights = [
+        name
+        for name, weight in named_refinement_weights.items()
+        if not np.isfinite(weight) or weight < 0.0
+    ]
+    if invalid_weights:
+        raise ValueError(
+            f"Stage 3A loss weights must be finite and non-negative: {invalid_weights}"
+        )
+    if cfg.loss.w_rgb <= 0.0:
+        raise ValueError("anchor_delta refinement requires --loss.w-rgb > 0")
+    if cfg.loss.w_delta_phi_prior <= 0.0:
+        raise ValueError(
+            "anchor_delta refinement requires --loss.w-delta-phi-prior > 0"
+        )
+    delta_lr = cfg.lr.modal_refinement.delta_phi
+    if not np.isfinite(delta_lr) or delta_lr <= 0.0:
+        raise ValueError(
+            "--lr.modal-refinement.delta-phi must be finite and positive"
+        )
 
 
 def _make_modal_stage1_data_config(

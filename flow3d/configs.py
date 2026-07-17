@@ -39,6 +39,12 @@ class CameraPoseLRConfig:
 class ModalLRConfig:
     activations: float = 1e-3
 
+
+@dataclass
+class ModalRefinementLRConfig:
+    delta_phi: float = 1e-4
+
+
 @dataclass
 class SceneLRConfig:
     fg: FGLRConfig
@@ -47,6 +53,9 @@ class SceneLRConfig:
     camera_poses: CameraPoseLRConfig
     camera_scales: CameraScalesLRConfig
     modal: ModalLRConfig = field(default_factory=ModalLRConfig)
+    modal_refinement: ModalRefinementLRConfig = field(
+        default_factory=ModalRefinementLRConfig
+    )
 
 
 @dataclass
@@ -63,6 +72,9 @@ class LossesConfig:
     w_z_accel: float = 1.0
     w_dct_coef: float = 1e-4
     w_act_mag: float = 0.001
+    w_modal_2d: float = 0.0
+    w_delta_phi_prior: float = 0.0
+    w_delta_phi_spatial: float = 0.0
     w_local_iso_ray: float = 0.0
     w_local_iso_perp: float = 0.00
     w_local_iso_dist: float = 0.0

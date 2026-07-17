@@ -18,6 +18,11 @@ from flow3d.vis.viewer import (
 from modal_surface.io import load_view_config
 
 
+MODAL_SHAPE_PARAMETERIZATION = "anchor_delta_phi_v1"
+MODAL_DELTA_PHI_STATE_KEY = "modal_refinement.params.delta_phi"
+MODAL_ANCHOR_MASK_STATE_KEY = "modal_anchor_mask"
+
+
 class Renderer:
     def __init__(
         self,
@@ -98,13 +103,51 @@ class Renderer:
         guru.info(f"Loading checkpoint from {path}")
         ckpt = torch.load(path, weights_only=False)
         state_dict = ckpt["model"]
+        init_metadata = ckpt.get("init_metadata")
+        shape_parameterization = (
+            init_metadata.get("modal_shape_parameterization")
+            if isinstance(init_metadata, dict)
+            else None
+        )
+        has_delta_phi = MODAL_DELTA_PHI_STATE_KEY in state_dict
+        has_anchor_mask = MODAL_ANCHOR_MASK_STATE_KEY in state_dict
+        has_frozen_activation = (
+            isinstance(init_metadata, dict)
+            and init_metadata.get("modal_activation_frozen") is True
+        )
+        harmonic_source = (
+            init_metadata.get("modal_harmonic_init_ckpt")
+            if isinstance(init_metadata, dict)
+            else None
+        )
+        if shape_parameterization is None and not (
+            has_delta_phi or has_anchor_mask
+        ):
+            pass
+        elif (
+            shape_parameterization == MODAL_SHAPE_PARAMETERIZATION
+            and has_delta_phi
+            and has_anchor_mask
+            and has_frozen_activation
+            and isinstance(harmonic_source, str)
+            and bool(harmonic_source)
+        ):
+            raise ValueError(
+                "Viser rendering does not yet support Stage 3A refined modal "
+                "shape checkpoints; inspect this checkpoint with "
+                "run_modal_reconstruction.py"
+            )
+        else:
+            raise ValueError(
+                "Checkpoint has an incomplete or incompatible modal "
+                "shape-refinement contract"
+            )
         if "modal.params.activations" in state_dict:
             if "modal_frame_times_sec" not in state_dict:
                 raise ValueError(
                     "Legacy per-frame modal activation checkpoints are not "
                     "supported; render a per-view harmonic checkpoint"
                 )
-            init_metadata = ckpt.get("init_metadata")
             parameterization = (
                 init_metadata.get("modal_parameterization")
                 if isinstance(init_metadata, dict)

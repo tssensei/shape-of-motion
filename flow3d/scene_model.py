@@ -9,6 +9,7 @@ from torch import Tensor
 from flow3d.params import (
     GaussianParams,
     ModalActivations,
+    ModalShapeRefinement,
     MotionBases,
     CameraScales,
     CameraPoses,
@@ -46,6 +47,8 @@ class SceneModel(nn.Module):
         modal_frame_local_indices: Tensor | None = None,
         modal_frame_times_sec: Tensor | None = None,
         modal_synthetic_enabled: bool | Tensor = False,
+        modal_refinement: ModalShapeRefinement | None = None,
+        modal_anchor_mask: Tensor | None = None,
     ):
         super().__init__()
         if trajectory_type not in TRAJECTORY_TYPE_TO_ID:
@@ -59,6 +62,7 @@ class SceneModel(nn.Module):
         self.fg = fg_params
         self.motion_bases = motion_bases
         self.modal = modal
+        self.modal_refinement = modal_refinement
         self.bg = bg_params
         scene_scale = 1.0 if bg_params is None else bg_params.scene_scale
         self.register_buffer("bg_scene_scale", torch.as_tensor(scene_scale))
@@ -139,6 +143,45 @@ class SceneModel(nn.Module):
             torch.isfinite(modal_phi_imag).all().item()
         ):
             raise ValueError("modal phi real/imag tensors must contain only finite values")
+
+        if modal_refinement is not None:
+            if trajectory_type != "modal_activation":
+                raise ValueError(
+                    "modal shape refinement requires modal_activation trajectory"
+                )
+            delta_phi = modal_refinement.params["delta_phi"]
+            expected_delta_shape = (*modal_phi_real.shape, 2)
+            if delta_phi.shape != expected_delta_shape:
+                raise ValueError(
+                    "modal delta_phi must have shape "
+                    f"{expected_delta_shape}, got {tuple(delta_phi.shape)}"
+                )
+            if delta_phi.dtype != modal_phi_real.dtype:
+                raise ValueError("modal delta_phi dtype must match staged modal phi")
+            if delta_phi.device != modal_phi_real.device:
+                raise ValueError("modal delta_phi device must match staged modal phi")
+            if modal_anchor_mask is None:
+                raise ValueError("modal shape refinement requires modal_anchor_mask")
+            if modal_anchor_mask.dtype != torch.bool:
+                raise ValueError("modal_anchor_mask must have bool dtype")
+            if modal_anchor_mask.shape != modal_phi_real.shape[:2]:
+                raise ValueError(
+                    "modal_anchor_mask must have shape "
+                    f"{tuple(modal_phi_real.shape[:2])}, "
+                    f"got {tuple(modal_anchor_mask.shape)}"
+                )
+            if modal_anchor_mask.device != delta_phi.device:
+                raise ValueError("modal_anchor_mask device must match modal delta_phi")
+            if not bool(modal_anchor_mask.any(dim=1).all().item()):
+                raise ValueError(
+                    "modal_anchor_mask must contain at least one anchor per mode"
+                )
+            if bool(torch.count_nonzero(delta_phi[~modal_anchor_mask]).item()):
+                raise ValueError("non-anchor modal delta_phi values must be exactly zero")
+        elif modal_anchor_mask is not None:
+            raise ValueError(
+                "modal_anchor_mask cannot be provided without modal shape refinement"
+            )
 
         if modal_freqs_hz is None:
             if modal_phi_real.shape[0] > 0:
@@ -242,6 +285,7 @@ class SceneModel(nn.Module):
                 )
         self.register_buffer("modal_phi_real", modal_phi_real)
         self.register_buffer("modal_phi_imag", modal_phi_imag)
+        self.register_buffer("modal_anchor_mask", modal_anchor_mask)
         self.register_buffer("modal_freqs_hz", modal_freqs_hz)
         self.register_buffer("modal_obs_count_per_point", modal_obs_count_per_point.long())
         if isinstance(modal_synthetic_enabled, Tensor):
@@ -292,6 +336,10 @@ class SceneModel(nn.Module):
     @property
     def has_modal_field(self) -> bool:
         return self.modal_phi_real.numel() > 0 and self.modal_phi_imag.numel() > 0
+
+    @property
+    def has_modal_refinement(self) -> bool:
+        return self.modal_refinement is not None
 
     @property
     def has_modal_obs_count(self) -> bool:
@@ -369,14 +417,36 @@ class SceneModel(nn.Module):
         self, ts: torch.Tensor, inds: torch.Tensor | None = None
     ) -> torch.Tensor:
         real, imag = self.compute_modal_coefficients(ts)
-        phi_real = self.modal_phi_real
-        phi_imag = self.modal_phi_imag
-        if inds is not None:
-            phi_real = phi_real[:, inds]
-            phi_imag = phi_imag[:, inds]
+        phi_real, phi_imag = self.get_effective_modal_phi(inds)
         return torch.einsum("bk,kgc->gbc", real, phi_real) - torch.einsum(
             "bk,kgc->gbc", imag, phi_imag
         )
+
+    def get_effective_modal_phi(
+        self, inds: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        phi_real = self.modal_phi_real
+        phi_imag = self.modal_phi_imag
+        if self.modal_refinement is not None:
+            delta_phi = self.modal_refinement.params["delta_phi"]
+            anchor_mask = self.modal_anchor_mask
+            if anchor_mask is None:
+                raise RuntimeError(
+                    "modal shape refinement is missing modal_anchor_mask"
+                )
+            if inds is not None:
+                delta_phi = delta_phi[:, inds]
+                anchor_mask = anchor_mask[:, inds]
+            mask = anchor_mask[..., None].to(dtype=delta_phi.dtype)
+            phi_real = phi_real if inds is None else phi_real[:, inds]
+            phi_imag = phi_imag if inds is None else phi_imag[:, inds]
+            phi_real = phi_real + mask * delta_phi[..., 0]
+            phi_imag = phi_imag + mask * delta_phi[..., 1]
+            return phi_real, phi_imag
+        if inds is not None:
+            phi_real = phi_real[:, inds]
+            phi_imag = phi_imag[:, inds]
+        return phi_real, phi_imag
 
     def compute_synthetic_modal_offsets(
         self,
@@ -390,11 +460,7 @@ class SceneModel(nn.Module):
             raise ValueError(
                 f"q must have shape ({self.modal_phi_real.shape[0]},), got {tuple(q.shape)}"
             )
-        phi_real = self.modal_phi_real
-        phi_imag = self.modal_phi_imag
-        if inds is not None:
-            phi_real = phi_real[:, inds]
-            phi_imag = phi_imag[:, inds]
+        phi_real, phi_imag = self.get_effective_modal_phi(inds)
         q = q.to(device=phi_real.device)
         q_real = q.real.to(dtype=phi_real.dtype)
         q_imag = q.imag.to(dtype=phi_real.dtype)
@@ -414,6 +480,8 @@ class SceneModel(nn.Module):
     def densify_modal_fields(self, should_split: torch.Tensor, should_dup: torch.Tensor):
         if not self.has_modal_field:
             return
+        if self.has_modal_refinement:
+            raise RuntimeError("modal shape refinement does not support densification")
         for name in ("modal_phi_real", "modal_phi_imag"):
             x = getattr(self, name)
             x_dup = x[:, should_dup]
@@ -431,6 +499,8 @@ class SceneModel(nn.Module):
     def cull_modal_fields(self, should_cull: torch.Tensor):
         if not self.has_modal_field:
             return
+        if self.has_modal_refinement:
+            raise RuntimeError("modal shape refinement does not support culling")
         self.modal_phi_real = self.modal_phi_real[:, ~should_cull]
         self.modal_phi_imag = self.modal_phi_imag[:, ~should_cull]
         if self.has_modal_obs_count:
@@ -563,6 +633,8 @@ class SceneModel(nn.Module):
         modal_frame_view_indices = None
         modal_frame_local_indices = None
         modal_frame_times_sec = None
+        modal_refinement = None
+        modal_anchor_mask = None
         if f"{prefix}modal_phi_real" in state_dict:
             modal_phi_real = state_dict[f"{prefix}modal_phi_real"]
             modal_phi_imag = state_dict[f"{prefix}modal_phi_imag"]
@@ -596,6 +668,18 @@ class SceneModel(nn.Module):
             modal_frame_view_indices = state_dict[f"{prefix}modal_frame_view_indices"]
             modal_frame_local_indices = state_dict[f"{prefix}modal_frame_local_indices"]
             modal_frame_times_sec = state_dict[f"{prefix}modal_frame_times_sec"]
+        refinement_key = f"{prefix}modal_refinement.params.delta_phi"
+        anchor_mask_key = f"{prefix}modal_anchor_mask"
+        if (refinement_key in state_dict) != (anchor_mask_key in state_dict):
+            raise ValueError(
+                "Modal shape-refinement checkpoint must contain both "
+                f"{refinement_key} and {anchor_mask_key}"
+            )
+        if refinement_key in state_dict:
+            modal_refinement = ModalShapeRefinement.init_from_state_dict(
+                state_dict, prefix=f"{prefix}modal_refinement.params."
+            )
+            modal_anchor_mask = state_dict[anchor_mask_key]
         modal_synthetic_enabled = state_dict.get(
             f"{prefix}modal_synthetic_enabled",
             torch.tensor(False),
@@ -620,6 +704,8 @@ class SceneModel(nn.Module):
             modal_frame_local_indices=modal_frame_local_indices,
             modal_frame_times_sec=modal_frame_times_sec,
             modal_synthetic_enabled=modal_synthetic_enabled,
+            modal_refinement=modal_refinement,
+            modal_anchor_mask=modal_anchor_mask,
         )
 
     def render(
