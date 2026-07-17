@@ -104,7 +104,7 @@ class TrainConfig:
     modal_stage1_frame_map: str | None = None
     modal_stage1_epochs: int = 0
     modal_stage1_init_ckpt: str | None = None
-    modal_shape_refinement: Literal["fixed", "anchor_delta"] = "fixed"
+    modal_shape_refinement: Literal["fixed", "role_delta"] = "fixed"
     modal_envelope_init_ckpt: str | None = None
     modal_envelope_knot_interval_sec: float = 0.5
     modal_stage2_train_base_means: bool = False
@@ -155,8 +155,8 @@ def main(cfg: TrainConfig):
     )
     if cfg.trajectory_type == "static":
         guru.info(f"Static sweep dataset has {train_dataset.num_frames} frames")
-    elif cfg.modal_shape_refinement == "anchor_delta":
-        guru.info(f"Stage 3A dynamic dataset has {train_dataset.num_frames} frames")
+    elif cfg.modal_shape_refinement == "role_delta":
+        guru.info(f"Stage 3 dynamic dataset has {train_dataset.num_frames} frames")
     else:
         guru.info(f"Stage 2 dynamic dataset has {train_dataset.num_frames} frames")
     stage1_dataset = None
@@ -209,21 +209,13 @@ def main(cfg: TrainConfig):
         modal_stage2_lr_fg_scales=cfg.modal_stage2_lr_fg_scales,
         modal_stage2_lr_fg_quats=cfg.modal_stage2_lr_fg_quats,
     )
-    if cfg.modal_shape_refinement == "anchor_delta":
+    if cfg.modal_shape_refinement == "role_delta":
         assert cfg.modal_manifest is not None
-        assert cfg.modal_frame_map is not None
-        frame_map = load_modal_frame_map(
-            cfg.modal_frame_map,
-            train_dataset,
-            trainer.model.num_frames,
-            device,
-        )
         refinement_data = initial_refinement_data
         if refinement_data is None:
             refinement_data = load_gaussian_modal_refinement_data(
                 cfg.modal_manifest,
                 trainer.model.fg.params["means"],
-                frame_map.view_ids,
                 device,
                 trainer.model.fg.params["means"].dtype,
             )
@@ -285,8 +277,8 @@ def main(cfg: TrainConfig):
         else:
             active_loader = train_loader
             stage_name = (
-                "stage3a"
-                if cfg.modal_shape_refinement == "anchor_delta"
+                "stage3"
+                if cfg.modal_shape_refinement == "role_delta"
                 else "stage2"
             )
         for batch in active_loader:
@@ -391,7 +383,8 @@ def initialize_and_checkpoint_model(
     modal_frame_envelope_right = None
     modal_frame_envelope_lerp = None
     modal_refinement = None
-    modal_anchor_mask = None
+    modal_refinement_mask = None
+    modal_refinement_role = None
     if cfg.trajectory_type == "modal_activation":
         resolve_required_modal_paths(cfg.modal_manifest, cfg.modal_frame_map)
         assert cfg.modal_manifest is not None
@@ -423,15 +416,15 @@ def initialize_and_checkpoint_model(
         modal_frame_envelope_left = envelope_layout.frame_left_indices
         modal_frame_envelope_right = envelope_layout.frame_right_indices
         modal_frame_envelope_lerp = envelope_layout.frame_lerp_weights
-        if cfg.modal_shape_refinement == "anchor_delta":
+        if cfg.modal_shape_refinement == "role_delta":
             refinement_data = load_gaussian_modal_refinement_data(
                 cfg.modal_manifest,
                 fg_params.params["means"],
-                frame_map.view_ids,
                 device,
                 fg_params.params["means"].dtype,
             )
-            modal_anchor_mask = refinement_data.anchor_mask
+            modal_refinement_mask = refinement_data.refinement_mask
+            modal_refinement_role = refinement_data.display_class
             modal_refinement = ModalShapeRefinement(
                 torch.zeros(
                     (*modal_phi_real.shape, 2),
@@ -439,10 +432,10 @@ def initialize_and_checkpoint_model(
                     dtype=modal_phi_real.dtype,
                 )
             )
-            anchor_counts = refinement_data.anchor_mask.sum(dim=1).tolist()
+            role_counts = refinement_data.role_counts.tolist()
             guru.info(
-                "Initialized anchor-only modal shape refinement: "
-                f"anchor_counts={anchor_counts}, "
+                "Initialized role-based modal shape refinement: "
+                f"anchor_partial_filled_counts={role_counts}, "
                 f"delta_shape={tuple(modal_refinement.params['delta_phi'].shape)}"
             )
             modal = _load_harmonic_envelope_from_checkpoint(
@@ -538,7 +531,8 @@ def initialize_and_checkpoint_model(
         modal_frame_envelope_right=modal_frame_envelope_right,
         modal_frame_envelope_lerp=modal_frame_envelope_lerp,
         modal_refinement=modal_refinement,
-        modal_anchor_mask=modal_anchor_mask,
+        modal_refinement_mask=modal_refinement_mask,
+        modal_refinement_role=modal_refinement_role,
     )
 
     checkpoint = {
@@ -557,7 +551,7 @@ def initialize_and_checkpoint_model(
         guru.info(f"Saving initialization to {ckpt_path}")
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         torch.save(checkpoint, ckpt_path)
-    return refinement_data if cfg.modal_shape_refinement == "anchor_delta" else None
+    return refinement_data if cfg.modal_shape_refinement == "role_delta" else None
 
 
 def _save_new_initial_checkpoints(
@@ -676,7 +670,7 @@ def _load_harmonic_envelope_from_checkpoint(
     device: torch.device,
 ) -> ModalHarmonicEnvelope:
     if path is None:
-        raise ValueError("anchor_delta refinement requires --modal-envelope-init-ckpt")
+        raise ValueError("role_delta refinement requires --modal-envelope-init-ckpt")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Envelope source checkpoint does not exist: {path}")
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
@@ -719,6 +713,8 @@ def _load_harmonic_envelope_from_checkpoint(
         )
     refinement_keys = {
         "modal_refinement.params.delta_phi",
+        "modal_refinement_mask",
+        "modal_refinement_role",
         "modal_anchor_mask",
     }
     present_refinement_keys = sorted(refinement_keys & set(state_dict))
@@ -959,13 +955,12 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
                 "w_envelope_curvature": cfg.loss.w_envelope_curvature,
             }
         )
-    if cfg.modal_shape_refinement == "anchor_delta":
+    if cfg.modal_shape_refinement == "role_delta":
         metadata.update(
             {
-                "modal_shape_parameterization": "anchor_delta_phi_v1",
+                "modal_shape_parameterization": "role_delta_phi_v1",
                 "modal_envelope_init_ckpt": cfg.modal_envelope_init_ckpt,
                 "modal_envelope_frozen": True,
-                "w_modal_2d": cfg.loss.w_modal_2d,
                 "w_delta_phi_prior": cfg.loss.w_delta_phi_prior,
                 "w_delta_phi_spatial": cfg.loss.w_delta_phi_spatial,
                 "lr_modal_refinement_delta_phi": (
@@ -1364,34 +1359,33 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
             raise ValueError(
                 "Harmonic-envelope training does not accept Gaussian LR overrides"
             )
-    is_anchor_delta = cfg.modal_shape_refinement == "anchor_delta"
+    is_role_delta = cfg.modal_shape_refinement == "role_delta"
     refinement_weights = (
-        cfg.loss.w_modal_2d,
         cfg.loss.w_delta_phi_prior,
         cfg.loss.w_delta_phi_spatial,
     )
-    if not is_anchor_delta:
+    if not is_role_delta:
         if cfg.modal_envelope_init_ckpt is not None:
             raise ValueError(
                 "--modal-envelope-init-ckpt requires "
-                "--modal-shape-refinement anchor_delta"
+                "--modal-shape-refinement role_delta"
             )
         if any(weight != 0.0 for weight in refinement_weights):
             raise ValueError(
-                "Stage 3A loss weights require "
-                "--modal-shape-refinement anchor_delta"
+                "Stage 3 loss weights require "
+                "--modal-shape-refinement role_delta"
             )
         return
 
     if cfg.trajectory_type != "modal_activation":
-        raise ValueError("anchor_delta refinement requires modal_activation")
+        raise ValueError("role_delta refinement requires modal_activation")
     if cfg.modal_stage1_init_ckpt is None:
         raise ValueError(
-            "anchor_delta refinement requires --modal-stage1-init-ckpt"
+            "role_delta refinement requires --modal-stage1-init-ckpt"
         )
     if cfg.modal_envelope_init_ckpt is None:
         raise ValueError(
-            "anchor_delta refinement requires --modal-envelope-init-ckpt"
+            "role_delta refinement requires --modal-envelope-init-ckpt"
         )
     if not os.path.exists(cfg.modal_envelope_init_ckpt):
         raise FileNotFoundError(
@@ -1400,14 +1394,14 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
         )
     if cfg.modal_manifest is None or cfg.modal_frame_map is None:
         raise ValueError(
-            "anchor_delta refinement requires --modal-manifest and "
+            "role_delta refinement requires --modal-manifest and "
             "--modal-frame-map"
         )
     if cfg.modal_train_view_id is not None:
-        raise ValueError("anchor_delta refinement requires joint all-view training")
+        raise ValueError("role_delta refinement requires joint all-view training")
     if cfg.port is not None or cfg.vis_debug:
         raise ValueError(
-            "Stage 3A Viser integration is deferred; run without --port and "
+            "Stage 3 Viser integration is deferred; run without --port and "
             "--vis-debug, then use run_modal_reconstruction.py"
         )
 
@@ -1433,13 +1427,12 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
     ]
     if nonzero_unrelated:
         raise ValueError(
-            "anchor_delta refinement only uses RGB, mask, and Stage 3A losses; "
+            "role_delta refinement only uses RGB, mask, prior, and spatial losses; "
             f"set these weights to zero: {nonzero_unrelated}"
         )
     named_refinement_weights = {
         "w_rgb": cfg.loss.w_rgb,
         "w_mask": cfg.loss.w_mask,
-        "w_modal_2d": cfg.loss.w_modal_2d,
         "w_delta_phi_prior": cfg.loss.w_delta_phi_prior,
         "w_delta_phi_spatial": cfg.loss.w_delta_phi_spatial,
     }
@@ -1450,14 +1443,10 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
     ]
     if invalid_weights:
         raise ValueError(
-            f"Stage 3A loss weights must be finite and non-negative: {invalid_weights}"
+            f"Stage 3 loss weights must be finite and non-negative: {invalid_weights}"
         )
     if cfg.loss.w_rgb <= 0.0:
-        raise ValueError("anchor_delta refinement requires --loss.w-rgb > 0")
-    if cfg.loss.w_delta_phi_prior <= 0.0:
-        raise ValueError(
-            "anchor_delta refinement requires --loss.w-delta-phi-prior > 0"
-        )
+        raise ValueError("role_delta refinement requires --loss.w-rgb > 0")
     delta_lr = cfg.lr.modal_refinement.delta_phi
     if not np.isfinite(delta_lr) or delta_lr <= 0.0:
         raise ValueError(

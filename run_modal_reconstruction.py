@@ -18,13 +18,18 @@ from loguru import logger as guru
 
 from flow3d.data.casual_dataset import CasualDataset
 from flow3d.metrics import mSSIM
-from flow3d.modal_utils import ModalFrameMap, build_modal_envelope_layout
+from flow3d.modal_utils import (
+    MOTION_FILL_DISPLAY_NAMES,
+    ModalFrameMap,
+    build_modal_envelope_layout,
+)
 from flow3d.scene_model import SceneModel
 
 
-MODAL_SHAPE_PARAMETERIZATION = "anchor_delta_phi_v1"
+MODAL_SHAPE_PARAMETERIZATION = "role_delta_phi_v1"
 MODAL_DELTA_PHI_STATE_KEY = "modal_refinement.params.delta_phi"
-MODAL_ANCHOR_MASK_STATE_KEY = "modal_anchor_mask"
+MODAL_REFINEMENT_MASK_STATE_KEY = "modal_refinement_mask"
+MODAL_REFINEMENT_ROLE_STATE_KEY = "modal_refinement_role"
 
 
 @dataclass
@@ -149,9 +154,14 @@ def _validate_modal_shape_checkpoint_contract(
         else None
     )
     has_delta_phi = MODAL_DELTA_PHI_STATE_KEY in state_dict
-    has_anchor_mask = MODAL_ANCHOR_MASK_STATE_KEY in state_dict
-    has_any_shape_state = has_delta_phi or has_anchor_mask
-    has_complete_shape_state = has_delta_phi and has_anchor_mask
+    has_refinement_mask = MODAL_REFINEMENT_MASK_STATE_KEY in state_dict
+    has_refinement_role = MODAL_REFINEMENT_ROLE_STATE_KEY in state_dict
+    has_any_shape_state = (
+        has_delta_phi or has_refinement_mask or has_refinement_role
+    )
+    has_complete_shape_state = (
+        has_delta_phi and has_refinement_mask and has_refinement_role
+    )
 
     if marker is None and not has_any_shape_state:
         return False
@@ -176,8 +186,8 @@ def _validate_modal_shape_checkpoint_contract(
         "Checkpoint has an incomplete or incompatible modal shape-refinement "
         "contract: expected no shape marker/state for Stage 2, or "
         f"modal_shape_parameterization={MODAL_SHAPE_PARAMETERIZATION!r} with "
-        f"both {MODAL_DELTA_PHI_STATE_KEY!r} and "
-        f"{MODAL_ANCHOR_MASK_STATE_KEY!r}, frozen envelope metadata, and "
+        f"{MODAL_DELTA_PHI_STATE_KEY!r}, {MODAL_REFINEMENT_MASK_STATE_KEY!r}, "
+        f"and {MODAL_REFINEMENT_ROLE_STATE_KEY!r}, frozen envelope metadata, and "
         "an envelope source checkpoint"
     )
 
@@ -680,37 +690,45 @@ def _harmonic_envelope_modes(
 
 def _shape_refinement_metrics(
     model: SceneModel,
-) -> list[dict[str, float | int]] | None:
+) -> list[dict[str, Any]] | None:
     if not model.has_modal_refinement:
         return None
-    if model.modal_refinement is None or model.modal_anchor_mask is None:
-        raise ValueError("Stage 3A model has incomplete modal refinement state")
+    if (
+        model.modal_refinement is None
+        or model.modal_refinement_mask is None
+        or model.modal_refinement_role is None
+    ):
+        raise ValueError("Stage 3 model has incomplete modal refinement state")
 
     delta_phi = model.modal_refinement.params["delta_phi"].detach()
-    anchor_mask = model.modal_anchor_mask.detach()
+    refinement_mask = model.modal_refinement_mask.detach()
+    refinement_role = model.modal_refinement_role.detach()
     expected_shape = tuple(model.modal_phi_real.shape) + (2,)
     if tuple(delta_phi.shape) != expected_shape:
         raise ValueError(
-            "Stage 3A delta_phi shape is inconsistent: expected "
+            "Stage 3 delta_phi shape is inconsistent: expected "
             f"{expected_shape}, got {tuple(delta_phi.shape)}"
         )
-    if anchor_mask.dtype != torch.bool or tuple(anchor_mask.shape) != tuple(
-        model.modal_phi_real.shape[:2]
-    ):
-        raise ValueError("Stage 3A modal anchor mask is inconsistent")
+    expected_mask_shape = tuple(model.modal_phi_real.shape[:2])
+    if refinement_mask.dtype != torch.bool or tuple(
+        refinement_mask.shape
+    ) != expected_mask_shape:
+        raise ValueError("Stage 3 modal refinement mask is inconsistent")
+    if tuple(refinement_role.shape) != expected_mask_shape:
+        raise ValueError("Stage 3 modal refinement role is inconsistent")
     if not bool(torch.isfinite(delta_phi).all()):
-        raise ValueError("Stage 3A delta_phi contains non-finite values")
+        raise ValueError("Stage 3 delta_phi contains non-finite values")
 
     effective_real, effective_imag = model.get_effective_modal_phi()
     staged_real = model.modal_phi_real.detach()
     staged_imag = model.modal_phi_imag.detach()
-    metrics: list[dict[str, float | int]] = []
+    metrics: list[dict[str, Any]] = []
     for mode_slot in range(delta_phi.shape[0]):
-        mode_anchor_mask = anchor_mask[mode_slot]
-        anchor_count = int(mode_anchor_mask.sum().item())
-        if anchor_count == 0:
+        mode_refinement_mask = refinement_mask[mode_slot]
+        refinement_count = int(mode_refinement_mask.sum().item())
+        if refinement_count == 0:
             raise ValueError(
-                f"Stage 3A mode slot {mode_slot} has no fixed-anchor Gaussians"
+                f"Stage 3 mode slot {mode_slot} has no refinement Gaussians"
             )
 
         mode_delta = delta_phi[mode_slot]
@@ -723,40 +741,83 @@ def _shape_refinement_metrics(
             effective_real[mode_slot].square().sum(dim=-1)
             + effective_imag[mode_slot].square().sum(dim=-1)
         )
-        anchor_delta_norm = delta_norm[mode_anchor_mask]
-        anchor_staged_norm = staged_norm[mode_anchor_mask]
-        anchor_refined_norm = refined_norm[mode_anchor_mask]
-        delta_rms = torch.sqrt(anchor_delta_norm.square().mean())
-        staged_anchor_rms = torch.sqrt(anchor_staged_norm.square().mean())
-        refined_anchor_rms = torch.sqrt(anchor_refined_norm.square().mean())
-        if not bool(torch.isfinite(staged_anchor_rms)) or float(
-            staged_anchor_rms.item()
+        selected_delta_norm = delta_norm[mode_refinement_mask]
+        selected_staged_norm = staged_norm[mode_refinement_mask]
+        selected_refined_norm = refined_norm[mode_refinement_mask]
+        delta_rms = torch.sqrt(selected_delta_norm.square().mean())
+        staged_refinement_rms = torch.sqrt(
+            selected_staged_norm.square().mean()
+        )
+        refined_refinement_rms = torch.sqrt(
+            selected_refined_norm.square().mean()
+        )
+        if not bool(torch.isfinite(staged_refinement_rms)) or float(
+            staged_refinement_rms.item()
         ) <= 0.0:
             raise ValueError(
-                f"Stage 3A mode slot {mode_slot} has invalid staged anchor RMS"
+                f"Stage 3 mode slot {mode_slot} has invalid staged refinement RMS"
             )
 
-        nonanchor_delta_norm = delta_norm[~mode_anchor_mask]
-        nonanchor_delta_count = int((nonanchor_delta_norm != 0).sum().item())
-        nonanchor_delta_max = (
+        frozen_delta_norm = delta_norm[~mode_refinement_mask]
+        frozen_delta_count = int((frozen_delta_norm != 0).sum().item())
+        frozen_delta_max = (
             0.0
-            if nonanchor_delta_norm.numel() == 0
-            else float(nonanchor_delta_norm.max().cpu().item())
+            if frozen_delta_norm.numel() == 0
+            else float(frozen_delta_norm.max().cpu().item())
         )
+        role_metrics: dict[str, dict[str, float | int | None]] = {}
+        for role_index, role_name in enumerate(MOTION_FILL_DISPLAY_NAMES):
+            role_mask = refinement_role[mode_slot] == role_index
+            role_count = int(role_mask.sum().item())
+            if role_count == 0:
+                role_metrics[role_name] = {
+                    "count": 0,
+                    "delta_rms": 0.0,
+                    "delta_max": 0.0,
+                    "staged_rms": None,
+                    "refined_rms": None,
+                    "relative_delta_rms": None,
+                }
+                continue
+            role_delta_norm = delta_norm[role_mask]
+            role_staged_norm = staged_norm[role_mask]
+            role_refined_norm = refined_norm[role_mask]
+            role_delta_rms = torch.sqrt(role_delta_norm.square().mean())
+            role_staged_rms = torch.sqrt(role_staged_norm.square().mean())
+            role_refined_rms = torch.sqrt(role_refined_norm.square().mean())
+            relative_delta_rms = (
+                None
+                if float(role_staged_rms.item()) <= 0.0
+                else float((role_delta_rms / role_staged_rms).cpu().item())
+            )
+            role_metrics[role_name] = {
+                "count": role_count,
+                "delta_rms": float(role_delta_rms.cpu().item()),
+                "delta_max": float(role_delta_norm.max().cpu().item()),
+                "staged_rms": float(role_staged_rms.cpu().item()),
+                "refined_rms": float(role_refined_rms.cpu().item()),
+                "relative_delta_rms": relative_delta_rms,
+            }
+
         metrics.append(
             {
                 "mode_slot": mode_slot,
                 "frequency_hz": float(model.modal_freqs_hz[mode_slot].cpu().item()),
-                "anchor_count": anchor_count,
+                "refinement_count": refinement_count,
                 "delta_rms": float(delta_rms.cpu().item()),
-                "delta_max": float(anchor_delta_norm.max().cpu().item()),
-                "staged_anchor_rms": float(staged_anchor_rms.cpu().item()),
-                "refined_anchor_rms": float(refined_anchor_rms.cpu().item()),
-                "relative_delta_rms": float(
-                    (delta_rms / staged_anchor_rms).cpu().item()
+                "delta_max": float(selected_delta_norm.max().cpu().item()),
+                "staged_refinement_rms": float(
+                    staged_refinement_rms.cpu().item()
                 ),
-                "nonanchor_delta_max": nonanchor_delta_max,
-                "nonanchor_delta_count": nonanchor_delta_count,
+                "refined_refinement_rms": float(
+                    refined_refinement_rms.cpu().item()
+                ),
+                "relative_delta_rms": float(
+                    (delta_rms / staged_refinement_rms).cpu().item()
+                ),
+                "frozen_delta_max": frozen_delta_max,
+                "frozen_delta_count": frozen_delta_count,
+                "roles": role_metrics,
             }
         )
     return metrics

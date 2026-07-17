@@ -18,9 +18,10 @@ from flow3d.vis.viewer import (
 from modal_surface.io import load_view_config
 
 
-MODAL_SHAPE_PARAMETERIZATION = "anchor_delta_phi_v1"
+MODAL_SHAPE_PARAMETERIZATION = "role_delta_phi_v1"
 MODAL_DELTA_PHI_STATE_KEY = "modal_refinement.params.delta_phi"
-MODAL_ANCHOR_MASK_STATE_KEY = "modal_anchor_mask"
+MODAL_REFINEMENT_MASK_STATE_KEY = "modal_refinement_mask"
+MODAL_REFINEMENT_ROLE_STATE_KEY = "modal_refinement_role"
 
 
 class Renderer:
@@ -110,7 +111,8 @@ class Renderer:
             else None
         )
         has_delta_phi = MODAL_DELTA_PHI_STATE_KEY in state_dict
-        has_anchor_mask = MODAL_ANCHOR_MASK_STATE_KEY in state_dict
+        has_refinement_mask = MODAL_REFINEMENT_MASK_STATE_KEY in state_dict
+        has_refinement_role = MODAL_REFINEMENT_ROLE_STATE_KEY in state_dict
         has_frozen_envelope = (
             isinstance(init_metadata, dict)
             and init_metadata.get("modal_envelope_frozen") is True
@@ -121,19 +123,20 @@ class Renderer:
             else None
         )
         if shape_parameterization is None and not (
-            has_delta_phi or has_anchor_mask
+            has_delta_phi or has_refinement_mask or has_refinement_role
         ):
             pass
         elif (
             shape_parameterization == MODAL_SHAPE_PARAMETERIZATION
             and has_delta_phi
-            and has_anchor_mask
+            and has_refinement_mask
+            and has_refinement_role
             and has_frozen_envelope
             and isinstance(envelope_source, str)
             and bool(envelope_source)
         ):
             raise ValueError(
-                "Viser rendering does not yet support Stage 3A refined modal "
+                "Viser rendering does not yet support Stage 3 refined modal "
                 "shape checkpoints; inspect this checkpoint with "
                 "run_modal_reconstruction.py"
             )

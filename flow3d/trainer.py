@@ -56,27 +56,29 @@ def _modal_delta_phi_gradient_norm(
     delta_grad = model.modal_refinement.params["delta_phi"].grad
     if delta_grad is None:
         raise RuntimeError(
-            "Stage 3A delta_phi received no gradient at "
+            "Stage 3 delta_phi received no gradient at "
             f"step {global_step}"
         )
     grad_norm = torch.linalg.vector_norm(delta_grad)
     if not torch.isfinite(grad_norm):
         raise FloatingPointError(
-            "Stage 3A delta_phi gradient norm is not finite at "
+            "Stage 3 delta_phi gradient norm is not finite at "
             f"step {global_step}: {grad_norm.item()}"
         )
     return float(grad_norm.item())
 
 
-def _require_zero_nonanchor_delta(model: SceneModel) -> None:
+def _require_zero_nonrefinement_delta(model: SceneModel) -> None:
     if not model.has_modal_refinement or model.modal_refinement is None:
         return
-    anchor_mask = model.modal_anchor_mask
-    if anchor_mask is None:
-        raise RuntimeError("Stage 3A model is missing modal_anchor_mask")
+    refinement_mask = model.modal_refinement_mask
+    if refinement_mask is None:
+        raise RuntimeError("Stage 3 model is missing modal_refinement_mask")
     delta_phi = model.modal_refinement.params["delta_phi"]
-    if bool(torch.count_nonzero(delta_phi[~anchor_mask]).item()):
-        raise RuntimeError("Stage 3A assigned nonzero delta_phi to a non-anchor")
+    if bool(torch.count_nonzero(delta_phi[~refinement_mask]).item()):
+        raise RuntimeError(
+            "Stage 3 assigned nonzero delta_phi outside the refinement mask"
+        )
 
 
 class Trainer:
@@ -267,7 +269,7 @@ class Trainer:
                 group["lr"] = float(lr)
 
     def save_checkpoint(self, path: str):
-        _require_zero_nonanchor_delta(self.model)
+        _require_zero_nonrefinement_delta(self.model)
         model_dict = self.model.state_dict()
         optimizer_dict = {k: v.state_dict() for k, v in self.optimizers.items()}
         scheduler_dict = {k: v.state_dict() for k, v in self.scheduler.items()}
@@ -286,7 +288,7 @@ class Trainer:
     def require_modal_delta_gradient_observed(self) -> None:
         if self.model.has_modal_refinement and not self.modal_delta_gradient_seen:
             raise RuntimeError(
-                "Stage 3A completed without observing a nonzero delta_phi gradient"
+                "Stage 3 completed without observing a nonzero delta_phi gradient"
             )
 
     def set_modal_refinement_data(
@@ -294,29 +296,38 @@ class Trainer:
         data: GaussianModalRefinementData,
     ) -> None:
         if not self.model.has_modal_refinement:
-            raise ValueError("modal refinement data requires a Stage 3A model")
-        anchor_mask = self.model.modal_anchor_mask
-        if anchor_mask is None or not torch.equal(data.anchor_mask, anchor_mask):
+            raise ValueError("modal refinement data requires a Stage 3 model")
+        refinement_mask = self.model.modal_refinement_mask
+        refinement_role = self.model.modal_refinement_role
+        if refinement_mask is None or not torch.equal(
+            data.refinement_mask, refinement_mask
+        ):
             raise ValueError(
-                "modal refinement data anchor mask does not match the checkpoint"
+                "modal refinement data mask does not match the checkpoint"
+            )
+        if refinement_role is None or not torch.equal(
+            data.display_class, refinement_role
+        ):
+            raise ValueError(
+                "modal refinement data roles do not match the checkpoint"
             )
         expected_modes = int(self.model.modal_phi_real.shape[0])
-        if data.staged_anchor_energy.shape != (expected_modes,):
+        if data.staged_refinement_energy.shape != (expected_modes,):
             raise ValueError(
                 "modal refinement data mode count does not match the checkpoint"
             )
-        group_count = int(data.group_target_energy.shape[0])
-        if data.group_mode_indices.shape != (group_count,) or (
-            data.group_view_indices.shape != (group_count,)
+        if data.role_counts.shape != (expected_modes, 3):
+            raise ValueError("modal refinement role counts are invalid")
+        edge_count = int(data.refinement_edge_weights.shape[0])
+        if data.refinement_edge_index.shape != (2, edge_count) or (
+            data.refinement_edge_mode_indices.shape != (edge_count,)
         ):
-            raise ValueError("modal refinement observation group metadata is invalid")
+            raise ValueError("modal refinement graph metadata is invalid")
         self.modal_refinement_data = data
         guru.info(
-            "Loaded Stage 3A constraints: "
-            f"anchors={data.anchor_mask.sum(dim=1).tolist()}, "
-            f"observation_rows={data.obs_y_real.shape[0]}, "
-            f"anchor_edges={data.anchor_edge_weights.shape[0]}, "
-            f"groups={data.group_target_energy.shape[0]}"
+            "Loaded Stage 3 role constraints: "
+            f"anchor_partial_filled_counts={data.role_counts.tolist()}, "
+            f"refinement_edges={edge_count}"
         )
 
     @staticmethod
@@ -414,61 +425,62 @@ class Trainer:
     ]:
         if not self.model.has_modal_refinement or self.model.modal_refinement is None:
             zero = self.model.fg.params["means"].new_zeros(())
-            return zero, zero, zero, zero, zero.reshape(1)
+            zero_roles = zero.new_zeros((3,))
+            return zero, zero, zero, zero_roles, zero_roles
         data = self.modal_refinement_data
         if data is None:
             raise RuntimeError(
-                "Stage 3A training requires loaded modal refinement data"
+                "Stage 3 training requires loaded modal refinement data"
             )
-        anchor_mask = self.model.modal_anchor_mask
-        if anchor_mask is None:
-            raise RuntimeError("Stage 3A model is missing modal_anchor_mask")
-        phi_real, phi_imag = self.model.get_effective_modal_phi()
-        obs_phi_real = phi_real[
-            data.obs_mode_indices,
-            data.obs_gaussian_indices,
-        ]
-        obs_phi_imag = phi_imag[
-            data.obs_mode_indices,
-            data.obs_gaussian_indices,
-        ]
-        projected_real = torch.einsum("oij,oj->oi", data.obs_J, obs_phi_real)
-        projected_imag = torch.einsum("oij,oj->oi", data.obs_J, obs_phi_imag)
-        predicted_real = (
-            data.obs_alpha_real[:, None] * projected_real
-            - data.obs_alpha_imag[:, None] * projected_imag
-        )
-        predicted_imag = (
-            data.obs_alpha_real[:, None] * projected_imag
-            + data.obs_alpha_imag[:, None] * projected_real
-        )
-        residual_energy = (
-            (predicted_real - data.obs_y_real).square()
-            + (predicted_imag - data.obs_y_imag).square()
-        ).sum(dim=-1)
-        group_residual = torch.zeros_like(data.group_target_energy)
-        group_residual.index_add_(
-            0,
-            data.obs_group_indices,
-            data.obs_effective_weights * residual_energy,
-        )
-        modal_2d_group_loss = group_residual / data.group_target_energy
-        modal_2d_loss = modal_2d_group_loss.mean()
+        refinement_mask = self.model.modal_refinement_mask
+        refinement_role = self.model.modal_refinement_role
+        if refinement_mask is None or refinement_role is None:
+            raise RuntimeError(
+                "Stage 3 model is missing refinement mask or role state"
+            )
 
         delta_phi = self.model.modal_refinement.params["delta_phi"]
-        anchor_count = anchor_mask.sum(dim=1).to(dtype=delta_phi.dtype)
         delta_point_energy = delta_phi.square().sum(dim=(-1, -2))
-        delta_mode_energy = (
-            (delta_point_energy * anchor_mask.to(dtype=delta_phi.dtype)).sum(dim=1)
-            / anchor_count
-        )
-        relative_delta_energy = delta_mode_energy / data.staged_anchor_energy
-        delta_prior_loss = relative_delta_energy.mean()
-        relative_delta_rms = torch.sqrt(relative_delta_energy).mean()
+        relative_role_energies = []
+        role_delta_rms_values = []
+        role_delta_max_values = []
+        for display_role in range(3):
+            role_mask = refinement_role == display_role
+            role_count_per_mode = role_mask.sum(dim=1)
+            valid_modes = role_count_per_mode > 0
+            if not bool(valid_modes.any().item()):
+                role_delta_rms_values.append(delta_phi.new_zeros(()))
+                role_delta_max_values.append(delta_phi.new_zeros(()))
+                continue
+            mode_delta_energy = (
+                (
+                    delta_point_energy
+                    * role_mask.to(dtype=delta_phi.dtype)
+                ).sum(dim=1)
+                / role_count_per_mode.clamp_min(1).to(dtype=delta_phi.dtype)
+            )
+            relative_mode_energy = (
+                mode_delta_energy / data.staged_refinement_energy
+            )
+            relative_role_energies.append(relative_mode_energy[valid_modes])
+            selected_delta_energy = delta_point_energy[role_mask]
+            role_delta_rms_values.append(
+                torch.sqrt(selected_delta_energy.mean())
+            )
+            role_delta_max_values.append(
+                torch.sqrt(selected_delta_energy).max()
+            )
+        if not relative_role_energies:
+            raise RuntimeError("Stage 3 refinement mask contains no trainable roles")
+        relative_energy = torch.cat(relative_role_energies, dim=0)
+        delta_prior_loss = relative_energy.mean()
+        relative_delta_rms = torch.sqrt(relative_energy).mean()
+        role_delta_rms = torch.stack(role_delta_rms_values)
+        role_delta_max = torch.stack(role_delta_max_values)
 
-        edge_modes = data.anchor_edge_mode_indices
-        edge_start = data.anchor_edge_index[0]
-        edge_end = data.anchor_edge_index[1]
+        edge_modes = data.refinement_edge_mode_indices
+        edge_start = data.refinement_edge_index[0]
+        edge_end = data.refinement_edge_index[1]
         edge_delta = (
             delta_phi[edge_modes, edge_start]
             - delta_phi[edge_modes, edge_end]
@@ -479,32 +491,39 @@ class Trainer:
         spatial_sum.index_add_(
             0,
             edge_modes,
-            data.anchor_edge_weights * edge_energy,
+            data.refinement_edge_weights * edge_energy,
         )
         edge_count = torch.bincount(edge_modes, minlength=num_modes).to(
             dtype=delta_phi.dtype
         )
         if bool((edge_count <= 0).any().item()):
             raise RuntimeError(
-                "Stage 3A spatial constraints require anchor-anchor edges per mode"
+                "Stage 3 spatial constraints require trainable edges per mode"
             )
         delta_spatial_loss = (
-            spatial_sum / edge_count / data.staged_anchor_energy
+            spatial_sum
+            / edge_count
+            / data.staged_refinement_energy
         ).mean()
         for name, value in (
-            ("modal 2D", modal_2d_loss),
             ("delta prior", delta_prior_loss),
             ("delta spatial", delta_spatial_loss),
             ("relative delta RMS", relative_delta_rms),
         ):
             if not torch.isfinite(value):
-                raise FloatingPointError(f"Stage 3A {name} loss is not finite")
+                raise FloatingPointError(f"Stage 3 {name} loss is not finite")
+        if not bool(torch.isfinite(role_delta_rms).all().item()) or not bool(
+            torch.isfinite(role_delta_max).all().item()
+        ):
+            raise FloatingPointError(
+                "Stage 3 role-based delta diagnostics are not finite"
+            )
         return (
-            modal_2d_loss,
             delta_prior_loss,
             delta_spatial_loss,
             relative_delta_rms,
-            modal_2d_group_loss,
+            role_delta_rms,
+            role_delta_max,
         )
 
     def train_step(self, batch):
@@ -552,7 +571,7 @@ class Trainer:
             raise FloatingPointError(
                 f"Modal envelope became non-finite at step {self.global_step}"
             )
-        _require_zero_nonanchor_delta(self.model)
+        _require_zero_nonrefinement_delta(self.model)
         for sched in self.scheduler.values():
             sched.step()
         self._apply_modal_stage2_lr_overrides()
@@ -945,13 +964,12 @@ class Trainer:
             envelope_max_knot_jump = torch.zeros((), device=self.device)
             envelope_max_slope_change = torch.zeros((), device=self.device)
             (
-                modal_2d_loss,
                 delta_phi_prior_loss,
                 delta_phi_spatial_loss,
                 relative_delta_rms,
-                modal_2d_group_loss,
+                role_delta_rms,
+                role_delta_max,
             ) = self._compute_modal_refinement_losses()
-            loss += self.losses_cfg.w_modal_2d * modal_2d_loss
             loss += self.losses_cfg.w_delta_phi_prior * delta_phi_prior_loss
             loss += self.losses_cfg.w_delta_phi_spatial * delta_phi_spatial_loss
         elif is_modal_activation:
@@ -978,11 +996,11 @@ class Trainer:
                 self.losses_cfg.w_envelope_curvature
                 * envelope_curvature_loss
             )
-            modal_2d_loss = torch.zeros((), device=self.device)
             delta_phi_prior_loss = torch.zeros((), device=self.device)
             delta_phi_spatial_loss = torch.zeros((), device=self.device)
             relative_delta_rms = torch.zeros((), device=self.device)
-            modal_2d_group_loss = torch.empty((0,), device=self.device)
+            role_delta_rms = torch.zeros((3,), device=self.device)
+            role_delta_max = torch.zeros((3,), device=self.device)
         else:
             act_mag_loss = torch.zeros((), device=self.device)
             envelope_smoothness_loss = torch.zeros((), device=self.device)
@@ -990,11 +1008,11 @@ class Trainer:
             envelope_rms = torch.zeros((), device=self.device)
             envelope_max_knot_jump = torch.zeros((), device=self.device)
             envelope_max_slope_change = torch.zeros((), device=self.device)
-            modal_2d_loss = torch.zeros((), device=self.device)
             delta_phi_prior_loss = torch.zeros((), device=self.device)
             delta_phi_spatial_loss = torch.zeros((), device=self.device)
             relative_delta_rms = torch.zeros((), device=self.device)
-            modal_2d_group_loss = torch.empty((0,), device=self.device)
+            role_delta_rms = torch.zeros((3,), device=self.device)
+            role_delta_max = torch.zeros((3,), device=self.device)
 
         # Prepare stats for logging.
         stats = {
@@ -1013,7 +1031,6 @@ class Trainer:
             "train/envelope_rms": envelope_rms.item(),
             "train/envelope_max_knot_jump": envelope_max_knot_jump.item(),
             "train/envelope_max_slope_change": envelope_max_slope_change.item(),
-            "train/modal_2d_loss": modal_2d_loss.item(),
             "train/delta_phi_prior_loss": delta_phi_prior_loss.item(),
             "train/delta_phi_spatial_loss": delta_phi_spatial_loss.item(),
             "train/modal_relative_delta_rms": relative_delta_rms.item(),
@@ -1028,21 +1045,13 @@ class Trainer:
             "train/modal_dynamic_stage": float(self._modal_in_dynamic_stage()),
         }
         if self.model.has_modal_refinement:
-            refinement_data = self.modal_refinement_data
-            if refinement_data is None:
-                raise RuntimeError("Stage 3A modal refinement data is unavailable")
-            for group_index, group_loss in enumerate(modal_2d_group_loss):
-                mode_slot = int(
-                    refinement_data.group_mode_indices[group_index].item()
+            for role_index, role_name in enumerate(("anchor", "partial", "filled")):
+                stats[f"train/modal_delta_phi_{role_name}_rms"] = (
+                    role_delta_rms[role_index].item()
                 )
-                view_index = int(
-                    refinement_data.group_view_indices[group_index].item()
+                stats[f"train/modal_delta_phi_{role_name}_max"] = (
+                    role_delta_max[role_index].item()
                 )
-                source_mode = refinement_data.source_mode_indices[mode_slot]
-                view_id = refinement_data.view_ids[view_index]
-                stats[
-                    f"train/modal_2d_mode_{source_mode}_view_{view_id}"
-                ] = group_loss.item()
 
         # Compute metrics.
         with torch.no_grad():

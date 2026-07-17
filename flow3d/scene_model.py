@@ -54,7 +54,8 @@ class SceneModel(nn.Module):
         modal_frame_envelope_lerp: Tensor | None = None,
         modal_synthetic_enabled: bool | Tensor = False,
         modal_refinement: ModalShapeRefinement | None = None,
-        modal_anchor_mask: Tensor | None = None,
+        modal_refinement_mask: Tensor | None = None,
+        modal_refinement_role: Tensor | None = None,
     ):
         super().__init__()
         if trajectory_type not in TRAJECTORY_TYPE_TO_ID:
@@ -166,27 +167,66 @@ class SceneModel(nn.Module):
                 raise ValueError("modal delta_phi dtype must match staged modal phi")
             if delta_phi.device != modal_phi_real.device:
                 raise ValueError("modal delta_phi device must match staged modal phi")
-            if modal_anchor_mask is None:
-                raise ValueError("modal shape refinement requires modal_anchor_mask")
-            if modal_anchor_mask.dtype != torch.bool:
-                raise ValueError("modal_anchor_mask must have bool dtype")
-            if modal_anchor_mask.shape != modal_phi_real.shape[:2]:
+            if modal_refinement_mask is None:
                 raise ValueError(
-                    "modal_anchor_mask must have shape "
+                    "modal shape refinement requires modal_refinement_mask"
+                )
+            if modal_refinement_mask.dtype != torch.bool:
+                raise ValueError("modal_refinement_mask must have bool dtype")
+            if modal_refinement_mask.shape != modal_phi_real.shape[:2]:
+                raise ValueError(
+                    "modal_refinement_mask must have shape "
                     f"{tuple(modal_phi_real.shape[:2])}, "
-                    f"got {tuple(modal_anchor_mask.shape)}"
+                    f"got {tuple(modal_refinement_mask.shape)}"
                 )
-            if modal_anchor_mask.device != delta_phi.device:
-                raise ValueError("modal_anchor_mask device must match modal delta_phi")
-            if not bool(modal_anchor_mask.any(dim=1).all().item()):
+            if modal_refinement_mask.device != delta_phi.device:
                 raise ValueError(
-                    "modal_anchor_mask must contain at least one anchor per mode"
+                    "modal_refinement_mask device must match modal delta_phi"
                 )
-            if bool(torch.count_nonzero(delta_phi[~modal_anchor_mask]).item()):
-                raise ValueError("non-anchor modal delta_phi values must be exactly zero")
-        elif modal_anchor_mask is not None:
+            if not bool(modal_refinement_mask.any(dim=1).all().item()):
+                raise ValueError(
+                    "modal_refinement_mask must contain at least one point per mode"
+                )
+            if modal_refinement_role is None:
+                raise ValueError(
+                    "modal shape refinement requires modal_refinement_role"
+                )
+            if modal_refinement_role.dtype not in {
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            }:
+                raise ValueError("modal_refinement_role must have integer dtype")
+            if modal_refinement_role.shape != modal_phi_real.shape[:2]:
+                raise ValueError(
+                    "modal_refinement_role must have shape "
+                    f"{tuple(modal_phi_real.shape[:2])}, "
+                    f"got {tuple(modal_refinement_role.shape)}"
+                )
+            if modal_refinement_role.device != delta_phi.device:
+                raise ValueError(
+                    "modal_refinement_role device must match modal delta_phi"
+                )
+            if bool(
+                ((modal_refinement_role < 0) | (modal_refinement_role > 4))
+                .any()
+                .item()
+            ):
+                raise ValueError("modal_refinement_role values must lie in [0,4]")
+            expected_refinement_mask = modal_refinement_role <= 2
+            if not torch.equal(modal_refinement_mask, expected_refinement_mask):
+                raise ValueError(
+                    "modal_refinement_mask must select anchor, partial, and filled roles"
+                )
+            if bool(torch.count_nonzero(delta_phi[~modal_refinement_mask]).item()):
+                raise ValueError(
+                    "non-refinement modal delta_phi values must be exactly zero"
+                )
+        elif modal_refinement_mask is not None or modal_refinement_role is not None:
             raise ValueError(
-                "modal_anchor_mask cannot be provided without modal shape refinement"
+                "modal refinement mask/role cannot be provided without refinement"
             )
 
         if modal_freqs_hz is None:
@@ -471,7 +511,8 @@ class SceneModel(nn.Module):
                 )
         self.register_buffer("modal_phi_real", modal_phi_real)
         self.register_buffer("modal_phi_imag", modal_phi_imag)
-        self.register_buffer("modal_anchor_mask", modal_anchor_mask)
+        self.register_buffer("modal_refinement_mask", modal_refinement_mask)
+        self.register_buffer("modal_refinement_role", modal_refinement_role)
         self.register_buffer("modal_freqs_hz", modal_freqs_hz)
         self.register_buffer("modal_obs_count_per_point", modal_obs_count_per_point.long())
         if isinstance(modal_synthetic_enabled, Tensor):
@@ -705,15 +746,15 @@ class SceneModel(nn.Module):
         phi_imag = self.modal_phi_imag
         if self.modal_refinement is not None:
             delta_phi = self.modal_refinement.params["delta_phi"]
-            anchor_mask = self.modal_anchor_mask
-            if anchor_mask is None:
+            refinement_mask = self.modal_refinement_mask
+            if refinement_mask is None:
                 raise RuntimeError(
-                    "modal shape refinement is missing modal_anchor_mask"
+                    "modal shape refinement is missing modal_refinement_mask"
                 )
             if inds is not None:
                 delta_phi = delta_phi[:, inds]
-                anchor_mask = anchor_mask[:, inds]
-            mask = anchor_mask[..., None].to(dtype=delta_phi.dtype)
+                refinement_mask = refinement_mask[:, inds]
+            mask = refinement_mask[..., None].to(dtype=delta_phi.dtype)
             phi_real = phi_real if inds is None else phi_real[:, inds]
             phi_imag = phi_imag if inds is None else phi_imag[:, inds]
             phi_real = phi_real + mask * delta_phi[..., 0]
@@ -1045,7 +1086,8 @@ class SceneModel(nn.Module):
         modal_frame_envelope_right = None
         modal_frame_envelope_lerp = None
         modal_refinement = None
-        modal_anchor_mask = None
+        modal_refinement_mask = None
+        modal_refinement_role = None
         if f"{prefix}modal_phi_real" in state_dict:
             modal_phi_real = state_dict[f"{prefix}modal_phi_real"]
             modal_phi_imag = state_dict[f"{prefix}modal_phi_imag"]
@@ -1099,17 +1141,33 @@ class SceneModel(nn.Module):
                 f"{prefix}modal_frame_envelope_lerp"
             ]
         refinement_key = f"{prefix}modal_refinement.params.delta_phi"
-        anchor_mask_key = f"{prefix}modal_anchor_mask"
-        if (refinement_key in state_dict) != (anchor_mask_key in state_dict):
+        refinement_mask_key = f"{prefix}modal_refinement_mask"
+        refinement_role_key = f"{prefix}modal_refinement_role"
+        legacy_anchor_mask_key = f"{prefix}modal_anchor_mask"
+        if legacy_anchor_mask_key in state_dict:
             raise ValueError(
-                "Modal shape-refinement checkpoint must contain both "
-                f"{refinement_key} and {anchor_mask_key}"
+                "Anchor-only modal shape-refinement checkpoints are incompatible; "
+                "start a new role-based refinement run from a Stage 2B checkpoint"
+            )
+        refinement_state_count = sum(
+            key in state_dict
+            for key in (
+                refinement_key,
+                refinement_mask_key,
+                refinement_role_key,
+            )
+        )
+        if refinement_state_count not in (0, 3):
+            raise ValueError(
+                "Modal shape-refinement checkpoint must contain delta_phi, "
+                "modal_refinement_mask, and modal_refinement_role together"
             )
         if refinement_key in state_dict:
             modal_refinement = ModalShapeRefinement.init_from_state_dict(
                 state_dict, prefix=f"{prefix}modal_refinement.params."
             )
-            modal_anchor_mask = state_dict[anchor_mask_key]
+            modal_refinement_mask = state_dict[refinement_mask_key]
+            modal_refinement_role = state_dict[refinement_role_key]
         modal_synthetic_enabled = state_dict.get(
             f"{prefix}modal_synthetic_enabled",
             torch.tensor(False),
@@ -1141,7 +1199,8 @@ class SceneModel(nn.Module):
             modal_frame_envelope_lerp=modal_frame_envelope_lerp,
             modal_synthetic_enabled=modal_synthetic_enabled,
             modal_refinement=modal_refinement,
-            modal_anchor_mask=modal_anchor_mask,
+            modal_refinement_mask=modal_refinement_mask,
+            modal_refinement_role=modal_refinement_role,
         )
 
     def render(

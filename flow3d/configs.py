@@ -74,7 +74,6 @@ class LossesConfig:
     w_act_mag: float = 0.001
     w_envelope_smooth: float = 1.0
     w_envelope_curvature: float = 1.0
-    w_modal_2d: float = 0.0
     w_delta_phi_prior: float = 0.0
     w_delta_phi_spatial: float = 0.0
     w_local_iso_ray: float = 0.0
