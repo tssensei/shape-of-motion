@@ -214,6 +214,8 @@ def main(cfg: TrainConfig):
             cfg.modal_consistency_min_zbuffer_samples
         ),
     )
+    if cfg.trajectory_type == "modal_activation":
+        _log_trainable_parameters(trainer.model)
 
     stage1_loader = None
     if stage1_dataset is not None:
@@ -292,6 +294,8 @@ def main(cfg: TrainConfig):
             ):
                 validator.save_train_videos(epoch)
 
+    _save_training_completion_checkpoint(trainer, ckpt_path)
+
 
 def initialize_and_checkpoint_model(
     cfg: TrainConfig,
@@ -305,6 +309,12 @@ def initialize_and_checkpoint_model(
     if os.path.exists(ckpt_path):
         guru.info(f"model checkpoint exists at {ckpt_path}")
         return
+    init_ckpt_path = os.path.join(os.path.dirname(ckpt_path), "init.ckpt")
+    if cfg.trajectory_type == "modal_activation" and os.path.exists(init_ckpt_path):
+        raise ValueError(
+            f"Initialization checkpoint already exists at {init_ckpt_path}; "
+            "refusing to overwrite it."
+        )
 
     if cfg.modal_stage1_init_ckpt is not None:
         if cfg.trajectory_type != "modal_activation":
@@ -437,10 +447,23 @@ def initialize_and_checkpoint_model(
                 dtype=fg_params.params["means"].dtype,
             )
         )
+        view_counts = torch.bincount(
+            frame_map.frame_view_indices.detach().cpu(),
+            minlength=len(frame_map.view_ids),
+        )
+        mode_summary = ", ".join(
+            f"index={mode.mode_index}, freq={mode.freq_hz:.9g}Hz"
+            for mode in modal_modes
+        )
+        view_summary = ", ".join(
+            f"{view_id}={int(view_counts[view_index].item())}"
+            for view_index, view_id in enumerate(frame_map.view_ids)
+        )
         guru.info(
-            f"Initialized modal_activation with {len(modal_modes)} modes, "
-            f"{len(frame_map.view_ids)} views, "
-            f"{modal_smooth_triplets.shape[0]} smoothness triplets"
+            f"Initialized modal_activation: modes={len(modal_modes)} "
+            f"[{mode_summary}], per_view_frames=[{view_summary}], "
+            f"activation_shape={tuple(modal.params['activations'].shape)}, "
+            f"smoothness_triplets={modal_smooth_triplets.shape[0]}"
         )
 
     model = SceneModel(
@@ -473,16 +496,57 @@ def initialize_and_checkpoint_model(
         modal_consistency_fps=modal_consistency_fps,
     )
 
-    guru.info(f"Saving initialization to {ckpt_path}")
+    checkpoint = {
+        "model": model.state_dict(),
+        "epoch": 0,
+        "global_step": 0,
+        "init_metadata": init_metadata,
+    }
+    if cfg.trajectory_type == "modal_activation":
+        guru.info(
+            "Initialized SceneModel Gaussians: "
+            f"fg={model.num_fg_gaussians}, bg={model.num_bg_gaussians}"
+        )
+        _save_new_initial_checkpoints(checkpoint, ckpt_path)
+    else:
+        guru.info(f"Saving initialization to {ckpt_path}")
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+        torch.save(checkpoint, ckpt_path)
+
+
+def _save_new_initial_checkpoints(
+    checkpoint: dict[str, Any],
+    ckpt_path: str,
+) -> None:
+    init_ckpt_path = os.path.join(os.path.dirname(ckpt_path), "init.ckpt")
+    existing_paths = [
+        path for path in (init_ckpt_path, ckpt_path) if os.path.exists(path)
+    ]
+    if existing_paths:
+        raise ValueError(
+            "Refusing to overwrite existing initialization checkpoint path(s): "
+            + ", ".join(existing_paths)
+        )
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "epoch": 0,
-            "global_step": 0,
-            "init_metadata": init_metadata,
-        },
-        ckpt_path,
+    torch.save(checkpoint, init_ckpt_path)
+    torch.save(checkpoint, ckpt_path)
+    guru.info(
+        f"Saved initialization to {init_ckpt_path} and training checkpoint to "
+        f"{ckpt_path}"
+    )
+
+
+def _save_training_completion_checkpoint(trainer: Trainer, ckpt_path: str) -> None:
+    trainer.save_checkpoint(ckpt_path)
+
+
+def _log_trainable_parameters(model: SceneModel) -> None:
+    trainable_names = [
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    ]
+    guru.info(
+        f"Trainable parameters ({len(trainable_names)}): "
+        + (", ".join(trainable_names) if trainable_names else "<none>")
     )
 
 
@@ -629,6 +693,15 @@ def _validate_checkpoint_policy(
         if resume:
             raise ValueError(
                 f"--resume was set but checkpoint does not exist: {ckpt_path}"
+            )
+        init_ckpt_path = os.path.join(os.path.dirname(ckpt_path), "init.ckpt")
+        if (
+            expected_metadata.get("trajectory_type") == "modal_activation"
+            and os.path.exists(init_ckpt_path)
+        ):
+            raise ValueError(
+                f"Initialization checkpoint already exists at {init_ckpt_path}; "
+                "use a new work_dir rather than overwriting it."
             )
         return
 
@@ -981,6 +1054,14 @@ def _make_modal_stage1_data_config(
 
 
 def _inject_vggt_static_view_config(cfg: TrainConfig):
+    depth_losses_enabled = any(
+        weight > 0.0
+        for weight in (
+            cfg.loss.w_depth_reg,
+            cfg.loss.w_depth_grad,
+            cfg.loss.w_depth_const,
+        )
+    )
     if cfg.trajectory_type == "static":
         if cfg.modal_manifest is not None or cfg.modal_frame_map is not None:
             raise ValueError("static trajectory does not use modal training inputs")
@@ -1042,6 +1123,8 @@ def _inject_vggt_static_view_config(cfg: TrainConfig):
         modal_frame_map=cfg.modal_frame_map,
         modal_train_view_id=cfg.modal_train_view_id,
         modal_max_local_frames_per_view=cfg.modal_max_local_frames_per_view,
+        load_tracks=False,
+        load_depths=depth_losses_enabled,
     )
 
 
