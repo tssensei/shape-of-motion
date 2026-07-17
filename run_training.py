@@ -121,6 +121,7 @@ class TrainConfig:
     modal_stage2_lr_fg_quats: float | None = None
     modal_train_view_id: str | None = None
     modal_max_local_frames_per_view: int | None = None
+    modal_temporal_frame_offsets: tuple[int, ...] = (1, 3, 5)
     num_epochs: int = 200
     port: int | None = None
     vis_debug: bool = False 
@@ -959,6 +960,14 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
         metadata.update(
             {
                 "modal_shape_parameterization": "role_delta_phi_v1",
+                "modal_phi_training_objective": "temporal_rgb_v1",
+                "modal_temporal_frame_offsets": cfg.modal_temporal_frame_offsets,
+                "temporal_rgb_charbonnier_epsilon": (
+                    cfg.loss.temporal_rgb_charbonnier_epsilon
+                ),
+                "w_temporal_rgb": cfg.loss.w_temporal_rgb,
+                "w_rgb": cfg.loss.w_rgb,
+                "w_mask": cfg.loss.w_mask,
                 "modal_envelope_init_ckpt": cfg.modal_envelope_init_ckpt,
                 "modal_envelope_frozen": True,
                 "w_delta_phi_prior": cfg.loss.w_delta_phi_prior,
@@ -1361,6 +1370,7 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
             )
     is_role_delta = cfg.modal_shape_refinement == "role_delta"
     refinement_weights = (
+        cfg.loss.w_temporal_rgb,
         cfg.loss.w_delta_phi_prior,
         cfg.loss.w_delta_phi_spatial,
     )
@@ -1427,10 +1437,12 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
     ]
     if nonzero_unrelated:
         raise ValueError(
-            "role_delta refinement only uses RGB, mask, prior, and spatial losses; "
+            "role_delta refinement only uses temporal RGB, absolute RGB, "
+            "delta prior, and delta spatial losses; "
             f"set these weights to zero: {nonzero_unrelated}"
         )
     named_refinement_weights = {
+        "w_temporal_rgb": cfg.loss.w_temporal_rgb,
         "w_rgb": cfg.loss.w_rgb,
         "w_mask": cfg.loss.w_mask,
         "w_delta_phi_prior": cfg.loss.w_delta_phi_prior,
@@ -1445,8 +1457,32 @@ def _validate_modal_shape_refinement_config(cfg: TrainConfig) -> None:
         raise ValueError(
             f"Stage 3 loss weights must be finite and non-negative: {invalid_weights}"
         )
-    if cfg.loss.w_rgb <= 0.0:
-        raise ValueError("role_delta refinement requires --loss.w-rgb > 0")
+    if cfg.loss.w_temporal_rgb <= 0.0:
+        raise ValueError(
+            "role_delta refinement requires --loss.w-temporal-rgb > 0"
+        )
+    if cfg.loss.w_mask != 0.0:
+        raise ValueError("role_delta temporal RGB refinement requires --loss.w-mask 0")
+    if (
+        not np.isfinite(cfg.loss.temporal_rgb_charbonnier_epsilon)
+        or cfg.loss.temporal_rgb_charbonnier_epsilon <= 0.0
+    ):
+        raise ValueError(
+            "--loss.temporal-rgb-charbonnier-epsilon must be finite and positive"
+        )
+    offsets = cfg.modal_temporal_frame_offsets
+    if any(
+        isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset <= 0
+        for offset in offsets
+    ) or tuple(sorted(set(offsets))) != offsets:
+        raise ValueError(
+            "--modal-temporal-frame-offsets must be ordered, unique, "
+            "positive integers"
+        )
+    if not offsets:
+        raise ValueError("role_delta refinement requires temporal frame offsets")
     delta_lr = cfg.lr.modal_refinement.delta_phi
     if not np.isfinite(delta_lr) or delta_lr <= 0.0:
         raise ValueError(
@@ -1592,6 +1628,11 @@ def _inject_vggt_static_view_config(cfg: TrainConfig):
         modal_frame_map=cfg.modal_frame_map,
         modal_train_view_id=cfg.modal_train_view_id,
         modal_max_local_frames_per_view=cfg.modal_max_local_frames_per_view,
+        modal_temporal_frame_offsets=(
+            cfg.modal_temporal_frame_offsets
+            if cfg.modal_shape_refinement == "role_delta"
+            else ()
+        ),
         load_tracks=False,
         load_depths=depth_losses_enabled,
     )

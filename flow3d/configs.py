@@ -61,6 +61,8 @@ class SceneLRConfig:
 @dataclass
 class LossesConfig:
     w_rgb: float = 1.0
+    w_temporal_rgb: float = 0.0
+    temporal_rgb_charbonnier_epsilon: float = 1e-3
     w_depth_reg: float = 0.5
     w_depth_const: float = 0.0
     w_depth_grad: float = 1.0

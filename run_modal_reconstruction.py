@@ -30,6 +30,7 @@ MODAL_SHAPE_PARAMETERIZATION = "role_delta_phi_v1"
 MODAL_DELTA_PHI_STATE_KEY = "modal_refinement.params.delta_phi"
 MODAL_REFINEMENT_MASK_STATE_KEY = "modal_refinement_mask"
 MODAL_REFINEMENT_ROLE_STATE_KEY = "modal_refinement_role"
+TEMPORAL_RGB_OBJECTIVE = "temporal_rgb_v1"
 
 
 @dataclass
@@ -288,7 +289,7 @@ def _load_checkpoint_model(
     checkpoint_path: Path,
     device: torch.device,
     use_2dgs: bool,
-) -> SceneModel:
+) -> tuple[SceneModel, dict[str, Any]]:
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
     checkpoint = torch.load(
@@ -370,7 +371,9 @@ def _load_checkpoint_model(
     model.eval()
     if model.trajectory_type != "modal_activation" or model.modal is None:
         raise ValueError("Checkpoint does not contain a modal_activation model")
-    return model
+    if not isinstance(init_metadata, dict):
+        raise ValueError("Modal checkpoint init_metadata must be a mapping")
+    return model, init_metadata
 
 
 def _load_reconstruction_frames(
@@ -835,6 +838,164 @@ def _training_target(
     )
 
 
+def _temporal_rgb_evaluation_config(
+    init_metadata: Mapping[str, Any],
+    has_modal_refinement: bool,
+) -> tuple[tuple[int, ...], float] | None:
+    objective = init_metadata.get("modal_phi_training_objective")
+    if objective is None:
+        return None
+    if objective != TEMPORAL_RGB_OBJECTIVE or not has_modal_refinement:
+        raise ValueError(
+            "Checkpoint has an incompatible modal phi training objective: "
+            f"{objective!r}"
+        )
+    offsets_value = init_metadata.get("modal_temporal_frame_offsets")
+    if not isinstance(offsets_value, (list, tuple)) or not offsets_value:
+        raise ValueError(
+            "Temporal RGB checkpoint metadata must contain frame offsets"
+        )
+    if any(
+        isinstance(offset, bool) or not isinstance(offset, int) or offset <= 0
+        for offset in offsets_value
+    ):
+        raise ValueError(
+            "Temporal RGB checkpoint offsets must be positive integers"
+        )
+    offsets = tuple(int(offset) for offset in offsets_value)
+    if tuple(sorted(set(offsets))) != offsets:
+        raise ValueError(
+            "Temporal RGB checkpoint offsets must be ordered and unique"
+        )
+    epsilon_value = init_metadata.get("temporal_rgb_charbonnier_epsilon")
+    if (
+        isinstance(epsilon_value, bool)
+        or not isinstance(epsilon_value, (int, float))
+        or not math.isfinite(float(epsilon_value))
+        or float(epsilon_value) <= 0.0
+    ):
+        raise ValueError(
+            "Temporal RGB checkpoint metadata has an invalid Charbonnier epsilon"
+        )
+    weight_requirements = {
+        "w_temporal_rgb": True,
+        "w_rgb": False,
+        "w_mask": False,
+    }
+    for name, must_be_positive in weight_requirements.items():
+        value = init_metadata.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            or (must_be_positive and float(value) <= 0.0)
+        ):
+            raise ValueError(
+                f"Temporal RGB checkpoint metadata has invalid {name}={value!r}"
+            )
+    if float(init_metadata["w_mask"]) != 0.0:
+        raise ValueError("Temporal RGB checkpoint must have w_mask=0")
+    return offsets, float(epsilon_value)
+
+
+def _temporal_pair_metric(
+    current_observed: torch.Tensor,
+    partner_observed: torch.Tensor,
+    current_rendered: torch.Tensor,
+    partner_rendered: torch.Tensor,
+    current_valid: torch.Tensor,
+    partner_valid: torch.Tensor,
+    current_foreground: torch.Tensor,
+    partner_foreground: torch.Tensor,
+    epsilon: float,
+) -> tuple[float, int]:
+    image_shape = current_observed.shape
+    if (
+        current_observed.ndim != 3
+        or image_shape != partner_observed.shape
+        or image_shape != current_rendered.shape
+    ):
+        raise ValueError("Temporal pair images must have matching shapes")
+    if image_shape != partner_rendered.shape or image_shape[-1] != 3:
+        raise ValueError("Temporal pair images must have shape (H, W, 3)")
+    expected_mask_shape = image_shape[:2]
+    masks = (
+        current_valid,
+        partner_valid,
+        current_foreground,
+        partner_foreground,
+    )
+    if any(mask.shape != expected_mask_shape for mask in masks):
+        raise ValueError("Temporal pair mask shape does not match its images")
+    support = (
+        current_valid.bool()
+        & partner_valid.bool()
+        & (current_foreground.bool() | partner_foreground.bool())
+    )
+    support_pixel_count = int(support.sum().item())
+    if support_pixel_count == 0:
+        raise ValueError("Temporal reconstruction pair has empty support")
+    residual = (
+        (current_rendered - partner_rendered)
+        - (current_observed - partner_observed)
+    )
+    penalty = torch.sqrt(residual.square() + epsilon * epsilon) - epsilon
+    loss = (
+        penalty * support[..., None].to(penalty.dtype)
+    ).sum() / (3 * support_pixel_count)
+    if not bool(torch.isfinite(loss).item()):
+        raise ValueError("Temporal reconstruction pair loss is not finite")
+    return float(loss.detach().cpu().item()), support_pixel_count
+
+
+def _summarize_temporal_pairs(
+    records: Sequence[Mapping[str, Any]],
+    offsets: Sequence[int],
+) -> dict[str, Any]:
+    if not records:
+        raise ValueError("Cannot summarize empty temporal pair metrics")
+    per_gap: dict[str, dict[str, Any]] = {}
+    for gap in offsets:
+        gap_records = [
+            record for record in records if int(record["gap_frames"]) == gap
+        ]
+        per_gap[str(gap)] = {
+            "charbonnier_loss": (
+                None
+                if not gap_records
+                else float(
+                    np.mean(
+                        [float(record["charbonnier_loss"]) for record in gap_records]
+                    )
+                )
+            ),
+            "pair_count": len(gap_records),
+            "support_pixel_count": sum(
+                int(record["support_pixel_count"]) for record in gap_records
+            ),
+        }
+    unknown_gaps = sorted(
+        {
+            int(record["gap_frames"])
+            for record in records
+            if int(record["gap_frames"]) not in offsets
+        }
+    )
+    if unknown_gaps:
+        raise ValueError(f"Temporal pair metrics contain unknown gaps: {unknown_gaps}")
+    return {
+        "charbonnier_loss": float(
+            np.mean([float(record["charbonnier_loss"]) for record in records])
+        ),
+        "pair_count": len(records),
+        "support_pixel_count": sum(
+            int(record["support_pixel_count"]) for record in records
+        ),
+        "per_gap": per_gap,
+    }
+
+
 def _comparison_frame(
     observed: torch.Tensor,
     rendered: torch.Tensor,
@@ -991,6 +1152,57 @@ def _write_temporal_metrics(
     )
 
 
+def _write_temporal_pair_metrics(
+    path: Path,
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    if not records:
+        raise ValueError("Cannot write empty temporal pair metrics")
+    ordered = sorted(
+        records,
+        key=lambda record: (
+            int(record["view_index"]),
+            int(record["current_local_index"]),
+            int(record["partner_local_index"]),
+        ),
+    )
+    np.savez_compressed(
+        path,
+        view_index=np.asarray(
+            [int(record["view_index"]) for record in ordered],
+            dtype=np.int64,
+        ),
+        current_local_index=np.asarray(
+            [int(record["current_local_index"]) for record in ordered],
+            dtype=np.int64,
+        ),
+        partner_local_index=np.asarray(
+            [int(record["partner_local_index"]) for record in ordered],
+            dtype=np.int64,
+        ),
+        gap_frames=np.asarray(
+            [int(record["gap_frames"]) for record in ordered],
+            dtype=np.int64,
+        ),
+        current_time_sec=np.asarray(
+            [float(record["current_time_sec"]) for record in ordered],
+            dtype=np.float64,
+        ),
+        partner_time_sec=np.asarray(
+            [float(record["partner_time_sec"]) for record in ordered],
+            dtype=np.float64,
+        ),
+        charbonnier_loss=np.asarray(
+            [float(record["charbonnier_loss"]) for record in ordered],
+            dtype=np.float64,
+        ),
+        support_pixel_count=np.asarray(
+            [int(record["support_pixel_count"]) for record in ordered],
+            dtype=np.int64,
+        ),
+    )
+
+
 def _resolve_checkpoint_path(work_dir: Path, ckpt_path: str | None) -> Path:
     return (
         Path(ckpt_path).expanduser()
@@ -1019,7 +1231,7 @@ def run(cfg: ModalReconstructionConfig) -> None:
         dataset.frame_names,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _load_checkpoint_model(
+    model, init_metadata = _load_checkpoint_model(
         checkpoint_path,
         device,
         bool(train_cfg.get("use_2dgs", False)),
@@ -1028,6 +1240,10 @@ def run(cfg: ModalReconstructionConfig) -> None:
     modal = model.modal
     if modal is None:
         raise ValueError("Checkpoint has no modal envelope")
+    temporal_rgb_config = _temporal_rgb_evaluation_config(
+        init_metadata,
+        model.has_modal_refinement,
+    )
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir = Path(
@@ -1043,6 +1259,7 @@ def run(cfg: ModalReconstructionConfig) -> None:
         accumulators = []
         summaries = []
         temporal_records: list[dict[str, Any]] = []
+        temporal_pair_records: list[dict[str, Any]] = []
         active_envelope_magnitudes: list[np.ndarray] = []
         active_view_ids = [
             view_id for view_id in view_ids if frames_by_view[view_id]
@@ -1067,6 +1284,8 @@ def run(cfg: ModalReconstructionConfig) -> None:
             ).detach().cpu().numpy()
             active_envelope_magnitudes.append(frame_envelope_magnitudes)
             accumulator = _ViewMetricAccumulator(device)
+            view_temporal_pair_records: list[dict[str, Any]] = []
+            temporal_frame_cache: dict[int, dict[str, Any]] = {}
             video_path = temporary_dir / f"{view_id}_comparison.mp4"
             writer = imageio.get_writer(str(video_path), fps=float(cfg.fps))
             try:
@@ -1114,6 +1333,59 @@ def run(cfg: ModalReconstructionConfig) -> None:
                         valid_mask,
                         foreground_mask,
                     )
+                    if temporal_rgb_config is not None:
+                        temporal_offsets, temporal_epsilon = temporal_rgb_config
+                        for gap in temporal_offsets:
+                            partner = temporal_frame_cache.get(
+                                frame.local_index - gap
+                            )
+                            if partner is None:
+                                continue
+                            pair_loss, support_pixel_count = _temporal_pair_metric(
+                                observed,
+                                partner["observed"],
+                                rendered,
+                                partner["rendered"],
+                                valid_mask,
+                                partner["valid_mask"],
+                                foreground_mask,
+                                partner["foreground_mask"],
+                                temporal_epsilon,
+                            )
+                            pair_record = {
+                                "view_index": frame.view_index,
+                                "current_local_index": frame.local_index,
+                                "partner_local_index": int(
+                                    partner["local_index"]
+                                ),
+                                "gap_frames": gap,
+                                "current_time_sec": frame.time_sec,
+                                "partner_time_sec": float(
+                                    partner["time_sec"]
+                                ),
+                                "charbonnier_loss": pair_loss,
+                                "support_pixel_count": support_pixel_count,
+                            }
+                            view_temporal_pair_records.append(pair_record)
+                            temporal_pair_records.append(pair_record)
+                        temporal_frame_cache[frame.local_index] = {
+                            "local_index": frame.local_index,
+                            "time_sec": frame.time_sec,
+                            "observed": observed,
+                            "rendered": rendered,
+                            "valid_mask": valid_mask,
+                            "foreground_mask": foreground_mask,
+                        }
+                        minimum_local_index = (
+                            frame.local_index - max(temporal_offsets)
+                        )
+                        temporal_frame_cache = {
+                            local_index: cached_frame
+                            for local_index, cached_frame in (
+                                temporal_frame_cache.items()
+                            )
+                            if local_index >= minimum_local_index
+                        }
                     temporal_records.append(
                         {
                             "ts": frame.ts,
@@ -1149,6 +1421,11 @@ def run(cfg: ModalReconstructionConfig) -> None:
                 model.modal_freqs_hz,
                 knot_end - knot_start,
             )
+            if temporal_rgb_config is not None:
+                summary["temporal_rgb"] = _summarize_temporal_pairs(
+                    view_temporal_pair_records,
+                    temporal_rgb_config[0],
+                )
             view_metrics[view_id] = summary
             accumulators.append(accumulator)
             summaries.append(summary)
@@ -1162,6 +1439,11 @@ def run(cfg: ModalReconstructionConfig) -> None:
                 [values.reshape(-1) for values in active_envelope_magnitudes]
             ),
         )
+        if temporal_rgb_config is not None:
+            overall["temporal_rgb"] = _summarize_temporal_pairs(
+                temporal_pair_records,
+                temporal_rgb_config[0],
+            )
         metrics = {
             "version": 2,
             "work_dir": str(work_dir.resolve()),
@@ -1182,6 +1464,17 @@ def run(cfg: ModalReconstructionConfig) -> None:
             "views": view_metrics,
             "overall": overall,
         }
+        if temporal_rgb_config is not None:
+            metrics.update(
+                {
+                    "modal_phi_training_objective": TEMPORAL_RGB_OBJECTIVE,
+                    "modal_temporal_frame_offsets": list(
+                        temporal_rgb_config[0]
+                    ),
+                    "temporal_rgb_charbonnier_epsilon": temporal_rgb_config[1],
+                    "temporal_pair_metrics_path": "temporal_pair_metrics.npz",
+                }
+            )
         shape_refinement = _shape_refinement_metrics(model)
         if shape_refinement is not None:
             metrics["shape_refinement"] = shape_refinement
@@ -1194,6 +1487,11 @@ def run(cfg: ModalReconstructionConfig) -> None:
             temporary_dir / "temporal_metrics.npz",
             temporal_records,
         )
+        if temporal_rgb_config is not None:
+            _write_temporal_pair_metrics(
+                temporary_dir / "temporal_pair_metrics.npz",
+                temporal_pair_records,
+            )
         _write_metrics(temporary_dir / "metrics.json", metrics)
         os.replace(temporary_dir, output_dir)
     except BaseException:

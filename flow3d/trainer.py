@@ -608,6 +608,7 @@ class Trainer:
         Ks = batch["Ks"]
         # (B, H, W, 3).
         imgs = batch["imgs"]
+        observed_imgs = imgs
         # (B, H, W).
         valid_masks = batch.get("valid_masks", torch.ones_like(batch["imgs"][..., 0]))
         # (B, H, W).
@@ -645,6 +646,49 @@ class Trainer:
         device = means.device
         means = means.transpose(0, 1)
         quats = quats.transpose(0, 1)
+        temporal_partner_ts = None
+        temporal_partner_imgs = None
+        temporal_partner_masks = None
+        temporal_partner_valid_masks = None
+        temporal_partner_w2cs = None
+        temporal_partner_Ks = None
+        temporal_pair_gap_frames = None
+        temporal_partner_means = None
+        temporal_partner_quats = None
+        if self.model.has_modal_refinement:
+            temporal_keys = (
+                "temporal_partner_ts",
+                "temporal_partner_imgs",
+                "temporal_partner_masks",
+                "temporal_partner_valid_masks",
+                "temporal_partner_w2cs",
+                "temporal_partner_Ks",
+                "temporal_pair_gap_frames",
+            )
+            missing_temporal_keys = [
+                key for key in temporal_keys if key not in batch
+            ]
+            if missing_temporal_keys:
+                raise ValueError(
+                    "Stage 3 temporal RGB batch is missing fields: "
+                    f"{missing_temporal_keys}"
+                )
+            temporal_partner_ts = batch["temporal_partner_ts"]
+            temporal_partner_imgs = batch["temporal_partner_imgs"]
+            temporal_partner_masks = batch["temporal_partner_masks"]
+            temporal_partner_valid_masks = batch[
+                "temporal_partner_valid_masks"
+            ]
+            temporal_partner_w2cs = batch["temporal_partner_w2cs"]
+            temporal_partner_Ks = batch["temporal_partner_Ks"]
+            temporal_pair_gap_frames = batch["temporal_pair_gap_frames"]
+            if temporal_partner_ts.shape != ts.shape:
+                raise ValueError(
+                    "temporal_partner_ts must match the current timestep shape"
+                )
+            partner_poses = self.model.compute_poses_all(temporal_partner_ts)
+            temporal_partner_means = partner_poses[0].transpose(0, 1)
+            temporal_partner_quats = partner_poses[1].transpose(0, 1)
         if use_track_terms:
             # [(N, G, 3), ...].
             target_ts_vec = torch.cat(target_ts)
@@ -661,6 +705,7 @@ class Trainer:
 
         bg_colors = []
         rendered_all = []
+        temporal_partner_rendered_imgs = []
         self._batched_xys = []
         self._batched_radii = []
         self._batched_img_wh = []
@@ -695,8 +740,36 @@ class Trainer:
                 self._batched_radii.append(self.model._current_radii)
                 self._batched_img_wh.append(self.model._current_img_wh)
 
+        if self.model.has_modal_refinement:
+            if (
+                temporal_partner_ts is None
+                or temporal_partner_w2cs is None
+                or temporal_partner_Ks is None
+                or temporal_partner_means is None
+                or temporal_partner_quats is None
+            ):
+                raise RuntimeError("Stage 3 temporal render inputs were not prepared")
+            for i in range(B):
+                partner_rendered = self.model.render(
+                    temporal_partner_ts[i].item(),
+                    temporal_partner_w2cs[None, i],
+                    temporal_partner_Ks[None, i],
+                    img_wh,
+                    bg_color=torch.ones(1, 3, device=device),
+                    means=temporal_partner_means[i],
+                    quats=temporal_partner_quats[i],
+                )
+                partner_img = partner_rendered.get("img")
+                if not isinstance(partner_img, torch.Tensor):
+                    raise ValueError(
+                        "Stage 3 partner render did not return an image tensor"
+                    )
+                temporal_partner_rendered_imgs.append(partner_img)
+
         # Necessary to make viewer work.
-        num_rays_per_step = H * W * B
+        num_rays_per_step = H * W * B * (
+            2 if self.model.has_modal_refinement else 1
+        )
         num_rays_per_sec = num_rays_per_step / (time.time() - _tic)
 
         # (B, H, W, N, *).
@@ -761,6 +834,81 @@ class Trainer:
             1 - self.ssim(rendered_imgs.permute(0, 3, 1, 2), imgs.permute(0, 3, 1, 2))
         )
         loss += rgb_loss * self.losses_cfg.w_rgb
+
+        if self.model.has_modal_refinement:
+            if (
+                temporal_partner_imgs is None
+                or temporal_partner_masks is None
+                or temporal_partner_valid_masks is None
+                or temporal_pair_gap_frames is None
+                or len(temporal_partner_rendered_imgs) != B
+            ):
+                raise RuntimeError("Stage 3 temporal loss inputs were not prepared")
+            partner_rendered_imgs = torch.cat(
+                temporal_partner_rendered_imgs,
+                dim=0,
+            )
+            if (
+                partner_rendered_imgs.shape != rendered_imgs.shape
+                or temporal_partner_imgs.shape != observed_imgs.shape
+                or temporal_partner_masks.shape != masks.shape
+                or temporal_partner_valid_masks.shape != valid_masks.shape
+            ):
+                raise ValueError(
+                    "Stage 3 temporal partner tensors do not match current frame shapes"
+                )
+            temporal_support = (
+                (valid_masks > 0.5)
+                & (temporal_partner_valid_masks > 0.5)
+                & ((masks > 0.5) | (temporal_partner_masks > 0.5))
+            )
+            temporal_support_counts = temporal_support.flatten(1).sum(dim=1)
+            empty_pairs = torch.nonzero(
+                temporal_support_counts == 0,
+                as_tuple=False,
+            ).flatten()
+            if empty_pairs.numel() > 0:
+                raise ValueError(
+                    "Stage 3 temporal RGB pair has empty support for batch indices "
+                    f"{empty_pairs.detach().cpu().tolist()}"
+                )
+            temporal_residual = (
+                (rendered_imgs - partner_rendered_imgs)
+                - (observed_imgs - temporal_partner_imgs)
+            )
+            epsilon = self.losses_cfg.temporal_rgb_charbonnier_epsilon
+            temporal_penalty = torch.sqrt(
+                temporal_residual.square() + epsilon * epsilon
+            ) - epsilon
+            temporal_support_channels = temporal_support[..., None].to(
+                temporal_penalty.dtype
+            )
+            temporal_pair_losses = (
+                (temporal_penalty * temporal_support_channels)
+                .sum(dim=(1, 2, 3))
+                / (3 * temporal_support_counts)
+            )
+            temporal_rgb_loss = temporal_pair_losses.mean()
+            temporal_support_fraction = temporal_support.float().mean()
+            temporal_gap_frames = temporal_pair_gap_frames.to(torch.float32)
+            temporal_pair_gap_frames_mean = temporal_gap_frames.mean()
+            temporal_pair_gap_frames_max = temporal_gap_frames.max()
+            for name, value in (
+                ("temporal RGB", temporal_rgb_loss),
+                ("temporal support fraction", temporal_support_fraction),
+                ("temporal pair gap mean", temporal_pair_gap_frames_mean),
+                ("temporal pair gap max", temporal_pair_gap_frames_max),
+            ):
+                if not bool(torch.isfinite(value).item()):
+                    raise FloatingPointError(
+                        f"Stage 3 {name} diagnostic is not finite"
+                    )
+            loss += self.losses_cfg.w_temporal_rgb * temporal_rgb_loss
+        else:
+            temporal_rgb_loss = torch.zeros((), device=self.device)
+            temporal_support_fraction = torch.zeros((), device=self.device)
+            temporal_pair_gap_frames_mean = torch.zeros((), device=self.device)
+            temporal_pair_gap_frames_max = torch.zeros((), device=self.device)
 
         # Mask loss.
         if not self.model.has_bg:
@@ -1018,6 +1166,14 @@ class Trainer:
         stats = {
             "train/loss": loss.item(),
             "train/rgb_loss": rgb_loss.item(),
+            "train/temporal_rgb_loss": temporal_rgb_loss.item(),
+            "train/temporal_support_fraction": temporal_support_fraction.item(),
+            "train/temporal_pair_gap_frames_mean": (
+                temporal_pair_gap_frames_mean.item()
+            ),
+            "train/temporal_pair_gap_frames_max": (
+                temporal_pair_gap_frames_max.item()
+            ),
             "train/mask_loss": mask_loss.item(),
             "train/depth_loss": depth_loss.item(),
             "train/depth_gradient_loss": depth_gradient_loss.item(),
