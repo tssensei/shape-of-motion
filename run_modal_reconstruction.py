@@ -18,12 +18,25 @@ from loguru import logger as guru
 
 from flow3d.data.casual_dataset import CasualDataset
 from flow3d.metrics import mSSIM
+from flow3d.modal_flow_coordinates import (
+    MODAL_FLOW_COORDINATE_GAUGE,
+    MODAL_FLOW_COORDINATE_PARAMETERIZATION,
+    MODAL_FLOW_COORDINATE_SOLVER,
+)
+from flow3d.modal_joint_optimization import (
+    MODAL_JOINT_OBJECTIVE,
+    MODAL_JOINT_PARAMETERIZATION,
+)
 from flow3d.scene_model import SceneModel
 
 
-MODAL_PARAMETERIZATION = "per_frame_flow_coordinates_v1"
-MODAL_COORDINATE_SOLVER = "reference_flow_ridge_v1"
-MODAL_COORDINATE_GAUGE = "per_view_temporal_mean_zero"
+MODAL_PARAMETERIZATION = MODAL_FLOW_COORDINATE_PARAMETERIZATION
+MODAL_COORDINATE_SOLVER = MODAL_FLOW_COORDINATE_SOLVER
+MODAL_COORDINATE_GAUGE = MODAL_FLOW_COORDINATE_GAUGE
+SUPPORTED_MODAL_PARAMETERIZATIONS = {
+    MODAL_PARAMETERIZATION,
+    MODAL_JOINT_PARAMETERIZATION,
+}
 
 
 @dataclass
@@ -265,19 +278,26 @@ def _load_checkpoint_model(
     if not isinstance(init_metadata, dict):
         raise ValueError("Flow-coordinate checkpoint init_metadata must be a mapping")
     parameterization = init_metadata.get("modal_parameterization")
-    if parameterization != MODAL_PARAMETERIZATION:
+    if parameterization not in SUPPORTED_MODAL_PARAMETERIZATIONS:
         raise ValueError(
             "Checkpoint uses an incompatible modal parameterization "
-            f"({parameterization!r}); expected {MODAL_PARAMETERIZATION!r}"
+            f"({parameterization!r}); expected one of "
+            f"{sorted(SUPPORTED_MODAL_PARAMETERIZATIONS)!r}"
         )
     if init_metadata.get("modal_coordinate_solver") != MODAL_COORDINATE_SOLVER:
         raise ValueError("Checkpoint has an incompatible modal coordinate solver")
     if init_metadata.get("modal_coordinate_gauge") != MODAL_COORDINATE_GAUGE:
         raise ValueError("Checkpoint has an incompatible modal coordinate gauge")
-    if init_metadata.get("modal_phi_trainable") is not False:
-        raise ValueError("Flow-coordinate checkpoint must keep modal phi frozen")
-    if init_metadata.get("modal_coordinates_trainable") is not False:
-        raise ValueError("Flow-coordinate checkpoint coordinates must be frozen")
+    expected_trainable = parameterization == MODAL_JOINT_PARAMETERIZATION
+    if (
+        expected_trainable
+        and init_metadata.get("modal_training_objective") != MODAL_JOINT_OBJECTIVE
+    ):
+        raise ValueError("Checkpoint has an incompatible joint modal objective")
+    if init_metadata.get("modal_phi_trainable") is not expected_trainable:
+        raise ValueError("Checkpoint modal phi trainability metadata is inconsistent")
+    if init_metadata.get("modal_coordinates_trainable") is not expected_trainable:
+        raise ValueError("Checkpoint coordinate trainability metadata is inconsistent")
     coordinate_source = init_metadata.get("modal_coordinate_source")
     if not isinstance(coordinate_source, str) or not coordinate_source:
         raise ValueError("Checkpoint has no modal coordinate source artifact")
@@ -316,6 +336,8 @@ def _load_checkpoint_model(
     model.eval()
     if model.trajectory_type != "modal_activation" or not model.has_modal:
         raise ValueError("Checkpoint does not contain a modal_activation model")
+    if model.has_modal_joint != (parameterization == MODAL_JOINT_PARAMETERIZATION):
+        raise ValueError("Checkpoint modal parameterization does not match model state")
     return model, init_metadata
 
 
@@ -749,6 +771,56 @@ def _write_metrics(path: Path, payload: Mapping[str, Any]) -> None:
         f.write("\n")
 
 
+def _joint_refinement_metrics(model: SceneModel) -> dict[str, Any] | None:
+    if not model.has_modal_joint:
+        return None
+    with torch.inference_mode():
+        coordinate_real, coordinate_imag = model.get_all_modal_coefficients()
+        coordinate_delta = torch.sqrt(
+            (coordinate_real - model.modal_coordinate_real).square()
+            + (coordinate_imag - model.modal_coordinate_imag).square()
+        )
+        phi_real, phi_imag = model.get_effective_modal_phi()
+        phi_delta = torch.sqrt(
+            (phi_real - model.modal_phi_real).square()
+            + (phi_imag - model.modal_phi_imag).square()
+        )
+        phi_initial = torch.sqrt(
+            model.modal_phi_real.square() + model.modal_phi_imag.square()
+        )
+        mode_summaries = []
+        for mode_slot in range(model.modal_phi_real.shape[0]):
+            selected = model.modal_phi_trainable_mask[mode_slot]
+            frozen = ~selected
+            delta_values = phi_delta[mode_slot, selected]
+            initial_values = phi_initial[mode_slot, selected]
+            mode_summaries.append(
+                {
+                    "mode_slot": mode_slot,
+                    "frequency_hz": float(model.modal_freqs_hz[mode_slot].item()),
+                    "trainable_point_count": int(selected.sum().item()),
+                    "delta_rms": float(torch.sqrt(delta_values.square().mean()).item()),
+                    "delta_max": float(delta_values.amax().item()),
+                    "relative_delta_rms": float(
+                        torch.sqrt(delta_values.square().mean()).item()
+                        / max(torch.sqrt(initial_values.square().mean()).item(), 1e-12)
+                    ),
+                    "frozen_delta_max": float(
+                        phi_delta[mode_slot, frozen].amax().item()
+                        if bool(frozen.any().item())
+                        else 0.0
+                    ),
+                }
+            )
+    return {
+        "coordinate_delta_rms": float(
+            torch.sqrt(coordinate_delta.square().mean()).item()
+        ),
+        "coordinate_delta_max": float(coordinate_delta.amax().item()),
+        "phi_modes": mode_summaries,
+    }
+
+
 def _write_modal_coordinates(
     path: Path,
     model: SceneModel,
@@ -758,8 +830,12 @@ def _write_modal_coordinates(
     ordered = sorted(frames, key=lambda frame: frame.ts)
     if [frame.ts for frame in ordered] != list(range(model.num_frames)):
         raise ValueError("Modal coordinate export frames do not cover global ts order")
-    real = model.modal_coordinate_real.detach().cpu().numpy()
-    imaginary = model.modal_coordinate_imag.detach().cpu().numpy()
+    with torch.inference_mode():
+        effective_real, effective_imaginary = model.get_all_modal_coefficients()
+    real = effective_real.detach().cpu().numpy()
+    imaginary = effective_imaginary.detach().cpu().numpy()
+    initial_real = model.modal_coordinate_real.detach().cpu().numpy()
+    initial_imaginary = model.modal_coordinate_imag.detach().cpu().numpy()
     if (
         real.shape != imaginary.shape
         or real.shape != (model.num_frames, model.modal_phi_real.shape[0])
@@ -786,6 +862,10 @@ def _write_modal_coordinates(
         ),
         coordinate_real=real,
         coordinate_imag=imaginary,
+        initial_coordinate_real=initial_real,
+        initial_coordinate_imag=initial_imaginary,
+        delta_coordinate_real=real - initial_real,
+        delta_coordinate_imag=imaginary - initial_imaginary,
         coordinate_magnitude=magnitude,
         coordinate_phase_rad=phase,
     )
@@ -1015,7 +1095,7 @@ def run(cfg: ModalReconstructionConfig) -> None:
             "declared_views": view_ids,
             "active_views": active_view_ids,
             "num_modes": int(model.modal_phi_real.shape[0]),
-            "modal_parameterization": MODAL_PARAMETERIZATION,
+            "modal_parameterization": init_metadata["modal_parameterization"],
             "modal_coordinate_solver": MODAL_COORDINATE_SOLVER,
             "modal_coordinate_gauge": MODAL_COORDINATE_GAUGE,
             "modal_coordinate_source": str(
@@ -1030,6 +1110,9 @@ def run(cfg: ModalReconstructionConfig) -> None:
             "views": view_metrics,
             "overall": overall,
         }
+        joint_refinement = _joint_refinement_metrics(model)
+        if joint_refinement is not None:
+            metrics["joint_refinement"] = joint_refinement
         all_frames = [
             frame
             for view_id in view_ids

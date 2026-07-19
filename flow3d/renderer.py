@@ -8,6 +8,15 @@ from flow3d.modal_utils import (
     load_modal_modes,
     stack_modal_motion_fill_display_classes,
 )
+from flow3d.modal_flow_coordinates import (
+    MODAL_FLOW_COORDINATE_GAUGE,
+    MODAL_FLOW_COORDINATE_PARAMETERIZATION,
+    MODAL_FLOW_COORDINATE_SOLVER,
+)
+from flow3d.modal_joint_optimization import (
+    MODAL_JOINT_OBJECTIVE,
+    MODAL_JOINT_PARAMETERIZATION,
+)
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import draw_tracks_2d_th, get_server
 from flow3d.vis.viewer import (
@@ -18,9 +27,13 @@ from flow3d.vis.viewer import (
 from modal_surface.io import load_view_config
 
 
-MODAL_PARAMETERIZATION = "per_frame_flow_coordinates_v1"
-MODAL_COORDINATE_SOLVER = "reference_flow_ridge_v1"
-MODAL_COORDINATE_GAUGE = "per_view_temporal_mean_zero"
+MODAL_PARAMETERIZATION = MODAL_FLOW_COORDINATE_PARAMETERIZATION
+MODAL_COORDINATE_SOLVER = MODAL_FLOW_COORDINATE_SOLVER
+MODAL_COORDINATE_GAUGE = MODAL_FLOW_COORDINATE_GAUGE
+SUPPORTED_MODAL_PARAMETERIZATIONS = {
+    MODAL_PARAMETERIZATION,
+    MODAL_JOINT_PARAMETERIZATION,
+}
 
 
 class Renderer:
@@ -50,6 +63,14 @@ class Renderer:
             self.modal_anchor_role_classes,
             modal_anchor_role_mode_labels,
         ) = self._load_modal_anchor_data(modal_anchor_manifest)
+        if self.model.has_modal_joint and self.modal_anchor_points is not None:
+            if self.modal_anchor_points.shape[0] != self.model.num_fg_gaussians:
+                raise ValueError(
+                    "Joint modal overlay point count does not match foreground Gaussians"
+                )
+            effective_real, effective_imag = self.model.get_effective_modal_phi()
+            self.modal_anchor_phi_real = effective_real.detach()
+            self.modal_anchor_phi_imag = effective_imag.detach()
 
         self.viewer = None
         if port is not None:
@@ -152,10 +173,11 @@ class Renderer:
                     "Flow-coordinate checkpoint is missing required modal state: "
                     f"{missing_coordinate_state}"
                 )
-            if parameterization != MODAL_PARAMETERIZATION:
+            if parameterization not in SUPPORTED_MODAL_PARAMETERIZATIONS:
                 raise ValueError(
                     "Checkpoint uses an incompatible modal parameterization "
-                    f"({parameterization!r}); expected {MODAL_PARAMETERIZATION!r}"
+                    f"({parameterization!r}); expected one of "
+                    f"{sorted(SUPPORTED_MODAL_PARAMETERIZATIONS)!r}"
                 )
             if (
                 init_metadata.get("modal_coordinate_solver")
@@ -171,10 +193,17 @@ class Renderer:
                 raise ValueError(
                     "Checkpoint has an incompatible modal coordinate gauge"
                 )
-            if init_metadata.get("modal_phi_trainable") is not False:
-                raise ValueError("Flow-coordinate checkpoint must keep modal phi frozen")
-            if init_metadata.get("modal_coordinates_trainable") is not False:
-                raise ValueError("Flow-coordinate checkpoint coordinates must be frozen")
+            expected_trainable = parameterization == MODAL_JOINT_PARAMETERIZATION
+            if (
+                expected_trainable
+                and init_metadata.get("modal_training_objective")
+                != MODAL_JOINT_OBJECTIVE
+            ):
+                raise ValueError("Checkpoint has an incompatible joint modal objective")
+            if init_metadata.get("modal_phi_trainable") is not expected_trainable:
+                raise ValueError("Checkpoint modal phi trainability is inconsistent")
+            if init_metadata.get("modal_coordinates_trainable") is not expected_trainable:
+                raise ValueError("Checkpoint coordinate trainability is inconsistent")
             coordinate_source = init_metadata.get("modal_coordinate_source")
             if not isinstance(coordinate_source, str) or not coordinate_source:
                 raise ValueError("Checkpoint has no modal coordinate source artifact")
@@ -189,6 +218,10 @@ class Renderer:
                     "Checkpoint has an invalid modal coordinate ridge value"
                 )
         model = SceneModel.init_from_state_dict(state_dict)
+        if parameterization is not None and model.has_modal_joint != (
+            parameterization == MODAL_JOINT_PARAMETERIZATION
+        ):
+            raise ValueError("Checkpoint modal parameterization does not match model state")
         model.use_2dgs = use_2dgs
         model = model.to(device)
         print(f"num gs: {model.num_gaussians}")
@@ -291,25 +324,40 @@ class Renderer:
         )
 
     def _current_modal_anchor_points(
-        self, modal_oscillator: tuple[np.ndarray, float] | None
+        self,
+        modal_oscillator: tuple[np.ndarray, float] | None,
+        timestep: int | None,
     ) -> torch.Tensor | None:
         if self.modal_anchor_points is None:
             return None
         points = self.modal_anchor_points
-        if modal_oscillator is None:
+        if modal_oscillator is None and timestep is None:
             return points
 
         assert self.modal_anchor_phi_real is not None
         assert self.modal_anchor_phi_imag is not None
-        q_np, motion_scale = modal_oscillator
-        if q_np.shape[0] != self.modal_anchor_phi_real.shape[0]:
+        if modal_oscillator is None:
+            coordinate_real, coordinate_imag = self.model.compute_modal_coefficients(
+                torch.as_tensor([timestep], device=self.device, dtype=torch.long)
+            )
+            q_real = coordinate_real[0]
+            q_imag = coordinate_imag[0]
+            motion_scale = 1.0
+        else:
+            q_np, motion_scale = modal_oscillator
+            if q_np.shape[0] != self.modal_anchor_phi_real.shape[0]:
+                raise ValueError(
+                    f"Modal oscillator has {q_np.shape[0]} modes but anchors have "
+                    f"{self.modal_anchor_phi_real.shape[0]}"
+                )
+            q = torch.from_numpy(q_np).to(self.device)
+            q_real = q.real.to(dtype=self.modal_anchor_phi_real.dtype)
+            q_imag = q.imag.to(dtype=self.modal_anchor_phi_imag.dtype)
+        if q_real.shape[0] != self.modal_anchor_phi_real.shape[0]:
             raise ValueError(
-                f"Modal oscillator has {q_np.shape[0]} modes but anchors have "
+                f"Modal coordinate has {q_real.shape[0]} modes but anchors have "
                 f"{self.modal_anchor_phi_real.shape[0]}"
             )
-        q = torch.from_numpy(q_np).to(self.device)
-        q_real = q.real.to(dtype=self.modal_anchor_phi_real.dtype)
-        q_imag = q.imag.to(dtype=self.modal_anchor_phi_imag.dtype)
         offsets = torch.einsum("k,knc->nc", q_real, self.modal_anchor_phi_real) - torch.einsum(
             "k,knc->nc", q_imag, self.modal_anchor_phi_imag
         )
@@ -375,8 +423,9 @@ class Renderer:
         J_cam[:, 1, 1] = fy / z_safe
         J_cam[:, 1, 2] = -fy * y / (z_safe * z_safe)
         J = torch.einsum("nij,jk->nik", J_cam, R.to(dtype=means.dtype))
-        phi_real = self.model.modal_phi_real[mode_index]
-        phi_imag = self.model.modal_phi_imag[mode_index]
+        effective_real, effective_imag = self.model.get_effective_modal_phi()
+        phi_real = effective_real[mode_index]
+        phi_imag = effective_imag[mode_index]
         projected_real = torch.einsum("nij,nj->ni", J, phi_real)
         projected_imag = torch.einsum("nij,nj->ni", J, phi_imag)
         real = projected_real[:, component_index]
@@ -508,7 +557,7 @@ class Renderer:
                 q_key,
             )
         if self.viewer.wants_modal_anchors():
-            anchor_points = self._current_modal_anchor_points(modal_oscillator)
+            anchor_points = self._current_modal_anchor_points(modal_oscillator, t)
             if anchor_points is not None:
                 self.viewer.update_modal_anchors(
                     anchor_points.detach().cpu().numpy(),

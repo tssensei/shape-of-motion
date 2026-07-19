@@ -388,6 +388,11 @@ def load_gaussian_modal_fields(
             obs_count = latent["obs_count_per_point"]
             freq = np.asarray(latent["freq_hz"])
             mode_index = np.asarray(latent["mode_index"])
+            motion_fill_display_class = _load_motion_fill_display_class(
+                latent,
+                latent_path,
+                num_gaussians,
+            )
 
         expected_point_shape = (num_gaussians, 3)
         if points_world.shape != expected_point_shape:
@@ -471,6 +476,7 @@ def load_gaussian_modal_fields(
             latent_path=latent_path,
             points_world=points_world,
             phi=phi.astype(np.complex64),
+            motion_fill_display_class=motion_fill_display_class,
         )
         modes.append(mode)
         phi_values.append(mode.phi)

@@ -234,6 +234,69 @@ class GaussianParams(nn.Module):
         return updated_params
 
 
+class ModalJointParams(nn.Module):
+    """Trainable residuals around fixed flow coordinates and staged modal fields."""
+
+    def __init__(
+        self,
+        delta_coordinate_real: torch.Tensor,
+        delta_coordinate_imag: torch.Tensor,
+        delta_phi_real: torch.Tensor,
+        delta_phi_imag: torch.Tensor,
+    ):
+        super().__init__()
+        if delta_coordinate_real.shape != delta_coordinate_imag.shape:
+            raise ValueError("modal coordinate residual tensors must have matching shapes")
+        if delta_phi_real.shape != delta_phi_imag.shape:
+            raise ValueError("modal phi residual tensors must have matching shapes")
+        if delta_coordinate_real.ndim != 2:
+            raise ValueError("modal coordinate residual tensors must have shape (T,K)")
+        if delta_phi_real.ndim != 3 or delta_phi_real.shape[-1] != 3:
+            raise ValueError("modal phi residual tensors must have shape (K,G,3)")
+        if delta_coordinate_real.shape[1] != delta_phi_real.shape[0]:
+            raise ValueError("modal coordinate and phi residual mode counts must match")
+        tensors = (
+            delta_coordinate_real,
+            delta_coordinate_imag,
+            delta_phi_real,
+            delta_phi_imag,
+        )
+        if any(not torch.is_floating_point(value) for value in tensors):
+            raise ValueError("modal joint residual tensors must be floating point")
+        if len({value.dtype for value in tensors}) != 1:
+            raise ValueError("modal joint residual tensors must share one dtype")
+        if len({value.device for value in tensors}) != 1:
+            raise ValueError("modal joint residual tensors must share one device")
+        if any(not bool(torch.isfinite(value).all().item()) for value in tensors):
+            raise ValueError("modal joint residual tensors must be finite")
+        self.params = nn.ParameterDict(
+            {
+                "delta_coordinate_real": nn.Parameter(delta_coordinate_real),
+                "delta_coordinate_imag": nn.Parameter(delta_coordinate_imag),
+                "delta_phi_real": nn.Parameter(delta_phi_real),
+                "delta_phi_imag": nn.Parameter(delta_phi_imag),
+            }
+        )
+
+    @staticmethod
+    def init_from_state_dict(
+        state_dict: dict[str, Tensor],
+        prefix: str = "params.",
+    ) -> "ModalJointParams":
+        fields = (
+            "delta_coordinate_real",
+            "delta_coordinate_imag",
+            "delta_phi_real",
+            "delta_phi_imag",
+        )
+        missing = [field for field in fields if f"{prefix}{field}" not in state_dict]
+        if missing:
+            raise ValueError(f"modal joint checkpoint is missing fields: {missing}")
+        return ModalJointParams(
+            **{field: state_dict[f"{prefix}{field}"] for field in fields}
+        )
+
+
 class MotionBases(nn.Module):
     def __init__(self, rots, transls):
         super().__init__()

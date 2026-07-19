@@ -43,6 +43,13 @@ from flow3d.modal_flow_coordinates import (
     MODAL_FLOW_COORDINATE_SOLVER,
     ModalFlowCoordinates,
     load_modal_flow_coordinates,
+    parse_flow_cache_specs,
+)
+from flow3d.modal_joint_optimization import (
+    MODAL_JOINT_OBJECTIVE,
+    MODAL_JOINT_PARAMETERIZATION,
+    load_modal_joint_graph,
+    load_modal_joint_training_context,
 )
 from flow3d.modal_utils import (
     ModalFrameMap,
@@ -53,6 +60,7 @@ from flow3d.modal_utils import (
 from flow3d.params import (
     CameraScales,
     GaussianParams,
+    ModalJointParams,
 )
 from flow3d.scene_model import SceneModel, TRAJECTORY_TYPE_TO_ID
 from flow3d.tensor_dataclass import StaticObservations, TrackObservations
@@ -101,6 +109,10 @@ class TrainConfig:
     vggt_view_configs: tuple[str, ...] = ()
     modal_stage1_init_ckpt: str | None = None
     modal_flow_coordinates: str | None = None
+    modal_optimization: Literal["fixed", "joint"] = "fixed"
+    modal_flow_caches: tuple[str, ...] = ()
+    modal_bilateral_graph: str | None = None
+    modal_min_trainable_graph_degree: int = 3
     modal_train_view_id: str | None = None
     modal_max_local_frames_per_view: int | None = None
     num_epochs: int = 200
@@ -154,12 +166,35 @@ def main(cfg: TrainConfig):
         port=cfg.port,
     )
 
-    if cfg.trajectory_type == "modal_activation":
+    if cfg.trajectory_type == "modal_activation" and cfg.modal_optimization == "fixed":
         guru.info(
             "Materialized fixed flow-derived modal coordinates; no optimizer or "
             "training loop was created."
         )
         return
+
+    modal_joint_context_loader = None
+    if cfg.trajectory_type == "modal_activation":
+        assert cfg.modal_manifest is not None
+        assert cfg.modal_bilateral_graph is not None
+        assert cfg.modal_flow_coordinates is not None
+
+        def _load_modal_joint_context(model: SceneModel):
+            modal_fields = load_gaussian_modal_fields(
+                cfg.modal_manifest,
+                model.fg.params["means"],
+            )
+            return load_modal_joint_training_context(
+                model=model,
+                modal_fields=modal_fields,
+                graph_path=cfg.modal_bilateral_graph,
+                flow_cache_specs=cfg.modal_flow_caches,
+                coordinate_path=cfg.modal_flow_coordinates,
+                minimum_mode_degree=cfg.modal_min_trainable_graph_degree,
+                device=device,
+            )
+
+        modal_joint_context_loader = _load_modal_joint_context
 
     trainer, start_epoch = Trainer.init_from_checkpoint(
         ckpt_path,
@@ -168,6 +203,7 @@ def main(cfg: TrainConfig):
         cfg.lr,
         cfg.loss,
         cfg.optim,
+        modal_joint_context_loader=modal_joint_context_loader,
         work_dir=cfg.work_dir,
         port=cfg.port,
     )
@@ -298,6 +334,8 @@ def initialize_and_checkpoint_model(
     modal_frame_view_indices = None
     modal_frame_local_indices = None
     modal_frame_times_sec = None
+    modal_joint_params = None
+    modal_phi_trainable_mask = None
     if cfg.trajectory_type == "modal_activation":
         resolve_required_modal_paths(cfg.modal_manifest, cfg.modal_frame_map)
         assert cfg.modal_manifest is not None
@@ -386,6 +424,31 @@ def initialize_and_checkpoint_model(
             f"coordinate_shape={tuple(modal_coordinate_real.shape)}, "
             "parameterization=per_frame_flow_coordinates_v1"
         )
+        if cfg.modal_optimization == "joint":
+            assert cfg.modal_bilateral_graph is not None
+            joint_graph = load_modal_joint_graph(
+                cfg.modal_bilateral_graph,
+                modal_fields,
+                fg_params.params["means"],
+                cfg.modal_min_trainable_graph_degree,
+            )
+            modal_phi_trainable_mask = torch.as_tensor(
+                joint_graph.trainable_phi_mask,
+                device=device,
+                dtype=torch.bool,
+            )
+            modal_joint_params = ModalJointParams(
+                delta_coordinate_real=torch.zeros_like(modal_coordinate_real),
+                delta_coordinate_imag=torch.zeros_like(modal_coordinate_imag),
+                delta_phi_real=torch.zeros_like(modal_phi_real),
+                delta_phi_imag=torch.zeros_like(modal_phi_imag),
+            )
+            guru.info(
+                "Initialized joint q/phi refinement: "
+                f"trainable_phi_per_mode="
+                f"{modal_phi_trainable_mask.sum(dim=1).tolist()}, "
+                f"graph={joint_graph.path}"
+            )
 
     model = SceneModel(
         Ks, 
@@ -407,10 +470,41 @@ def initialize_and_checkpoint_model(
         modal_frame_view_indices=modal_frame_view_indices,
         modal_frame_local_indices=modal_frame_local_indices,
         modal_frame_times_sec=modal_frame_times_sec,
+        modal_joint_params=modal_joint_params,
+        modal_phi_trainable_mask=modal_phi_trainable_mask,
     )
 
     if cfg.trajectory_type == "modal_activation":
         model.requires_grad_(False)
+        if cfg.modal_optimization == "joint":
+            assert model.modal_joint is not None
+            model.modal_joint.requires_grad_(True)
+            assert cfg.modal_manifest is not None
+            assert cfg.modal_bilateral_graph is not None
+            assert cfg.modal_flow_coordinates is not None
+            load_modal_joint_training_context(
+                model=model,
+                modal_fields=modal_fields,
+                graph_path=cfg.modal_bilateral_graph,
+                flow_cache_specs=cfg.modal_flow_caches,
+                coordinate_path=cfg.modal_flow_coordinates,
+                minimum_mode_degree=cfg.modal_min_trainable_graph_degree,
+                device=device,
+            )
+            initial_coordinate_real, initial_coordinate_imag = (
+                model.get_all_modal_coefficients()
+            )
+            initial_phi_real, initial_phi_imag = model.get_effective_modal_phi()
+            coordinates_unchanged = torch.equal(
+                initial_coordinate_real, model.modal_coordinate_real
+            ) and torch.equal(initial_coordinate_imag, model.modal_coordinate_imag)
+            if not coordinates_unchanged:
+                raise RuntimeError("Zero joint coordinate residual changed initialization")
+            phi_unchanged = torch.equal(
+                initial_phi_real, model.modal_phi_real
+            ) and torch.equal(initial_phi_imag, model.modal_phi_imag)
+            if not phi_unchanged:
+                raise RuntimeError("Zero joint phi residual changed initialization")
 
     checkpoint = {
         "model": model.state_dict(),
@@ -782,17 +876,62 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
     if cfg.trajectory_type == "modal_activation":
         assert cfg.modal_flow_coordinates is not None
         coordinates = load_modal_flow_coordinates(cfg.modal_flow_coordinates)
-        metadata.update(
-            {
-                "modal_parameterization": MODAL_FLOW_COORDINATE_PARAMETERIZATION,
-                "modal_coordinate_solver": MODAL_FLOW_COORDINATE_SOLVER,
-                "modal_coordinate_gauge": MODAL_FLOW_COORDINATE_GAUGE,
-                "modal_coordinate_source": str(coordinates.path),
-                "modal_coordinate_ridge_relative": coordinates.ridge_relative,
-                "modal_phi_trainable": False,
-                "modal_coordinates_trainable": False,
-            }
-        )
+        modal_metadata = {
+            "modal_optimization": cfg.modal_optimization,
+            "modal_parameterization": MODAL_FLOW_COORDINATE_PARAMETERIZATION,
+            "modal_coordinate_solver": MODAL_FLOW_COORDINATE_SOLVER,
+            "modal_coordinate_gauge": MODAL_FLOW_COORDINATE_GAUGE,
+            "modal_coordinate_source": str(coordinates.path),
+            "modal_coordinate_ridge_relative": coordinates.ridge_relative,
+            "modal_phi_trainable": False,
+            "modal_coordinates_trainable": False,
+        }
+        if cfg.modal_optimization == "joint":
+            assert cfg.modal_bilateral_graph is not None
+            modal_metadata.update(
+                {
+                    "modal_parameterization": MODAL_JOINT_PARAMETERIZATION,
+                    "modal_training_objective": MODAL_JOINT_OBJECTIVE,
+                    "modal_phi_trainable": True,
+                    "modal_coordinates_trainable": True,
+                    "modal_bilateral_graph": str(
+                        Path(cfg.modal_bilateral_graph).expanduser().resolve()
+                    ),
+                    "modal_flow_caches": list(cfg.modal_flow_caches),
+                    "modal_min_trainable_graph_degree": (
+                        cfg.modal_min_trainable_graph_degree
+                    ),
+                    "modal_coordinate_delta_gauge": "per_view_temporal_mean_zero",
+                    "modal_phi_gauge": "staged_phase_trainable_rms",
+                    "canonical_gaussians_trainable": False,
+                    "camera_parameters_trainable": False,
+                    "modal_frequencies_trainable": False,
+                    "modal_loss_weights": {
+                        "rgb": cfg.loss.w_rgb,
+                        "flow": cfg.loss.w_modal_flow,
+                        "rigidity": cfg.loss.w_modal_rigidity,
+                        "coordinate_prior": cfg.loss.w_modal_coordinate_prior,
+                        "coordinate_temporal": cfg.loss.w_modal_coordinate_temporal,
+                        "phi_prior": cfg.loss.w_modal_phi_prior,
+                    },
+                    "modal_joint_learning_rates": asdict(cfg.lr.modal_joint),
+                    "modal_joint_loss_parameters": {
+                        "rigidity_huber_beta": (
+                            cfg.loss.modal_rigidity_huber_beta
+                        ),
+                        "coordinate_temporal_scale_sec": (
+                            cfg.loss.modal_coordinate_temporal_scale_sec
+                        ),
+                        "flow_charbonnier_epsilon_px": (
+                            cfg.loss.modal_flow_charbonnier_epsilon_px
+                        ),
+                        "flow_render_acc_min": (
+                            cfg.loss.modal_flow_render_acc_min
+                        ),
+                    },
+                }
+            )
+        metadata.update(modal_metadata)
     return {key: _metadata_value(value) for key, value in metadata.items()}
 
 
@@ -1067,24 +1206,36 @@ def _sample_colmap_points(
 
 def _validate_modal_coordinate_config(cfg: TrainConfig) -> None:
     if cfg.trajectory_type != "modal_activation":
-        if cfg.modal_flow_coordinates is not None:
+        if cfg.modal_flow_coordinates is not None or cfg.modal_optimization != "fixed":
             raise ValueError(
-                "--modal-flow-coordinates requires trajectory_type=modal_activation"
+                "modal flow-coordinate options require trajectory_type=modal_activation"
             )
+        if cfg.modal_flow_caches or cfg.modal_bilateral_graph is not None:
+            raise ValueError("joint modal inputs require trajectory_type=modal_activation")
         if cfg.modal_stage1_init_ckpt is not None:
             raise ValueError(
                 "--modal-stage1-init-ckpt requires trajectory_type=modal_activation"
             )
         return
 
-    if cfg.num_epochs != 0:
-        raise ValueError(
-            "Flow-derived modal coordinates are fixed; use --num-epochs 0"
-        )
-    if cfg.resume:
-        raise ValueError(
-            "Flow-derived modal coordinate materialization does not support --resume"
-        )
+    if cfg.modal_optimization == "fixed":
+        if cfg.num_epochs != 0:
+            raise ValueError("Fixed flow coordinates require --num-epochs 0")
+        if cfg.resume:
+            raise ValueError("Fixed flow-coordinate materialization cannot resume")
+        if cfg.modal_flow_caches or cfg.modal_bilateral_graph is not None:
+            raise ValueError("Fixed flow-coordinate mode does not use joint inputs")
+    else:
+        if cfg.num_epochs <= 0:
+            raise ValueError("Joint q/phi optimization requires positive --num-epochs")
+        if cfg.modal_train_view_id is not None:
+            raise ValueError("Joint q/phi optimization requires all declared views")
+        if cfg.modal_bilateral_graph is None:
+            raise ValueError("Joint q/phi optimization requires --modal-bilateral-graph")
+        if not cfg.modal_flow_caches:
+            raise ValueError("Joint q/phi optimization requires --modal-flow-caches")
+        if cfg.modal_min_trainable_graph_degree <= 0:
+            raise ValueError("--modal-min-trainable-graph-degree must be positive")
     if cfg.modal_stage1_init_ckpt is None:
         raise ValueError(
             "Flow-derived modal coordinates require --modal-stage1-init-ckpt"
@@ -1118,6 +1269,79 @@ def _validate_modal_coordinate_config(cfg: TrainConfig) -> None:
     ):
         if not os.path.exists(path):
             raise FileNotFoundError(f"{label} does not exist: {path}")
+    if cfg.modal_bilateral_graph is not None and not os.path.exists(
+        cfg.modal_bilateral_graph
+    ):
+        raise FileNotFoundError(cfg.modal_bilateral_graph)
+
+    if cfg.modal_optimization == "joint":
+        parsed_flow_caches = parse_flow_cache_specs(cfg.modal_flow_caches)
+        missing_flow_caches = [
+            str(path) for _, path in parsed_flow_caches if not path.is_dir()
+        ]
+        if missing_flow_caches:
+            raise FileNotFoundError(
+                "Joint modal flow cache directories do not exist: "
+                + ", ".join(missing_flow_caches)
+            )
+        for name, value in asdict(cfg.lr.modal_joint).items():
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"--lr.modal-joint.{name.replace('_', '-')} must be finite "
+                    "and strictly positive"
+                )
+        scalar_values = {
+            "loss.w-rgb": cfg.loss.w_rgb,
+            "loss.w-modal-flow": cfg.loss.w_modal_flow,
+            "loss.w-modal-rigidity": cfg.loss.w_modal_rigidity,
+            "loss.w-modal-coordinate-prior": cfg.loss.w_modal_coordinate_prior,
+            "loss.w-modal-coordinate-temporal": cfg.loss.w_modal_coordinate_temporal,
+            "loss.w-modal-phi-prior": cfg.loss.w_modal_phi_prior,
+            "loss.modal-rigidity-huber-beta": cfg.loss.modal_rigidity_huber_beta,
+            "loss.modal-coordinate-temporal-scale-sec": (
+                cfg.loss.modal_coordinate_temporal_scale_sec
+            ),
+            "loss.modal-flow-charbonnier-epsilon-px": (
+                cfg.loss.modal_flow_charbonnier_epsilon_px
+            ),
+            "loss.modal-flow-render-acc-min": cfg.loss.modal_flow_render_acc_min,
+        }
+        for name, value in scalar_values.items():
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"--{name} must be finite and non-negative")
+        for name in (
+            "modal_rigidity_huber_beta",
+            "modal_coordinate_temporal_scale_sec",
+            "modal_flow_charbonnier_epsilon_px",
+            "modal_flow_render_acc_min",
+        ):
+            if getattr(cfg.loss, name) <= 0.0:
+                raise ValueError(f"loss.{name} must be strictly positive")
+        if cfg.loss.modal_flow_render_acc_min > 1.0:
+            raise ValueError("loss.modal_flow_render_acc_min must not exceed 1")
+        if cfg.loss.w_rgb <= 0.0 or cfg.loss.w_modal_flow <= 0.0:
+            raise ValueError("Joint q/phi optimization requires positive RGB and flow weights")
+        forbidden_weights = {
+            "w_mask": cfg.loss.w_mask,
+            "w_depth_reg": cfg.loss.w_depth_reg,
+            "w_depth_const": cfg.loss.w_depth_const,
+            "w_depth_grad": cfg.loss.w_depth_grad,
+            "w_track": cfg.loss.w_track,
+            "w_smooth_bases": cfg.loss.w_smooth_bases,
+            "w_smooth_tracks": cfg.loss.w_smooth_tracks,
+            "w_scale_var": cfg.loss.w_scale_var,
+            "w_z_accel": cfg.loss.w_z_accel,
+            "w_dct_coef": cfg.loss.w_dct_coef,
+            "w_local_iso_ray": cfg.loss.w_local_iso_ray,
+            "w_local_iso_perp": cfg.loss.w_local_iso_perp,
+            "w_local_iso_dist": cfg.loss.w_local_iso_dist,
+        }
+        nonzero = [name for name, value in forbidden_weights.items() if value != 0.0]
+        if nonzero:
+            raise ValueError(
+                "Joint q/phi optimization requires disabled unrelated losses: "
+                + ", ".join(nonzero)
+            )
 
 
 def _inject_vggt_static_view_config(cfg: TrainConfig):
