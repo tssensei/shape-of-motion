@@ -18,10 +18,9 @@ from flow3d.vis.viewer import (
 from modal_surface.io import load_view_config
 
 
-MODAL_SHAPE_PARAMETERIZATION = "role_delta_phi_v1"
-MODAL_DELTA_PHI_STATE_KEY = "modal_refinement.params.delta_phi"
-MODAL_REFINEMENT_MASK_STATE_KEY = "modal_refinement_mask"
-MODAL_REFINEMENT_ROLE_STATE_KEY = "modal_refinement_role"
+MODAL_PARAMETERIZATION = "per_frame_flow_coordinates_v1"
+MODAL_COORDINATE_SOLVER = "reference_flow_ridge_v1"
+MODAL_COORDINATE_GAUGE = "per_view_temporal_mean_zero"
 
 
 class Renderer:
@@ -105,108 +104,89 @@ class Renderer:
         ckpt = torch.load(path, weights_only=False)
         state_dict = ckpt["model"]
         init_metadata = ckpt.get("init_metadata")
-        shape_parameterization = (
-            init_metadata.get("modal_shape_parameterization")
+        legacy_modal_keys = (
+            "modal.params.activations",
+            "modal.params.envelope_knots",
+            "modal_refinement.params.delta_phi",
+            "modal_refinement_mask",
+            "modal_refinement_role",
+        )
+        present_legacy_keys = [
+            key for key in legacy_modal_keys if key in state_dict
+        ]
+        if present_legacy_keys:
+            raise ValueError(
+                "Checkpoint uses the removed harmonic-envelope or shape-refinement "
+                f"route ({present_legacy_keys}); rebuild it from the static checkpoint, "
+                "modal manifest, and a per-frame flow-coordinate artifact"
+            )
+        coordinate_keys = {"modal_coordinate_real", "modal_coordinate_imag"}
+        present_coordinate_keys = coordinate_keys & set(state_dict)
+        parameterization = (
+            init_metadata.get("modal_parameterization")
             if isinstance(init_metadata, dict)
             else None
         )
-        has_delta_phi = MODAL_DELTA_PHI_STATE_KEY in state_dict
-        has_refinement_mask = MODAL_REFINEMENT_MASK_STATE_KEY in state_dict
-        has_refinement_role = MODAL_REFINEMENT_ROLE_STATE_KEY in state_dict
-        has_frozen_envelope = (
-            isinstance(init_metadata, dict)
-            and init_metadata.get("modal_envelope_frozen") is True
-        )
-        envelope_source = (
-            init_metadata.get("modal_envelope_init_ckpt")
-            if isinstance(init_metadata, dict)
-            else None
-        )
-        if shape_parameterization is None and not (
-            has_delta_phi or has_refinement_mask or has_refinement_role
-        ):
-            pass
-        elif (
-            shape_parameterization == MODAL_SHAPE_PARAMETERIZATION
-            and has_delta_phi
-            and has_refinement_mask
-            and has_refinement_role
-            and has_frozen_envelope
-            and isinstance(envelope_source, str)
-            and bool(envelope_source)
-        ):
-            raise ValueError(
-                "Viser rendering does not yet support Stage 3 refined modal "
-                "shape checkpoints; inspect this checkpoint with "
-                "run_modal_reconstruction.py"
-            )
-        else:
-            raise ValueError(
-                "Checkpoint has an incomplete or incompatible modal "
-                "shape-refinement contract"
-            )
-        if "modal.params.activations" in state_dict:
-            raise ValueError(
-                "Constant per-view harmonic activation checkpoints are not "
-                "supported; render a harmonic-envelope checkpoint"
-            )
-        if "modal.params.envelope_knots" in state_dict:
+        if present_coordinate_keys or parameterization is not None:
             if not isinstance(init_metadata, dict):
-                raise ValueError("Envelope checkpoint metadata must be a mapping")
-            required_envelope_keys = {
-                "modal_frame_times_sec",
-                "modal_envelope_knot_offsets",
-                "modal_envelope_knot_times_sec",
-                "modal_envelope_knot_interval_sec",
-                "modal_frame_envelope_left",
-                "modal_frame_envelope_right",
-                "modal_frame_envelope_lerp",
-            }
-            missing_envelope_keys = sorted(required_envelope_keys - set(state_dict))
-            if missing_envelope_keys:
+                raise ValueError("Flow-coordinate checkpoint metadata must be a mapping")
+            missing_coordinate_keys = sorted(coordinate_keys - set(state_dict))
+            if missing_coordinate_keys:
                 raise ValueError(
-                    "Harmonic-envelope checkpoint is missing required state: "
-                    f"{missing_envelope_keys}"
+                    "Flow-coordinate checkpoint is missing required state: "
+                    f"{missing_coordinate_keys}"
                 )
-            parameterization = (
-                init_metadata.get("modal_parameterization")
-                if isinstance(init_metadata, dict)
-                else None
+            required_coordinate_keys = {
+                "modal_phi_real",
+                "modal_phi_imag",
+                "modal_freqs_hz",
+                "modal_frame_view_indices",
+                "modal_frame_local_indices",
+                "modal_frame_times_sec",
+            }
+            missing_coordinate_state = sorted(
+                required_coordinate_keys - set(state_dict)
             )
-            if parameterization != "per_view_harmonic_envelope_v2":
+            if missing_coordinate_state:
+                raise ValueError(
+                    "Flow-coordinate checkpoint is missing required modal state: "
+                    f"{missing_coordinate_state}"
+                )
+            if parameterization != MODAL_PARAMETERIZATION:
                 raise ValueError(
                     "Checkpoint uses an incompatible modal parameterization "
-                    f"({parameterization!r}); expected "
-                    "'per_view_harmonic_envelope_v2'"
+                    f"({parameterization!r}); expected {MODAL_PARAMETERIZATION!r}"
                 )
             if (
-                init_metadata.get("modal_envelope_interpolation")
-                != "cubic_hermite_complex"
+                init_metadata.get("modal_coordinate_solver")
+                != MODAL_COORDINATE_SOLVER
             ):
                 raise ValueError(
-                    "Checkpoint must use cubic_hermite_complex modal envelope "
-                    "interpolation"
+                    "Checkpoint has an incompatible modal coordinate solver"
                 )
-            metadata_interval = init_metadata.get(
-                "modal_envelope_knot_interval_sec"
-            )
-            state_interval = state_dict["modal_envelope_knot_interval_sec"]
             if (
-                isinstance(metadata_interval, bool)
-                or not isinstance(metadata_interval, (int, float))
-                or not np.isfinite(float(metadata_interval))
-                or float(metadata_interval) <= 0.0
-                or not isinstance(state_interval, torch.Tensor)
-                or state_interval.ndim != 0
-                or not np.isclose(
-                    float(state_interval.item()),
-                    float(metadata_interval),
-                    rtol=1.0e-6,
-                    atol=1.0e-8,
-                )
+                init_metadata.get("modal_coordinate_gauge")
+                != MODAL_COORDINATE_GAUGE
             ):
                 raise ValueError(
-                    "Checkpoint envelope interval state/metadata is invalid"
+                    "Checkpoint has an incompatible modal coordinate gauge"
+                )
+            if init_metadata.get("modal_phi_trainable") is not False:
+                raise ValueError("Flow-coordinate checkpoint must keep modal phi frozen")
+            if init_metadata.get("modal_coordinates_trainable") is not False:
+                raise ValueError("Flow-coordinate checkpoint coordinates must be frozen")
+            coordinate_source = init_metadata.get("modal_coordinate_source")
+            if not isinstance(coordinate_source, str) or not coordinate_source:
+                raise ValueError("Checkpoint has no modal coordinate source artifact")
+            ridge = init_metadata.get("modal_coordinate_ridge_relative")
+            if (
+                isinstance(ridge, bool)
+                or not isinstance(ridge, (int, float))
+                or not np.isfinite(float(ridge))
+                or float(ridge) <= 0.0
+            ):
+                raise ValueError(
+                    "Checkpoint has an invalid modal coordinate ridge value"
                 )
         model = SceneModel.init_from_state_dict(state_dict)
         model.use_2dgs = use_2dgs

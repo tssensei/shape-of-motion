@@ -263,8 +263,8 @@ class DynamicViewer(Viewer):
         with self.server.gui.add_folder("Modal playback"):
             drive = self.server.gui.add_dropdown(
                 "Drive",
-                options=("trained harmonic", "manual oscillator"),
-                initial_value="trained harmonic",
+                options=("flow-derived coordinates", "manual oscillator"),
+                initial_value="flow-derived coordinates",
             )
             motion_scale = self.server.gui.add_slider(
                 "Motion scale",

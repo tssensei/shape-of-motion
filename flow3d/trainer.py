@@ -20,65 +20,10 @@ from flow3d.loss_utils import (
     masked_l1_loss,
 )
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
-from flow3d.modal_utils import GaussianModalRefinementData
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import get_server
-from flow3d.vis.viewer import DynamicViewer, build_modal_playback_groups
+from flow3d.vis.viewer import DynamicViewer
 from flow3d.normal_utils import depth_to_normal
-
-
-def _harmonic_envelope_gradient_norm(
-    model: SceneModel,
-    global_step: int,
-) -> float:
-    if model.trajectory_type != "modal_activation":
-        return 0.0
-    if model.modal is None:
-        raise ValueError("modal_activation trajectory requires modal parameters")
-    envelope_grad = model.modal.params["envelope_knots"].grad
-    if envelope_grad is None:
-        return 0.0
-    grad_norm = torch.linalg.vector_norm(envelope_grad)
-    if not torch.isfinite(grad_norm):
-        raise FloatingPointError(
-            "Harmonic envelope gradient norm is not finite at "
-            f"step {global_step}: {grad_norm.item()}"
-        )
-    return float(grad_norm.item())
-
-
-def _modal_delta_phi_gradient_norm(
-    model: SceneModel,
-    global_step: int,
-) -> float:
-    if not model.has_modal_refinement or model.modal_refinement is None:
-        return 0.0
-    delta_grad = model.modal_refinement.params["delta_phi"].grad
-    if delta_grad is None:
-        raise RuntimeError(
-            "Stage 3 delta_phi received no gradient at "
-            f"step {global_step}"
-        )
-    grad_norm = torch.linalg.vector_norm(delta_grad)
-    if not torch.isfinite(grad_norm):
-        raise FloatingPointError(
-            "Stage 3 delta_phi gradient norm is not finite at "
-            f"step {global_step}: {grad_norm.item()}"
-        )
-    return float(grad_norm.item())
-
-
-def _require_zero_nonrefinement_delta(model: SceneModel) -> None:
-    if not model.has_modal_refinement or model.modal_refinement is None:
-        return
-    refinement_mask = model.modal_refinement_mask
-    if refinement_mask is None:
-        raise RuntimeError("Stage 3 model is missing modal_refinement_mask")
-    delta_phi = model.modal_refinement.params["delta_phi"]
-    if bool(torch.count_nonzero(delta_phi[~refinement_mask]).item()):
-        raise RuntimeError(
-            "Stage 3 assigned nonzero delta_phi outside the refinement mask"
-        )
 
 
 class Trainer:
@@ -97,20 +42,6 @@ class Trainer:
         validate_every: int = 500,
         validate_video_every: int = 1000,
         validate_viewer_assets_every: int = 100,
-        modal_warmup_epochs: int = 0,
-        modal_train_base_means: bool = False,
-        modal_stage2_train_base_means: bool = False,
-        modal_stage2_train_colors: bool = False,
-        modal_stage2_train_opacities: bool = False,
-        modal_stage2_train_scales: bool = False,
-        modal_stage2_train_quats: bool = False,
-        modal_stage2_train_bg_means: bool = False,
-        modal_stage2_train_bg_colors: bool = False,
-        modal_stage2_train_bg_opacities: bool = False,
-        modal_stage2_train_bg_scales: bool = False,
-        modal_stage2_train_bg_quats: bool = False,
-        modal_stage2_lr_fg_scales: float | None = None,
-        modal_stage2_lr_fg_quats: float | None = None,
         init_metadata: dict[str, Any] | None = None,
     ):
         self.device = device
@@ -126,30 +57,11 @@ class Trainer:
         self.lr_cfg = lr_cfg
         self.losses_cfg = losses_cfg
         self.optim_cfg = optim_cfg
-        self.modal_warmup_epochs = modal_warmup_epochs
-        self.modal_train_base_means = modal_train_base_means
-        self.modal_stage2_train_base_means = (
-            modal_stage2_train_base_means or modal_train_base_means
-        )
-        self.modal_stage2_train_colors = modal_stage2_train_colors
-        self.modal_stage2_train_opacities = modal_stage2_train_opacities
-        self.modal_stage2_train_scales = modal_stage2_train_scales
-        self.modal_stage2_train_quats = modal_stage2_train_quats
-        self.modal_stage2_train_bg_means = modal_stage2_train_bg_means
-        self.modal_stage2_train_bg_colors = modal_stage2_train_bg_colors
-        self.modal_stage2_train_bg_opacities = modal_stage2_train_bg_opacities
-        self.modal_stage2_train_bg_scales = modal_stage2_train_bg_scales
-        self.modal_stage2_train_bg_quats = modal_stage2_train_bg_quats
-        self.modal_stage2_lr_fg_scales = modal_stage2_lr_fg_scales
-        self.modal_stage2_lr_fg_quats = modal_stage2_lr_fg_quats
         self.init_metadata = init_metadata
-        self.modal_refinement_data: GaussianModalRefinementData | None = None
-        self.modal_delta_gradient_seen = False
-        if self.model.has_modal_refinement and self.model.modal_refinement is not None:
-            self.modal_delta_gradient_seen = bool(
-                torch.count_nonzero(
-                    self.model.modal_refinement.params["delta_phi"]
-                ).item()
+        if self.model.trajectory_type == "modal_activation":
+            raise ValueError(
+                "Per-frame flow-coordinate modal experiments do not use Trainer; "
+                "materialize the fixed checkpoint with run_training.py --num-epochs 0"
             )
 
         self.reset_opacity_every = (
@@ -170,28 +82,16 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=work_dir)
         self.global_step = 0
         self.epoch = 0
-        self._apply_modal_trainability()
 
         self.viewer = None
         if port is not None:
             server = get_server(port=port)
-            playback_groups = build_modal_playback_groups(
-                model.modal_frame_view_indices,
-                model.modal_frame_local_indices,
-            )
-            modal_freqs_hz = ()
-            if model.has_modal_field:
-                modal_freqs_hz = tuple(
-                    float(x) for x in model.modal_freqs_hz.detach().cpu().numpy()
-                )
             self.viewer = DynamicViewer(
                 server,
                 self.render_fn,
                 model.num_frames,
                 work_dir,
                 mode="training",
-                playback_groups=playback_groups,
-                modal_freqs_hz=modal_freqs_hz,
             )
 
         # metrics
@@ -209,67 +109,8 @@ class Trainer:
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
-        self._apply_modal_trainability()
-        self._apply_modal_stage2_lr_overrides()
-
-    def _modal_in_dynamic_stage(self) -> bool:
-        return (
-            self.model.trajectory_type == "modal_activation"
-            and self.epoch >= self.modal_warmup_epochs
-        )
-
-    def _apply_modal_trainability(self):
-        if self.model.trajectory_type != "modal_activation":
-            return
-        dynamic_stage = self._modal_in_dynamic_stage()
-        for name, param in self.model.named_parameters():
-            if self.model.has_modal_refinement:
-                trainable = (
-                    dynamic_stage
-                    and name == "modal_refinement.params.delta_phi"
-                )
-            elif name.startswith("motion_bases."):
-                trainable = False
-            elif name == "modal.params.envelope_knots":
-                trainable = dynamic_stage
-            elif dynamic_stage:
-                trainable = self._modal_stage2_param_trainable(name)
-            else:
-                trainable = not name.startswith("modal.")
-            param.requires_grad_(trainable)
-
-    def _modal_stage2_param_trainable(self, name: str) -> bool:
-        trainable_fg_params = {
-            "fg.params.means": self.modal_stage2_train_base_means,
-            "fg.params.colors": self.modal_stage2_train_colors,
-            "fg.params.opacities": self.modal_stage2_train_opacities,
-            "fg.params.scales": self.modal_stage2_train_scales,
-            "fg.params.quats": self.modal_stage2_train_quats,
-            "bg.params.means": self.modal_stage2_train_bg_means,
-            "bg.params.colors": self.modal_stage2_train_bg_colors,
-            "bg.params.opacities": self.modal_stage2_train_bg_opacities,
-            "bg.params.scales": self.modal_stage2_train_bg_scales,
-            "bg.params.quats": self.modal_stage2_train_bg_quats,
-        }
-        return trainable_fg_params.get(name, False)
-
-    def _apply_modal_stage2_lr_overrides(self):
-        if self.model.has_modal_refinement or not self._modal_in_dynamic_stage():
-            return
-        lr_overrides = {
-            "fg.params.scales": self.modal_stage2_lr_fg_scales,
-            "fg.params.quats": self.modal_stage2_lr_fg_quats,
-        }
-        for name, lr in lr_overrides.items():
-            if lr is None:
-                continue
-            if name not in self.optimizers:
-                raise ValueError(f"Missing optimizer for modal Stage 2 LR override: {name}")
-            for group in self.optimizers[name].param_groups:
-                group["lr"] = float(lr)
 
     def save_checkpoint(self, path: str):
-        _require_zero_nonrefinement_delta(self.model)
         model_dict = self.model.state_dict()
         optimizer_dict = {k: v.state_dict() for k, v in self.optimizers.items()}
         scheduler_dict = {k: v.state_dict() for k, v in self.scheduler.items()}
@@ -280,55 +121,9 @@ class Trainer:
             "global_step": self.global_step,
             "epoch": self.epoch,
             "init_metadata": self.init_metadata,
-            "modal_delta_gradient_seen": self.modal_delta_gradient_seen,
         }
         torch.save(ckpt, path)
         guru.info(f"Saved checkpoint at {self.global_step=} to {path}")
-
-    def require_modal_delta_gradient_observed(self) -> None:
-        if self.model.has_modal_refinement and not self.modal_delta_gradient_seen:
-            raise RuntimeError(
-                "Stage 3 completed without observing a nonzero delta_phi gradient"
-            )
-
-    def set_modal_refinement_data(
-        self,
-        data: GaussianModalRefinementData,
-    ) -> None:
-        if not self.model.has_modal_refinement:
-            raise ValueError("modal refinement data requires a Stage 3 model")
-        refinement_mask = self.model.modal_refinement_mask
-        refinement_role = self.model.modal_refinement_role
-        if refinement_mask is None or not torch.equal(
-            data.refinement_mask, refinement_mask
-        ):
-            raise ValueError(
-                "modal refinement data mask does not match the checkpoint"
-            )
-        if refinement_role is None or not torch.equal(
-            data.display_class, refinement_role
-        ):
-            raise ValueError(
-                "modal refinement data roles do not match the checkpoint"
-            )
-        expected_modes = int(self.model.modal_phi_real.shape[0])
-        if data.staged_refinement_energy.shape != (expected_modes,):
-            raise ValueError(
-                "modal refinement data mode count does not match the checkpoint"
-            )
-        if data.role_counts.shape != (expected_modes, 3):
-            raise ValueError("modal refinement role counts are invalid")
-        edge_count = int(data.refinement_edge_weights.shape[0])
-        if data.refinement_edge_index.shape != (2, edge_count) or (
-            data.refinement_edge_mode_indices.shape != (edge_count,)
-        ):
-            raise ValueError("modal refinement graph metadata is invalid")
-        self.modal_refinement_data = data
-        guru.info(
-            "Loaded Stage 3 role constraints: "
-            f"anchor_partial_filled_counts={data.role_counts.tolist()}, "
-            f"refinement_edges={edge_count}"
-        )
 
     @staticmethod
     def init_from_checkpoint(
@@ -353,12 +148,6 @@ class Trainer:
         if "schedulers" in ckpt:
             trainer.load_checkpoint_schedulers(ckpt["schedulers"])
         trainer.global_step = ckpt.get("global_step", 0)
-        trainer.modal_delta_gradient_seen = bool(
-            ckpt.get(
-                "modal_delta_gradient_seen",
-                trainer.modal_delta_gradient_seen,
-            )
-        )
         start_epoch = ckpt.get("epoch", 0)
         trainer.set_epoch(start_epoch)
         return trainer, start_epoch
@@ -387,144 +176,13 @@ class Trainer:
         if self.viewer is not None:
             t = self.viewer.current_timestep()
         self.model.training = False
-        means = None
-        quats = None
-        render_t = t
-        modal_oscillator = (
-            self.viewer.current_modal_oscillator()
-            if self.viewer is not None
-            else None
-        )
-        if modal_oscillator is not None:
-            q_np, motion_scale = modal_oscillator
-            base_means, base_quats = self.model.compute_poses_all(None)
-            means = base_means[:, 0].clone()
-            quats = base_quats[:, 0]
-            q = torch.from_numpy(q_np).to(self.device)
-            fg_offsets = self.model.compute_synthetic_modal_offsets(q, motion_scale)
-            means[: self.model.num_fg_gaussians] += fg_offsets
-            render_t = None
         img = self.model.render(
-            render_t,
+            t,
             w2c[None],
             K[None],
             img_wh,
-            means=means,
-            quats=quats,
         )["img"][0]
         return (img.cpu().numpy() * 255.0).astype(np.uint8)
-
-    def _compute_modal_refinement_losses(
-        self,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        if not self.model.has_modal_refinement or self.model.modal_refinement is None:
-            zero = self.model.fg.params["means"].new_zeros(())
-            zero_roles = zero.new_zeros((3,))
-            return zero, zero, zero, zero_roles, zero_roles
-        data = self.modal_refinement_data
-        if data is None:
-            raise RuntimeError(
-                "Stage 3 training requires loaded modal refinement data"
-            )
-        refinement_mask = self.model.modal_refinement_mask
-        refinement_role = self.model.modal_refinement_role
-        if refinement_mask is None or refinement_role is None:
-            raise RuntimeError(
-                "Stage 3 model is missing refinement mask or role state"
-            )
-
-        delta_phi = self.model.modal_refinement.params["delta_phi"]
-        delta_point_energy = delta_phi.square().sum(dim=(-1, -2))
-        relative_role_energies = []
-        role_delta_rms_values = []
-        role_delta_max_values = []
-        for display_role in range(3):
-            role_mask = refinement_role == display_role
-            role_count_per_mode = role_mask.sum(dim=1)
-            valid_modes = role_count_per_mode > 0
-            if not bool(valid_modes.any().item()):
-                role_delta_rms_values.append(delta_phi.new_zeros(()))
-                role_delta_max_values.append(delta_phi.new_zeros(()))
-                continue
-            mode_delta_energy = (
-                (
-                    delta_point_energy
-                    * role_mask.to(dtype=delta_phi.dtype)
-                ).sum(dim=1)
-                / role_count_per_mode.clamp_min(1).to(dtype=delta_phi.dtype)
-            )
-            relative_mode_energy = (
-                mode_delta_energy / data.staged_refinement_energy
-            )
-            relative_role_energies.append(relative_mode_energy[valid_modes])
-            selected_delta_energy = delta_point_energy[role_mask]
-            role_delta_rms_values.append(
-                torch.sqrt(selected_delta_energy.mean())
-            )
-            role_delta_max_values.append(
-                torch.sqrt(selected_delta_energy).max()
-            )
-        if not relative_role_energies:
-            raise RuntimeError("Stage 3 refinement mask contains no trainable roles")
-        relative_energy = torch.cat(relative_role_energies, dim=0)
-        delta_prior_loss = relative_energy.mean()
-        relative_delta_rms = torch.sqrt(relative_energy).mean()
-        role_delta_rms = torch.stack(role_delta_rms_values)
-        role_delta_max = torch.stack(role_delta_max_values)
-
-        edge_modes = data.refinement_edge_mode_indices
-        edge_start = data.refinement_edge_index[0]
-        edge_end = data.refinement_edge_index[1]
-        edge_delta = (
-            delta_phi[edge_modes, edge_start]
-            - delta_phi[edge_modes, edge_end]
-        )
-        edge_energy = edge_delta.square().sum(dim=(-1, -2))
-        num_modes = int(delta_phi.shape[0])
-        spatial_sum = delta_phi.new_zeros((num_modes,))
-        spatial_sum.index_add_(
-            0,
-            edge_modes,
-            data.refinement_edge_weights * edge_energy,
-        )
-        edge_count = torch.bincount(edge_modes, minlength=num_modes).to(
-            dtype=delta_phi.dtype
-        )
-        if bool((edge_count <= 0).any().item()):
-            raise RuntimeError(
-                "Stage 3 spatial constraints require trainable edges per mode"
-            )
-        delta_spatial_loss = (
-            spatial_sum
-            / edge_count
-            / data.staged_refinement_energy
-        ).mean()
-        for name, value in (
-            ("delta prior", delta_prior_loss),
-            ("delta spatial", delta_spatial_loss),
-            ("relative delta RMS", relative_delta_rms),
-        ):
-            if not torch.isfinite(value):
-                raise FloatingPointError(f"Stage 3 {name} loss is not finite")
-        if not bool(torch.isfinite(role_delta_rms).all().item()) or not bool(
-            torch.isfinite(role_delta_max).all().item()
-        ):
-            raise FloatingPointError(
-                "Stage 3 role-based delta diagnostics are not finite"
-            )
-        return (
-            delta_prior_loss,
-            delta_spatial_loss,
-            relative_delta_rms,
-            role_delta_rms,
-            role_delta_max,
-        )
 
     def train_step(self, batch):
         if self.viewer is not None:
@@ -533,48 +191,17 @@ class Trainer:
             self.viewer.lock.acquire()
 
         loss, stats, num_rays_per_step, num_rays_per_sec = self.compute_losses(batch)
-        if self.model.trajectory_type == "modal_activation" and not bool(
-            torch.isfinite(loss).item()
-        ):
-            raise FloatingPointError(
-                f"Modal training loss is not finite at step {self.global_step}"
-            )
         if loss.isnan():
             guru.info(f"Loss is NaN at step {self.global_step}!!")
             import ipdb
 
             ipdb.set_trace()
         loss.backward()
-        if self.model.has_modal_refinement:
-            delta_grad_norm = _modal_delta_phi_gradient_norm(
-                self.model, self.global_step
-            )
-            stats["train/modal_delta_phi_grad_norm"] = delta_grad_norm
-            self.modal_delta_gradient_seen |= delta_grad_norm > 0.0
-        elif self.model.trajectory_type == "modal_activation":
-            stats["train/harmonic_envelope_grad_norm"] = (
-                _harmonic_envelope_gradient_norm(self.model, self.global_step)
-            )
-
         for opt in self.optimizers.values():
             opt.step()
             opt.zero_grad(set_to_none=True)
-        if (
-            self.model.trajectory_type == "modal_activation"
-            and self.model.modal is not None
-            and not bool(
-                torch.isfinite(
-                    self.model.modal.params["envelope_knots"]
-                ).all().item()
-            )
-        ):
-            raise FloatingPointError(
-                f"Modal envelope became non-finite at step {self.global_step}"
-            )
-        _require_zero_nonrefinement_delta(self.model)
         for sched in self.scheduler.values():
             sched.step()
-        self._apply_modal_stage2_lr_overrides()
 
         self.log_dict(stats)
         self.global_step += 1
@@ -593,7 +220,6 @@ class Trainer:
 
     def compute_losses(self, batch):
         self.model.training = True
-        is_modal_activation = self.model.trajectory_type == "modal_activation"
         use_track_terms = self.model.trajectory_type in ("som_basis", "dct_center")
 
         B = batch["imgs"].shape[0]
@@ -608,7 +234,6 @@ class Trainer:
         Ks = batch["Ks"]
         # (B, H, W, 3).
         imgs = batch["imgs"]
-        observed_imgs = imgs
         # (B, H, W).
         valid_masks = batch.get("valid_masks", torch.ones_like(batch["imgs"][..., 0]))
         # (B, H, W).
@@ -646,49 +271,6 @@ class Trainer:
         device = means.device
         means = means.transpose(0, 1)
         quats = quats.transpose(0, 1)
-        temporal_partner_ts = None
-        temporal_partner_imgs = None
-        temporal_partner_masks = None
-        temporal_partner_valid_masks = None
-        temporal_partner_w2cs = None
-        temporal_partner_Ks = None
-        temporal_pair_gap_frames = None
-        temporal_partner_means = None
-        temporal_partner_quats = None
-        if self.model.has_modal_refinement:
-            temporal_keys = (
-                "temporal_partner_ts",
-                "temporal_partner_imgs",
-                "temporal_partner_masks",
-                "temporal_partner_valid_masks",
-                "temporal_partner_w2cs",
-                "temporal_partner_Ks",
-                "temporal_pair_gap_frames",
-            )
-            missing_temporal_keys = [
-                key for key in temporal_keys if key not in batch
-            ]
-            if missing_temporal_keys:
-                raise ValueError(
-                    "Stage 3 temporal RGB batch is missing fields: "
-                    f"{missing_temporal_keys}"
-                )
-            temporal_partner_ts = batch["temporal_partner_ts"]
-            temporal_partner_imgs = batch["temporal_partner_imgs"]
-            temporal_partner_masks = batch["temporal_partner_masks"]
-            temporal_partner_valid_masks = batch[
-                "temporal_partner_valid_masks"
-            ]
-            temporal_partner_w2cs = batch["temporal_partner_w2cs"]
-            temporal_partner_Ks = batch["temporal_partner_Ks"]
-            temporal_pair_gap_frames = batch["temporal_pair_gap_frames"]
-            if temporal_partner_ts.shape != ts.shape:
-                raise ValueError(
-                    "temporal_partner_ts must match the current timestep shape"
-                )
-            partner_poses = self.model.compute_poses_all(temporal_partner_ts)
-            temporal_partner_means = partner_poses[0].transpose(0, 1)
-            temporal_partner_quats = partner_poses[1].transpose(0, 1)
         if use_track_terms:
             # [(N, G, 3), ...].
             target_ts_vec = torch.cat(target_ts)
@@ -705,7 +287,6 @@ class Trainer:
 
         bg_colors = []
         rendered_all = []
-        temporal_partner_rendered_imgs = []
         self._batched_xys = []
         self._batched_radii = []
         self._batched_img_wh = []
@@ -740,36 +321,8 @@ class Trainer:
                 self._batched_radii.append(self.model._current_radii)
                 self._batched_img_wh.append(self.model._current_img_wh)
 
-        if self.model.has_modal_refinement:
-            if (
-                temporal_partner_ts is None
-                or temporal_partner_w2cs is None
-                or temporal_partner_Ks is None
-                or temporal_partner_means is None
-                or temporal_partner_quats is None
-            ):
-                raise RuntimeError("Stage 3 temporal render inputs were not prepared")
-            for i in range(B):
-                partner_rendered = self.model.render(
-                    temporal_partner_ts[i].item(),
-                    temporal_partner_w2cs[None, i],
-                    temporal_partner_Ks[None, i],
-                    img_wh,
-                    bg_color=torch.ones(1, 3, device=device),
-                    means=temporal_partner_means[i],
-                    quats=temporal_partner_quats[i],
-                )
-                partner_img = partner_rendered.get("img")
-                if not isinstance(partner_img, torch.Tensor):
-                    raise ValueError(
-                        "Stage 3 partner render did not return an image tensor"
-                    )
-                temporal_partner_rendered_imgs.append(partner_img)
-
         # Necessary to make viewer work.
-        num_rays_per_step = H * W * B * (
-            2 if self.model.has_modal_refinement else 1
-        )
+        num_rays_per_step = H * W * B
         num_rays_per_sec = num_rays_per_step / (time.time() - _tic)
 
         # (B, H, W, N, *).
@@ -810,8 +363,7 @@ class Trainer:
             )
 
         if (
-            not is_modal_activation
-            and rendered_all["rend_normal"] != None
+            rendered_all["rend_normal"] != None
             and rendered_all["surf_normal"] != None
         ):
             # 2DGS normal consistency
@@ -834,81 +386,6 @@ class Trainer:
             1 - self.ssim(rendered_imgs.permute(0, 3, 1, 2), imgs.permute(0, 3, 1, 2))
         )
         loss += rgb_loss * self.losses_cfg.w_rgb
-
-        if self.model.has_modal_refinement:
-            if (
-                temporal_partner_imgs is None
-                or temporal_partner_masks is None
-                or temporal_partner_valid_masks is None
-                or temporal_pair_gap_frames is None
-                or len(temporal_partner_rendered_imgs) != B
-            ):
-                raise RuntimeError("Stage 3 temporal loss inputs were not prepared")
-            partner_rendered_imgs = torch.cat(
-                temporal_partner_rendered_imgs,
-                dim=0,
-            )
-            if (
-                partner_rendered_imgs.shape != rendered_imgs.shape
-                or temporal_partner_imgs.shape != observed_imgs.shape
-                or temporal_partner_masks.shape != masks.shape
-                or temporal_partner_valid_masks.shape != valid_masks.shape
-            ):
-                raise ValueError(
-                    "Stage 3 temporal partner tensors do not match current frame shapes"
-                )
-            temporal_support = (
-                (valid_masks > 0.5)
-                & (temporal_partner_valid_masks > 0.5)
-                & ((masks > 0.5) | (temporal_partner_masks > 0.5))
-            )
-            temporal_support_counts = temporal_support.flatten(1).sum(dim=1)
-            empty_pairs = torch.nonzero(
-                temporal_support_counts == 0,
-                as_tuple=False,
-            ).flatten()
-            if empty_pairs.numel() > 0:
-                raise ValueError(
-                    "Stage 3 temporal RGB pair has empty support for batch indices "
-                    f"{empty_pairs.detach().cpu().tolist()}"
-                )
-            temporal_residual = (
-                (rendered_imgs - partner_rendered_imgs)
-                - (observed_imgs - temporal_partner_imgs)
-            )
-            epsilon = self.losses_cfg.temporal_rgb_charbonnier_epsilon
-            temporal_penalty = torch.sqrt(
-                temporal_residual.square() + epsilon * epsilon
-            ) - epsilon
-            temporal_support_channels = temporal_support[..., None].to(
-                temporal_penalty.dtype
-            )
-            temporal_pair_losses = (
-                (temporal_penalty * temporal_support_channels)
-                .sum(dim=(1, 2, 3))
-                / (3 * temporal_support_counts)
-            )
-            temporal_rgb_loss = temporal_pair_losses.mean()
-            temporal_support_fraction = temporal_support.float().mean()
-            temporal_gap_frames = temporal_pair_gap_frames.to(torch.float32)
-            temporal_pair_gap_frames_mean = temporal_gap_frames.mean()
-            temporal_pair_gap_frames_max = temporal_gap_frames.max()
-            for name, value in (
-                ("temporal RGB", temporal_rgb_loss),
-                ("temporal support fraction", temporal_support_fraction),
-                ("temporal pair gap mean", temporal_pair_gap_frames_mean),
-                ("temporal pair gap max", temporal_pair_gap_frames_max),
-            ):
-                if not bool(torch.isfinite(value).item()):
-                    raise FloatingPointError(
-                        f"Stage 3 {name} diagnostic is not finite"
-                    )
-            loss += self.losses_cfg.w_temporal_rgb * temporal_rgb_loss
-        else:
-            temporal_rgb_loss = torch.zeros((), device=self.device)
-            temporal_support_fraction = torch.zeros((), device=self.device)
-            temporal_pair_gap_frames_mean = torch.zeros((), device=self.device)
-            temporal_pair_gap_frames_max = torch.zeros((), device=self.device)
 
         # Mask loss.
         if not self.model.has_bg:
@@ -1104,76 +581,10 @@ class Trainer:
 
 
         loss += self.losses_cfg.w_z_accel * z_accel_loss
-        if self.model.has_modal_refinement:
-            act_mag_loss = torch.zeros((), device=self.device)
-            envelope_smoothness_loss = torch.zeros((), device=self.device)
-            envelope_curvature_loss = torch.zeros((), device=self.device)
-            envelope_rms = torch.zeros((), device=self.device)
-            envelope_max_knot_jump = torch.zeros((), device=self.device)
-            envelope_max_slope_change = torch.zeros((), device=self.device)
-            (
-                delta_phi_prior_loss,
-                delta_phi_spatial_loss,
-                relative_delta_rms,
-                role_delta_rms,
-                role_delta_max,
-            ) = self._compute_modal_refinement_losses()
-            loss += self.losses_cfg.w_delta_phi_prior * delta_phi_prior_loss
-            loss += self.losses_cfg.w_delta_phi_spatial * delta_phi_spatial_loss
-        elif is_modal_activation:
-            act_mag_loss = self.model.compute_envelope_magnitude_loss()
-            envelope_smoothness_loss = (
-                self.model.compute_envelope_smoothness_loss()
-            )
-            envelope_curvature_loss = (
-                self.model.compute_envelope_curvature_loss()
-            )
-            envelope_rms = torch.sqrt(act_mag_loss)
-            envelope_max_knot_jump = (
-                self.model.compute_envelope_max_knot_jump()
-            )
-            envelope_max_slope_change = (
-                self.model.compute_envelope_max_slope_change()
-            )
-            loss += self.losses_cfg.w_act_mag * act_mag_loss
-            loss += (
-                self.losses_cfg.w_envelope_smooth
-                * envelope_smoothness_loss
-            )
-            loss += (
-                self.losses_cfg.w_envelope_curvature
-                * envelope_curvature_loss
-            )
-            delta_phi_prior_loss = torch.zeros((), device=self.device)
-            delta_phi_spatial_loss = torch.zeros((), device=self.device)
-            relative_delta_rms = torch.zeros((), device=self.device)
-            role_delta_rms = torch.zeros((3,), device=self.device)
-            role_delta_max = torch.zeros((3,), device=self.device)
-        else:
-            act_mag_loss = torch.zeros((), device=self.device)
-            envelope_smoothness_loss = torch.zeros((), device=self.device)
-            envelope_curvature_loss = torch.zeros((), device=self.device)
-            envelope_rms = torch.zeros((), device=self.device)
-            envelope_max_knot_jump = torch.zeros((), device=self.device)
-            envelope_max_slope_change = torch.zeros((), device=self.device)
-            delta_phi_prior_loss = torch.zeros((), device=self.device)
-            delta_phi_spatial_loss = torch.zeros((), device=self.device)
-            relative_delta_rms = torch.zeros((), device=self.device)
-            role_delta_rms = torch.zeros((3,), device=self.device)
-            role_delta_max = torch.zeros((3,), device=self.device)
-
         # Prepare stats for logging.
         stats = {
             "train/loss": loss.item(),
             "train/rgb_loss": rgb_loss.item(),
-            "train/temporal_rgb_loss": temporal_rgb_loss.item(),
-            "train/temporal_support_fraction": temporal_support_fraction.item(),
-            "train/temporal_pair_gap_frames_mean": (
-                temporal_pair_gap_frames_mean.item()
-            ),
-            "train/temporal_pair_gap_frames_max": (
-                temporal_pair_gap_frames_max.item()
-            ),
             "train/mask_loss": mask_loss.item(),
             "train/depth_loss": depth_loss.item(),
             "train/depth_gradient_loss": depth_gradient_loss.item(),
@@ -1181,15 +592,6 @@ class Trainer:
             "train/track_2d_loss": track_2d_loss.item(),
             "train/small_accel_loss": small_accel_loss.item(),
             "train/dct_coef_loss": dct_coef_loss.item(),
-            "train/envelope_magnitude_loss": act_mag_loss.item(),
-            "train/envelope_smoothness_loss": envelope_smoothness_loss.item(),
-            "train/envelope_curvature_loss": envelope_curvature_loss.item(),
-            "train/envelope_rms": envelope_rms.item(),
-            "train/envelope_max_knot_jump": envelope_max_knot_jump.item(),
-            "train/envelope_max_slope_change": envelope_max_slope_change.item(),
-            "train/delta_phi_prior_loss": delta_phi_prior_loss.item(),
-            "train/delta_phi_spatial_loss": delta_phi_spatial_loss.item(),
-            "train/modal_relative_delta_rms": relative_delta_rms.item(),
             "train/z_acc_loss": z_accel_loss.item(),
             "train/local_iso_ray_loss": local_iso_ray_loss.item(),
             "train/local_iso_perp_loss": local_iso_perp_loss.item(),
@@ -1198,17 +600,7 @@ class Trainer:
             "train/num_gaussians": self.model.num_gaussians,
             "train/num_fg_gaussians": self.model.num_fg_gaussians,
             "train/num_bg_gaussians": self.model.num_bg_gaussians,
-            "train/modal_dynamic_stage": float(self._modal_in_dynamic_stage()),
         }
-        if self.model.has_modal_refinement:
-            for role_index, role_name in enumerate(("anchor", "partial", "filled")):
-                stats[f"train/modal_delta_phi_{role_name}_rms"] = (
-                    role_delta_rms[role_index].item()
-                )
-                stats[f"train/modal_delta_phi_{role_name}_max"] = (
-                    role_delta_max[role_index].item()
-                )
-
         # Compute metrics.
         with torch.no_grad():
             psnr = self.psnr_metric(

@@ -60,7 +60,6 @@ class DavisDataConfig:
     modal_frame_map: tyro.conf.Suppress[str | None] = None
     modal_train_view_id: tyro.conf.Suppress[str | None] = None
     modal_max_local_frames_per_view: tyro.conf.Suppress[int | None] = None
-    modal_temporal_frame_offsets: tyro.conf.Suppress[tuple[int, ...]] = ()
     load_depths: tyro.conf.Suppress[bool] = True
     load_tracks: tyro.conf.Suppress[bool] = True
 
@@ -92,7 +91,6 @@ class CustomDataConfig:
     modal_frame_map: tyro.conf.Suppress[str | None] = None
     modal_train_view_id: tyro.conf.Suppress[str | None] = None
     modal_max_local_frames_per_view: tyro.conf.Suppress[int | None] = None
-    modal_temporal_frame_offsets: tyro.conf.Suppress[tuple[int, ...]] = ()
     load_depths: tyro.conf.Suppress[bool] = True
     load_tracks: tyro.conf.Suppress[bool] = True
 
@@ -125,7 +123,6 @@ class CasualDataset(BaseDataset):
         modal_frame_map: str | None = None,
         modal_train_view_id: str | None = None,
         modal_max_local_frames_per_view: int | None = None,
-        modal_temporal_frame_offsets: tuple[int, ...] = (),
         load_depths: bool = True,
         load_tracks: bool = True,
         **_,
@@ -144,27 +141,6 @@ class CasualDataset(BaseDataset):
         self.camera_type = camera_type
         self.load_depths = load_depths
         self.load_tracks = load_tracks
-        self.modal_temporal_frame_offsets = tuple(modal_temporal_frame_offsets)
-        if any(
-            isinstance(offset, bool)
-            or not isinstance(offset, int)
-            or offset <= 0
-            for offset in self.modal_temporal_frame_offsets
-        ) or (
-            tuple(sorted(set(self.modal_temporal_frame_offsets)))
-            != self.modal_temporal_frame_offsets
-        ):
-            raise ValueError(
-                "modal_temporal_frame_offsets must be ordered, unique, "
-                "positive integers"
-            )
-        if self.modal_temporal_frame_offsets and camera_type != "vggt":
-            raise ValueError("modal temporal pairing requires camera_type='vggt'")
-        if self.modal_temporal_frame_offsets and modal_frame_map is None:
-            raise ValueError("modal temporal pairing requires modal_frame_map")
-        self._modal_temporal_partners_by_gap: (
-            list[dict[int, tuple[int, ...]]] | None
-        ) = None
 
         self.img_dir = f"{data_dir}/{image_type}/{res}"
         self.img_ext = os.path.splitext(os.listdir(self.img_dir)[0])[1]
@@ -323,76 +299,6 @@ class CasualDataset(BaseDataset):
                 if frame_name in frame_to_record:
                     raise ValueError(f"Duplicate frame_name in modal frame map: {frame_name}")
                 frame_to_record[frame_name] = record
-
-            if self.modal_temporal_frame_offsets:
-                selected_keys: list[tuple[str, int]] = []
-                index_by_key: dict[tuple[str, int], int] = {}
-                selected_view_counts: dict[str, int] = {}
-                for dataset_index, frame_name in enumerate(self.frame_names):
-                    if frame_name not in frame_to_record:
-                        raise ValueError(
-                            f"{modal_frame_map} is missing training frame {frame_name}"
-                        )
-                    record = frame_to_record[frame_name]
-                    view_id = record.get("view_id")
-                    local_index = record.get("local_index")
-                    if not isinstance(view_id, str) or not view_id:
-                        raise ValueError(
-                            f"Frame {frame_name} has invalid view_id={view_id!r}"
-                        )
-                    if not isinstance(local_index, int) or local_index < 0:
-                        raise ValueError(
-                            f"Frame {frame_name} has invalid local_index={local_index!r}"
-                        )
-                    key = (view_id, local_index)
-                    if key in index_by_key:
-                        raise ValueError(
-                            "Modal temporal pairing found duplicate view/local index "
-                            f"{key}"
-                        )
-                    index_by_key[key] = dataset_index
-                    selected_keys.append(key)
-                    selected_view_counts[view_id] = (
-                        selected_view_counts.get(view_id, 0) + 1
-                    )
-                short_views = {
-                    view_id: count
-                    for view_id, count in selected_view_counts.items()
-                    if count < 2
-                }
-                if short_views:
-                    raise ValueError(
-                        "Modal temporal pairing requires at least two selected "
-                        f"frames per view; got {short_views}"
-                    )
-
-                partners_by_frame: list[dict[int, tuple[int, ...]]] = []
-                for dataset_index, (view_id, local_index) in enumerate(selected_keys):
-                    partners_by_gap: dict[int, tuple[int, ...]] = {}
-                    for gap in self.modal_temporal_frame_offsets:
-                        candidates = tuple(
-                            index_by_key[key]
-                            for key in (
-                                (view_id, local_index - gap),
-                                (view_id, local_index + gap),
-                            )
-                            if key in index_by_key
-                        )
-                        if candidates:
-                            partners_by_gap[gap] = candidates
-                    if not partners_by_gap:
-                        raise ValueError(
-                            "Modal temporal pairing found no valid same-view partner "
-                            f"for frame {self.frame_names[dataset_index]} with offsets "
-                            f"{self.modal_temporal_frame_offsets}"
-                        )
-                    partners_by_frame.append(partners_by_gap)
-                self._modal_temporal_partners_by_gap = partners_by_frame
-                guru.info(
-                    "Prepared modal temporal partners: "
-                    f"frames={len(partners_by_frame)}, "
-                    f"offsets={self.modal_temporal_frame_offsets}"
-                )
 
             Ks_list = []
             w2cs_list = []
@@ -742,24 +648,6 @@ class CasualDataset(BaseDataset):
         mask = tri_mask == 1  # fg mask
         data["masks"] = mask.float()
         data["valid_masks"] = valid_mask.float()
-
-        if self._modal_temporal_partners_by_gap is not None:
-            partners_by_gap = self._modal_temporal_partners_by_gap[index]
-            available_gaps = tuple(partners_by_gap)
-            gap = available_gaps[np.random.randint(len(available_gaps))]
-            candidates = partners_by_gap[gap]
-            partner_index = candidates[np.random.randint(len(candidates))]
-            partner_img = self.get_image(partner_index)
-            partner_tri_mask = self.get_mask(partner_index)
-            data["temporal_partner_ts"] = torch.tensor(partner_index)
-            data["temporal_partner_imgs"] = partner_img
-            data["temporal_partner_masks"] = (partner_tri_mask == 1).float()
-            data["temporal_partner_valid_masks"] = (
-                partner_tri_mask != 0
-            ).float()
-            data["temporal_partner_w2cs"] = self.w2cs[partner_index]
-            data["temporal_partner_Ks"] = self.Ks[partner_index]
-            data["temporal_pair_gap_frames"] = torch.tensor(gap)
 
         if self.camera_type == "vggt" or not self.load_tracks:
             data["query_tracks_2d"] = torch.empty(0, 2)

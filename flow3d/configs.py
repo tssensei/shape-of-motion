@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -36,33 +36,17 @@ class CameraPoseLRConfig:
     ts: float = 1e-3
 
 @dataclass
-class ModalLRConfig:
-    envelope_knots: float = 1e-3
-
-
-@dataclass
-class ModalRefinementLRConfig:
-    delta_phi: float = 1e-4
-
-
-@dataclass
 class SceneLRConfig:
     fg: FGLRConfig
     bg: BGLRConfig
     motion_bases: MotionLRConfig
     camera_poses: CameraPoseLRConfig
     camera_scales: CameraScalesLRConfig
-    modal: ModalLRConfig = field(default_factory=ModalLRConfig)
-    modal_refinement: ModalRefinementLRConfig = field(
-        default_factory=ModalRefinementLRConfig
-    )
 
 
 @dataclass
 class LossesConfig:
     w_rgb: float = 1.0
-    w_temporal_rgb: float = 0.0
-    temporal_rgb_charbonnier_epsilon: float = 1e-3
     w_depth_reg: float = 0.5
     w_depth_const: float = 0.0
     w_depth_grad: float = 1.0
@@ -73,11 +57,6 @@ class LossesConfig:
     w_scale_var: float = 0.01
     w_z_accel: float = 1.0
     w_dct_coef: float = 1e-4
-    w_act_mag: float = 0.001
-    w_envelope_smooth: float = 1.0
-    w_envelope_curvature: float = 1.0
-    w_delta_phi_prior: float = 0.0
-    w_delta_phi_spatial: float = 0.0
     w_local_iso_ray: float = 0.0
     w_local_iso_perp: float = 0.00
     w_local_iso_dist: float = 0.0
