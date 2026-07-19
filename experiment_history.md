@@ -203,3 +203,73 @@ Gaussian motion field.
   local rigidity should follow only after that diagnosis; a later stage may
   integrate the complete modal model into dynamic 3DGS optimization instead of
   remaining attached to a frozen static Gaussian reconstruction.
+
+## `dense_exact_dft_greedy_20260719_002548`
+
+Date: 2026-07-19
+
+### Purpose
+
+Measure how much of the K=10 uniform-frequency basis limitation comes from the
+frequency choices themselves before paying for any additional 3D solves. Build
+an in-sample exact-DFT dictionary on a shared 0.2--2.2 Hz grid with 0.025 Hz
+spacing, treat each real/imaginary pair as one inseparable complex mode, and use
+equal-view greedy residual reduction to report nested K=5/10/15/20 direct-2D
+capacity on the existing pixel-candidate ROI.
+
+### Reusable paths
+
+- Output directory: `/home/zs292/outputs_modal/bush4/frequency_selection/dense_exact_dft_greedy_20260719_002548`
+- Summary: `/home/zs292/outputs_modal/bush4/frequency_selection/dense_exact_dft_greedy_20260719_002548/frequency_selection_summary.json`
+- Detailed diagnostics: `/home/zs292/outputs_modal/bush4/frequency_selection/dense_exact_dft_greedy_20260719_002548/frequency_selection_diagnostics.npz`
+- Capacity plot: `/home/zs292/outputs_modal/bush4/frequency_selection/dense_exact_dft_greedy_20260719_002548/frequency_selection_curves.png`
+- Export-compatible shortlists: `selected_frequencies_k5.json`,
+  `selected_frequencies_k10.json`, `selected_frequencies_k15.json`, and
+  `selected_frequencies_k20.json` in the same output directory.
+- Source K=10 manifest: `/home/zs292/outputs_modal/bush4/gaussian_modes_uniform_k10_0p3_2p0_motion_fill_k8_d0p008/modal_modes_manifest.json`
+- Source frame map: `/home/zs292/outputs_modal/bush4/dynamic_rgb_720_phase0/modal_frame_map.json`
+
+### Primary configuration and result
+
+- Candidate grid: 81 exact-DFT frequencies from 0.2 through 2.2 Hz; no amplitude
+  clamp; full time series used both to form and evaluate each spatial mode.
+- Candidate pixels: view1 34,672; view2 24,961; view3 20,563.
+- Pooled R2: K=5 0.719651, K=10 0.829752, K=15 0.885500, and K=20
+  0.915107. The previous uniform K=10 direct-2D baseline was 0.726825.
+- Equal-view macro R2: K=5 0.700382, K=10 0.818885, K=15 0.880356,
+  and K=20 0.913175. This is the primary capacity score because view1 carries
+  about 66.9% of the pooled flow energy, versus 24.6% for view2 and 8.5% for
+  view3.
+- Worst-view R2: K=5 0.676569, K=10 0.793683, K=15 0.860371, and
+  K=20 0.900117. Every view retained the full real rank 2K.
+- The K=15 greedy prefix was 0.2, 0.225, 1.525, 0.425, 0.85, 1.25,
+  0.525, 0.275, 1.65, 1.4, 1.8, 1.025, 0.3, 1.725, and 1.1 Hz in
+  selection order.
+- The apparent worst 4x4 regions carried very little motion energy: at K=20 the
+  minimum-R2 regions accounted for approximately 0.34% of view1 energy, 0.25%
+  of view2 energy, and 0.0094% of view3 energy.
+
+### Current conclusion
+
+- Frequency selection matters substantially: greedy K=5 nearly matches the old
+  uniform K=10, while greedy K=10 improves pooled R2 by about 0.103 and reduces
+  the old unexplained flow energy by about 37.7%.
+- K=15 is the current capacity knee; K=10 to K=15 adds about 0.056 pooled R2,
+  whereas K=15 to K=20 adds about 0.030.
+- These are optimistic in-sample capacity values: the same complete sequences
+  were used to select and score the frequencies. They do not yet demonstrate
+  held-out temporal generalization or identify 15 physical natural modes.
+- The shortlist is not yet a physical natural-frequency list. The first two
+  atoms are adjacent 0.2/0.225 Hz frequencies at the lower search boundary and
+  are already strongly correlated; later 0.275/0.3/0.375/0.525/0.55 Hz atoms
+  also become highly redundant. Greedy is using nearby whole-clip DFT snapshots
+  to span slow, broadband, or nonstationary motion.
+- The early selection of 1.525 Hz is consistent with the previously useful
+  1.52 Hz mode, but it is especially strong in view2 rather than uniformly
+  strong in all three videos.
+- Do not run a full K=20 3D solve from this list yet. The next experiment should
+  first test whether the dominant low-frequency atom follows the lower search
+  boundary, then use Welch/FDD or SPOD-style window stability, frequency-band
+  grouping, and blocked temporal validation to distinguish repeatable modes
+  from drift/noise. Only then run a staged no-fill anchor/partial pilot before
+  full motion fill.
