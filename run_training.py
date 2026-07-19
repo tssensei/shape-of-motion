@@ -587,21 +587,27 @@ def _select_modal_coordinate_tensors(
             missing.append(frame_name)
             continue
         ts = int(time_ids[dataset_index].item())
+        coordinate_view_index = int(coordinates.frame_view_indices[row])
+        coordinate_local_index = int(coordinates.frame_local_indices[row])
+        coordinate_time_sec = float(coordinates.frame_times_sec[row])
+        active_view_index = int(frame_view_indices[ts])
+        active_local_index = int(frame_local_indices[ts])
+        active_time_sec = float(frame_times_sec[ts])
+        coordinate_time_in_active_dtype = np.asarray(
+            coordinate_time_sec,
+            dtype=frame_times_sec.dtype,
+        ).item()
         if (
-            int(coordinates.frame_view_indices[row])
-            != int(frame_view_indices[ts])
-            or int(coordinates.frame_local_indices[row])
-            != int(frame_local_indices[ts])
-            or not np.isclose(
-                float(coordinates.frame_times_sec[row]),
-                float(frame_times_sec[ts]),
-                rtol=0.0,
-                atol=1e-6,
-            )
+            coordinate_view_index != active_view_index
+            or coordinate_local_index != active_local_index
+            or coordinate_time_in_active_dtype != active_time_sec
         ):
             raise ValueError(
                 "Modal coordinate frame metadata does not match the active frame map "
-                f"for {frame_name!r}"
+                f"for {frame_name!r}: artifact=(view={coordinate_view_index}, "
+                f"local={coordinate_local_index}, time={coordinate_time_sec:.12g}), "
+                f"active=(view={active_view_index}, local={active_local_index}, "
+                f"time={active_time_sec:.12g}, dtype={frame_times_sec.dtype})"
             )
         selected_real[ts] = coordinates.coordinate_real[row]
         selected_imag[ts] = coordinates.coordinate_imag[row]
