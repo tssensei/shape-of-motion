@@ -273,3 +273,83 @@ capacity on the existing pixel-candidate ROI.
   grouping, and blocked temporal validation to distinguish repeatable modes
   from drift/noise. Only then run a staged no-fill anchor/partial pilot before
   full motion fill.
+
+## `bush4_flow_coordinates_greedy_k15_quality_20260719_v1_fixed_phi`
+
+Date: 2026-07-19
+
+### Purpose
+
+Test reconstruction quality with the quality-first K=15 prefix selected by the
+dense exact-DFT greedy experiment. This experiment deliberately accepts that
+nearby low-frequency Fourier atoms may span broadband or nonstationary slow
+motion rather than represent fifteen independent physical natural modes. Its
+purpose is to establish whether the richer fixed 3D basis is already strong
+enough to serve as the initialization for subsequent joint dynamic-3DGS
+optimization.
+
+### Reusable paths
+
+- 3D modal output: `/home/zs292/outputs_modal/bush4/gaussian_modes_greedy_k15_quality_20260719_v1_motion_fill_k8_d0p008`
+- Modal manifest: `/home/zs292/outputs_modal/bush4/gaussian_modes_greedy_k15_quality_20260719_v1_motion_fill_k8_d0p008/modal_modes_manifest.json`
+- Flow-coordinate directory: `/home/zs292/outputs_modal/bush4/flow_coordinates_greedy_k15_quality_20260719_v1_ridge1e4`
+- Flow-coordinate artifact: `/home/zs292/outputs_modal/bush4/flow_coordinates_greedy_k15_quality_20260719_v1_ridge1e4/modal_flow_coordinates.npz`
+- Fixed-coordinate run: `/home/zs292/outputs_3dmode/bush4_flow_coordinates_greedy_k15_quality_20260719_v1_fixed_phi`
+- Final checkpoint: `/home/zs292/outputs_3dmode/bush4_flow_coordinates_greedy_k15_quality_20260719_v1_fixed_phi/checkpoints/last.ckpt`
+- Reconstruction: `/home/zs292/outputs_3dmode/bush4_flow_coordinates_greedy_k15_quality_20260719_v1_fixed_phi/reconstruction_last`
+- Clean static initialization checkpoint: `/home/zs292/outputs_modal/bush4/static_checkpoints/bush4_static_for_modal_solver.ckpt`
+
+### Primary configuration
+
+- Frequencies in greedy prefix order: 0.2, 0.225, 1.525, 0.425, 0.85, 1.25,
+  0.525, 0.275, 1.65, 1.4, 1.8, 1.025, 0.3, 1.725, and 1.1 Hz.
+- Each 3D mode uses the staged multi-view Gaussian solve followed by distance-KNN
+  motion fill with `k=8` and maximum edge distance `0.008` scene units.
+- Per-frame complex coordinates are inverted from the three full Farneback flow
+  caches with relative ridge weight `1e-4`.
+- The 3D modal fields, coordinates, static Gaussian geometry, and appearance are
+  all fixed; no RGB optimizer or training loop is used.
+
+### Qualitative result and current conclusion
+
+- The reconstruction quality is considered sufficient to become the current
+  formal baseline and initialization for joint optimization.
+- The richer K=15 representation is visibly preferable to the earlier limited
+  bases, so basis capacity is no longer the immediate blocking issue for
+  beginning trainable-phi and dynamic-Gaussian experiments.
+- Motion is generally convincing, but rare frames still contain very slight
+  temporal twitching. This should be addressed by a weak coordinate data prior
+  plus temporal smoothing or joint coordinate refinement, without returning to
+  the earlier restrictive cubic-envelope parameterization.
+- The next stage should jointly refine modal coordinates and shared phi under an
+  explicit basis gauge and local structural constraints. Gaussian geometry and
+  appearance should be opened only in controlled stages so they cannot absorb
+  motion errors before the deformation model is stable.
+
+### Known static-scene limitation
+
+- The inherited static scene is adequate for the current foreground/modal
+  baseline, but its background is visibly lower quality than a vanilla static
+  3DGS reconstruction. This is a known limitation of the base checkpoint rather
+  than evidence that the K=15 modal representation is incorrect.
+- The source static checkpoint is
+  `/home/zs292/outputs/bush4_sweep_static_3dgs_hq_v1/checkpoints/last.ckpt`;
+  `/home/zs292/outputs_modal/bush4/static_checkpoints/bush4_static_for_modal_solver.ckpt`
+  is only a solver-compatible copy of the same static field and does not improve
+  its background.
+- The current representation stores one view-independent RGB value per Gaussian
+  rather than the spherical-harmonic appearance used by vanilla 3DGS. The static
+  foreground/background split also classifies sparse COLMAP points by mask votes
+  without point-track visibility or occlusion testing; ties and unobserved points
+  are assigned to foreground. Both groups are then initialized independently,
+  leaving the spatially broader background comparatively sparse and smooth.
+- Additional inherited differences include a five-times larger background
+  opacity learning rate, scale-variance regularization, and adaptive density
+  control ending at global step 4,000 even though this checkpoint was optimized
+  for roughly 48,000 steps. These factors may further disadvantage distant or
+  low-contrast background structure.
+- Until the static representation is replaced or improved, joint modal training
+  should initially keep the background frozen and prevent background RGB/flow
+  residuals from being interpreted as evidence for changing modal coordinates or
+  phi. Foreground quality is considered sufficient to continue the current line
+  of experiments.
