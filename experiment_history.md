@@ -134,3 +134,72 @@ flow-derived coordinates, rigidity, or further phi refinement.
   with the new direct flow-coordinate code. Preserve its videos, metrics, and
   analysis export as the baseline; reuse the static checkpoint, K=10 manifest,
   motion-fill graph, frame map, dataset, and camera configs in new experiments.
+
+## `bush4_flow_coordinates_k10_fixed_phi`
+
+Date: 2026-07-18
+
+### Purpose
+
+Test the K=10 spatial basis without a learned harmonic envelope. Directly invert
+every full-frame Farneback reference-flow field into one complex modal coordinate
+per frame and mode, then render those fixed coordinates with the same fixed
+staged/motion-filled Gaussian mode shapes. This separates temporal-coordinate
+quality from RGB optimization and provides an expression-capacity experiment for
+the current two-dimensional signal, solved three-dimensional basis, and local
+Gaussian motion field.
+
+### Reusable paths
+
+- Work directory: `/home/zs292/outputs_3dmode/bush4_flow_coordinates_k10_fixed_phi`
+- Initialization checkpoint: `/home/zs292/outputs_3dmode/bush4_flow_coordinates_k10_fixed_phi/checkpoints/init.ckpt`
+- Final checkpoint: `/home/zs292/outputs_3dmode/bush4_flow_coordinates_k10_fixed_phi/checkpoints/last.ckpt`
+- Reconstruction: `/home/zs292/outputs_3dmode/bush4_flow_coordinates_k10_fixed_phi/reconstruction_last`
+- Coordinate directory: `/home/zs292/outputs_modal/bush4/flow_coordinates_uniform_k10_ridge1e4`
+- Coordinate artifact: `/home/zs292/outputs_modal/bush4/flow_coordinates_uniform_k10_ridge1e4/modal_flow_coordinates.npz`
+- Coordinate diagnostics: `/home/zs292/outputs_modal/bush4/flow_coordinates_uniform_k10_ridge1e4/diagnostics.json`
+- Detailed coordinate diagnostics: `/home/zs292/outputs_modal/bush4/flow_coordinates_uniform_k10_ridge1e4/coordinate_diagnostics.npz`
+- Static 3DGS checkpoint: `/home/zs292/outputs/bush4_sweep_static_3dgs_hq_v1/checkpoints/last.ckpt`
+- K=10 modal manifest: `/home/zs292/outputs_modal/bush4/gaussian_modes_uniform_k10_0p3_2p0_motion_fill_k8_d0p008/modal_modes_manifest.json`
+- Dynamic RGB dataset: `/home/zs292/outputs_modal/bush4/dynamic_rgb_720_phase0`
+- Modal frame map: `/home/zs292/outputs_modal/bush4/dynamic_rgb_720_phase0/modal_frame_map.json`
+
+### Primary configuration
+
+- Frequencies/mode labels: the same ten uniformly spaced values from 0.3 to
+  2.0 Hz as the preceding K=10 envelope baseline.
+- Parameterization: `per_frame_flow_coordinates_v1`; frequency is a mode label
+  and is not multiplied into the runtime coordinate.
+- Coordinate solve: candidate-weighted projected fixed phi, reference-relative
+  flow, ridge-relative weight `1e-4`, and per-view temporal mean-zero gauge.
+- Coordinate shape: `[3203, 10]`, with full frames view1 1,170, view2 1,013,
+  and view3 1,020.
+- Staged/motion-filled phi, frequency labels, foreground/background Gaussians,
+  and all appearance parameters remain fixed.
+- No optimizer or training loop is created; trainable parameter count is zero.
+  `init.ckpt` and `last.ckpt` contain identical model state.
+
+### Qualitative result and current conclusion
+
+- This route is visibly better than the preceding cubic-envelope direction and
+  is the current fixed-phi K=10 baseline.
+- Overall motion remains conservative. Two large flower clusters in the upper
+  left are reconstructed particularly well, while most of the remaining bush
+  has less varied motion than the source video.
+- Rare frames show a small unnatural jerk. Some Gaussians on one physical
+  branch move while nearby Gaussians remain nearly static, giving the branch a
+  visibly stretched rather than approximately rigid motion.
+- The conservative result has two leading explanations that remain entangled:
+  the ten uniformly selected mode shapes may not span the bush's complex motion,
+  and the Farneback-derived two-dimensional signal may not contain sufficiently
+  accurate motion for either the FFT mode shapes or the per-frame coordinate
+  inversion.
+- The within-structure stretching is a separate spatial-field issue: the fixed
+  staged/motion-filled phi can assign inconsistent displacement magnitudes to
+  neighboring Gaussians even when the shared coordinates are reasonable.
+- The next priority is a better modal representation: first distinguish
+  two-dimensional signal quality from basis-span limitations, then improve mode
+  count/selection or replace the 2D signal estimator. Shared phi refinement and
+  local rigidity should follow only after that diagnosis; a later stage may
+  integrate the complete modal model into dynamic 3DGS optimization instead of
+  remaining attached to a frozen static Gaussian reconstruction.
