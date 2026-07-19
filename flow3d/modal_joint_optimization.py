@@ -444,7 +444,9 @@ def weighted_mode_rigidity_loss(
         (0.0, 1.0),
     )
     losses: list[torch.Tensor] = []
-    strains: list[torch.Tensor] = []
+    strain_sum = torch.zeros((), device=phi_real.device, dtype=phi_real.dtype)
+    strain_count = 0
+    strain_max = torch.zeros((), device=phi_real.device, dtype=phi_real.dtype)
     for mode_slot in mode_slots.tolist():
         slot = int(mode_slot)
         selected = trainable_mask[slot, source] | trainable_mask[slot, target]
@@ -483,9 +485,15 @@ def weighted_mode_rigidity_loss(
             mode_losses.append(torch.sum(selected_weights * robust) / weight_sum)
             mode_strains.append(strain.abs())
         losses.append(torch.stack(mode_losses).mean())
-        strains.append(torch.stack(mode_strains))
-    all_strains = torch.stack(strains)
-    return torch.stack(losses).mean(), all_strains.mean(), all_strains.amax()
+        mode_strains_tensor = torch.stack(mode_strains)
+        strain_sum = strain_sum + mode_strains_tensor.sum()
+        strain_count += mode_strains_tensor.numel()
+        strain_max = torch.maximum(strain_max, mode_strains_tensor.amax())
+    return (
+        torch.stack(losses).mean(),
+        strain_sum / strain_count,
+        strain_max,
+    )
 
 
 def weighted_delta_phi_local_loss(
