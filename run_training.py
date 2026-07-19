@@ -630,26 +630,74 @@ def _load_stage1_gaussians_from_checkpoint(
     state_dict = ckpt.get("model")
     if not isinstance(state_dict, dict):
         raise ValueError(f"Stage 1 init checkpoint has no model state: {path}")
-    if (
-        "modal.params.activations" in state_dict
-        or "modal.params.envelope_knots" in state_dict
-        or "modal_coordinate_real" in state_dict
-        or "modal_coordinate_imag" in state_dict
-        or "modal_phi_real" in state_dict
-        or "modal_phi_imag" in state_dict
-        or "modal_freqs_hz" in state_dict
-    ):
-        raise ValueError(
-            "Stage 1 init checkpoint must be the original static checkpoint, "
-            "not a modal trajectory checkpoint"
-        )
     trajectory_type_id = state_dict.get("trajectory_type_id")
-    if trajectory_type_id is not None and int(trajectory_type_id.item()) != (
-        TRAJECTORY_TYPE_TO_ID["static"]
+    if (
+        not isinstance(trajectory_type_id, torch.Tensor)
+        or trajectory_type_id.numel() != 1
+        or int(trajectory_type_id.item()) != TRAJECTORY_TYPE_TO_ID["static"]
     ):
         raise ValueError(
             "Stage 1 init checkpoint must have trajectory_type='static'"
         )
+
+    legacy_modal_keys = [
+        key
+        for key in state_dict
+        if key
+        in (
+            "modal.params.activations",
+            "modal.params.envelope_knots",
+            "modal_refinement_mask",
+            "modal_refinement_role",
+            "modal_anchor_mask",
+        )
+        or key.startswith("modal_refinement.")
+    ]
+    if legacy_modal_keys:
+        raise ValueError(
+            "Stage 1 init checkpoint contains legacy modal training state: "
+            f"{legacy_modal_keys}"
+        )
+
+    nonempty_modal_buffers: list[str] = []
+    for key in (
+        "modal_coordinate_real",
+        "modal_coordinate_imag",
+        "modal_phi_real",
+        "modal_phi_imag",
+        "modal_freqs_hz",
+        "modal_obs_count_per_point",
+    ):
+        value = state_dict.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(
+                f"Stage 1 init checkpoint field {key!r} must be a tensor"
+            )
+        if value.numel() != 0:
+            nonempty_modal_buffers.append(
+                f"{key}(shape={tuple(value.shape)}, numel={value.numel()})"
+            )
+    if nonempty_modal_buffers:
+        raise ValueError(
+            "Stage 1 init checkpoint contains non-empty modal motion buffers: "
+            + ", ".join(nonempty_modal_buffers)
+        )
+
+    modal_synthetic_enabled = state_dict.get("modal_synthetic_enabled")
+    if modal_synthetic_enabled is not None:
+        if (
+            not isinstance(modal_synthetic_enabled, torch.Tensor)
+            or modal_synthetic_enabled.numel() != 1
+        ):
+            raise ValueError(
+                "Stage 1 init checkpoint has malformed modal synthetic state"
+            )
+        if bool(modal_synthetic_enabled.item()):
+            raise ValueError(
+                "Stage 1 init checkpoint has modal synthetic playback enabled"
+            )
     try:
         fg_params = GaussianParams.init_from_state_dict(
             state_dict,
