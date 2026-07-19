@@ -910,7 +910,10 @@ def run(cfg: ModalReconstructionConfig) -> None:
                 dim=-1,
             ).detach().cpu().numpy()
             active_coordinate_magnitudes.append(frame_coordinate_magnitudes)
-            frame_times_sec = model.modal_frame_times_sec[frame_ts]
+            frame_times_sec = torch.as_tensor(
+                [frame.time_sec for frame in frames],
+                dtype=torch.float64,
+            )
             accumulator = _ViewMetricAccumulator(device)
             video_path = temporary_dir / f"{view_id}_comparison.mp4"
             writer = imageio.get_writer(str(video_path), fps=float(cfg.fps))
