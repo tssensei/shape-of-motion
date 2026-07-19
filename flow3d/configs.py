@@ -45,6 +45,12 @@ class ModalJointLRConfig:
 
 
 @dataclass
+class ModalPhiRefinementLRConfig:
+    delta_phi_real: float = 1e-4
+    delta_phi_imag: float = 1e-4
+
+
+@dataclass
 class SceneLRConfig:
     fg: FGLRConfig
     bg: BGLRConfig
@@ -52,6 +58,7 @@ class SceneLRConfig:
     camera_poses: CameraPoseLRConfig
     camera_scales: CameraScalesLRConfig
     modal_joint: ModalJointLRConfig
+    modal_phi_refinement: ModalPhiRefinementLRConfig
 
 
 @dataclass
@@ -77,6 +84,9 @@ class LossesConfig:
     local_iso_edge_weight_temp: float = 1.0
     w_modal_flow: float = 1.0
     w_modal_rigidity: float = 0.1
+    w_modal_mode_rigidity: float = 1.0
+    w_modal_delta_phi_local: float = 0.05
+    modal_structure_modes_per_step: int = 3
     modal_rigidity_huber_beta: float = 0.01
     w_modal_coordinate_prior: float = 0.1
     w_modal_coordinate_temporal: float = 0.01

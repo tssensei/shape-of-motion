@@ -16,6 +16,8 @@ from flow3d.modal_flow_coordinates import (
 from flow3d.modal_joint_optimization import (
     MODAL_JOINT_OBJECTIVE,
     MODAL_JOINT_PARAMETERIZATION,
+    MODAL_PHI_OBJECTIVE,
+    MODAL_PHI_PARAMETERIZATION,
 )
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import draw_tracks_2d_th, get_server
@@ -33,6 +35,7 @@ MODAL_COORDINATE_GAUGE = MODAL_FLOW_COORDINATE_GAUGE
 SUPPORTED_MODAL_PARAMETERIZATIONS = {
     MODAL_PARAMETERIZATION,
     MODAL_JOINT_PARAMETERIZATION,
+    MODAL_PHI_PARAMETERIZATION,
 }
 
 
@@ -63,10 +66,10 @@ class Renderer:
             self.modal_anchor_role_classes,
             modal_anchor_role_mode_labels,
         ) = self._load_modal_anchor_data(modal_anchor_manifest)
-        if self.model.has_modal_joint and self.modal_anchor_points is not None:
+        if self.model.has_trainable_modal_phi and self.modal_anchor_points is not None:
             if self.modal_anchor_points.shape[0] != self.model.num_fg_gaussians:
                 raise ValueError(
-                    "Joint modal overlay point count does not match foreground Gaussians"
+                    "Refined modal overlay point count does not match foreground Gaussians"
                 )
             effective_real, effective_imag = self.model.get_effective_modal_phi()
             self.modal_anchor_phi_real = effective_real.detach()
@@ -193,16 +196,26 @@ class Renderer:
                 raise ValueError(
                     "Checkpoint has an incompatible modal coordinate gauge"
                 )
-            expected_trainable = parameterization == MODAL_JOINT_PARAMETERIZATION
-            if (
-                expected_trainable
-                and init_metadata.get("modal_training_objective")
-                != MODAL_JOINT_OBJECTIVE
-            ):
-                raise ValueError("Checkpoint has an incompatible joint modal objective")
-            if init_metadata.get("modal_phi_trainable") is not expected_trainable:
+            expected_phi_trainable = parameterization in {
+                MODAL_JOINT_PARAMETERIZATION,
+                MODAL_PHI_PARAMETERIZATION,
+            }
+            expected_coordinate_trainable = (
+                parameterization == MODAL_JOINT_PARAMETERIZATION
+            )
+            expected_objective = {
+                MODAL_JOINT_PARAMETERIZATION: MODAL_JOINT_OBJECTIVE,
+                MODAL_PHI_PARAMETERIZATION: MODAL_PHI_OBJECTIVE,
+            }.get(parameterization)
+            if expected_objective is not None and init_metadata.get(
+                "modal_training_objective"
+            ) != expected_objective:
+                raise ValueError("Checkpoint has an incompatible modal objective")
+            if init_metadata.get("modal_phi_trainable") is not expected_phi_trainable:
                 raise ValueError("Checkpoint modal phi trainability is inconsistent")
-            if init_metadata.get("modal_coordinates_trainable") is not expected_trainable:
+            if init_metadata.get(
+                "modal_coordinates_trainable"
+            ) is not expected_coordinate_trainable:
                 raise ValueError("Checkpoint coordinate trainability is inconsistent")
             coordinate_source = init_metadata.get("modal_coordinate_source")
             if not isinstance(coordinate_source, str) or not coordinate_source:
@@ -222,6 +235,12 @@ class Renderer:
             parameterization == MODAL_JOINT_PARAMETERIZATION
         ):
             raise ValueError("Checkpoint modal parameterization does not match model state")
+        if parameterization is not None and model.has_modal_phi_refinement != (
+            parameterization == MODAL_PHI_PARAMETERIZATION
+        ):
+            raise ValueError(
+                "Checkpoint phi-only parameterization does not match model state"
+            )
         model.use_2dgs = use_2dgs
         model = model.to(device)
         print(f"num gs: {model.num_gaussians}")

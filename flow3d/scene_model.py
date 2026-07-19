@@ -9,6 +9,7 @@ from torch import Tensor
 from flow3d.params import (
     GaussianParams,
     ModalJointParams,
+    ModalPhiRefinementParams,
     MotionBases,
     CameraPoses,
     build_dct_basis,
@@ -47,6 +48,7 @@ class SceneModel(nn.Module):
         modal_frame_times_sec: Tensor | None = None,
         modal_synthetic_enabled: bool | Tensor = False,
         modal_joint_params: ModalJointParams | None = None,
+        modal_phi_refinement_params: ModalPhiRefinementParams | None = None,
         modal_phi_trainable_mask: Tensor | None = None,
     ):
         super().__init__()
@@ -325,6 +327,8 @@ class SceneModel(nn.Module):
         if modal_phi_trainable_mask.dtype != torch.bool:
             raise ValueError("modal_phi_trainable_mask must have boolean dtype")
         modal_phi_trainable_mask = modal_phi_trainable_mask.to(device=frame_device)
+        if modal_joint_params is not None and modal_phi_refinement_params is not None:
+            raise ValueError("modal joint and phi-only parameters are mutually exclusive")
         if modal_joint_params is not None:
             if trajectory_type != "modal_activation":
                 raise ValueError("modal joint parameters require modal_activation")
@@ -356,10 +360,34 @@ class SceneModel(nn.Module):
                     )
             if not bool(modal_phi_trainable_mask.any().item()):
                 raise ValueError("modal joint optimization requires trainable phi points")
+        elif modal_phi_refinement_params is not None:
+            if trajectory_type != "modal_activation":
+                raise ValueError("modal phi refinement requires modal_activation")
+            expected_phi_shape = (num_modes, self.num_fg_gaussians, 3)
+            for name in ("delta_phi_real", "delta_phi_imag"):
+                value = modal_phi_refinement_params.params[name]
+                if value.shape != expected_phi_shape:
+                    raise ValueError(
+                        f"modal_phi_refinement.params.{name} must have shape "
+                        f"{expected_phi_shape}"
+                    )
+                if value.device != frame_device or value.dtype != frame_dtype:
+                    raise ValueError(
+                        f"modal_phi_refinement.params.{name} must match the "
+                        "foreground Gaussian device and dtype"
+                    )
+                if bool((value[~modal_phi_trainable_mask] != 0).any().item()):
+                    raise ValueError(
+                        f"modal_phi_refinement.params.{name} must be exactly zero "
+                        "outside the trainable phi mask"
+                    )
+            if not bool(modal_phi_trainable_mask.any().item()):
+                raise ValueError("modal phi refinement requires trainable phi points")
         elif bool(modal_phi_trainable_mask.any().item()):
-            raise ValueError("modal phi trainable mask requires modal joint parameters")
+            raise ValueError("modal phi trainable mask requires trainable phi parameters")
 
         self.modal_joint = modal_joint_params
+        self.modal_phi_refinement = modal_phi_refinement_params
         self.register_buffer("modal_coordinate_real", modal_coordinate_real)
         self.register_buffer("modal_coordinate_imag", modal_coordinate_imag)
         self.register_buffer("modal_phi_real", modal_phi_real)
@@ -411,6 +439,14 @@ class SceneModel(nn.Module):
     @property
     def has_modal_joint(self) -> bool:
         return self.modal_joint is not None
+
+    @property
+    def has_modal_phi_refinement(self) -> bool:
+        return self.modal_phi_refinement is not None
+
+    @property
+    def has_trainable_modal_phi(self) -> bool:
+        return self.has_modal_joint or self.has_modal_phi_refinement
 
     @property
     def has_modal_obs_count(self) -> bool:
@@ -539,17 +575,21 @@ class SceneModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         phi_real = self.modal_phi_real
         phi_imag = self.modal_phi_imag
-        if self.has_modal_joint:
-            assert self.modal_joint is not None
+        if self.has_trainable_modal_phi:
+            residuals = (
+                self.modal_joint.params
+                if self.modal_joint is not None
+                else self.modal_phi_refinement.params
+            )
             mask = self.modal_phi_trainable_mask[..., None]
             raw_real = phi_real + torch.where(
                 mask,
-                self.modal_joint.params["delta_phi_real"],
+                residuals["delta_phi_real"],
                 torch.zeros_like(phi_real),
             )
             raw_imag = phi_imag + torch.where(
                 mask,
-                self.modal_joint.params["delta_phi_imag"],
+                residuals["delta_phi_imag"],
                 torch.zeros_like(phi_imag),
             )
 
@@ -612,8 +652,8 @@ class SceneModel(nn.Module):
 
     @torch.no_grad()
     def densify_modal_fields(self, should_split: torch.Tensor, should_dup: torch.Tensor):
-        if self.has_modal_joint:
-            raise RuntimeError("joint modal optimization forbids Gaussian densification")
+        if self.has_trainable_modal_phi:
+            raise RuntimeError("modal phi optimization forbids Gaussian densification")
         if not self.has_modal_field:
             return
         for name in ("modal_phi_real", "modal_phi_imag"):
@@ -631,8 +671,8 @@ class SceneModel(nn.Module):
 
     @torch.no_grad()
     def cull_modal_fields(self, should_cull: torch.Tensor):
-        if self.has_modal_joint:
-            raise RuntimeError("joint modal optimization forbids Gaussian culling")
+        if self.has_trainable_modal_phi:
+            raise RuntimeError("modal phi optimization forbids Gaussian culling")
         if not self.has_modal_field:
             return
         self.modal_phi_real = self.modal_phi_real[:, ~should_cull]
@@ -791,6 +831,7 @@ class SceneModel(nn.Module):
         modal_frame_local_indices = None
         modal_frame_times_sec = None
         modal_joint_params = None
+        modal_phi_refinement_params = None
         modal_phi_trainable_mask = None
 
         modal_field_keys = (
@@ -842,7 +883,15 @@ class SceneModel(nn.Module):
             modal_frame_times_sec = state_dict[f"{prefix}modal_frame_times_sec"]
 
             joint_prefix = f"{prefix}modal_joint.params."
+            phi_refinement_prefix = f"{prefix}modal_phi_refinement.params."
             joint_keys = [key for key in state_dict if key.startswith(joint_prefix)]
+            phi_refinement_keys = [
+                key for key in state_dict if key.startswith(phi_refinement_prefix)
+            ]
+            if joint_keys and phi_refinement_keys:
+                raise ValueError(
+                    "Checkpoint contains both joint and phi-only modal parameters"
+                )
             if joint_keys:
                 modal_joint_params = ModalJointParams.init_from_state_dict(
                     state_dict,
@@ -852,6 +901,20 @@ class SceneModel(nn.Module):
                 if mask_key not in state_dict:
                     raise ValueError(
                         "Joint modal checkpoint is missing modal_phi_trainable_mask"
+                )
+                modal_phi_trainable_mask = state_dict[mask_key]
+            elif phi_refinement_keys:
+                modal_phi_refinement_params = (
+                    ModalPhiRefinementParams.init_from_state_dict(
+                        state_dict,
+                        prefix=phi_refinement_prefix,
+                    )
+                )
+                mask_key = f"{prefix}modal_phi_trainable_mask"
+                if mask_key not in state_dict:
+                    raise ValueError(
+                        "Phi-only modal checkpoint is missing "
+                        "modal_phi_trainable_mask"
                     )
                 modal_phi_trainable_mask = state_dict[mask_key]
             elif f"{prefix}modal_phi_trainable_mask" in state_dict:
@@ -888,6 +951,7 @@ class SceneModel(nn.Module):
             modal_frame_times_sec=modal_frame_times_sec,
             modal_synthetic_enabled=modal_synthetic_enabled,
             modal_joint_params=modal_joint_params,
+            modal_phi_refinement_params=modal_phi_refinement_params,
             modal_phi_trainable_mask=modal_phi_trainable_mask,
         )
 

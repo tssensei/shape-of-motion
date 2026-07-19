@@ -22,6 +22,8 @@ from flow3d.loss_utils import (
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
 from flow3d.modal_joint_optimization import (
     ModalJointTrainingContext,
+    weighted_delta_phi_local_loss,
+    weighted_mode_rigidity_loss,
     weighted_rigidity_loss,
 )
 from flow3d.modal_utils import (
@@ -69,9 +71,9 @@ class Trainer:
         self.optim_cfg = optim_cfg
         self.init_metadata = init_metadata
         if self.model.trajectory_type == "modal_activation":
-            if not self.model.has_modal_joint or modal_joint_context is None:
+            if not self.model.has_trainable_modal_phi or modal_joint_context is None:
                 raise ValueError(
-                    "Trainer only accepts joint q/phi modal checkpoints with a "
+                    "Trainer only accepts trainable-phi modal checkpoints with a "
                     "validated training context"
                 )
             trainable_names = {
@@ -79,12 +81,19 @@ class Trainer:
                 for name, parameter in self.model.named_parameters()
                 if parameter.requires_grad
             }
-            expected_names = {
-                "modal_joint.params.delta_coordinate_real",
-                "modal_joint.params.delta_coordinate_imag",
-                "modal_joint.params.delta_phi_real",
-                "modal_joint.params.delta_phi_imag",
-            }
+            expected_names = (
+                {
+                    "modal_joint.params.delta_coordinate_real",
+                    "modal_joint.params.delta_coordinate_imag",
+                    "modal_joint.params.delta_phi_real",
+                    "modal_joint.params.delta_phi_imag",
+                }
+                if self.model.has_modal_joint
+                else {
+                    "modal_phi_refinement.params.delta_phi_real",
+                    "modal_phi_refinement.params.delta_phi_imag",
+                }
+            )
             if trainable_names != expected_names:
                 raise ValueError(
                     "Joint q/phi optimizer received unexpected trainable parameters: "
@@ -175,6 +184,10 @@ class Trainer:
             model.requires_grad_(False)
             assert model.modal_joint is not None
             model.modal_joint.requires_grad_(True)
+        elif model.has_modal_phi_refinement:
+            model.requires_grad_(False)
+            assert model.modal_phi_refinement is not None
+            model.modal_phi_refinement.requires_grad_(True)
         print(use_2dgs)
         model.use_2dgs = use_2dgs
         modal_joint_context = (
@@ -249,6 +262,20 @@ class Trainer:
                 if not bool(torch.isfinite(parameter.grad).all().item()):
                     raise FloatingPointError(
                         f"Non-finite gradient for modal_joint.params.{name}"
+                    )
+                stats[f"train/modal_{name}_grad_norm"] = float(
+                    torch.linalg.vector_norm(parameter.grad).item()
+                )
+        elif self.model.has_modal_phi_refinement:
+            assert self.model.modal_phi_refinement is not None
+            for name, parameter in self.model.modal_phi_refinement.params.items():
+                if parameter.grad is None:
+                    raise RuntimeError(
+                        f"Missing gradient for modal_phi_refinement.params.{name}"
+                    )
+                if not bool(torch.isfinite(parameter.grad).all().item()):
+                    raise FloatingPointError(
+                        f"Non-finite gradient for modal_phi_refinement.params.{name}"
                     )
                 stats[f"train/modal_{name}_grad_norm"] = float(
                     torch.linalg.vector_norm(parameter.grad).item()
@@ -395,8 +422,8 @@ class Trainer:
 
     def _compute_modal_joint_losses(self, batch):
         context = self.modal_joint_context
-        if context is None or not self.model.has_modal_joint:
-            raise RuntimeError("joint q/phi loss requires a validated context")
+        if context is None or not self.model.has_trainable_modal_phi:
+            raise RuntimeError("modal phi loss requires a validated context")
         started = time.time()
         ts = batch["ts"]
         w2cs = batch["w2cs"]
@@ -523,17 +550,62 @@ class Trainer:
             context.edge_weight,
             self.losses_cfg.modal_rigidity_huber_beta,
         )
-        coordinate_prior_loss = self._modal_coordinate_prior_loss()
-        coordinate_temporal_loss = self._modal_coordinate_temporal_loss()
+        zero = torch.zeros((), device=self.device, dtype=dynamic_fg.dtype)
+        if self.model.has_modal_joint:
+            coordinate_prior_loss = self._modal_coordinate_prior_loss()
+            coordinate_temporal_loss = self._modal_coordinate_temporal_loss()
+        else:
+            coordinate_prior_loss = zero
+            coordinate_temporal_loss = zero
         phi_prior_loss = self._modal_phi_prior_loss(
             effective_phi_real,
             effective_phi_imag,
         )
+        if self.model.has_modal_phi_refinement:
+            mode_count = effective_phi_real.shape[0]
+            modes_per_step = min(
+                int(self.losses_cfg.modal_structure_modes_per_step),
+                mode_count,
+            )
+            start = (self.global_step * modes_per_step) % mode_count
+            mode_slots = (
+                torch.arange(modes_per_step, device=self.device) + start
+            ) % mode_count
+            mode_rigidity_loss, mode_mean_strain, mode_max_strain = (
+                weighted_mode_rigidity_loss(
+                    effective_phi_real,
+                    effective_phi_imag,
+                    canonical_fg,
+                    context.edge_index,
+                    context.edge_weight,
+                    context.mode_rigidity_probe_scale,
+                    mode_slots,
+                    self.model.modal_phi_trainable_mask,
+                    self.losses_cfg.modal_rigidity_huber_beta,
+                )
+            )
+            delta_phi_local_loss = weighted_delta_phi_local_loss(
+                effective_phi_real - self.model.modal_phi_real,
+                effective_phi_imag - self.model.modal_phi_imag,
+                canonical_fg,
+                context.edge_index,
+                context.edge_weight,
+                mode_slots,
+                self.model.modal_phi_trainable_mask,
+            )
+        else:
+            mode_slots = torch.empty(0, device=self.device, dtype=torch.long)
+            mode_rigidity_loss = zero
+            mode_mean_strain = zero
+            mode_max_strain = zero
+            delta_phi_local_loss = zero
 
         loss = (
             self.losses_cfg.w_rgb * rgb_loss
             + self.losses_cfg.w_modal_flow * flow_loss
             + self.losses_cfg.w_modal_rigidity * rigidity_loss
+            + self.losses_cfg.w_modal_mode_rigidity * mode_rigidity_loss
+            + self.losses_cfg.w_modal_delta_phi_local * delta_phi_local_loss
             + self.losses_cfg.w_modal_coordinate_prior * coordinate_prior_loss
             + self.losses_cfg.w_modal_coordinate_temporal * coordinate_temporal_loss
             + self.losses_cfg.w_modal_phi_prior * phi_prior_loss
@@ -551,6 +623,22 @@ class Trainer:
             "train/modal_rigidity_loss": float(rigidity_loss.detach().item()),
             "train/modal_rigidity_mean_abs_strain": float(mean_abs_strain.detach().item()),
             "train/modal_rigidity_max_abs_strain": float(max_abs_strain.detach().item()),
+            "train/modal_mode_rigidity_loss": float(mode_rigidity_loss.detach().item()),
+            "train/modal_mode_rigidity_mean_abs_strain": float(mode_mean_strain.detach().item()),
+            "train/modal_mode_rigidity_max_abs_strain": float(mode_max_strain.detach().item()),
+            "train/modal_delta_phi_local_loss": float(delta_phi_local_loss.detach().item()),
+            "train/modal_mode_probe_scale_min": float(
+                context.mode_rigidity_probe_scale.amin().item()
+            ),
+            "train/modal_mode_probe_scale_median": float(
+                context.mode_rigidity_probe_scale.median().item()
+            ),
+            "train/modal_mode_probe_scale_max": float(
+                context.mode_rigidity_probe_scale.amax().item()
+            ),
+            "train/modal_structure_mode_slot_mean": (
+                -1.0 if mode_slots.numel() == 0 else float(mode_slots.float().mean().item())
+            ),
             "train/modal_coordinate_prior_loss": float(coordinate_prior_loss.detach().item()),
             "train/modal_coordinate_temporal_loss": float(coordinate_temporal_loss.detach().item()),
             "train/modal_phi_prior_loss": float(phi_prior_loss.detach().item()),

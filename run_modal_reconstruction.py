@@ -26,6 +26,8 @@ from flow3d.modal_flow_coordinates import (
 from flow3d.modal_joint_optimization import (
     MODAL_JOINT_OBJECTIVE,
     MODAL_JOINT_PARAMETERIZATION,
+    MODAL_PHI_OBJECTIVE,
+    MODAL_PHI_PARAMETERIZATION,
 )
 from flow3d.scene_model import SceneModel
 
@@ -36,6 +38,7 @@ MODAL_COORDINATE_GAUGE = MODAL_FLOW_COORDINATE_GAUGE
 SUPPORTED_MODAL_PARAMETERIZATIONS = {
     MODAL_PARAMETERIZATION,
     MODAL_JOINT_PARAMETERIZATION,
+    MODAL_PHI_PARAMETERIZATION,
 }
 
 
@@ -288,15 +291,22 @@ def _load_checkpoint_model(
         raise ValueError("Checkpoint has an incompatible modal coordinate solver")
     if init_metadata.get("modal_coordinate_gauge") != MODAL_COORDINATE_GAUGE:
         raise ValueError("Checkpoint has an incompatible modal coordinate gauge")
-    expected_trainable = parameterization == MODAL_JOINT_PARAMETERIZATION
-    if (
-        expected_trainable
-        and init_metadata.get("modal_training_objective") != MODAL_JOINT_OBJECTIVE
-    ):
-        raise ValueError("Checkpoint has an incompatible joint modal objective")
-    if init_metadata.get("modal_phi_trainable") is not expected_trainable:
+    expected_phi_trainable = parameterization in {
+        MODAL_JOINT_PARAMETERIZATION,
+        MODAL_PHI_PARAMETERIZATION,
+    }
+    expected_coordinate_trainable = parameterization == MODAL_JOINT_PARAMETERIZATION
+    expected_objective = {
+        MODAL_JOINT_PARAMETERIZATION: MODAL_JOINT_OBJECTIVE,
+        MODAL_PHI_PARAMETERIZATION: MODAL_PHI_OBJECTIVE,
+    }.get(parameterization)
+    if expected_objective is not None and init_metadata.get(
+        "modal_training_objective"
+    ) != expected_objective:
+        raise ValueError("Checkpoint has an incompatible modal training objective")
+    if init_metadata.get("modal_phi_trainable") is not expected_phi_trainable:
         raise ValueError("Checkpoint modal phi trainability metadata is inconsistent")
-    if init_metadata.get("modal_coordinates_trainable") is not expected_trainable:
+    if init_metadata.get("modal_coordinates_trainable") is not expected_coordinate_trainable:
         raise ValueError("Checkpoint coordinate trainability metadata is inconsistent")
     coordinate_source = init_metadata.get("modal_coordinate_source")
     if not isinstance(coordinate_source, str) or not coordinate_source:
@@ -338,6 +348,10 @@ def _load_checkpoint_model(
         raise ValueError("Checkpoint does not contain a modal_activation model")
     if model.has_modal_joint != (parameterization == MODAL_JOINT_PARAMETERIZATION):
         raise ValueError("Checkpoint modal parameterization does not match model state")
+    if model.has_modal_phi_refinement != (
+        parameterization == MODAL_PHI_PARAMETERIZATION
+    ):
+        raise ValueError("Checkpoint phi-only parameterization does not match model state")
     return model, init_metadata
 
 
@@ -772,7 +786,7 @@ def _write_metrics(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _joint_refinement_metrics(model: SceneModel) -> dict[str, Any] | None:
-    if not model.has_modal_joint:
+    if not model.has_trainable_modal_phi:
         return None
     with torch.inference_mode():
         coordinate_real, coordinate_imag = model.get_all_modal_coefficients()
@@ -1112,7 +1126,8 @@ def run(cfg: ModalReconstructionConfig) -> None:
         }
         joint_refinement = _joint_refinement_metrics(model)
         if joint_refinement is not None:
-            metrics["joint_refinement"] = joint_refinement
+            key = "joint_refinement" if model.has_modal_joint else "phi_refinement"
+            metrics[key] = joint_refinement
         all_frames = [
             frame
             for view_id in view_ids

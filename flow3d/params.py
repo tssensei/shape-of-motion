@@ -297,6 +297,52 @@ class ModalJointParams(nn.Module):
         )
 
 
+class ModalPhiRefinementParams(nn.Module):
+    """Trainable modal-field residuals around fixed flow coordinates."""
+
+    def __init__(
+        self,
+        delta_phi_real: torch.Tensor,
+        delta_phi_imag: torch.Tensor,
+    ):
+        super().__init__()
+        if delta_phi_real.shape != delta_phi_imag.shape:
+            raise ValueError("modal phi residual tensors must have matching shapes")
+        if delta_phi_real.ndim != 3 or delta_phi_real.shape[-1] != 3:
+            raise ValueError("modal phi residual tensors must have shape (K,G,3)")
+        if not torch.is_floating_point(delta_phi_real) or not torch.is_floating_point(
+            delta_phi_imag
+        ):
+            raise ValueError("modal phi residual tensors must be floating point")
+        if delta_phi_real.dtype != delta_phi_imag.dtype:
+            raise ValueError("modal phi residual tensors must share one dtype")
+        if delta_phi_real.device != delta_phi_imag.device:
+            raise ValueError("modal phi residual tensors must share one device")
+        if not bool(torch.isfinite(delta_phi_real).all().item()) or not bool(
+            torch.isfinite(delta_phi_imag).all().item()
+        ):
+            raise ValueError("modal phi residual tensors must be finite")
+        self.params = nn.ParameterDict(
+            {
+                "delta_phi_real": nn.Parameter(delta_phi_real),
+                "delta_phi_imag": nn.Parameter(delta_phi_imag),
+            }
+        )
+
+    @staticmethod
+    def init_from_state_dict(
+        state_dict: dict[str, Tensor],
+        prefix: str = "params.",
+    ) -> "ModalPhiRefinementParams":
+        fields = ("delta_phi_real", "delta_phi_imag")
+        missing = [field for field in fields if f"{prefix}{field}" not in state_dict]
+        if missing:
+            raise ValueError(f"modal phi checkpoint is missing fields: {missing}")
+        return ModalPhiRefinementParams(
+            **{field: state_dict[f"{prefix}{field}"] for field in fields}
+        )
+
+
 class MotionBases(nn.Module):
     def __init__(self, rots, transls):
         super().__init__()

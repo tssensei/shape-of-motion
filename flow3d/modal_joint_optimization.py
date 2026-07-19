@@ -29,6 +29,8 @@ from modal_peak_pick.core.cache import ModalAnalysisCache, load_analysis_cache
 
 MODAL_JOINT_PARAMETERIZATION = "joint_flow_coordinates_phi_v1"
 MODAL_JOINT_OBJECTIVE = "foreground_rgb_reference_flow_bilateral_rigidity_v1"
+MODAL_PHI_PARAMETERIZATION = "fixed_flow_coordinates_trainable_phi_v1"
+MODAL_PHI_OBJECTIVE = "foreground_rgb_reference_flow_mode_rigidity_v1"
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,7 @@ class ModalJointTrainingContext:
     reference_coordinate_imag: torch.Tensor
     reference_active_ts: torch.Tensor
     coordinate_scale: torch.Tensor
+    mode_rigidity_probe_scale: torch.Tensor
     flow_height: int
     flow_width: int
 
@@ -345,6 +348,17 @@ def load_modal_joint_training_context(
         energy = np.mean(model_q_real[rows] ** 2 + model_q_imag[rows] ** 2, axis=0)
         coordinate_scale[view_index] = np.sqrt(np.maximum(energy, 1e-12))
 
+    mode_probe_scale = np.percentile(
+        np.sqrt(model_q_real**2 + model_q_imag**2),
+        90,
+        axis=0,
+    ).astype(np.float32)
+    positive_probe_scale = mode_probe_scale[mode_probe_scale > 0.0]
+    if positive_probe_scale.size == 0:
+        raise ValueError("Fixed modal coordinates have zero amplitude for every mode")
+    probe_floor = 0.25 * float(np.median(positive_probe_scale))
+    mode_probe_scale = np.maximum(mode_probe_scale, probe_floor)
+
     height, width = caches[0].flow_u.shape[1:]
     reference_flows = tuple(
         np.stack(
@@ -374,6 +388,7 @@ def load_modal_joint_training_context(
         reference_coordinate_imag=torch.as_tensor(reference_imag, device=device),
         reference_active_ts=torch.as_tensor(reference_active_ts, device=device),
         coordinate_scale=torch.as_tensor(coordinate_scale, device=device),
+        mode_rigidity_probe_scale=torch.as_tensor(mode_probe_scale, device=device),
         flow_height=int(height),
         flow_width=int(width),
     )
@@ -406,12 +421,124 @@ def weighted_rigidity_loss(
     return loss, strain.abs().mean(), strain.abs().amax()
 
 
+def weighted_mode_rigidity_loss(
+    phi_real: torch.Tensor,
+    phi_imag: torch.Tensor,
+    canonical_means: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor,
+    probe_scale: torch.Tensor,
+    mode_slots: torch.Tensor,
+    trainable_mask: torch.Tensor,
+    huber_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if mode_slots.ndim != 1 or mode_slots.numel() == 0:
+        raise ValueError("mode_slots must be a non-empty one-dimensional tensor")
+    source = edge_index[:, 0]
+    target = edge_index[:, 1]
+    weights = edge_weight.to(dtype=phi_real.dtype)
+    phase_vectors = (
+        (1.0, 0.0),
+        (0.0, -1.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+    )
+    losses: list[torch.Tensor] = []
+    strains: list[torch.Tensor] = []
+    for mode_slot in mode_slots.tolist():
+        slot = int(mode_slot)
+        selected = trainable_mask[slot, source] | trainable_mask[slot, target]
+        if not bool(selected.any().item()):
+            raise RuntimeError(f"Mode slot {slot} has no trainable bilateral edges")
+        selected_source = source[selected]
+        selected_target = target[selected]
+        rest_vectors = (
+            canonical_means[selected_source] - canonical_means[selected_target]
+        )
+        rest_lengths = torch.linalg.vector_norm(rest_vectors, dim=-1).clamp_min(1e-8)
+        selected_weights = weights[selected]
+        weight_sum = selected_weights.sum().clamp_min(1e-12)
+        real_edge = (
+            phi_real[slot, selected_source] - phi_real[slot, selected_target]
+        )
+        imag_edge = (
+            phi_imag[slot, selected_source] - phi_imag[slot, selected_target]
+        )
+        mode_losses: list[torch.Tensor] = []
+        mode_strains: list[torch.Tensor] = []
+        amplitude = probe_scale[slot].to(dtype=phi_real.dtype)
+        for cosine, negative_sine in phase_vectors:
+            displacement = amplitude * (cosine * real_edge + negative_sine * imag_edge)
+            deformed_lengths = torch.linalg.vector_norm(
+                rest_vectors + displacement,
+                dim=-1,
+            )
+            strain = (deformed_lengths - rest_lengths) / rest_lengths
+            robust = F.smooth_l1_loss(
+                strain,
+                torch.zeros_like(strain),
+                beta=float(huber_beta),
+                reduction="none",
+            )
+            mode_losses.append(torch.sum(selected_weights * robust) / weight_sum)
+            mode_strains.append(strain.abs())
+        losses.append(torch.stack(mode_losses).mean())
+        strains.append(torch.stack(mode_strains))
+    all_strains = torch.stack(strains)
+    return torch.stack(losses).mean(), all_strains.mean(), all_strains.amax()
+
+
+def weighted_delta_phi_local_loss(
+    delta_phi_real: torch.Tensor,
+    delta_phi_imag: torch.Tensor,
+    canonical_means: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor,
+    mode_slots: torch.Tensor,
+    trainable_mask: torch.Tensor,
+) -> torch.Tensor:
+    source = edge_index[:, 0]
+    target = edge_index[:, 1]
+    rest_squared = (
+        (canonical_means[source] - canonical_means[target]).square().sum(dim=-1)
+    ).clamp_min(1e-16)
+    weights = edge_weight.to(dtype=delta_phi_real.dtype)
+    losses: list[torch.Tensor] = []
+    for mode_slot in mode_slots.tolist():
+        slot = int(mode_slot)
+        selected = trainable_mask[slot, source] & trainable_mask[slot, target]
+        if not bool(selected.any().item()):
+            raise RuntimeError(f"Mode slot {slot} has no trainable bilateral edges")
+        real_difference = (
+            delta_phi_real[slot, source[selected]]
+            - delta_phi_real[slot, target[selected]]
+        )
+        imag_difference = (
+            delta_phi_imag[slot, source[selected]]
+            - delta_phi_imag[slot, target[selected]]
+        )
+        normalized = (
+            real_difference.square().sum(dim=-1)
+            + imag_difference.square().sum(dim=-1)
+        ) / rest_squared[selected]
+        selected_weights = weights[selected]
+        losses.append(
+            torch.sum(selected_weights * normalized)
+            / selected_weights.sum().clamp_min(1e-12)
+        )
+    return torch.stack(losses).mean()
+
+
 __all__ = [
     "MODAL_JOINT_OBJECTIVE",
     "MODAL_JOINT_PARAMETERIZATION",
+    "MODAL_PHI_OBJECTIVE",
+    "MODAL_PHI_PARAMETERIZATION",
     "ModalJointGraph",
     "ModalJointTrainingContext",
     "load_modal_joint_graph",
     "load_modal_joint_training_context",
     "weighted_rigidity_loss",
+    "weighted_mode_rigidity_loss",
+    "weighted_delta_phi_local_loss",
 ]
