@@ -52,6 +52,9 @@ class ModalSurfaceCliTests(unittest.TestCase):
         self.assertFalse(args.motion_fill)
         self.assertEqual(args.motion_fill_k, 8)
         self.assertIsNone(args.motion_fill_max_distance)
+        self.assertFalse(args.anchor_graph)
+        self.assertEqual(args.anchor_graph_max_neighbors, 8)
+        self.assertIsNone(args.anchor_graph_max_distance)
 
     def test_observation_filter_controls_are_not_registered(self) -> None:
         cli = importlib.import_module("modal_surface.__main__")
@@ -112,6 +115,59 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 )
             )
 
+    def test_anchor_graph_controls_and_validation(self) -> None:
+        cli = importlib.import_module("modal_surface.__main__")
+        app = importlib.import_module("modal_surface.apps.solve_gaussian_modes")
+        parser = cli.build_arg_parser()
+        option_strings = _option_strings(parser)
+        self.assertTrue(
+            {
+                "--anchor-graph",
+                "--anchor-graph-max-distance",
+                "--anchor-graph-max-neighbors",
+                "--anchor-graph-color-mad-multiplier",
+                "--anchor-graph-depth-mad-multiplier",
+                "--anchor-graph-depth-samples",
+                "--anchor-graph-min-shared-views",
+            }.issubset(option_strings)
+        )
+        base = {
+            "anchor_graph": True,
+            "anchor_graph_max_distance": 0.05,
+            "anchor_graph_max_neighbors": 8,
+            "anchor_graph_color_mad_multiplier": 3.0,
+            "anchor_graph_depth_mad_multiplier": 3.0,
+            "anchor_graph_depth_samples": 5,
+            "anchor_graph_min_shared_views": 1,
+            "pixel_render_acc_min": 0.05,
+        }
+        app._validate_anchor_graph_arguments(
+            argparse.Namespace(**base),
+            num_views=2,
+        )
+        for changes, message in (
+            ({"anchor_graph_max_distance": None}, "requires"),
+            ({"anchor_graph_max_distance": 0.0}, "finite and positive"),
+            ({"anchor_graph_depth_samples": 1}, "at least 2"),
+            ({"anchor_graph_min_shared_views": 3}, "cannot exceed"),
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValueError, message):
+                    app._validate_anchor_graph_arguments(
+                        argparse.Namespace(**{**base, **changes}),
+                        num_views=2,
+                    )
+        with self.assertRaisesRegex(ValueError, "require --anchor-graph"):
+            app._validate_anchor_graph_arguments(
+                argparse.Namespace(
+                    **{
+                        **base,
+                        "anchor_graph": False,
+                        "anchor_graph_max_distance": None,
+                        "anchor_graph_max_neighbors": 4,
+                    }
+                )
+            )
     def test_snr_weighting_controls_are_not_registered(self) -> None:
         cli = importlib.import_module("modal_surface.__main__")
         parser = cli.build_arg_parser()

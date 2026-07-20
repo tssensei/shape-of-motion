@@ -5,6 +5,8 @@ from loguru import logger as guru
 from nerfview import CameraState
 
 from flow3d.modal_utils import (
+    AnchorStructureGraphData,
+    load_anchor_structure_graphs,
     load_modal_modes,
     stack_modal_motion_fill_display_classes,
 )
@@ -50,6 +52,7 @@ class Renderer:
             modal_anchor_freqs_hz,
             self.modal_anchor_role_classes,
             modal_anchor_role_mode_labels,
+            self.modal_anchor_structure_graphs,
         ) = self._load_modal_anchor_data(modal_anchor_manifest)
 
         self.viewer = None
@@ -89,6 +92,7 @@ class Renderer:
                 ),
                 modal_anchor_role_classes=self.modal_anchor_role_classes,
                 modal_anchor_role_mode_labels=modal_anchor_role_mode_labels,
+                anchor_structure_graphs=self.modal_anchor_structure_graphs,
             )
 
         self.tracks_3d = self.model.compute_poses_fg(
@@ -266,11 +270,13 @@ class Renderer:
         tuple[float, ...],
         np.ndarray | None,
         tuple[str, ...],
+        tuple[AnchorStructureGraphData, ...] | None,
     ]:
         if modal_anchor_manifest is None:
-            return None, None, None, (), None, ()
+            return None, None, None, (), None, (), None
 
         modes = load_modal_modes(modal_anchor_manifest)
+        anchor_graphs = load_anchor_structure_graphs(modal_anchor_manifest, modes)
         points = modes[0].points_world.astype(np.float32)
         for mode in modes[1:]:
             if mode.points_world.shape != points.shape or not np.allclose(
@@ -278,6 +284,28 @@ class Renderer:
             ):
                 raise ValueError(
                     f"{modal_anchor_manifest} contains modes with different anchor points"
+                )
+        if anchor_graphs is not None:
+            static_fg_points = (
+                self.model.fg.params["means"]
+                .detach()
+                .cpu()
+                .float()
+                .numpy()
+                .astype(np.float32)
+            )
+            max_checkpoint_position_delta = (
+                float(np.max(np.abs(static_fg_points - points)))
+                if static_fg_points.shape == points.shape and points.shape[0]
+                else 0.0
+            )
+            if (
+                static_fg_points.shape != points.shape
+                or max_checkpoint_position_delta > 1e-5
+            ):
+                raise ValueError(
+                    f"{modal_anchor_manifest} anchor graph Gaussian positions do not "
+                    "match the loaded checkpoint"
                 )
         if self.model.has_modal_field and len(modes) != self.model.modal_phi_real.shape[0]:
             raise ValueError(
@@ -308,6 +336,7 @@ class Renderer:
             freqs_hz,
             role_classes,
             role_mode_labels,
+            anchor_graphs,
         )
 
     def _current_modal_anchor_points(
