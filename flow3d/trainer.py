@@ -20,6 +20,12 @@ from flow3d.loss_utils import (
     masked_l1_loss,
 )
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
+from flow3d.modal_canonical_optimization import (
+    MODAL_CANONICAL_OBJECTIVE,
+    MODAL_CANONICAL_TRAINABLE_FIELDS,
+    MODAL_CANONICAL_TRAINABLE_NAMES,
+    configure_canonical_only_trainability,
+)
 from flow3d.modal_joint_optimization import (
     ModalJointTrainingContext,
     weighted_delta_phi_local_loss,
@@ -70,35 +76,68 @@ class Trainer:
         self.losses_cfg = losses_cfg
         self.optim_cfg = optim_cfg
         self.init_metadata = init_metadata
+        self.modal_optimization = (
+            init_metadata.get("modal_optimization")
+            if isinstance(init_metadata, dict)
+            else None
+        )
         if self.model.trajectory_type == "modal_activation":
-            if not self.model.has_trainable_modal_phi or modal_joint_context is None:
+            if self.modal_optimization == "canonical_only":
+                assert isinstance(init_metadata, dict)
+                if modal_joint_context is not None:
+                    raise ValueError(
+                        "Canonical-only optimization does not accept a modal "
+                        "joint training context"
+                    )
+                if self.model.has_modal_joint or self.model.has_modal_phi_refinement:
+                    raise ValueError(
+                        "Canonical-only optimization requires fixed q and fixed phi"
+                    )
+                if init_metadata.get("modal_training_objective") != (
+                    MODAL_CANONICAL_OBJECTIVE
+                ):
+                    raise ValueError(
+                        "Canonical-only checkpoint has an incompatible objective"
+                    )
+                trainable_names = {
+                    name
+                    for name, parameter in self.model.named_parameters()
+                    if parameter.requires_grad
+                }
+                if trainable_names != MODAL_CANONICAL_TRAINABLE_NAMES:
+                    raise ValueError(
+                        "Canonical-only optimizer received unexpected trainable "
+                        f"parameters: {sorted(trainable_names)}"
+                    )
+            elif not self.model.has_trainable_modal_phi or modal_joint_context is None:
                 raise ValueError(
                     "Trainer only accepts trainable-phi modal checkpoints with a "
                     "validated training context"
                 )
-            trainable_names = {
-                name
-                for name, parameter in self.model.named_parameters()
-                if parameter.requires_grad
-            }
-            expected_names = (
-                {
-                    "modal_joint.params.delta_coordinate_real",
-                    "modal_joint.params.delta_coordinate_imag",
-                    "modal_joint.params.delta_phi_real",
-                    "modal_joint.params.delta_phi_imag",
+            else:
+                trainable_names = {
+                    name
+                    for name, parameter in self.model.named_parameters()
+                    if parameter.requires_grad
                 }
-                if self.model.has_modal_joint
-                else {
-                    "modal_phi_refinement.params.delta_phi_real",
-                    "modal_phi_refinement.params.delta_phi_imag",
-                }
-            )
-            if trainable_names != expected_names:
-                raise ValueError(
-                    "Joint q/phi optimizer received unexpected trainable parameters: "
-                    f"{sorted(trainable_names)}"
+                expected_names = (
+                    {
+                        "modal_joint.params.delta_coordinate_real",
+                        "modal_joint.params.delta_coordinate_imag",
+                        "modal_joint.params.delta_phi_real",
+                        "modal_joint.params.delta_phi_imag",
+                    }
+                    if self.model.has_modal_joint
+                    else {
+                        "modal_phi_refinement.params.delta_phi_real",
+                        "modal_phi_refinement.params.delta_phi_imag",
+                    }
                 )
+                if trainable_names != expected_names:
+                    raise ValueError(
+                        "Joint q/phi optimizer received unexpected trainable "
+                        f"parameters: {sorted(trainable_names)}"
+                    )
         elif modal_joint_context is not None:
             raise ValueError("modal joint training context requires modal_activation")
         self.modal_joint_context = modal_joint_context
@@ -180,7 +219,15 @@ class Trainer:
         state_dict = ckpt["model"]
         model = SceneModel.init_from_state_dict(state_dict)
         model = model.to(device)
-        if model.has_modal_joint:
+        init_metadata = ckpt.get("init_metadata")
+        modal_optimization = (
+            init_metadata.get("modal_optimization")
+            if isinstance(init_metadata, dict)
+            else None
+        )
+        if modal_optimization == "canonical_only":
+            configure_canonical_only_trainability(model)
+        elif model.has_modal_joint:
             model.requires_grad_(False)
             assert model.modal_joint is not None
             model.modal_joint.requires_grad_(True)
@@ -199,7 +246,7 @@ class Trainer:
             model,
             device,
             *args,
-            init_metadata=ckpt.get("init_metadata"),
+            init_metadata=init_metadata,
             modal_joint_context=modal_joint_context,
             **kwargs,
         )
@@ -278,6 +325,20 @@ class Trainer:
                         f"Non-finite gradient for modal_phi_refinement.params.{name}"
                     )
                 stats[f"train/modal_{name}_grad_norm"] = float(
+                    torch.linalg.vector_norm(parameter.grad).item()
+                )
+        elif self.modal_optimization == "canonical_only":
+            for field in MODAL_CANONICAL_TRAINABLE_FIELDS:
+                parameter = self.model.fg.params[field]
+                if parameter.grad is None:
+                    raise RuntimeError(
+                        f"Missing gradient for foreground canonical field {field!r}"
+                    )
+                if not bool(torch.isfinite(parameter.grad).all().item()):
+                    raise FloatingPointError(
+                        f"Non-finite gradient for foreground canonical field {field!r}"
+                    )
+                stats[f"train/canonical_{field}_grad_norm"] = float(
                     torch.linalg.vector_norm(parameter.grad).item()
                 )
         for opt in self.optimizers.values():
@@ -419,6 +480,57 @@ class Trainer:
         if not losses:
             raise RuntimeError("modal phi prior has no trainable role groups")
         return torch.stack(losses).mean()
+
+    def _compute_modal_canonical_losses(self, batch):
+        if self.modal_optimization != "canonical_only":
+            raise RuntimeError("Canonical RGB loss requires canonical-only mode")
+        started = time.time()
+        ts = batch["ts"]
+        w2cs = batch["w2cs"]
+        Ks = batch["Ks"]
+        imgs = batch["imgs"]
+        valid_masks = batch.get(
+            "valid_masks", torch.ones_like(batch["imgs"][..., 0])
+        ) > 0.5
+        batch_size, height, width = imgs.shape[:3]
+        img_wh = (width, height)
+
+        rgb_losses: list[torch.Tensor] = []
+        support_fractions: list[torch.Tensor] = []
+        for batch_index in range(batch_size):
+            rendered = self.model.render(
+                int(ts[batch_index].item()),
+                w2cs[batch_index : batch_index + 1],
+                Ks[batch_index : batch_index + 1],
+                img_wh,
+                bg_color=1.0,
+            )["img"][0]
+            support = valid_masks[batch_index]
+            if not bool(support.any().item()):
+                raise ValueError("Canonical-only RGB support is empty")
+            rgb_losses.append(
+                torch.abs(rendered[support] - imgs[batch_index][support]).mean()
+            )
+            support_fractions.append(support.float().mean())
+        rgb_loss = torch.stack(rgb_losses).mean()
+        loss = self.losses_cfg.w_rgb * rgb_loss
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(
+                "Canonical-only RGB objective produced a non-finite loss"
+            )
+
+        num_rays_per_step = height * width * batch_size
+        num_rays_per_sec = num_rays_per_step / (time.time() - started)
+        stats = {
+            "train/loss": float(loss.detach().item()),
+            "train/rgb_loss": float(rgb_loss.detach().item()),
+            "train/rgb_support_fraction": float(
+                torch.stack(support_fractions).mean().item()
+            ),
+            "train/num_rays_per_sec": num_rays_per_sec,
+            "train/num_rays_per_step": float(num_rays_per_step),
+        }
+        return loss, stats, num_rays_per_step, num_rays_per_sec
 
     def _compute_modal_joint_losses(self, batch):
         context = self.modal_joint_context
@@ -650,6 +762,8 @@ class Trainer:
     def compute_losses(self, batch):
         self.model.training = True
         if self.model.trajectory_type == "modal_activation":
+            if self.modal_optimization == "canonical_only":
+                return self._compute_modal_canonical_losses(batch)
             return self._compute_modal_joint_losses(batch)
         use_track_terms = self.model.trajectory_type in ("som_basis", "dct_center")
 

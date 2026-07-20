@@ -8,6 +8,11 @@ from flow3d.modal_utils import (
     load_modal_modes,
     stack_modal_motion_fill_display_classes,
 )
+from flow3d.modal_canonical_optimization import (
+    MODAL_CANONICAL_GAUSSIAN_CONTROL,
+    MODAL_CANONICAL_OBJECTIVE,
+    MODAL_CANONICAL_TRAINABLE_FIELDS,
+)
 from flow3d.modal_flow_coordinates import (
     MODAL_FLOW_COORDINATE_GAUGE,
     MODAL_FLOW_COORDINATE_PARAMETERIZATION,
@@ -65,14 +70,16 @@ class Renderer:
             self.modal_anchor_role_classes,
             modal_anchor_role_mode_labels,
         ) = self._load_modal_anchor_data(modal_anchor_manifest)
-        if self.model.has_trainable_modal_phi and self.modal_anchor_points is not None:
+        if self.modal_anchor_points is not None:
             if self.modal_anchor_points.shape[0] != self.model.num_fg_gaussians:
                 raise ValueError(
-                    "Refined modal overlay point count does not match foreground Gaussians"
+                    "Modal overlay point count does not match foreground Gaussians"
                 )
-            effective_real, effective_imag = self.model.get_effective_modal_phi()
-            self.modal_anchor_phi_real = effective_real.detach()
-            self.modal_anchor_phi_imag = effective_imag.detach()
+            self.modal_anchor_points = self.model.fg.params["means"].detach()
+            if self.model.has_trainable_modal_phi:
+                effective_real, effective_imag = self.model.get_effective_modal_phi()
+                self.modal_anchor_phi_real = effective_real.detach()
+                self.modal_anchor_phi_imag = effective_imag.detach()
 
         self.viewer = None
         if port is not None:
@@ -216,6 +223,36 @@ class Renderer:
                 "modal_coordinates_trainable"
             ) is not expected_coordinate_trainable:
                 raise ValueError("Checkpoint coordinate trainability is inconsistent")
+            if init_metadata.get("modal_optimization") == "canonical_only":
+                if parameterization != MODAL_FLOW_COORDINATE_PARAMETERIZATION:
+                    raise ValueError(
+                        "Canonical-only checkpoint must keep the fixed coordinate "
+                        "parameterization"
+                    )
+                if init_metadata.get("modal_training_objective") != (
+                    MODAL_CANONICAL_OBJECTIVE
+                ):
+                    raise ValueError(
+                        "Canonical-only checkpoint has an incompatible objective"
+                    )
+                if init_metadata.get("canonical_gaussians_trainable") != (
+                    "foreground_all"
+                ):
+                    raise ValueError(
+                        "Canonical-only checkpoint has inconsistent trainability"
+                    )
+                if init_metadata.get("canonical_trainable_fields") != list(
+                    MODAL_CANONICAL_TRAINABLE_FIELDS
+                ):
+                    raise ValueError(
+                        "Canonical-only checkpoint has inconsistent canonical fields"
+                    )
+                if init_metadata.get("canonical_gaussian_control") != (
+                    MODAL_CANONICAL_GAUSSIAN_CONTROL
+                ):
+                    raise ValueError(
+                        "Canonical-only checkpoint must disable Gaussian control"
+                    )
             coordinate_source = init_metadata.get("modal_coordinate_source")
             if not isinstance(coordinate_source, str) or not coordinate_source:
                 raise ValueError("Checkpoint has no modal coordinate source artifact")

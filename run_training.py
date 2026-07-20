@@ -45,6 +45,12 @@ from flow3d.modal_flow_coordinates import (
     load_modal_flow_coordinates,
     parse_flow_cache_specs,
 )
+from flow3d.modal_canonical_optimization import (
+    MODAL_CANONICAL_GAUSSIAN_CONTROL,
+    MODAL_CANONICAL_OBJECTIVE,
+    MODAL_CANONICAL_TRAINABLE_FIELDS,
+    configure_canonical_only_trainability,
+)
 from flow3d.modal_joint_optimization import (
     MODAL_JOINT_OBJECTIVE,
     MODAL_JOINT_PARAMETERIZATION,
@@ -112,7 +118,9 @@ class TrainConfig:
     vggt_view_configs: tuple[str, ...] = ()
     modal_stage1_init_ckpt: str | None = None
     modal_flow_coordinates: str | None = None
-    modal_optimization: Literal["fixed", "joint", "phi_only"] = "fixed"
+    modal_optimization: Literal[
+        "fixed", "joint", "phi_only", "canonical_only"
+    ] = "fixed"
     modal_flow_caches: tuple[str, ...] = ()
     modal_bilateral_graph: str | None = None
     modal_min_trainable_graph_degree: int = 3
@@ -177,7 +185,10 @@ def main(cfg: TrainConfig):
         return
 
     modal_joint_context_loader = None
-    if cfg.trajectory_type == "modal_activation":
+    if cfg.trajectory_type == "modal_activation" and cfg.modal_optimization in (
+        "joint",
+        "phi_only",
+    ):
         assert cfg.modal_manifest is not None
         assert cfg.modal_bilateral_graph is not None
         assert cfg.modal_flow_coordinates is not None
@@ -487,7 +498,13 @@ def initialize_and_checkpoint_model(
 
     if cfg.trajectory_type == "modal_activation":
         model.requires_grad_(False)
-        if cfg.modal_optimization in ("joint", "phi_only"):
+        if cfg.modal_optimization == "canonical_only":
+            configure_canonical_only_trainability(model)
+            guru.info(
+                "Initialized canonical-only RGB refinement: foreground fields="
+                f"{list(MODAL_CANONICAL_TRAINABLE_FIELDS)}, Gaussian control=disabled"
+            )
+        elif cfg.modal_optimization in ("joint", "phi_only"):
             if cfg.modal_optimization == "joint":
                 assert model.modal_joint is not None
                 model.modal_joint.requires_grad_(True)
@@ -993,6 +1010,35 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
                         },
                     }
                 )
+        elif cfg.modal_optimization == "canonical_only":
+            modal_metadata.update(
+                {
+                    "modal_training_objective": MODAL_CANONICAL_OBJECTIVE,
+                    "canonical_gaussians_trainable": "foreground_all",
+                    "canonical_trainable_fields": list(
+                        MODAL_CANONICAL_TRAINABLE_FIELDS
+                    ),
+                    "canonical_gaussian_control": (
+                        MODAL_CANONICAL_GAUSSIAN_CONTROL
+                    ),
+                    "canonical_gaussian_count": "fixed",
+                    "canonical_gaussian_identity": "fixed_checkpoint_order",
+                    "canonical_densification": False,
+                    "canonical_duplication": False,
+                    "canonical_culling": False,
+                    "canonical_opacity_reset": False,
+                    "camera_parameters_trainable": False,
+                    "background_gaussians_trainable": False,
+                    "modal_frequencies_trainable": False,
+                    "modal_loss_weights": {"rgb": cfg.loss.w_rgb},
+                    "canonical_learning_rates": {
+                        field: asdict(cfg.lr.fg)[field]
+                        for field in MODAL_CANONICAL_TRAINABLE_FIELDS
+                    },
+                    "modal_rgb_support": "valid_masks",
+                    "modal_rgb_loss": "l1",
+                }
+            )
         metadata.update(modal_metadata)
     return {key: _metadata_value(value) for key, value in metadata.items()}
 
@@ -1287,6 +1333,29 @@ def _validate_modal_coordinate_config(cfg: TrainConfig) -> None:
             raise ValueError("Fixed flow-coordinate materialization cannot resume")
         if cfg.modal_flow_caches or cfg.modal_bilateral_graph is not None:
             raise ValueError("Fixed flow-coordinate mode does not use joint inputs")
+    elif cfg.modal_optimization == "canonical_only":
+        if cfg.num_epochs <= 0:
+            raise ValueError(
+                "Canonical-only RGB refinement requires positive --num-epochs"
+            )
+        if cfg.modal_flow_caches or cfg.modal_bilateral_graph is not None:
+            raise ValueError(
+                "Canonical-only RGB refinement does not use flow caches or a "
+                "bilateral graph"
+            )
+        if not np.isfinite(cfg.loss.w_rgb) or cfg.loss.w_rgb <= 0.0:
+            raise ValueError(
+                "Canonical-only RGB refinement requires a finite positive "
+                "--loss.w-rgb"
+            )
+        for name, value in asdict(cfg.lr.fg).items():
+            if name not in MODAL_CANONICAL_TRAINABLE_FIELDS:
+                continue
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"Foreground canonical learning rate {name!r} must be finite "
+                    "and strictly positive"
+                )
     else:
         if cfg.num_epochs <= 0:
             raise ValueError("Joint q/phi optimization requires positive --num-epochs")
@@ -1335,7 +1404,7 @@ def _validate_modal_coordinate_config(cfg: TrainConfig) -> None:
     coordinate_provenance = load_modal_coordinate_provenance(coordinate_artifact)
     if (
         coordinate_provenance["solver"] == MODAL_PHYSICS_COORDINATE_SOLVER
-        and cfg.modal_optimization != "fixed"
+        and cfg.modal_optimization in ("joint", "phi_only")
     ):
         raise ValueError(
             "Latent-force oscillator post-fit coordinates are a fixed Stage-P0 "
