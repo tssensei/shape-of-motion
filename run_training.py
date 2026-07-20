@@ -38,10 +38,10 @@ from flow3d.init_utils import (
     init_trainable_poses,
 )
 from flow3d.modal_flow_coordinates import (
-    MODAL_FLOW_COORDINATE_GAUGE,
     MODAL_FLOW_COORDINATE_PARAMETERIZATION,
-    MODAL_FLOW_COORDINATE_SOLVER,
+    MODAL_PHYSICS_COORDINATE_SOLVER,
     ModalFlowCoordinates,
+    load_modal_coordinate_provenance,
     load_modal_flow_coordinates,
     parse_flow_cache_specs,
 )
@@ -891,16 +891,24 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
     if cfg.trajectory_type == "modal_activation":
         assert cfg.modal_flow_coordinates is not None
         coordinates = load_modal_flow_coordinates(cfg.modal_flow_coordinates)
+        coordinate_provenance = load_modal_coordinate_provenance(coordinates)
         modal_metadata = {
             "modal_optimization": cfg.modal_optimization,
             "modal_parameterization": MODAL_FLOW_COORDINATE_PARAMETERIZATION,
-            "modal_coordinate_solver": MODAL_FLOW_COORDINATE_SOLVER,
-            "modal_coordinate_gauge": MODAL_FLOW_COORDINATE_GAUGE,
+            "modal_coordinate_solver": coordinate_provenance["solver"],
+            "modal_coordinate_gauge": coordinate_provenance["gauge"],
             "modal_coordinate_source": str(coordinates.path),
             "modal_coordinate_ridge_relative": coordinates.ridge_relative,
             "modal_phi_trainable": False,
             "modal_coordinates_trainable": False,
         }
+        if "physics" in coordinate_provenance:
+            modal_metadata["modal_coordinate_physics"] = coordinate_provenance[
+                "physics"
+            ]
+            modal_metadata["modal_coordinate_prephysics_source"] = (
+                coordinate_provenance["source_coordinate"]
+            )
         if cfg.modal_optimization in ("joint", "phi_only"):
             assert cfg.modal_bilateral_graph is not None
             phi_only = cfg.modal_optimization == "phi_only"
@@ -1323,6 +1331,16 @@ def _validate_modal_coordinate_config(cfg: TrainConfig) -> None:
     ):
         if not os.path.exists(path):
             raise FileNotFoundError(f"{label} does not exist: {path}")
+    coordinate_artifact = load_modal_flow_coordinates(cfg.modal_flow_coordinates)
+    coordinate_provenance = load_modal_coordinate_provenance(coordinate_artifact)
+    if (
+        coordinate_provenance["solver"] == MODAL_PHYSICS_COORDINATE_SOLVER
+        and cfg.modal_optimization != "fixed"
+    ):
+        raise ValueError(
+            "Latent-force oscillator post-fit coordinates are a fixed Stage-P0 "
+            "experiment and cannot initialize joint or phi-only optimization"
+        )
     if cfg.modal_bilateral_graph is not None and not os.path.exists(
         cfg.modal_bilateral_graph
     ):

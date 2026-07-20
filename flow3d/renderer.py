@@ -11,7 +11,7 @@ from flow3d.modal_utils import (
 from flow3d.modal_flow_coordinates import (
     MODAL_FLOW_COORDINATE_GAUGE,
     MODAL_FLOW_COORDINATE_PARAMETERIZATION,
-    MODAL_FLOW_COORDINATE_SOLVER,
+    SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS,
 )
 from flow3d.modal_joint_optimization import (
     MODAL_JOINT_OBJECTIVE,
@@ -30,7 +30,6 @@ from modal_surface.io import load_view_config
 
 
 MODAL_PARAMETERIZATION = MODAL_FLOW_COORDINATE_PARAMETERIZATION
-MODAL_COORDINATE_SOLVER = MODAL_FLOW_COORDINATE_SOLVER
 MODAL_COORDINATE_GAUGE = MODAL_FLOW_COORDINATE_GAUGE
 SUPPORTED_MODAL_PARAMETERIZATIONS = {
     MODAL_PARAMETERIZATION,
@@ -184,7 +183,7 @@ class Renderer:
                 )
             if (
                 init_metadata.get("modal_coordinate_solver")
-                != MODAL_COORDINATE_SOLVER
+                not in SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS
             ):
                 raise ValueError(
                     "Checkpoint has an incompatible modal coordinate solver"

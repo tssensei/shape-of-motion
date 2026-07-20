@@ -19,7 +19,12 @@ MODAL_FLOW_COORDINATE_FORMAT = "modal_flow_coordinates"
 MODAL_FLOW_COORDINATE_VERSION = 1
 MODAL_FLOW_COORDINATE_PARAMETERIZATION = "per_frame_flow_coordinates_v1"
 MODAL_FLOW_COORDINATE_SOLVER = "reference_flow_ridge_v1"
+MODAL_PHYSICS_COORDINATE_SOLVER = "latent_force_oscillator_postfit_v1"
 MODAL_FLOW_COORDINATE_GAUGE = "per_view_temporal_mean_zero"
+SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS = {
+    MODAL_FLOW_COORDINATE_SOLVER,
+    MODAL_PHYSICS_COORDINATE_SOLVER,
+}
 
 COORDINATE_FILENAME = "modal_flow_coordinates.npz"
 DIAGNOSTICS_NPZ_FILENAME = "coordinate_diagnostics.npz"
@@ -33,8 +38,12 @@ __all__ = [
     "MODAL_FLOW_COORDINATE_GAUGE",
     "MODAL_FLOW_COORDINATE_PARAMETERIZATION",
     "MODAL_FLOW_COORDINATE_SOLVER",
+    "MODAL_PHYSICS_COORDINATE_SOLVER",
     "MODAL_FLOW_COORDINATE_VERSION",
+    "SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS",
     "ModalFlowCoordinates",
+    "evaluate_modal_flow_coordinate_sets",
+    "load_modal_coordinate_provenance",
     "load_modal_flow_coordinates",
     "parse_flow_cache_specs",
     "solve_modal_flow_coordinates",
@@ -117,6 +126,57 @@ class ModalFlowCoordinates:
     @property
     def coordinates(self) -> np.ndarray:
         return self.coordinate_real + 1j * self.coordinate_imag
+
+
+def load_modal_coordinate_provenance(
+    coordinates: ModalFlowCoordinates,
+) -> dict[str, Any]:
+    """Read solver provenance without changing the strict version-1 NPZ schema."""
+
+    provenance: dict[str, Any] = {
+        "solver": MODAL_FLOW_COORDINATE_SOLVER,
+        "gauge": MODAL_FLOW_COORDINATE_GAUGE,
+    }
+    diagnostics_path = coordinates.path.parent / DIAGNOSTICS_JSON_FILENAME
+    if not diagnostics_path.is_file():
+        return provenance
+    payload = _read_json_object(diagnostics_path)
+    artifact_format = payload.get("format")
+    if artifact_format == MODAL_FLOW_COORDINATE_FORMAT:
+        solver = payload.get("solver")
+        gauge = payload.get("gauge")
+        if solver != MODAL_FLOW_COORDINATE_SOLVER or gauge != MODAL_FLOW_COORDINATE_GAUGE:
+            raise ValueError(
+                f"{diagnostics_path} has incompatible coordinate solver provenance"
+            )
+        return provenance
+    if artifact_format != "modal_physics_coordinates" or payload.get("version") != 1:
+        raise ValueError(
+            f"{diagnostics_path} has unsupported coordinate diagnostics format/version"
+        )
+    solver = payload.get("solver")
+    gauge = payload.get("gauge")
+    if solver != MODAL_PHYSICS_COORDINATE_SOLVER:
+        raise ValueError(f"{diagnostics_path} has unsupported physics coordinate solver")
+    if gauge != MODAL_FLOW_COORDINATE_GAUGE:
+        raise ValueError(f"{diagnostics_path} has unsupported physics coordinate gauge")
+    output_name = payload.get("coordinate_artifact")
+    if output_name != coordinates.path.name:
+        raise ValueError(
+            f"{diagnostics_path} coordinate_artifact does not identify {coordinates.path.name}"
+        )
+    settings = payload.get("settings")
+    if not isinstance(settings, dict):
+        raise ValueError(f"{diagnostics_path} settings must be an object")
+    provenance.update(
+        {
+            "solver": solver,
+            "gauge": gauge,
+            "physics": settings,
+            "source_coordinate": payload.get("source_coordinate"),
+        }
+    )
+    return provenance
 
 
 @dataclass(frozen=True)
@@ -1587,6 +1647,183 @@ def load_modal_flow_coordinates(path_value: str | Path) -> ModalFlowCoordinates:
         source_modal_frame_map=Path(source_frame_map),
         source_flow_cache_dirs=tuple(Path(value) for value in source_cache_dirs),
     )
+
+
+def evaluate_modal_flow_coordinate_sets(
+    source: ModalFlowCoordinates,
+    coordinate_sets: Mapping[str, np.ndarray],
+    *,
+    frame_chunk_size: int = 64,
+) -> dict[str, dict[str, np.ndarray | float]]:
+    """Evaluate one or more coordinate fields against the source reference flow."""
+
+    if not coordinate_sets:
+        raise ValueError("coordinate_sets must be non-empty")
+    if (
+        isinstance(frame_chunk_size, bool)
+        or int(frame_chunk_size) != frame_chunk_size
+        or frame_chunk_size < 1
+    ):
+        raise ValueError("frame_chunk_size must be a positive integer")
+    chunk_size = int(frame_chunk_size)
+    expected_shape = (len(source.frame_names), source.mode_indices.size)
+    validated_sets: dict[str, np.ndarray] = {}
+    for label, values in coordinate_sets.items():
+        if not isinstance(label, str) or not label:
+            raise ValueError("coordinate set labels must be non-empty strings")
+        array = np.asarray(values, dtype=np.complex128)
+        if array.shape != expected_shape or not np.isfinite(array.real).all() or not np.isfinite(
+            array.imag
+        ).all():
+            raise ValueError(
+                f"Coordinate set {label!r} must be finite complex {expected_shape}"
+            )
+        validated_sets[label] = array
+
+    frame_map = _load_frame_map(source.source_modal_frame_map)
+    manifest = _load_manifest(source.source_modal_manifest)
+    if frame_map.view_ids != source.view_ids:
+        raise ValueError("Coordinate source view order differs from its frame map")
+    if frame_map.frame_names != source.frame_names:
+        raise ValueError("Coordinate source frame names differ from its frame map")
+    if not np.array_equal(frame_map.frame_view_indices, source.frame_view_indices):
+        raise ValueError("Coordinate source frame view indices differ from its frame map")
+    if not np.array_equal(frame_map.frame_local_indices, source.frame_local_indices):
+        raise ValueError("Coordinate source local indices differ from its frame map")
+    if not np.allclose(frame_map.frame_times_sec, source.frame_times_sec, rtol=0.0, atol=0.0):
+        raise ValueError("Coordinate source frame times differ from its frame map")
+    if not np.array_equal(manifest.mode_indices, source.mode_indices) or not np.allclose(
+        manifest.frequencies_hz, source.frequencies_hz, rtol=0.0, atol=0.0
+    ):
+        raise ValueError("Coordinate source modes differ from its modal manifest")
+    cache_specs = [
+        f"{view_id}={cache_path}"
+        for view_id, cache_path in zip(source.view_ids, source.source_flow_cache_dirs)
+    ]
+    caches = _load_and_validate_caches(frame_map, manifest.topology, cache_specs)
+
+    num_frames = len(source.frame_names)
+    num_views = len(source.view_ids)
+    num_modes = source.mode_indices.size
+    results: dict[str, dict[str, np.ndarray | float]] = {}
+    accumulators: dict[str, dict[str, float]] = {}
+    total_elements = 0.0
+    for label in validated_sets:
+        results[label] = {
+            "per_frame_flow_rmse": np.empty((num_frames,), dtype=np.float64),
+            "per_frame_relative_residual": np.empty((num_frames,), dtype=np.float64),
+            "per_frame_flow_r2": np.empty((num_frames,), dtype=np.float64),
+            "view_flow_rmse": np.empty((num_views,), dtype=np.float64),
+            "view_relative_residual": np.empty((num_views,), dtype=np.float64),
+            "view_flow_r2": np.empty((num_views,), dtype=np.float64),
+            "view_strong_motion_flow_r2": np.empty((num_views,), dtype=np.float64),
+        }
+        accumulators[label] = {"residual_sum_squares": 0.0, "flow_sum_squares": 0.0}
+
+    for view_index, cache in enumerate(caches):
+        sorted_rows, starts, pixels, sorted_weights, _ = _view_pixel_groups(
+            manifest.topology, view_index, cache
+        )
+        design, _ = _build_design_matrix(manifest, sorted_rows, starts, sorted_weights)
+        normalizer = float(2 * pixels.shape[0])
+        reference_index = int(source.reference_local_indices[view_index])
+        cache_reference_index = int(cache.metadata["analysis"]["reference_frame_index"])
+        if reference_index != cache_reference_index:
+            raise ValueError(
+                f"Coordinate reference index for {source.view_ids[view_index]!r} does not "
+                "match its source flow cache"
+            )
+        x = pixels[:, 0]
+        y = pixels[:, 1]
+        reference_u = np.asarray(cache.flow_u[reference_index, y, x], dtype=np.float64)
+        reference_v = np.asarray(cache.flow_v[reference_index, y, x], dtype=np.float64)
+        rows = np.flatnonzero(source.frame_view_indices == view_index)
+        order = np.argsort(source.frame_local_indices[rows])
+        ordered_rows = rows[order]
+        num_view_frames = ordered_rows.size
+        total_elements += normalizer * num_view_frames
+        flow_energy = np.empty((num_view_frames,), dtype=np.float64)
+        residual_energy = {
+            label: np.empty((num_view_frames,), dtype=np.float64)
+            for label in validated_sets
+        }
+        reference_coordinates = {
+            label: values[ordered_rows[reference_index]]
+            for label, values in validated_sets.items()
+        }
+        for start in range(0, num_view_frames, chunk_size):
+            end = min(start + chunk_size, num_view_frames)
+            flow = _flow_matrix(cache, pixels, start, end, reference_u, reference_v)
+            flow_energy[start:end] = np.sum(flow * flow, axis=0)
+            for label, values in validated_sets.items():
+                relative = (
+                    values[ordered_rows[start:end]] - reference_coordinates[label][None, :]
+                )
+                packed = np.empty((2 * num_modes, end - start), dtype=np.float64)
+                packed[0::2] = relative.real.T
+                packed[1::2] = relative.imag.T
+                residual = design @ packed - flow
+                residual_energy[label][start:end] = np.sum(residual * residual, axis=0)
+
+        positive_flow = flow_energy > np.finfo(np.float64).eps
+        strong_count = max(1, int(np.ceil(0.1 * num_view_frames)))
+        strong_rows = np.argpartition(flow_energy, -strong_count)[-strong_count:]
+        for label in validated_sets:
+            residual_sq = residual_energy[label]
+            per_frame_rmse = np.sqrt(residual_sq / normalizer)
+            per_frame_relative = np.zeros_like(per_frame_rmse)
+            per_frame_r2 = np.ones_like(per_frame_rmse)
+            per_frame_relative[positive_flow] = np.sqrt(
+                residual_sq[positive_flow] / flow_energy[positive_flow]
+            )
+            per_frame_r2[positive_flow] = (
+                1.0 - residual_sq[positive_flow] / flow_energy[positive_flow]
+            )
+            zero_flow_bad = (~positive_flow) & (
+                residual_sq > np.finfo(np.float64).eps
+            )
+            if np.any(zero_flow_bad):
+                raise ValueError(
+                    f"Coordinate set {label!r} predicts non-zero motion for a zero-flow "
+                    f"frame in view {source.view_ids[view_index]!r}"
+                )
+            total_residual = float(np.sum(residual_sq))
+            total_flow = float(np.sum(flow_energy))
+            relative = 0.0 if total_flow <= np.finfo(np.float64).eps else float(
+                np.sqrt(total_residual / total_flow)
+            )
+            r2 = 1.0 if total_flow <= np.finfo(np.float64).eps else float(
+                1.0 - total_residual / total_flow
+            )
+            strong_flow = float(np.sum(flow_energy[strong_rows]))
+            strong_residual = float(np.sum(residual_sq[strong_rows]))
+            strong_r2 = 1.0 if strong_flow <= np.finfo(np.float64).eps else float(
+                1.0 - strong_residual / strong_flow
+            )
+            result = results[label]
+            result["per_frame_flow_rmse"][ordered_rows] = per_frame_rmse
+            result["per_frame_relative_residual"][ordered_rows] = per_frame_relative
+            result["per_frame_flow_r2"][ordered_rows] = per_frame_r2
+            result["view_flow_rmse"][view_index] = float(
+                np.sqrt(total_residual / (normalizer * num_view_frames))
+            )
+            result["view_relative_residual"][view_index] = relative
+            result["view_flow_r2"][view_index] = r2
+            result["view_strong_motion_flow_r2"][view_index] = strong_r2
+            accumulators[label]["residual_sum_squares"] += total_residual
+            accumulators[label]["flow_sum_squares"] += total_flow
+
+    for label, result in results.items():
+        residual_sum = accumulators[label]["residual_sum_squares"]
+        flow_sum = accumulators[label]["flow_sum_squares"]
+        result["overall_flow_rmse"] = float(np.sqrt(residual_sum / total_elements))
+        result["overall_relative_residual"] = (
+            0.0 if flow_sum <= np.finfo(np.float64).eps else float(np.sqrt(residual_sum / flow_sum))
+        )
+        result["overall_flow_r2"] = (
+            1.0 if flow_sum <= np.finfo(np.float64).eps else float(1.0 - residual_sum / flow_sum)
+        )
+    return results
 
 
 def solve_modal_flow_coordinates(

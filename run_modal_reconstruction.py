@@ -21,7 +21,7 @@ from flow3d.metrics import mSSIM
 from flow3d.modal_flow_coordinates import (
     MODAL_FLOW_COORDINATE_GAUGE,
     MODAL_FLOW_COORDINATE_PARAMETERIZATION,
-    MODAL_FLOW_COORDINATE_SOLVER,
+    SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS,
 )
 from flow3d.modal_joint_optimization import (
     MODAL_JOINT_OBJECTIVE,
@@ -33,7 +33,6 @@ from flow3d.scene_model import SceneModel
 
 
 MODAL_PARAMETERIZATION = MODAL_FLOW_COORDINATE_PARAMETERIZATION
-MODAL_COORDINATE_SOLVER = MODAL_FLOW_COORDINATE_SOLVER
 MODAL_COORDINATE_GAUGE = MODAL_FLOW_COORDINATE_GAUGE
 SUPPORTED_MODAL_PARAMETERIZATIONS = {
     MODAL_PARAMETERIZATION,
@@ -287,7 +286,7 @@ def _load_checkpoint_model(
             f"({parameterization!r}); expected one of "
             f"{sorted(SUPPORTED_MODAL_PARAMETERIZATIONS)!r}"
         )
-    if init_metadata.get("modal_coordinate_solver") != MODAL_COORDINATE_SOLVER:
+    if init_metadata.get("modal_coordinate_solver") not in SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS:
         raise ValueError("Checkpoint has an incompatible modal coordinate solver")
     if init_metadata.get("modal_coordinate_gauge") != MODAL_COORDINATE_GAUGE:
         raise ValueError("Checkpoint has an incompatible modal coordinate gauge")
@@ -1110,7 +1109,7 @@ def run(cfg: ModalReconstructionConfig) -> None:
             "active_views": active_view_ids,
             "num_modes": int(model.modal_phi_real.shape[0]),
             "modal_parameterization": init_metadata["modal_parameterization"],
-            "modal_coordinate_solver": MODAL_COORDINATE_SOLVER,
+            "modal_coordinate_solver": init_metadata["modal_coordinate_solver"],
             "modal_coordinate_gauge": MODAL_COORDINATE_GAUGE,
             "modal_coordinate_source": str(
                 init_metadata["modal_coordinate_source"]
@@ -1124,6 +1123,13 @@ def run(cfg: ModalReconstructionConfig) -> None:
             "views": view_metrics,
             "overall": overall,
         }
+        if "modal_coordinate_physics" in init_metadata:
+            metrics["modal_coordinate_physics"] = init_metadata[
+                "modal_coordinate_physics"
+            ]
+            metrics["modal_coordinate_prephysics_source"] = init_metadata.get(
+                "modal_coordinate_prephysics_source"
+            )
         joint_refinement = _joint_refinement_metrics(model)
         if joint_refinement is not None:
             key = "joint_refinement" if model.has_modal_joint else "phi_refinement"
