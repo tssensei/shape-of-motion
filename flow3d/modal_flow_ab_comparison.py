@@ -333,6 +333,20 @@ def run_modal_flow_ab_comparison(
     )
     if len(stabilized_caches) != len(compensated_caches):
         raise ValueError("Stabilized and compensated cache counts differ")
+    compensation_models = {
+        str(
+            cache.metadata["analysis"]["camera_compensation"]["settings"][
+                "transform_model"
+            ]
+        )
+        for cache in compensated_caches
+    }
+    if len(compensation_models) != 1:
+        raise ValueError(
+            "All compensated caches must use the same background transform model; "
+            f"got {sorted(compensation_models)}"
+        )
+    background_transform_model = next(iter(compensation_models))
 
     temp = Path(
         tempfile.mkdtemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
@@ -350,7 +364,7 @@ def run_modal_flow_ab_comparison(
         }
         settings = BackgroundCompensationSettings(
             mask_dilate_px=int(background_mask_dilate_px),
-            transform_model="similarity",
+            transform_model=background_transform_model,
         )
         pooled_stable_energy = 0.0
         pooled_compensated_energy = 0.0
@@ -500,7 +514,7 @@ def run_modal_flow_ab_comparison(
                 "grid_rows": int(grid_rows),
                 "grid_cols": int(grid_cols),
                 "background_mask_dilate_px": int(background_mask_dilate_px),
-                "background_transform_model": "similarity",
+                "background_transform_model": background_transform_model,
             },
             "overall": {
                 "candidate_element_count": pooled_count,
