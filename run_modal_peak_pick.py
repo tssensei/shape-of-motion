@@ -27,6 +27,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--sigma-c", type=float, default=0.0, help="Reference pre-blur sigma.")
     p_analyze.add_argument("--analysis-mask-dilate-iters", type=int, default=0, help="Dilate the analysis mask with a 3x3 kernel before flow smoothing and spectrum computation.")
 
+    p_compensated = sub.add_parser(
+        "analyze-compensated",
+        help=(
+            "Analyze an unstabilized video after direct-to-reference background "
+            "motion compensation."
+        ),
+    )
+    p_compensated.add_argument("--video", required=True)
+    p_compensated.add_argument("--foreground-mask-dir", required=True)
+    p_compensated.add_argument("--frame-names-json", required=True)
+    p_compensated.add_argument("--reference-cache", required=True)
+    p_compensated.add_argument("--cache-dir", required=True)
+    p_compensated.add_argument("--resize", type=int, default=None)
+    p_compensated.add_argument("--mask-dilate-px", type=int, default=16)
+    p_compensated.add_argument(
+        "--transform-model",
+        choices=["similarity", "affine", "homography"],
+        default="similarity",
+    )
+    p_compensated.add_argument("--max-corners", type=int, default=4000)
+    p_compensated.add_argument("--feature-quality", type=float, default=0.01)
+    p_compensated.add_argument("--feature-min-distance-px", type=float, default=8.0)
+    p_compensated.add_argument("--lk-window-px", type=int, default=31)
+    p_compensated.add_argument("--lk-max-level", type=int, default=4)
+    p_compensated.add_argument("--max-forward-backward-error-px", type=float, default=1.5)
+    p_compensated.add_argument("--ransac-threshold-px", type=float, default=2.0)
+    p_compensated.add_argument("--min-inliers", type=int, default=30)
+    p_compensated.add_argument("--min-inlier-fraction", type=float, default=0.1)
+    p_compensated.add_argument("--min-background-coverage", type=float, default=0.05)
+    p_compensated.add_argument("--min-candidate-valid-fraction", type=float, default=0.99)
+    p_compensated.add_argument(
+        "--flow-method", choices=["farneback", "tvl1"], default="farneback"
+    )
+    p_compensated.add_argument("--no-smooth", action="store_true")
+    p_compensated.add_argument("--sigma-b", type=float, default=3.0)
+    p_compensated.add_argument("--sigma-c", type=float, default=0.0)
+
     p_pick = sub.add_parser("pick", help="Run interactive spectrum peak picking.")
     p_pick.add_argument("--cache-dir", required=True, help="Modal-analysis cache directory.")
     p_pick.add_argument("--snap-window-hz", type=float, default=1.0, help="Peak snapping window.")
@@ -85,6 +122,11 @@ def main(argv: list[str] | None = None) -> None:
         from modal_peak_pick.apps import analyze_cache
 
         analyze_cache.run(args)
+        return
+    if args.command == "analyze-compensated":
+        from modal_peak_pick.apps import analyze_compensated_cache
+
+        analyze_compensated_cache.run(args)
         return
     if args.command == "pick":
         from modal_peak_pick.apps import pick_ui

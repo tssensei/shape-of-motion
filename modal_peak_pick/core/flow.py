@@ -6,6 +6,65 @@ import cv2
 import numpy as np
 
 
+def compute_dense_flow_pair(
+    reference_gray: np.ndarray,
+    current_gray: np.ndarray,
+    method: str = "farneback",
+) -> np.ndarray:
+    """Compute dense image-plane flow from one grayscale frame to another."""
+    if reference_gray.ndim != 2 or current_gray.ndim != 2:
+        raise ValueError("reference_gray and current_gray must both be [H,W].")
+    if reference_gray.shape != current_gray.shape:
+        raise ValueError(
+            "reference_gray and current_gray must have the same shape; "
+            f"got {reference_gray.shape} and {current_gray.shape}."
+        )
+    if not np.isfinite(reference_gray).all() or not np.isfinite(current_gray).all():
+        raise ValueError("Dense-flow input frames must be finite.")
+
+    reference = np.clip(reference_gray * 255.0, 0.0, 255.0).astype(np.uint8)
+    current = np.clip(current_gray * 255.0, 0.0, 255.0).astype(np.uint8)
+    method_l = method.lower()
+    if method_l == "farneback":
+        return cv2.calcOpticalFlowFarneback(
+            reference,
+            current,
+            None,
+            pyr_scale=0.5,
+            levels=4,
+            winsize=15,
+            iterations=4,
+            poly_n=5,
+            poly_sigma=1.1,
+            flags=0,
+        ).astype(np.float32, copy=False)
+
+    if method_l in {"tvl1", "tv-l1", "tv_l1"}:
+        if not hasattr(cv2, "optflow") or not hasattr(
+            cv2.optflow, "DualTVL1OpticalFlow_create"
+        ):
+            raise RuntimeError(
+                "TV-L1 requires an OpenCV build with "
+                "cv2.optflow.DualTVL1OpticalFlow_create."
+            )
+        tvl1 = cv2.optflow.DualTVL1OpticalFlow_create()
+        tvl1.setTau(0.25)
+        tvl1.setLambda(0.05)
+        tvl1.setTheta(0.3)
+        tvl1.setScalesNumber(4)
+        tvl1.setWarpingsNumber(5)
+        tvl1.setEpsilon(0.01)
+        tvl1.setInnerIterations(30)
+        tvl1.setOuterIterations(10)
+        tvl1.setScaleStep(0.8)
+        tvl1.setGamma(0.0)
+        tvl1.setMedianFiltering(0)
+        tvl1.setUseInitialFlow(False)
+        return tvl1.calc(reference, current, None).astype(np.float32, copy=False)
+
+    raise ValueError(f"Unknown flow method: {method}")
+
+
 def compute_dense_flow_to_reference(
     frames_gray: np.ndarray,
     method: str = "farneback",
@@ -25,54 +84,12 @@ def compute_dense_flow_to_reference(
     v = np.zeros((num_frames, h, w), dtype=np.float32)
 
     t_ref = num_frames // 2
-    ref = (frames_gray[t_ref] * 255.0).astype(np.uint8)
-    method_l = method.lower()
-
-    if method_l == "farneback":
-        for t in range(num_frames):
-            cur = (frames_gray[t] * 255.0).astype(np.uint8)
-            flow = cv2.calcOpticalFlowFarneback(
-                ref,
-                cur,
-                None,
-                pyr_scale=0.5,
-                levels=4,
-                winsize=15,
-                iterations=4,
-                poly_n=5,
-                poly_sigma=1.1,
-                flags=0,
-            )
-            u[t] = flow[..., 0]
-            v[t] = flow[..., 1]
-        return u, v
-
-    if method_l in {"tvl1", "tv-l1", "tv_l1"}:
-        if not hasattr(cv2, "optflow") or not hasattr(cv2.optflow, "DualTVL1OpticalFlow_create"):
-            raise RuntimeError("TV-L1 requires an OpenCV build with cv2.optflow.DualTVL1OpticalFlow_create.")
-
-        tvl1 = cv2.optflow.DualTVL1OpticalFlow_create()
-        tvl1.setTau(0.25)
-        tvl1.setLambda(0.05)
-        tvl1.setTheta(0.3)
-        tvl1.setScalesNumber(4)
-        tvl1.setWarpingsNumber(5)
-        tvl1.setEpsilon(0.01)
-        tvl1.setInnerIterations(30)
-        tvl1.setOuterIterations(10)
-        tvl1.setScaleStep(0.8)
-        tvl1.setGamma(0.0)
-        tvl1.setMedianFiltering(0)
-        tvl1.setUseInitialFlow(False)
-
-        for t in range(num_frames):
-            cur = (frames_gray[t] * 255.0).astype(np.uint8)
-            flow = tvl1.calc(ref, cur, None)
-            u[t] = flow[..., 0]
-            v[t] = flow[..., 1]
-        return u, v
-
-    raise ValueError(f"Unknown flow method: {method}")
+    reference = frames_gray[t_ref]
+    for t in range(num_frames):
+        flow = compute_dense_flow_pair(reference, frames_gray[t], method=method)
+        u[t] = flow[..., 0]
+        v[t] = flow[..., 1]
+    return u, v
 
 
 def _pyramid_sobel(frame: np.ndarray, levels: int) -> tuple[np.ndarray, np.ndarray]:
