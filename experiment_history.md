@@ -353,3 +353,55 @@ optimization.
   residuals from being interpreted as evidence for changing modal coordinates or
   phi. Foreground quality is considered sufficient to continue the current line
   of experiments.
+
+## `bush4_physics_coordinates_k15_zeta0p05_force0p1_fixed_phi_20260719_200201`
+
+Date: 2026-07-19
+
+### Purpose
+
+Test whether the free per-frame K15 flow coordinates can be made more physically
+meaningful without training phi or any Gaussian parameter. Each view/mode complex
+coordinate was post-fit with the fixed assigned frequency, damping ratio 0.05,
+latent-force weight 0.1, and zero force-difference weight. The resulting coordinates
+were materialized as a fixed checkpoint and rendered with the same staged K15 phi.
+
+### Reusable paths
+
+- Input coordinates: `/home/zs292/outputs_modal/bush4/flow_coordinates_greedy_k15_quality_20260719_v1_ridge1e4/modal_flow_coordinates.npz`
+- Physics coordinate directory: `/home/zs292/outputs_modal/bush4/physics_coordinates_greedy_k15_zeta0p05_force0p1_20260719_200201`
+- Physics coordinate artifact: `/home/zs292/outputs_modal/bush4/physics_coordinates_greedy_k15_zeta0p05_force0p1_20260719_200201/modal_flow_coordinates.npz`
+- Fixed-phi run: `/home/zs292/outputs_3dmode/bush4_physics_coordinates_k15_zeta0p05_force0p1_fixed_phi_20260719_200201`
+- Reconstruction: `/home/zs292/outputs_3dmode/bush4_physics_coordinates_k15_zeta0p05_force0p1_fixed_phi_20260719_200201/reconstruction_last`
+
+### Quantitative result
+
+- Overall candidate-flow R2 changed from 0.841542 to 0.809967, a decrease of
+  0.031575. View losses were 0.025441, 0.040957, and 0.052719 respectively.
+- Strong-motion flow R2 was retained better: view1 0.885702 to 0.867791, view2
+  0.893994 to 0.861004, and view3 0.835016 to 0.811721.
+- Mean normalized latent-force RMS fell from 16.9498 to 0.7469, while mean
+  assigned-frequency energy rose from 0.2344 to 0.2848.
+- Mean coordinate RMS, p90, and p99 retention were approximately 0.8920, 0.8983,
+  and 0.8734; coordinate fidelity NRMSE was 0.2370.
+- RGB reconstruction was effectively unchanged: overall L1 improved by only
+  0.0000151, PSNR changed by -0.00275 dB, and SSIM improved by 0.000281.
+
+### Current conclusion
+
+- The post-fit successfully removes most high-force/nonphysical coordinate content
+  without collapsing strong amplitudes. Although weight 0.1 reduces overall flow R2
+  by 3.16 points and disproportionately affects views 2 and 3, direct video review
+  shows substantially fewer temporal twitches and no new dominant artifact. The
+  visual stability gain is accepted over the nominal two-point flow-R2 budget.
+- The low input assigned-band energy confirms that the original free coordinates
+  rely heavily on cross-frequency content. Raising the ratio only to 0.285 despite
+  the large force reduction also shows that the current phi-frequency association
+  cannot yet explain all observed motion as lightly forced physical modes.
+- This run is now the temporal-stability K15 baseline for subsequent experiments.
+  The original fixed-coordinate K15 run remains the higher-flow-fidelity reference.
+  Remaining visible errors are mainly insufficient motion expressivity and imperfect
+  fixed mode shapes, rather than the previously dominant coordinate twitching.
+- A weaker forcing weight such as 0.01 remains an optional ablation, not the next
+  required step. Future phi or representation experiments should compare against
+  both this stable baseline and the original free-coordinate reconstruction.

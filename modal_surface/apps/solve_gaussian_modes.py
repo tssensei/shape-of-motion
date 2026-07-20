@@ -23,8 +23,14 @@ from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_VERSION,
     GaussianMotionFillResult,
     apply_gaussian_motion_fill,
+    load_motion_fill_graph,
     write_motion_fill_diagnostics,
     write_motion_fill_graph,
+)
+from modal_surface.incremental_manifest import (
+    IncrementalManifestBase,
+    load_incremental_manifest_base,
+    validate_incremental_observation_topology,
 )
 from modal_surface.io import (
     load_modal_freqs,
@@ -61,6 +67,8 @@ def parse_mode_indices(raw: str, num_modes: int) -> list[int]:
         idx = int(text)
         if idx < 0 or idx >= num_modes:
             raise ValueError(f"mode index {idx} is outside [0,{num_modes - 1}].")
+        if idx in out:
+            raise ValueError(f"--mode-indices contains duplicate mode index {idx}.")
         out.append(idx)
     if not out:
         raise ValueError("--mode-indices must contain at least one index, or 'all'.")
@@ -189,6 +197,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Output directory for observations, diagnostics, latents, vis, and manifest.",
     )
     parser.add_argument("--mode-indices", default="all", help="Comma-separated zero-based mode indices, or 'all'.")
+    parser.add_argument(
+        "--base-manifest",
+        default=None,
+        help=(
+            "Existing contiguous-prefix Gaussian modal manifest to reuse. Only the "
+            "next mode slots named by --mode-indices are solved; the output manifest "
+            "references the old artifacts and appends the new modes."
+        ),
+    )
     parser.add_argument("--pixel-sample-stride", type=int, default=4, help="Pixel grid stride for pixel-candidates sampling.")
     parser.add_argument("--pixel-candidate-k", type=int, default=4, help="Number of top contribution Gaussians supervised by each sampled pixel.")
     parser.add_argument("--pixel-preselect-k", type=int, default=32, help="Number of 3D nearest Gaussians scored before top-k contribution selection.")
@@ -241,6 +258,40 @@ def _validate_motion_fill_arguments(
         raise ValueError(
             f"--motion-fill-k must be smaller than the foreground Gaussian count ({num_points})."
         )
+
+
+def _manifest_parameters(
+    args: argparse.Namespace,
+    motion_fill_graph_path: str | Path | None = None,
+) -> dict[str, Any]:
+    parameters: dict[str, Any] = {
+        "mask_erode_iters": int(args.mask_erode_iters),
+        "pixel_sample_stride": int(args.pixel_sample_stride),
+        "pixel_candidate_k": int(args.pixel_candidate_k),
+        "pixel_preselect_k": int(args.pixel_preselect_k),
+        "pixel_render_acc_min": float(args.pixel_render_acc_min),
+        "pixel_min_contribution": float(args.pixel_min_contribution),
+        "freq_tolerance_hz": float(args.freq_tolerance_hz),
+        "alpha_model": "per_view_per_mode",
+        "alpha_reference_view_index": 0,
+        "motion_fill_enabled": bool(args.motion_fill),
+        **staged_solver_manifest_parameters(args),
+    }
+    if bool(args.motion_fill):
+        parameters.update(
+            {
+                "motion_fill_method": MOTION_FILL_METHOD,
+                "motion_fill_k": int(args.motion_fill_k),
+                "motion_fill_max_distance": float(args.motion_fill_max_distance),
+                "motion_fill_epsilon": MOTION_FILL_EPSILON,
+                "motion_fill_nullspace_operator_rtol": MOTION_FILL_NULLSPACE_RTOL,
+                "motion_fill_observation_drift_rtol": MOTION_FILL_OBSERVATION_DRIFT_RTOL,
+                "motion_fill_excluded_policy": "retain_observable_exclude_from_graph",
+            }
+        )
+        if motion_fill_graph_path is not None:
+            parameters["motion_fill_graph_path"] = str(motion_fill_graph_path)
+    return parameters
 
 
 def _load_fg_pixel_candidate_inputs_from_checkpoint(path: str, view_config_paths: list[str],) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
@@ -661,7 +712,26 @@ def run(args: argparse.Namespace) -> None:
     modal_npzs_paths = list(args.modal_npz)
     if len(view_configs_paths) != len(modal_npzs_paths):
         raise ValueError("--view-config and --modal-npz must be supplied the same number of times.")
-    
+
+    freqs_per_view = load_modal_freqs(modal_npzs_paths)
+    mode_indices = parse_mode_indices(args.mode_indices, int(freqs_per_view[0].shape[0]))
+    incremental_base: IncrementalManifestBase | None = None
+    if args.base_manifest is not None:
+        incremental_base = load_incremental_manifest_base(
+            args.base_manifest,
+            source_checkpoint=str(args.input_ckpt),
+            source_view_configs=view_configs_paths,
+            frequencies_by_view=freqs_per_view,
+            extension_mode_indices=mode_indices,
+            expected_parameters=_manifest_parameters(args),
+            frequency_tolerance_hz=float(args.freq_tolerance_hz),
+        )
+        print(
+            "Incremental solve: reusing "
+            f"{len(incremental_base.mode_indices)} modes from {incremental_base.path}; "
+            f"solving only mode indices {mode_indices}."
+        )
+
     (
         fg_means,
         fg_scales,
@@ -679,13 +749,6 @@ def run(args: argparse.Namespace) -> None:
     gaussian_tree = cKDTree(fg_means.astype(np.float64))
 
     _validate_motion_fill_arguments(args, fg_means.shape[0])
-    
-    freqs_per_view = load_modal_freqs(modal_npzs_paths)
-    # e.g. freqs_per_view = [
-    # np.array([0.357, 0.714]),  # view 1
-    # np.array([0.359, 0.711]),  # view 2
-    # np.array([0.356, 0.716]),  # view 3 ]
-    mode_indices = parse_mode_indices(args.mode_indices, int(freqs_per_view[0].shape[0]))
     out_dir = Path(args.out_dir)
     obs_dir = out_dir / "observations"
     latent_dir = out_dir / "latents"
@@ -701,23 +764,37 @@ def run(args: argparse.Namespace) -> None:
     motion_fill_graph_path: Path | None = None
     motion_fill_mode_diagnostics: dict[str, Any] = {}
     if args.motion_fill:
-        candidates = query_knn_candidates(
-            fg_means,
-            int(args.motion_fill_k),
-            tree=gaussian_tree,
-        )
-        motion_fill_graph = build_knn_graph(
-            candidates,
-            int(args.motion_fill_k),
-            float(args.motion_fill_max_distance),
-            MOTION_FILL_EPSILON,
-        )
-        motion_fill_graph_path = write_motion_fill_graph(
-            out_dir / "motion_fill" / "graph.npz",
-            fg_means,
-            candidates,
-            motion_fill_graph,
-        )
+        if incremental_base is not None:
+            if incremental_base.motion_fill_graph_path is None:
+                raise ValueError(
+                    "The base manifest does not provide the required motion-fill graph"
+                )
+            motion_fill_graph_path = incremental_base.motion_fill_graph_path
+            motion_fill_graph = load_motion_fill_graph(
+                motion_fill_graph_path,
+                fg_means,
+                expected_k=int(args.motion_fill_k),
+                expected_max_distance=float(args.motion_fill_max_distance),
+            )
+            print(f"Reused motion-fill graph -> {motion_fill_graph_path}")
+        else:
+            candidates = query_knn_candidates(
+                fg_means,
+                int(args.motion_fill_k),
+                tree=gaussian_tree,
+            )
+            motion_fill_graph = build_knn_graph(
+                candidates,
+                int(args.motion_fill_k),
+                float(args.motion_fill_max_distance),
+                MOTION_FILL_EPSILON,
+            )
+            motion_fill_graph_path = write_motion_fill_graph(
+                out_dir / "motion_fill" / "graph.npz",
+                fg_means,
+                candidates,
+                motion_fill_graph,
+            )
 
     modes: list[dict[str, Any]] = []
     for mode_index in mode_indices:
@@ -752,6 +829,12 @@ def run(args: argparse.Namespace) -> None:
         )
         with np.load(str(obs_path), allow_pickle=False) as loaded:
             observations = {key: loaded[key] for key in loaded.files}
+        if incremental_base is not None:
+            validate_incremental_observation_topology(
+                incremental_base,
+                observations,
+                obs_path,
+            )
         _print_observation_sanity(observations, fg_means.shape[0])
         staged = optimize_multi_view_staged(
             observations=observations,
@@ -832,33 +915,14 @@ def run(args: argparse.Namespace) -> None:
             }
         )
 
-    manifest_parameters = {
-        "mask_erode_iters": int(args.mask_erode_iters),
-        "pixel_sample_stride": int(args.pixel_sample_stride),
-        "pixel_candidate_k": int(args.pixel_candidate_k),
-        "pixel_preselect_k": int(args.pixel_preselect_k),
-        "pixel_render_acc_min": float(args.pixel_render_acc_min),
-        "pixel_min_contribution": float(args.pixel_min_contribution),
-        "freq_tolerance_hz": float(args.freq_tolerance_hz),
-        "alpha_model": "per_view_per_mode",
-        "alpha_reference_view_index": 0,
-        "motion_fill_enabled": bool(args.motion_fill),
-        **staged_solver_manifest_parameters(args),
-    }
+    graph_manifest_path = (
+        relative_path(motion_fill_graph_path, out_dir)
+        if motion_fill_graph_path is not None
+        else None
+    )
+    manifest_parameters = _manifest_parameters(args, graph_manifest_path)
     if motion_fill_graph is not None:
         assert motion_fill_graph_path is not None
-        manifest_parameters.update(
-            {
-                "motion_fill_method": MOTION_FILL_METHOD,
-                "motion_fill_k": int(motion_fill_graph.k),
-                "motion_fill_max_distance": float(motion_fill_graph.max_distance),
-                "motion_fill_epsilon": float(motion_fill_graph.epsilon),
-                "motion_fill_nullspace_operator_rtol": MOTION_FILL_NULLSPACE_RTOL,
-                "motion_fill_observation_drift_rtol": MOTION_FILL_OBSERVATION_DRIFT_RTOL,
-                "motion_fill_graph_path": relative_path(motion_fill_graph_path, out_dir),
-                "motion_fill_excluded_policy": "retain_observable_exclude_from_graph",
-            }
-        )
         write_motion_fill_diagnostics(
             out_dir / "motion_fill" / "diagnostics.json",
             {
@@ -882,16 +946,31 @@ def run(args: argparse.Namespace) -> None:
             },
         )
 
-    manifest = {
+    new_modes = modes
+    if incremental_base is None:
+        combined_modes = new_modes
+        combined_mode_indices = mode_indices
+    else:
+        combined_modes = [*incremental_base.modes, *new_modes]
+        combined_mode_indices = [*incremental_base.mode_indices, *mode_indices]
+
+    manifest: dict[str, Any] = {
         "version": 1,
         "source_checkpoint": str(args.input_ckpt),
         "point_type": "foreground_gaussian_center",
         "source_view_configs": view_configs_paths,
         "source_modal_npzs": modal_npzs_paths,
-        "mode_indices": mode_indices,
+        "mode_indices": combined_mode_indices,
         "parameters": manifest_parameters,
-        "modes": modes,
+        "modes": combined_modes,
     }
+    if incremental_base is not None:
+        manifest["incremental_extension"] = {
+            "base_manifest": str(incremental_base.path),
+            "reused_mode_indices": list(incremental_base.mode_indices),
+            "solved_mode_indices": mode_indices,
+            "reused_motion_fill_graph": bool(args.motion_fill),
+        }
     manifest_path = out_dir / "modal_modes_manifest.json"
     with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)

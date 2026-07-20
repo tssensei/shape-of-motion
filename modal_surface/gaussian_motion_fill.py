@@ -669,6 +669,132 @@ def write_motion_fill_graph(
     return out
 
 
+def load_motion_fill_graph(
+    path: str | Path,
+    points_world: np.ndarray,
+    *,
+    expected_k: int,
+    expected_max_distance: float,
+) -> KnnGraph:
+    """Load a previously validated shared KNN graph for incremental mode solving."""
+
+    graph_path = Path(path).expanduser().resolve()
+    if not graph_path.is_file():
+        raise FileNotFoundError(graph_path)
+    required = {
+        "points_world",
+        "gaussian_indices",
+        "edge_index",
+        "edge_distance",
+        "edge_weight",
+        "degree",
+        "component_index",
+        "component_sizes",
+        "isolated_mask",
+        "k",
+        "max_distance",
+        "epsilon",
+        "candidate_directed_count",
+        "retained_directed_count",
+        "pruned_directed_count",
+        "unique_undirected_edge_count",
+    }
+    with np.load(graph_path, allow_pickle=False) as archive:
+        missing = sorted(required - set(archive.files))
+        if missing:
+            raise ValueError(f"{graph_path} is missing graph fields: {missing}")
+        stored_points = np.asarray(archive["points_world"], dtype=np.float32)
+        gaussian_indices = np.asarray(archive["gaussian_indices"])
+        edge_index = np.asarray(archive["edge_index"], dtype=np.int64)
+        edge_distance = np.asarray(archive["edge_distance"], dtype=np.float64)
+        edge_weight = np.asarray(archive["edge_weight"], dtype=np.float64)
+        degree = np.asarray(archive["degree"], dtype=np.int32)
+        component_index = np.asarray(archive["component_index"], dtype=np.int32)
+        component_sizes = np.asarray(archive["component_sizes"], dtype=np.int32)
+        isolated_mask = np.asarray(archive["isolated_mask"])
+        k = int(np.asarray(archive["k"]).item())
+        max_distance = float(np.asarray(archive["max_distance"]).item())
+        epsilon = float(np.asarray(archive["epsilon"]).item())
+        candidate_directed_count = int(
+            np.asarray(archive["candidate_directed_count"]).item()
+        )
+        retained_directed_count = int(
+            np.asarray(archive["retained_directed_count"]).item()
+        )
+        pruned_directed_count = int(
+            np.asarray(archive["pruned_directed_count"]).item()
+        )
+        stored_edge_count = int(
+            np.asarray(archive["unique_undirected_edge_count"]).item()
+        )
+
+    points = np.asarray(points_world, dtype=np.float32)
+    num_points = int(points.shape[0])
+    if stored_points.shape != points.shape or not np.array_equal(stored_points, points):
+        raise ValueError(
+            f"{graph_path} points_world does not match the current foreground Gaussians"
+        )
+    if not np.issubdtype(gaussian_indices.dtype, np.integer) or not np.array_equal(
+        gaussian_indices,
+        np.arange(num_points, dtype=gaussian_indices.dtype),
+    ):
+        raise ValueError(f"{graph_path} gaussian_indices are not contiguous")
+    if k != int(expected_k):
+        raise ValueError(
+            f"{graph_path} k={k} does not match --motion-fill-k={expected_k}"
+        )
+    if not np.isclose(max_distance, float(expected_max_distance), rtol=0.0, atol=1e-12):
+        raise ValueError(
+            f"{graph_path} max_distance={max_distance} does not match "
+            f"--motion-fill-max-distance={expected_max_distance}"
+        )
+    if not np.isclose(epsilon, MOTION_FILL_EPSILON, rtol=0.0, atol=0.0):
+        raise ValueError(f"{graph_path} epsilon does not match the current implementation")
+    if edge_index.ndim != 2 or edge_index.shape[1] != 2:
+        raise ValueError(f"{graph_path} edge_index must have shape [E,2]")
+    edge_count = int(edge_index.shape[0])
+    if stored_edge_count != edge_count:
+        raise ValueError(f"{graph_path} unique edge count is inconsistent")
+    if edge_distance.shape != (edge_count,) or edge_weight.shape != (edge_count,):
+        raise ValueError(f"{graph_path} edge arrays do not have shape [E]")
+    for name, values in (
+        ("degree", degree),
+        ("component_index", component_index),
+        ("isolated_mask", isolated_mask),
+    ):
+        if values.shape != (num_points,):
+            raise ValueError(f"{graph_path} {name} must have shape [{num_points}]")
+    if isolated_mask.dtype != np.bool_:
+        raise ValueError(f"{graph_path} isolated_mask must be boolean")
+    if component_sizes.ndim != 1 or component_sizes.size == 0:
+        raise ValueError(f"{graph_path} component_sizes must be a non-empty vector")
+    if edge_count and (np.any(edge_index < 0) or np.any(edge_index >= num_points)):
+        raise ValueError(f"{graph_path} edge_index contains out-of-range values")
+    for name, values in (
+        ("edge_distance", edge_distance),
+        ("edge_weight", edge_weight),
+    ):
+        if not np.isfinite(values).all():
+            raise ValueError(f"{graph_path} {name} contains non-finite values")
+
+    return KnnGraph(
+        edge_index=edge_index,
+        edge_distance=edge_distance,
+        edge_weight=edge_weight,
+        degree=degree,
+        component_index=component_index,
+        component_sizes=component_sizes,
+        isolated_mask=isolated_mask,
+        num_points=num_points,
+        k=k,
+        max_distance=max_distance,
+        epsilon=epsilon,
+        candidate_directed_count=candidate_directed_count,
+        retained_directed_count=retained_directed_count,
+        pruned_directed_count=pruned_directed_count,
+    )
+
+
 def write_motion_fill_diagnostics(path: str | Path, payload: Mapping[str, Any]) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
