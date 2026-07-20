@@ -26,7 +26,7 @@ from modal_peak_pick.core.background_compensation import (
 from modal_peak_pick.core.cache import load_analysis_cache, write_analysis_cache
 from modal_peak_pick.core.flow import contrast_weighted_smooth
 from modal_peak_pick.core.spectrum import fft_over_time, global_power_spectrum
-from modal_peak_pick.core.video_io import load_video_clip
+from modal_peak_pick.core.video_io import load_ordered_image_sequence, load_video_clip
 
 
 DIAGNOSTICS_FILENAME = "camera_compensation_diagnostics.npz"
@@ -36,7 +36,12 @@ PREVIEW_FILENAME = "camera_compensation_previews.png"
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--video", required=True, help="Raw, unstabilized input video.")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--video", help="Raw, unstabilized input video.")
+    source.add_argument(
+        "--image-dir",
+        help="Raw, unstabilized image sequence indexed by the frame-name sidecar.",
+    )
     parser.add_argument(
         "--foreground-mask-dir",
         required=True,
@@ -143,7 +148,7 @@ def _write_diagnostics(
     settings: BackgroundCompensationSettings,
     reference_index: int,
     reference_cache_path: Path,
-    raw_video: Path,
+    raw_source: Path,
 ) -> None:
     np.savez_compressed(
         directory / DIAGNOSTICS_FILENAME,
@@ -176,7 +181,7 @@ def _write_diagnostics(
         "format": "background_compensated_flow",
         "version": 1,
         "source": {
-            "raw_video": str(raw_video.resolve()),
+            "raw_input": str(raw_source.resolve()),
             "reference_cache": str(reference_cache_path.resolve()),
         },
         "settings": {
@@ -292,24 +297,35 @@ def run(args: argparse.Namespace) -> None:
 
     total_start = time.perf_counter()
     stage_start = time.perf_counter()
-    raw_frames, raw_fps = load_video_clip(
-        args.video,
-        t0=float(frame_range["t0_s"]),
-        t1=(
-            None
-            if frame_range["t1_s"] is None
-            else float(frame_range["t1_s"])
-        ),
-        resize=resize,
-        grayscale=True,
-        max_frames=frame_range["max_frames"],
-    )
     frame_names = load_frame_names(args.frame_names_json)
-    if len(frame_names) != raw_frames.shape[0]:
-        raise ValueError(
-            f"Frame-name sidecar has {len(frame_names)} entries but raw video decoded "
-            f"{raw_frames.shape[0]} frames"
+    if args.image_dir is not None:
+        raw_source = Path(args.image_dir).expanduser()
+        raw_frames = load_ordered_image_sequence(
+            raw_source,
+            frame_names,
+            resize=resize,
+            grayscale=True,
         )
+        raw_fps = float(reference_cache.fps)
+    else:
+        raw_source = Path(args.video).expanduser()
+        raw_frames, raw_fps = load_video_clip(
+            args.video,
+            t0=float(frame_range["t0_s"]),
+            t1=(
+                None
+                if frame_range["t1_s"] is None
+                else float(frame_range["t1_s"])
+            ),
+            resize=resize,
+            grayscale=True,
+            max_frames=frame_range["max_frames"],
+        )
+        if len(frame_names) != raw_frames.shape[0]:
+            raise ValueError(
+                f"Frame-name sidecar has {len(frame_names)} entries but raw video "
+                f"decoded {raw_frames.shape[0]} frames"
+            )
     raw_masks = load_ordered_foreground_masks(
         args.foreground_mask_dir,
         frame_names,
@@ -368,7 +384,8 @@ def run(args: argparse.Namespace) -> None:
 
     metadata = {
         "sources": {
-            "video": _source_metadata(args.video),
+            "video": _source_metadata(str(raw_source)),
+            "raw_input_type": "image_sequence" if args.image_dir is not None else "video",
             "mask": _source_metadata(args.frame_names_json),
             "foreground_mask_dir": str(Path(args.foreground_mask_dir).resolve()),
             "reference_cache": str(reference_cache_path.resolve()),
@@ -441,7 +458,7 @@ def run(args: argparse.Namespace) -> None:
                 reference_cache.metadata["analysis"]["reference_frame_index"]
             ),
             reference_cache_path=reference_cache_path,
-            raw_video=Path(args.video).expanduser(),
+            raw_source=raw_source,
         )
         if target.exists() or target.is_symlink():
             raise FileExistsError(f"Modal analysis cache target already exists: {target}")
@@ -464,7 +481,7 @@ def run(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a standard modal cache from an unstabilized video using "
+            "Build a standard modal cache from an unstabilized sequence using "
             "direct-to-reference background motion compensation."
         )
     )

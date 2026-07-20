@@ -30,11 +30,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_compensated = sub.add_parser(
         "analyze-compensated",
         help=(
-            "Analyze an unstabilized video after direct-to-reference background "
+            "Analyze an unstabilized sequence after direct-to-reference background "
             "motion compensation."
         ),
     )
-    p_compensated.add_argument("--video", required=True)
+    compensated_source = p_compensated.add_mutually_exclusive_group(required=True)
+    compensated_source.add_argument("--video")
+    compensated_source.add_argument("--image-dir")
     p_compensated.add_argument("--foreground-mask-dir", required=True)
     p_compensated.add_argument("--frame-names-json", required=True)
     p_compensated.add_argument("--reference-cache", required=True)

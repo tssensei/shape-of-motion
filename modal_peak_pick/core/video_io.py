@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
+
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
 @dataclass(frozen=True)
@@ -114,4 +118,65 @@ def load_video_clip(
     if len(frames) < 1:
         raise ValueError("Clip produced no frames.")
     return np.stack(frames, axis=0), fps
+
+
+def load_ordered_image_sequence(
+    directory: str | Path,
+    frame_names: tuple[str, ...],
+    *,
+    resize: Optional[int] = None,
+    grayscale: bool = True,
+) -> np.ndarray:
+    """Load an image sequence in an explicit sidecar order."""
+    source = Path(directory).expanduser()
+    if not source.is_dir():
+        raise FileNotFoundError(f"Image sequence directory does not exist: {source}")
+    if not frame_names:
+        raise ValueError("Image sequence frame_names must not be empty")
+
+    indexed: dict[str, Path] = {}
+    for path in sorted(source.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        if path.stem in indexed:
+            raise ValueError(
+                f"Image sequence repeats stem {path.stem!r}: "
+                f"{indexed[path.stem]} and {path}"
+            )
+        indexed[path.stem] = path
+    expected = set(frame_names)
+    actual = set(indexed)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:5]}")
+        if extra:
+            details.append(f"extra={extra[:5]}")
+        raise ValueError(
+            "Image sequence names do not match the frame-name sidecar: "
+            + ", ".join(details)
+        )
+
+    frames: list[np.ndarray] = []
+    output_shape: tuple[int, ...] | None = None
+    for frame_name in frame_names:
+        frame_bgr = cv2.imread(str(indexed[frame_name]), cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            raise ValueError(f"Failed to decode image sequence frame: {indexed[frame_name]}")
+        frame_bgr = _resize_frame(frame_bgr, resize)
+        if grayscale:
+            frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        else:
+            frame = frame_bgr.astype(np.float32) / 255.0
+        if output_shape is None:
+            output_shape = frame.shape
+        elif frame.shape != output_shape:
+            raise ValueError(
+                f"Image sequence frame shape mismatch for {indexed[frame_name]}: "
+                f"{frame.shape} versus {output_shape}"
+            )
+        frames.append(frame)
+    return np.stack(frames, axis=0)
 
