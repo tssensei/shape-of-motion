@@ -195,8 +195,6 @@ _RIGID_DIAGNOSTIC_REQUIRED_FIELDS = {
     "rigid_component_seed_policy",
     "rigid_seed_min_valid_views",
     "rigid_seed_min_singular_ratio",
-    "rigid_seed_min_component_nodes",
-    "rigid_seed_min_component_edges",
     "rigid_seed_mask",
     "observed_mask",
     "fill_target_mask",
@@ -218,7 +216,6 @@ _RIGID_DIAGNOSTIC_REQUIRED_FIELDS = {
     "component_seed_retained_mask",
     "component_valid_view_rejected_mask",
     "component_singular_rejected_mask",
-    "component_size_rejected_mask",
     "component_normalized_weighted_residual",
     "edge_component_index",
     "edge_finite_drift_max",
@@ -321,8 +318,6 @@ class RigidManifestViewData:
     motion_fill_enabled: bool
     rigid_seed_min_valid_views: int
     rigid_seed_min_singular_ratio: float
-    rigid_seed_min_component_nodes: int
-    rigid_seed_min_component_edges: int
     modes: tuple[RigidModeViewData, ...]
 
 
@@ -818,6 +813,7 @@ def _assert_observed_graph_identity(
         "node_observed_view_mask",
         "edge_index",
         "component_index",
+        "component_pruned_node_mask",
         "isolated_mask",
     ):
         if not np.array_equal(
@@ -890,16 +886,6 @@ def load_rigid_manifest(
         "rigid_seed_min_singular_ratio",
         manifest_path,
     )
-    rigid_seed_min_component_nodes = _manifest_integer(
-        parameters.get("rigid_seed_min_component_nodes"),
-        "rigid_seed_min_component_nodes",
-        manifest_path,
-    )
-    rigid_seed_min_component_edges = _manifest_integer(
-        parameters.get("rigid_seed_min_component_edges"),
-        "rigid_seed_min_component_edges",
-        manifest_path,
-    )
     if rigid_seed_min_valid_views <= 0:
         raise ValueError(
             f"{manifest_path} rigid_seed_min_valid_views must be positive"
@@ -907,14 +893,6 @@ def load_rigid_manifest(
     if not 0.0 <= rigid_seed_min_singular_ratio <= 1.0:
         raise ValueError(
             f"{manifest_path} rigid_seed_min_singular_ratio must lie in [0,1]"
-        )
-    if rigid_seed_min_component_nodes <= 0:
-        raise ValueError(
-            f"{manifest_path} rigid_seed_min_component_nodes must be positive"
-        )
-    if rigid_seed_min_component_edges <= 0:
-        raise ValueError(
-            f"{manifest_path} rigid_seed_min_component_edges must be positive"
         )
     expected_parameters = {
         "solver": "rigid_components",
@@ -928,7 +906,7 @@ def load_rigid_manifest(
         "rigid_component_edge_weight_use": "topology_only",
         "rigid_component_finite_rigidity": "first_order_only",
         "rigid_component_seed_policy": (
-            "postsolve_valid_view_singular_ratio_and_size_gate"
+            "postsolve_valid_view_and_singular_ratio_gate"
         ),
         "nonseed_policy": (
             "free_motion_fill"
@@ -1151,7 +1129,7 @@ def load_rigid_manifest(
             ),
             (
                 "rigid_component_seed_policy",
-                "postsolve_valid_view_singular_ratio_and_size_gate",
+                "postsolve_valid_view_and_singular_ratio_gate",
             ),
         ):
             if (
@@ -1167,16 +1145,6 @@ def load_rigid_manifest(
         diagnostic_min_singular_ratio = _scalar(
             diagnostics["rigid_seed_min_singular_ratio"],
             "rigid_seed_min_singular_ratio",
-            diagnostics_path,
-        )
-        diagnostic_min_component_nodes = _scalar(
-            diagnostics["rigid_seed_min_component_nodes"],
-            "rigid_seed_min_component_nodes",
-            diagnostics_path,
-        )
-        diagnostic_min_component_edges = _scalar(
-            diagnostics["rigid_seed_min_component_edges"],
-            "rigid_seed_min_component_edges",
             diagnostics_path,
         )
         if (
@@ -1199,25 +1167,6 @@ def load_rigid_manifest(
             raise ValueError(
                 f"{diagnostics_path} rigid seed singular ratio differs from manifest"
             )
-        for name, value, expected_value in (
-            (
-                "rigid_seed_min_component_nodes",
-                diagnostic_min_component_nodes,
-                rigid_seed_min_component_nodes,
-            ),
-            (
-                "rigid_seed_min_component_edges",
-                diagnostic_min_component_edges,
-                rigid_seed_min_component_edges,
-            ),
-        ):
-            if (
-                not np.issubdtype(value.dtype, np.integer)
-                or int(value.item()) != expected_value
-            ):
-                raise ValueError(
-                    f"{diagnostics_path} {name} differs from manifest"
-                )
         if _scalar_string(
             diagnostics["rigid_component_graph_path"],
             "rigid_component_graph_path",
@@ -1373,7 +1322,6 @@ def load_rigid_manifest(
                 "component_seed_retained_mask",
                 "component_valid_view_rejected_mask",
                 "component_singular_rejected_mask",
-                "component_size_rejected_mask",
             )
         }
         for name, values in component_selection_masks.items():
@@ -1388,14 +1336,8 @@ def load_rigid_manifest(
         expected_singular_rejected = (
             component_singular_ratio < rigid_seed_min_singular_ratio
         )
-        expected_size_rejected = (
-            (expected_node_count < rigid_seed_min_component_nodes)
-            | (expected_edge_count < rigid_seed_min_component_edges)
-        )
         expected_component_retained = ~(
-            expected_valid_view_rejected
-            | expected_singular_rejected
-            | expected_size_rejected
+            expected_valid_view_rejected | expected_singular_rejected
         )
         for name, expected_values in (
             (
@@ -1403,7 +1345,6 @@ def load_rigid_manifest(
                 expected_valid_view_rejected,
             ),
             ("component_singular_rejected_mask", expected_singular_rejected),
-            ("component_size_rejected_mask", expected_size_rejected),
             ("component_seed_retained_mask", expected_component_retained),
         ):
             if not np.array_equal(
@@ -1579,8 +1520,6 @@ def load_rigid_manifest(
         motion_fill_enabled=motion_fill_enabled,
         rigid_seed_min_valid_views=rigid_seed_min_valid_views,
         rigid_seed_min_singular_ratio=rigid_seed_min_singular_ratio,
-        rigid_seed_min_component_nodes=rigid_seed_min_component_nodes,
-        rigid_seed_min_component_edges=rigid_seed_min_component_edges,
         modes=tuple(loaded_modes),
     )
 
@@ -3346,7 +3285,11 @@ def main() -> None:
     print(
         "Loaded observed graph with "
         f"{graphs[0].edge_index.shape[0]} edge(s) and "
-        f"{graphs[0].node_points_world.shape[0]} observed node(s)."
+        f"{graphs[0].node_points_world.shape[0]} observed node(s); "
+        f"pruned {graphs[0].graph.counts['component_pruned_component_count']} "
+        "small component(s), "
+        f"{graphs[0].graph.counts['component_pruned_edge_count']} edge(s), and "
+        f"isolated {graphs[0].graph.counts['component_pruned_node_count']} node(s)."
     )
     print(
         "Viewer world origin is the observed-node AABB center: "

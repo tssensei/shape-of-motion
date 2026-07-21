@@ -71,8 +71,6 @@ from modal_surface.rigid_component_solver import (
 )
 from modal_surface.solver_cli import (
     RIGID_COMPONENT_RCOND_DEFAULT,
-    RIGID_SEED_MIN_COMPONENT_EDGES_DEFAULT,
-    RIGID_SEED_MIN_COMPONENT_NODES_DEFAULT,
     RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT,
     RIGID_SEED_MIN_VALID_VIEWS_DEFAULT,
     STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT,
@@ -300,8 +298,6 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     rcond = float(args.rigid_component_rcond)
     min_valid_views = int(args.rigid_seed_min_valid_views)
     min_singular_ratio = float(args.rigid_seed_min_singular_ratio)
-    min_component_nodes = int(args.rigid_seed_min_component_nodes)
-    min_component_edges = int(args.rigid_seed_min_component_edges)
     if not np.isfinite(rcond) or not (0.0 < rcond < 1.0):
         raise ValueError("--rigid-component-rcond must be finite and lie in (0,1).")
     if min_valid_views <= 0:
@@ -312,10 +308,6 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         raise ValueError(
             "--rigid-seed-min-singular-ratio must be finite and lie in [0,1]."
         )
-    if min_component_nodes <= 0:
-        raise ValueError("--rigid-seed-min-component-nodes must be positive.")
-    if min_component_edges <= 0:
-        raise ValueError("--rigid-seed-min-component-edges must be positive.")
     if args.solve_method == "staged":
         if graph_paths:
             raise ValueError(
@@ -334,16 +326,6 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         if min_singular_ratio != RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT:
             raise ValueError(
                 "A custom --rigid-seed-min-singular-ratio requires "
-                "--solve-method=rigid-components."
-            )
-        if min_component_nodes != RIGID_SEED_MIN_COMPONENT_NODES_DEFAULT:
-            raise ValueError(
-                "A custom --rigid-seed-min-component-nodes requires "
-                "--solve-method=rigid-components."
-            )
-        if min_component_edges != RIGID_SEED_MIN_COMPONENT_EDGES_DEFAULT:
-            raise ValueError(
-                "A custom --rigid-seed-min-component-edges requires "
                 "--solve-method=rigid-components."
             )
         return
@@ -841,9 +823,6 @@ def _rigid_gaussian_latent_stats(
         "singular_rejected_component_count": int(
             np.count_nonzero(seed_selection.component_singular_rejected_mask)
         ),
-        "size_rejected_component_count": int(
-            np.count_nonzero(seed_selection.component_size_rejected_mask)
-        ),
         "largest_rigid_component_node_count": int(
             np.max(rigid.component_node_count, initial=0)
         ),
@@ -1283,19 +1262,13 @@ def _write_rigid_solver_diagnostics(
             rigid.config.phase_samples, dtype=np.int32
         ),
         "rigid_component_seed_policy": np.array(
-            "postsolve_valid_view_singular_ratio_and_size_gate"
+            "postsolve_valid_view_and_singular_ratio_gate"
         ),
         "rigid_seed_min_valid_views": np.array(
             seed_selection.config.min_valid_views, dtype=np.int32
         ),
         "rigid_seed_min_singular_ratio": np.array(
             seed_selection.config.min_singular_ratio, dtype=np.float64
-        ),
-        "rigid_seed_min_component_nodes": np.array(
-            seed_selection.config.min_component_nodes, dtype=np.int32
-        ),
-        "rigid_seed_min_component_edges": np.array(
-            seed_selection.config.min_component_edges, dtype=np.int32
         ),
         "rigid_seed_mask": rigid.rigid_seed_mask.astype(bool),
         "observed_mask": rigid.observed_mask.astype(bool),
@@ -1344,9 +1317,6 @@ def _write_rigid_solver_diagnostics(
         ),
         "component_singular_rejected_mask": (
             seed_selection.component_singular_rejected_mask.astype(bool)
-        ),
-        "component_size_rejected_mask": (
-            seed_selection.component_size_rejected_mask.astype(bool)
         ),
         "component_condition": rigid.component_condition.astype(np.float32),
         "component_weighted_residual_norm": rigid.component_weighted_residual_norm.astype(
@@ -1678,12 +1648,6 @@ def run(args: argparse.Namespace) -> None:
                     min_singular_ratio=float(
                         args.rigid_seed_min_singular_ratio
                     ),
-                    min_component_nodes=int(
-                        args.rigid_seed_min_component_nodes
-                    ),
-                    min_component_edges=int(
-                        args.rigid_seed_min_component_edges
-                    ),
                 ),
             )
 
@@ -1700,9 +1664,7 @@ def run(args: argparse.Namespace) -> None:
                         raise ValueError(
                             "Rigid seed filtering retained no component for "
                             "motion fill. Relax --rigid-seed-min-valid-views "
-                            "--rigid-seed-min-singular-ratio, "
-                            "--rigid-seed-min-component-nodes, or "
-                            "--rigid-seed-min-component-edges."
+                            "or --rigid-seed-min-singular-ratio."
                         )
                     rigid_motion_fill = apply_rigid_seed_motion_fill(
                         prepared,

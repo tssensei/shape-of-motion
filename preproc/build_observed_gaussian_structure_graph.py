@@ -142,6 +142,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth-mad-multiplier", type=float, default=3.0)
     parser.add_argument("--depth-samples", type=int, default=5)
     parser.add_argument("--min-shared-views", type=int, default=1)
+    parser.add_argument("--min-component-nodes", type=int, default=4)
+    parser.add_argument("--min-component-edges", type=int, default=3)
     return parser
 
 
@@ -167,6 +169,8 @@ def main() -> None:
         depth_mad_multiplier=args.depth_mad_multiplier,
         depth_samples=args.depth_samples,
         min_shared_views=args.min_shared_views,
+        min_component_nodes=args.min_component_nodes,
+        min_component_edges=args.min_component_edges,
         render_acc_min=render_acc_min,
     )
     config.validate(num_nodes=0, num_views=len(configs))
@@ -230,7 +234,10 @@ def main() -> None:
         f"single_view={graph.counts['single_view_node_count']}, "
         f"multi_view={graph.counts['multi_view_node_count']}, "
         f"edges={graph.counts['retained_edge_count']}, "
-        f"isolated={graph.counts['isolated_node_count']}"
+        f"isolated={graph.counts['isolated_node_count']}, "
+        f"pruned_components={graph.counts['component_pruned_component_count']}, "
+        f"pruned_nodes={graph.counts['component_pruned_node_count']}, "
+        f"pruned_edges={graph.counts['component_pruned_edge_count']}"
     )
     print(f"Wrote {output}")
 

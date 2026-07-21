@@ -9,7 +9,7 @@ from typing import Mapping
 import numpy as np
 
 
-OBSERVED_STRUCTURE_GRAPH_VERSION = 1
+OBSERVED_STRUCTURE_GRAPH_VERSION = 2
 OBSERVED_STRUCTURE_GRAPH_EPSILON = 1.0e-8
 _MAD_SCALE = 1.4826
 _PROFILE_BATCH_SIZE = 65536
@@ -41,6 +41,7 @@ _OBSERVED_GRAPH_REQUIRED_FIELDS = {
     "degree",
     "component_index",
     "component_size",
+    "component_pruned_node_mask",
     "isolated_mask",
     "view_ids",
     "endpoint_gap_median_by_view",
@@ -58,6 +59,8 @@ _OBSERVED_GRAPH_REQUIRED_FIELDS = {
     "depth_mad_multiplier",
     "depth_samples",
     "min_shared_views",
+    "min_component_nodes",
+    "min_component_edges",
     "render_acc_min",
     "epsilon",
     "mad_scale",
@@ -67,6 +70,7 @@ _OBSERVED_GRAPH_REQUIRED_FIELDS = {
     "distance_weight_method",
     "color_weight_method",
     "depth_weight_method",
+    "component_pruning_policy",
     "knn_directed_candidate_count",
     "distance_rejected_directed_count",
     "nonmutual_rejected_pair_count",
@@ -89,6 +93,9 @@ _OBSERVED_GRAPH_REQUIRED_FIELDS = {
     "single_view_node_count",
     "multi_view_node_count",
     "isolated_node_count",
+    "component_pruned_component_count",
+    "component_pruned_node_count",
+    "component_pruned_edge_count",
 }
 _GRAPH_PARAMETER_FIELDS = (
     "version",
@@ -98,6 +105,8 @@ _GRAPH_PARAMETER_FIELDS = (
     "depth_mad_multiplier",
     "depth_samples",
     "min_shared_views",
+    "min_component_nodes",
+    "min_component_edges",
     "render_acc_min",
     "epsilon",
 )
@@ -108,6 +117,7 @@ _EXPECTED_SEMANTICS = {
     "distance_weight_method": "inverse_distance",
     "color_weight_method": "gaussian_adaptive_threshold",
     "depth_weight_method": "supporting_view_gaussian_score",
+    "component_pruning_policy": "remove_edges_keep_observed_nodes_isolated",
 }
 _OBSERVED_COUNT_FIELDS = {
     "knn_directed_candidate_count",
@@ -132,6 +142,9 @@ _OBSERVED_COUNT_FIELDS = {
     "single_view_node_count",
     "multi_view_node_count",
     "isolated_node_count",
+    "component_pruned_component_count",
+    "component_pruned_node_count",
+    "component_pruned_edge_count",
 }
 
 
@@ -143,6 +156,8 @@ class ObservedStructureGraphConfig:
     depth_mad_multiplier: float = 3.0
     depth_samples: int = 5
     min_shared_views: int = 1
+    min_component_nodes: int = 4
+    min_component_edges: int = 3
     render_acc_min: float = 0.05
     epsilon: float = OBSERVED_STRUCTURE_GRAPH_EPSILON
 
@@ -190,6 +205,18 @@ class ObservedStructureGraphConfig:
                 "observed graph min_shared_views cannot exceed the number of views "
                 f"({num_views})"
             )
+        for name, value in (
+            ("min_component_nodes", self.min_component_nodes),
+            ("min_component_edges", self.min_component_edges),
+        ):
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"observed graph {name} must be a positive integer"
+                )
         if not np.isfinite(self.render_acc_min) or not 0.0 <= self.render_acc_min <= 1.0:
             raise ValueError("observed graph render_acc_min must lie in [0,1]")
         if not np.isfinite(self.epsilon) or self.epsilon <= 0.0:
@@ -216,6 +243,7 @@ class ObservedStructureTopology:
     degree: np.ndarray
     component_index: np.ndarray
     component_size: np.ndarray
+    component_pruned_node_mask: np.ndarray
     isolated_mask: np.ndarray
     view_ids: np.ndarray
     endpoint_gap_median_by_view: np.ndarray
@@ -292,6 +320,10 @@ class LoadedObservedStructureGraph:
     @property
     def component_index(self) -> np.ndarray:
         return self.graph.topology.component_index
+
+    @property
+    def component_pruned_node_mask(self) -> np.ndarray:
+        return self.graph.topology.component_pruned_node_mask
 
     @property
     def isolated_mask(self) -> np.ndarray:
@@ -802,6 +834,42 @@ def _build_observed_topology(
         out=np.zeros(final_support_count.shape, dtype=np.float32),
         where=final_support_count > 0,
     ).astype(np.float32)
+    (
+        _preprune_degree,
+        preprune_component_index,
+        preprune_component_size,
+        _preprune_isolated,
+    ) = _component_data(node_indices.shape[0], final_edges)
+    preprune_component_edge_count = np.zeros(
+        preprune_component_size.shape,
+        dtype=np.int32,
+    )
+    if final_edges.shape[0]:
+        preprune_edge_component = preprune_component_index[final_edges[:, 0]]
+        preprune_component_edge_count = np.bincount(
+            preprune_edge_component,
+            minlength=preprune_component_size.shape[0],
+        ).astype(np.int32)
+    else:
+        preprune_edge_component = np.empty((0,), dtype=np.int32)
+    connected_component = preprune_component_edge_count > 0
+    pruned_component = connected_component & (
+        (preprune_component_size < config.min_component_nodes)
+        | (preprune_component_edge_count < config.min_component_edges)
+    )
+    component_pruned_node_mask = pruned_component[preprune_component_index]
+    retained_component_edge = ~pruned_component[preprune_edge_component]
+    component_pruned_edge_count = int(
+        np.count_nonzero(~retained_component_edge)
+    )
+    final_edges = final_edges[retained_component_edge]
+    final_distances = final_distances[retained_component_edge]
+    final_color_distances = final_color_distances[retained_component_edge]
+    final_support = final_support[retained_component_edge]
+    final_support_count = final_support_count[retained_component_edge]
+    final_endpoint_gaps = final_endpoint_gaps[retained_component_edge]
+    final_jumps = final_jumps[retained_component_edge]
+    final_depth_score = final_depth_score[retained_component_edge]
     distance_weight = (
         1.0 / np.maximum(final_distances, config.epsilon)
     ).astype(np.float32)
@@ -817,6 +885,10 @@ def _build_observed_topology(
         node_indices.shape[0],
         final_edges,
     )
+    if np.any(component_pruned_node_mask & ~isolated):
+        raise RuntimeError(
+            "observed graph component pruning did not isolate every rejected node"
+        )
     candidate_common_view_mask = (
         node_view_mask[candidate_edges[:, 0]]
         & node_view_mask[candidate_edges[:, 1]]
@@ -861,6 +933,13 @@ def _build_observed_topology(
         "retained_edge_count": int(final_edges.shape[0]),
         "isolated_node_count": int(np.count_nonzero(isolated)),
         "component_count": int(component_size.shape[0]),
+        "component_pruned_component_count": int(
+            np.count_nonzero(pruned_component)
+        ),
+        "component_pruned_node_count": int(
+            np.count_nonzero(component_pruned_node_mask)
+        ),
+        "component_pruned_edge_count": component_pruned_edge_count,
     }
     return ObservedStructureTopology(
         node_gaussian_indices=node_indices,
@@ -881,6 +960,7 @@ def _build_observed_topology(
         degree=degree,
         component_index=component_index,
         component_size=component_size,
+        component_pruned_node_mask=component_pruned_node_mask,
         isolated_mask=isolated,
         view_ids=normalized_view_ids,
         endpoint_gap_median_by_view=endpoint_medians,
@@ -1016,6 +1096,9 @@ def write_observed_structure_graph(
         "degree": topology.degree.astype(np.int32),
         "component_index": topology.component_index.astype(np.int32),
         "component_size": topology.component_size.astype(np.int32),
+        "component_pruned_node_mask": (
+            topology.component_pruned_node_mask.astype(bool)
+        ),
         "isolated_mask": topology.isolated_mask.astype(bool),
         "view_ids": topology.view_ids.astype(str),
         "endpoint_gap_median_by_view": topology.endpoint_gap_median_by_view.astype(
@@ -1058,6 +1141,14 @@ def write_observed_structure_graph(
             topology.config.min_shared_views,
             dtype=np.int32,
         ),
+        "min_component_nodes": np.array(
+            topology.config.min_component_nodes,
+            dtype=np.int32,
+        ),
+        "min_component_edges": np.array(
+            topology.config.min_component_edges,
+            dtype=np.int32,
+        ),
         "render_acc_min": np.array(topology.config.render_acc_min, dtype=np.float32),
         "epsilon": np.array(topology.config.epsilon, dtype=np.float32),
         "mad_scale": np.array(_MAD_SCALE, dtype=np.float32),
@@ -1067,6 +1158,9 @@ def write_observed_structure_graph(
         "distance_weight_method": np.array("inverse_distance"),
         "color_weight_method": np.array("gaussian_adaptive_threshold"),
         "depth_weight_method": np.array("supporting_view_gaussian_score"),
+        "component_pruning_policy": np.array(
+            "remove_edges_keep_observed_nodes_isolated"
+        ),
     }
     arrays.update(
         {name: np.array(value, dtype=np.int64) for name, value in graph.counts.items()}
@@ -1177,7 +1271,7 @@ def _validate_adaptive_threshold_formula(
 def load_observed_structure_graph(
     path: str | Path,
 ) -> LoadedObservedStructureGraph:
-    """Load and strictly validate a version-1 observed structure graph."""
+    """Load and strictly validate a version-2 observed structure graph."""
     graph_path = Path(path)
     if not graph_path.is_file():
         raise ValueError(f"Observed graph does not exist: {graph_path}")
@@ -1191,7 +1285,7 @@ def load_observed_structure_graph(
     if not np.issubdtype(version_value.dtype, np.integer) or int(
         version_value.item()
     ) != OBSERVED_STRUCTURE_GRAPH_VERSION:
-        raise ValueError(f"{graph_path} must be a version 1 observed graph")
+        raise ValueError(f"{graph_path} must be a version 2 observed graph")
     if (
         _artifact_scalar_string(arrays["graph_type"], "graph_type", graph_path)
         != "foreground_gaussian_observed_structure_graph"
@@ -1251,7 +1345,13 @@ def load_observed_structure_graph(
         ).item()
         for field_name in _GRAPH_PARAMETER_FIELDS
     }
-    for field_name in ("max_neighbors", "depth_samples", "min_shared_views"):
+    for field_name in (
+        "max_neighbors",
+        "depth_samples",
+        "min_shared_views",
+        "min_component_nodes",
+        "min_component_edges",
+    ):
         if not np.issubdtype(arrays[field_name].dtype, np.integer):
             raise ValueError(f"{graph_path} {field_name} must be an integer scalar")
     config = ObservedStructureGraphConfig(
@@ -1261,6 +1361,8 @@ def load_observed_structure_graph(
         depth_mad_multiplier=float(numeric_parameters["depth_mad_multiplier"]),
         depth_samples=int(numeric_parameters["depth_samples"]),
         min_shared_views=int(numeric_parameters["min_shared_views"]),
+        min_component_nodes=int(numeric_parameters["min_component_nodes"]),
+        min_component_edges=int(numeric_parameters["min_component_edges"]),
         render_acc_min=float(numeric_parameters["render_acc_min"]),
         epsilon=float(numeric_parameters["epsilon"]),
     )
@@ -1614,6 +1716,14 @@ def load_observed_structure_graph(
         raise ValueError(
             f"{graph_path} component_size is inconsistent with edge_index"
         )
+    component_pruned_node_mask = arrays["component_pruned_node_mask"]
+    if (
+        component_pruned_node_mask.dtype != np.bool_
+        or component_pruned_node_mask.shape != (num_nodes,)
+    ):
+        raise ValueError(
+            f"{graph_path} component_pruned_node_mask must be boolean ({num_nodes},)"
+        )
     isolated = arrays["isolated_mask"]
     if (
         isolated.dtype != np.bool_
@@ -1621,6 +1731,28 @@ def load_observed_structure_graph(
         or not np.array_equal(isolated, expected_isolated)
     ):
         raise ValueError(f"{graph_path} isolated_mask is inconsistent with degree")
+    if np.any(component_pruned_node_mask & ~isolated):
+        raise ValueError(
+            f"{graph_path} component-pruned nodes must remain isolated"
+        )
+    final_component_edge_count = np.zeros(expected_sizes.shape, dtype=np.int64)
+    if num_edges:
+        final_edge_component = expected_components[edges[:, 0]]
+        final_component_edge_count = np.bincount(
+            final_edge_component,
+            minlength=expected_sizes.shape[0],
+        )
+    connected_component = final_component_edge_count > 0
+    if np.any(
+        connected_component
+        & (
+            (expected_sizes < config.min_component_nodes)
+            | (final_component_edge_count < config.min_component_edges)
+        )
+    ):
+        raise ValueError(
+            f"{graph_path} contains a connected component below its size thresholds"
+        )
 
     count_values: dict[str, int] = {}
     for field_name in _OBSERVED_COUNT_FIELDS:
@@ -1663,8 +1795,31 @@ def load_observed_structure_graph(
         "depth_retained_count"
     ] != count_values["color_retained_count"]:
         raise ValueError(f"{graph_path} depth filtering counts are inconsistent")
-    if count_values["depth_retained_count"] != num_edges:
-        raise ValueError(f"{graph_path} retained depth count is inconsistent")
+    if count_values["depth_retained_count"] != (
+        num_edges + count_values["component_pruned_edge_count"]
+    ):
+        raise ValueError(f"{graph_path} component pruning edge count is inconsistent")
+    if count_values["component_pruned_node_count"] != int(
+        np.count_nonzero(component_pruned_node_mask)
+    ):
+        raise ValueError(f"{graph_path} component pruning node count is inconsistent")
+    if count_values["component_pruned_component_count"] == 0 and (
+        count_values["component_pruned_node_count"] != 0
+        or count_values["component_pruned_edge_count"] != 0
+    ):
+        raise ValueError(f"{graph_path} component pruning counts are inconsistent")
+    if count_values["component_pruned_component_count"] > 0 and (
+        count_values["component_pruned_node_count"] == 0
+        or count_values["component_pruned_edge_count"] == 0
+    ):
+        raise ValueError(f"{graph_path} component pruning counts are inconsistent")
+    if (
+        2 * count_values["component_pruned_component_count"]
+        > count_values["component_pruned_node_count"]
+        or count_values["component_pruned_component_count"]
+        > count_values["component_pruned_edge_count"]
+    ):
+        raise ValueError(f"{graph_path} component pruning counts are inconsistent")
     if count_values["raw_depth_valid_candidate_view_count"] != (
         count_values["endpoint_rejected_candidate_view_count"]
         + count_values["jump_rejected_candidate_view_count"]
@@ -1698,6 +1853,7 @@ def load_observed_structure_graph(
         degree=degree.astype(np.int32),
         component_index=components.astype(np.int32),
         component_size=sizes.astype(np.int32),
+        component_pruned_node_mask=component_pruned_node_mask,
         isolated_mask=isolated,
         view_ids=np.asarray(view_ids),
         endpoint_gap_median_by_view=endpoint_median.astype(np.float32),

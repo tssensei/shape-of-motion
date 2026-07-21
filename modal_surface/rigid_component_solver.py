@@ -49,8 +49,6 @@ class RigidComponentSolverConfig:
 class RigidComponentSeedSelectionConfig:
     min_valid_views: int = 2
     min_singular_ratio: float = 1.0e-3
-    min_component_nodes: int = 4
-    min_component_edges: int = 3
 
     def validate(self) -> None:
         if (
@@ -66,16 +64,6 @@ class RigidComponentSeedSelectionConfig:
             raise ValueError(
                 "rigid seed min_singular_ratio must be finite and lie in [0,1]"
             )
-        for name, value in (
-            ("min_component_nodes", self.min_component_nodes),
-            ("min_component_edges", self.min_component_edges),
-        ):
-            if (
-                isinstance(value, (bool, np.bool_))
-                or not isinstance(value, (int, np.integer))
-                or value <= 0
-            ):
-                raise ValueError(f"rigid seed {name} must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -140,7 +128,6 @@ class RigidComponentSeedSelectionResult:
     component_seed_retained_mask: np.ndarray
     component_valid_view_rejected_mask: np.ndarray
     component_singular_rejected_mask: np.ndarray
-    component_size_rejected_mask: np.ndarray
     component_singular_ratio: np.ndarray
 
 
@@ -176,29 +163,12 @@ def select_trusted_rigid_component_seeds(
         or np.any(valid_view_count < 1)
     ):
         raise ValueError("rigid component valid-view count is invalid")
-    component_node_count = np.asarray(rigid.component_node_count)
-    component_edge_count = np.asarray(rigid.component_edge_count)
-    for name, values in (
-        ("node", component_node_count),
-        ("edge", component_edge_count),
-    ):
-        if (
-            values.shape != (num_components,)
-            or not np.issubdtype(values.dtype, np.integer)
-            or np.any(values <= 0)
-        ):
-            raise ValueError(f"rigid component {name} count is invalid")
-
     singular_ratio = np.zeros((num_components,), dtype=np.float64)
     full_rank = (rank == 6) & (singular[:, 0] > 0.0)
     singular_ratio[full_rank] = singular[full_rank, 5] / singular[full_rank, 0]
     valid_view_rejected = valid_view_count < int(config.min_valid_views)
     singular_rejected = singular_ratio < float(config.min_singular_ratio)
-    size_rejected = (
-        (component_node_count < int(config.min_component_nodes))
-        | (component_edge_count < int(config.min_component_edges))
-    )
-    retained = ~(valid_view_rejected | singular_rejected | size_rejected)
+    retained = ~(valid_view_rejected | singular_rejected)
 
     candidate_mask = np.asarray(rigid.rigid_seed_mask)
     point_component = np.asarray(rigid.point_component_index)
@@ -229,7 +199,6 @@ def select_trusted_rigid_component_seeds(
         component_seed_retained_mask=retained,
         component_valid_view_rejected_mask=valid_view_rejected,
         component_singular_rejected_mask=singular_rejected,
-        component_size_rejected_mask=size_rejected,
         component_singular_ratio=singular_ratio.astype(np.float32),
     )
 
