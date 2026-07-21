@@ -12,8 +12,10 @@ from preproc.vis_anchor_structure_graph import (
     anchor_graph_component_colors,
     anchor_graph_scalar_colors,
     build_parser,
+    gaussian_covariances,
     load_anchor_graph_source,
     load_anchor_graphs_from_manifest,
+    load_gaussian_visualization_sidecar,
     stable_uniform_edge_indices,
 )
 
@@ -139,6 +141,47 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_gaussian_sidecar(
+        self,
+        path: Path,
+        *,
+        source_checkpoint: str = "source.ckpt",
+        center_offset: float = 0.0,
+    ) -> None:
+        centers = np.array(
+            [[0.0, 0.0, 0.0], [0.004, 0.0, 0.0], [0.02, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        centers[0, 0] += center_offset
+        half_sqrt = np.float32(np.sqrt(0.5))
+        np.savez_compressed(
+            path,
+            version=np.array(1, dtype=np.int32),
+            point_type=np.array("static_3dgs_activated_gaussians"),
+            source_checkpoint=np.array(source_checkpoint),
+            has_background=np.array(False, dtype=bool),
+            num_foreground_gaussians=np.array(3, dtype=np.int64),
+            fg_gaussian_indices=np.arange(3, dtype=np.int64),
+            fg_centers=centers,
+            fg_scales=np.tile(
+                np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+                (3, 1),
+            ),
+            fg_quats_wxyz=np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [half_sqrt, 0.0, 0.0, half_sqrt],
+                    [1.0, 0.0, 0.0, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            fg_rgbs=np.array(
+                [[1.0, 1.0, 1.0], [0.9, 0.9, 0.9], [0.0, 1.0, 0.0]],
+                dtype=np.float32,
+            ),
+            fg_opacities=np.full((3, 1), 0.8, dtype=np.float32),
+        )
+
     def test_direct_artifact_and_display_helpers_are_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             graph_path = Path(tmp) / "graph.npz"
@@ -180,10 +223,72 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "component_index"):
                 load_anchor_graphs_from_manifest(manifest_path)
 
+    def test_gaussian_sidecar_covariance_and_graph_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph_path = root / "graph.npz"
+            sidecar_path = root / "gaussians.npz"
+            self._write_graph(graph_path)
+            self._write_gaussian_sidecar(sidecar_path)
+            graphs = load_anchor_graph_source(
+                manifest_path=None,
+                graph_path=graph_path,
+            )
+            gaussians = load_gaussian_visualization_sidecar(
+                sidecar_path,
+                graphs,
+            )
+        self.assertIsNone(gaussians.background)
+        np.testing.assert_allclose(
+            gaussians.foreground.covariances[0],
+            np.diag([1.0, 4.0, 9.0]),
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            gaussians.foreground.covariances[1],
+            np.diag([4.0, 1.0, 9.0]),
+            atol=1.0e-5,
+        )
+        np.testing.assert_allclose(
+            gaussian_covariances(
+                np.ones((1, 3), dtype=np.float32),
+                np.array([[2.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+            ),
+            np.eye(3, dtype=np.float32)[None],
+        )
+
+    def test_gaussian_sidecar_provenance_and_anchor_mismatch_fail_fast(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph_path = root / "graph.npz"
+            sidecar_path = root / "gaussians.npz"
+            self._write_graph(graph_path)
+            graphs = load_anchor_graph_source(
+                manifest_path=None,
+                graph_path=graph_path,
+            )
+            self._write_gaussian_sidecar(
+                sidecar_path,
+                source_checkpoint="other.ckpt",
+            )
+            with self.assertRaisesRegex(ValueError, "source_checkpoint"):
+                load_gaussian_visualization_sidecar(sidecar_path, graphs)
+            self._write_gaussian_sidecar(sidecar_path, center_offset=1.0e-3)
+            with self.assertRaisesRegex(ValueError, "centers do not match"):
+                load_gaussian_visualization_sidecar(sidecar_path, graphs)
+
     def test_cli_requires_one_source_and_validates_display_ranges(self) -> None:
         parser = build_parser()
-        args = parser.parse_args(["--graph-npz", "graph.npz"])
+        args = parser.parse_args(
+            [
+                "--graph-npz",
+                "graph.npz",
+                "--gaussian-npz",
+                "gaussians.npz",
+            ]
+        )
         _validate_args(args)
+        self.assertEqual(args.gaussian_npz, Path("gaussians.npz"))
         with self.assertRaises(SystemExit):
             parser.parse_args([])
         with self.assertRaises(SystemExit):
@@ -199,6 +304,11 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
             ["--graph-npz", "graph.npz", "--line-width", "0.0"]
         )
         with self.assertRaisesRegex(ValueError, "line-width"):
+            _validate_args(args)
+        args = parser.parse_args(
+            ["--graph-npz", "graph.npz", "--gaussian-scale", "3.1"]
+        )
+        with self.assertRaisesRegex(ValueError, "gaussian-scale"):
             _validate_args(args)
 
 

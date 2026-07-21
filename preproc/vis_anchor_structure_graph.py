@@ -128,6 +128,22 @@ _COUNT_FIELDS = {
     "component_count",
 }
 
+_GAUSSIAN_BASE_REQUIRED_FIELDS = {
+    "version",
+    "point_type",
+    "source_checkpoint",
+    "has_background",
+}
+
+_GAUSSIAN_GROUP_FIELDS = (
+    "gaussian_indices",
+    "centers",
+    "scales",
+    "quats_wxyz",
+    "rgbs",
+    "opacities",
+)
+
 
 @dataclass(frozen=True)
 class AnchorGraphViewData:
@@ -135,6 +151,8 @@ class AnchorGraphViewData:
     freq_hz: float
     graph_path: Path
     source_checkpoint: str
+    num_foreground_gaussians: int
+    anchor_gaussian_indices: np.ndarray
     anchor_points_world: np.ndarray
     anchor_colors_rgb: np.ndarray
     edge_index: np.ndarray
@@ -147,6 +165,22 @@ class AnchorGraphViewData:
     @property
     def label(self) -> str:
         return f"Mode {self.mode_index}: {self.freq_hz:.3f} Hz"
+
+
+@dataclass(frozen=True)
+class GaussianSplatGroup:
+    centers: np.ndarray
+    covariances: np.ndarray
+    rgbs: np.ndarray
+    opacities: np.ndarray
+
+
+@dataclass(frozen=True)
+class GaussianVisualizationData:
+    sidecar_path: Path
+    source_checkpoint: str
+    foreground: GaussianSplatGroup
+    background: GaussianSplatGroup | None
 
 
 def stable_uniform_edge_indices(
@@ -234,6 +268,42 @@ def anchor_graph_scalar_colors(values: np.ndarray) -> np.ndarray:
     return np.column_stack(
         [1.0 - normalized, 0.25 + 0.75 * normalized, normalized]
     ).astype(np.float32)
+
+
+def gaussian_covariances(
+    scales: np.ndarray,
+    quats_wxyz: np.ndarray,
+) -> np.ndarray:
+    scales = np.asarray(scales, dtype=np.float64)
+    quaternions = np.asarray(quats_wxyz, dtype=np.float64)
+    if scales.ndim != 2 or scales.shape[1] != 3:
+        raise ValueError("Gaussian scales must have shape (N,3)")
+    if quaternions.shape != (scales.shape[0], 4):
+        raise ValueError("Gaussian quats_wxyz must have shape (N,4)")
+    if not np.isfinite(scales).all() or np.any(scales <= 0.0):
+        raise ValueError("Gaussian scales must be finite and positive")
+    if not np.isfinite(quaternions).all():
+        raise ValueError("Gaussian quats_wxyz must be finite")
+    norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
+    if np.any(norms <= 0.0):
+        raise ValueError("Gaussian quats_wxyz must be nonzero")
+    quaternions = quaternions / norms
+    w, x, y, z = quaternions.T
+    rotations = np.empty((scales.shape[0], 3, 3), dtype=np.float64)
+    rotations[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
+    rotations[:, 0, 1] = 2.0 * (x * y - z * w)
+    rotations[:, 0, 2] = 2.0 * (x * z + y * w)
+    rotations[:, 1, 0] = 2.0 * (x * y + z * w)
+    rotations[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
+    rotations[:, 1, 2] = 2.0 * (y * z - x * w)
+    rotations[:, 2, 0] = 2.0 * (x * z - y * w)
+    rotations[:, 2, 1] = 2.0 * (y * z + x * w)
+    rotations[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
+    scaled_rotations = rotations * np.square(scales)[:, None, :]
+    covariances = scaled_rotations @ np.swapaxes(rotations, 1, 2)
+    if not np.isfinite(covariances).all():
+        raise ValueError("Gaussian covariances must be finite")
+    return covariances.astype(np.float32)
 
 
 def _scalar(array: np.ndarray, name: str, path: Path) -> np.ndarray:
@@ -610,6 +680,8 @@ def _load_graph_archive(
         freq_hz=freq_hz,
         graph_path=graph_path,
         source_checkpoint=source_checkpoint,
+        num_foreground_gaussians=num_gaussians,
+        anchor_gaussian_indices=anchor_indices,
         anchor_points_world=points,
         anchor_colors_rgb=colors,
         edge_index=edges.astype(np.int32),
@@ -699,6 +771,227 @@ def load_anchor_graph_source(
         return load_anchor_graphs_from_manifest(manifest_path)
     assert graph_path is not None
     return (_load_graph_archive(graph_path),)
+
+
+def _load_gaussian_splat_group(
+    arrays: dict[str, np.ndarray],
+    sidecar_path: Path,
+    group_name: str,
+) -> GaussianSplatGroup:
+    short_name = "fg" if group_name == "foreground" else "bg"
+    count_name = f"num_{group_name}_gaussians"
+    required = {count_name} | {
+        f"{short_name}_{field_name}" for field_name in _GAUSSIAN_GROUP_FIELDS
+    }
+    missing = sorted(required - set(arrays))
+    if missing:
+        raise ValueError(f"{sidecar_path} missing required fields: {missing}")
+    count_value = _scalar(arrays[count_name], count_name, sidecar_path)
+    if not np.issubdtype(count_value.dtype, np.integer):
+        raise ValueError(f"{sidecar_path} {count_name} must be an integer scalar")
+    count = int(count_value.item())
+    if count <= 0:
+        raise ValueError(f"{sidecar_path} {count_name} must be positive")
+
+    indices_name = f"{short_name}_gaussian_indices"
+    indices = arrays[indices_name]
+    if indices.shape != (count,) or not np.issubdtype(indices.dtype, np.integer):
+        raise ValueError(f"{sidecar_path} {indices_name} must be integer ({count},)")
+    if not np.array_equal(indices, np.arange(count, dtype=indices.dtype)):
+        raise ValueError(f"{sidecar_path} {indices_name} must be contiguous")
+
+    centers = arrays[f"{short_name}_centers"].astype(np.float32)
+    scales = arrays[f"{short_name}_scales"].astype(np.float32)
+    quaternions = arrays[f"{short_name}_quats_wxyz"].astype(np.float32)
+    rgbs = arrays[f"{short_name}_rgbs"].astype(np.float32)
+    opacities = arrays[f"{short_name}_opacities"].astype(np.float32)
+    for field_name, array, expected_shape in (
+        ("centers", centers, (count, 3)),
+        ("scales", scales, (count, 3)),
+        ("quats_wxyz", quaternions, (count, 4)),
+        ("rgbs", rgbs, (count, 3)),
+        ("opacities", opacities, (count, 1)),
+    ):
+        if array.shape != expected_shape or not np.isfinite(array).all():
+            raise ValueError(
+                f"{sidecar_path} {short_name}_{field_name} must be finite "
+                f"{expected_shape}"
+            )
+    if np.any(scales <= 0.0):
+        raise ValueError(f"{sidecar_path} {short_name}_scales must be positive")
+    quaternion_norms = np.linalg.norm(quaternions.astype(np.float64), axis=1)
+    if not np.allclose(quaternion_norms, 1.0, rtol=1e-5, atol=1e-6):
+        raise ValueError(
+            f"{sidecar_path} {short_name}_quats_wxyz must be normalized"
+        )
+    if np.any(rgbs < 0.0) or np.any(rgbs > 1.0):
+        raise ValueError(f"{sidecar_path} {short_name}_rgbs must lie in [0,1]")
+    if np.any(opacities < 0.0) or np.any(opacities > 1.0):
+        raise ValueError(
+            f"{sidecar_path} {short_name}_opacities must lie in [0,1]"
+        )
+    return GaussianSplatGroup(
+        centers=centers,
+        covariances=gaussian_covariances(scales, quaternions),
+        rgbs=rgbs,
+        opacities=opacities,
+    )
+
+
+def load_gaussian_visualization_sidecar(
+    sidecar_path: Path,
+    graphs: tuple[AnchorGraphViewData, ...],
+) -> GaussianVisualizationData:
+    if not graphs:
+        raise ValueError("Gaussian sidecar validation requires at least one graph")
+    if not sidecar_path.is_file():
+        raise ValueError(
+            f"Gaussian visualization sidecar does not exist: {sidecar_path}"
+        )
+    with np.load(str(sidecar_path), allow_pickle=False) as archive:
+        missing = sorted(_GAUSSIAN_BASE_REQUIRED_FIELDS - set(archive.files))
+        if missing:
+            raise ValueError(f"{sidecar_path} missing required fields: {missing}")
+        arrays = {name: np.asarray(archive[name]) for name in archive.files}
+
+    version_value = _scalar(arrays["version"], "version", sidecar_path)
+    if not np.issubdtype(version_value.dtype, np.integer) or int(
+        version_value.item()
+    ) != 1:
+        raise ValueError(f"{sidecar_path} must be a version 1 Gaussian sidecar")
+    if (
+        _scalar_string(arrays["point_type"], "point_type", sidecar_path)
+        != "static_3dgs_activated_gaussians"
+    ):
+        raise ValueError(f"{sidecar_path} point_type is incompatible")
+    source_checkpoint = _scalar_string(
+        arrays["source_checkpoint"],
+        "source_checkpoint",
+        sidecar_path,
+    )
+    background_value = _scalar(
+        arrays["has_background"],
+        "has_background",
+        sidecar_path,
+    )
+    if background_value.dtype != np.dtype(bool):
+        raise ValueError(f"{sidecar_path} has_background must be a boolean scalar")
+    has_background = bool(background_value.item())
+
+    foreground = _load_gaussian_splat_group(
+        arrays,
+        sidecar_path,
+        "foreground",
+    )
+    background_fields = {"num_background_gaussians"} | {
+        f"bg_{field_name}" for field_name in _GAUSSIAN_GROUP_FIELDS
+    }
+    if has_background:
+        background = _load_gaussian_splat_group(
+            arrays,
+            sidecar_path,
+            "background",
+        )
+    else:
+        unexpected = sorted(background_fields & set(arrays))
+        if unexpected:
+            raise ValueError(
+                f"{sidecar_path} has_background=false but contains {unexpected}"
+            )
+        background = None
+
+    for graph in graphs:
+        if graph.source_checkpoint != source_checkpoint:
+            raise ValueError(
+                f"{sidecar_path} source_checkpoint does not match "
+                f"{graph.graph_path}"
+            )
+        if graph.num_foreground_gaussians != foreground.centers.shape[0]:
+            raise ValueError(
+                f"{sidecar_path} foreground count does not match {graph.graph_path}"
+            )
+        if graph.anchor_gaussian_indices.shape[0]:
+            sidecar_anchor_points = foreground.centers[
+                graph.anchor_gaussian_indices
+            ]
+            if not np.allclose(
+                sidecar_anchor_points,
+                graph.anchor_points_world,
+                rtol=1e-6,
+                atol=1e-5,
+            ):
+                raise ValueError(
+                    f"{sidecar_path} foreground centers do not match "
+                    f"{graph.graph_path} anchors"
+                )
+    return GaussianVisualizationData(
+        sidecar_path=sidecar_path,
+        source_checkpoint=source_checkpoint,
+        foreground=foreground,
+        background=background,
+    )
+
+
+class StaticGaussianViewer:
+    def __init__(
+        self,
+        server: Any,
+        gaussians: GaussianVisualizationData,
+        *,
+        splat_scale: float,
+    ) -> None:
+        self.foreground_handle = server.scene.add_gaussian_splats(
+            "/static_gaussians/foreground",
+            centers=gaussians.foreground.centers,
+            covariances=gaussians.foreground.covariances,
+            rgbs=gaussians.foreground.rgbs,
+            opacities=gaussians.foreground.opacities,
+            scale=splat_scale,
+            visible=True,
+        )
+        self.background_handle = None
+        if gaussians.background is not None:
+            self.background_handle = server.scene.add_gaussian_splats(
+                "/static_gaussians/background",
+                centers=gaussians.background.centers,
+                covariances=gaussians.background.covariances,
+                rgbs=gaussians.background.rgbs,
+                opacities=gaussians.background.opacities,
+                scale=splat_scale,
+                visible=True,
+            )
+        with server.gui.add_folder("Static Gaussian checkpoint"):
+            self.show_foreground = server.gui.add_checkbox(
+                "Show foreground splats",
+                True,
+            )
+            self.show_background = None
+            if self.background_handle is not None:
+                self.show_background = server.gui.add_checkbox(
+                    "Show background splats",
+                    True,
+                )
+            self.splat_scale = server.gui.add_slider(
+                "Gaussian scale",
+                min=0.1,
+                max=3.0,
+                step=0.05,
+                initial_value=splat_scale,
+            )
+        self.show_foreground.on_update(self._update)
+        if self.show_background is not None:
+            self.show_background.on_update(self._update)
+        self.splat_scale.on_update(self._update)
+        self._update()
+
+    def _update(self, _event: Any = None) -> None:
+        self.foreground_handle.visible = bool(self.show_foreground.value)
+        scale = float(self.splat_scale.value)
+        self.foreground_handle.scale = scale
+        if self.background_handle is not None:
+            assert self.show_background is not None
+            self.background_handle.visible = bool(self.show_background.value)
+            self.background_handle.scale = scale
 
 
 class AnchorGraphViewer:
@@ -893,12 +1186,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Single version-1 anchor graph NPZ artifact",
     )
+    parser.add_argument(
+        "--gaussian-npz",
+        type=Path,
+        help=(
+            "Optional static Gaussian sidecar produced by "
+            "export_static_gaussians_for_viser.py"
+        ),
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--max-visible-edges", type=int, default=20000)
     parser.add_argument("--line-width", type=float, default=1.0)
     parser.add_argument("--anchor-point-size", type=float, default=0.0009)
     parser.add_argument("--isolated-point-size", type=float, default=0.002)
+    parser.add_argument("--gaussian-scale", type=float, default=1.0)
     return parser
 
 
@@ -909,6 +1211,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-visible-edges must be non-negative")
     if not np.isfinite(args.line_width) or not 0.1 <= args.line_width <= 10.0:
         raise ValueError("--line-width must lie in [0.1,10.0]")
+    if not np.isfinite(args.gaussian_scale) or not 0.1 <= args.gaussian_scale <= 3.0:
+        raise ValueError("--gaussian-scale must lie in [0.1,3.0]")
     for name in ("anchor_point_size", "isolated_point_size"):
         value = float(getattr(args, name))
         if not np.isfinite(value) or not 0.0001 <= value <= 0.008:
@@ -922,6 +1226,11 @@ def main() -> None:
     graphs = load_anchor_graph_source(
         manifest_path=args.manifest,
         graph_path=args.graph_npz,
+    )
+    gaussians = (
+        load_gaussian_visualization_sidecar(args.gaussian_npz, graphs)
+        if args.gaussian_npz is not None
+        else None
     )
 
     try:
@@ -942,6 +1251,11 @@ def main() -> None:
             f"(detected version {viser_version}); run this script in the isolated "
             "anchor_graph_viewer environment with viser==1.0.30"
         )
+    if gaussians is not None and not hasattr(SceneApi, "add_gaussian_splats"):
+        raise RuntimeError(
+            "Installed Viser lacks SceneApi.add_gaussian_splats "
+            f"(detected version {viser_version})"
+        )
 
     server = viser.ViserServer(
         host=args.host,
@@ -950,6 +1264,12 @@ def main() -> None:
     )
     server.scene.set_up_direction("+z")
     _configure_initial_camera(server, graphs)
+    if gaussians is not None:
+        StaticGaussianViewer(
+            server,
+            gaussians,
+            splat_scale=args.gaussian_scale,
+        )
     AnchorGraphViewer(
         server,
         graphs,
@@ -964,6 +1284,17 @@ def main() -> None:
         f"{sum(graph.edge_index.shape[0] for graph in graphs)} edge(s), "
         f"{sum(graph.anchor_points_world.shape[0] for graph in graphs)} anchor(s)."
     )
+    if gaussians is not None:
+        background_count = (
+            0
+            if gaussians.background is None
+            else gaussians.background.centers.shape[0]
+        )
+        print(
+            "Loaded static Gaussian sidecar with "
+            f"{gaussians.foreground.centers.shape[0]} foreground and "
+            f"{background_count} background splat(s)."
+        )
     print(
         f"Viser {viser_version} listening on {server.get_host()}:{server.get_port()}"
     )
