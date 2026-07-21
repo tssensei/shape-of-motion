@@ -195,6 +195,7 @@ _RIGID_DIAGNOSTIC_REQUIRED_FIELDS = {
     "rigid_component_seed_policy",
     "rigid_seed_min_valid_views",
     "rigid_seed_min_singular_ratio",
+    "rigid_seed_max_finite_drift",
     "rigid_seed_mask",
     "observed_mask",
     "fill_target_mask",
@@ -216,7 +217,9 @@ _RIGID_DIAGNOSTIC_REQUIRED_FIELDS = {
     "component_seed_retained_mask",
     "component_valid_view_rejected_mask",
     "component_singular_rejected_mask",
+    "component_finite_drift_rejected_mask",
     "component_normalized_weighted_residual",
+    "component_finite_drift_max",
     "edge_component_index",
     "edge_finite_drift_max",
 }
@@ -309,6 +312,7 @@ class RigidModeViewData:
     component_distinct_valid_view_count: np.ndarray
     component_singular_ratio: np.ndarray
     component_motion_rms: np.ndarray
+    component_finite_drift_max: np.ndarray
     edge_component_index: np.ndarray
     edge_finite_drift_max: np.ndarray
 
@@ -320,6 +324,7 @@ class RigidManifestViewData:
     motion_fill_enabled: bool
     rigid_seed_min_valid_views: int
     rigid_seed_min_singular_ratio: float
+    rigid_seed_max_finite_drift: float
     modes: tuple[RigidModeViewData, ...]
 
 
@@ -888,6 +893,11 @@ def load_rigid_manifest(
         "rigid_seed_min_singular_ratio",
         manifest_path,
     )
+    rigid_seed_max_finite_drift = _manifest_number(
+        parameters.get("rigid_seed_max_finite_drift"),
+        "rigid_seed_max_finite_drift",
+        manifest_path,
+    )
     if rigid_seed_min_valid_views <= 0:
         raise ValueError(
             f"{manifest_path} rigid_seed_min_valid_views must be positive"
@@ -895,6 +905,10 @@ def load_rigid_manifest(
     if not 0.0 <= rigid_seed_min_singular_ratio <= 1.0:
         raise ValueError(
             f"{manifest_path} rigid_seed_min_singular_ratio must lie in [0,1]"
+        )
+    if rigid_seed_max_finite_drift < 0.0:
+        raise ValueError(
+            f"{manifest_path} rigid_seed_max_finite_drift must be non-negative"
         )
     expected_parameters = {
         "solver": "rigid_components",
@@ -908,7 +922,7 @@ def load_rigid_manifest(
         "rigid_component_edge_weight_use": "topology_only",
         "rigid_component_finite_rigidity": "first_order_only",
         "rigid_component_seed_policy": (
-            "postsolve_valid_view_and_singular_ratio_gate"
+            "postsolve_valid_view_singular_ratio_and_finite_drift_gate"
         ),
         "nonseed_policy": (
             "single_view_component_rigid_else_free_motion_fill"
@@ -1136,7 +1150,7 @@ def load_rigid_manifest(
             ),
             (
                 "rigid_component_seed_policy",
-                "postsolve_valid_view_and_singular_ratio_gate",
+                "postsolve_valid_view_singular_ratio_and_finite_drift_gate",
             ),
         ):
             if (
@@ -1152,6 +1166,11 @@ def load_rigid_manifest(
         diagnostic_min_singular_ratio = _scalar(
             diagnostics["rigid_seed_min_singular_ratio"],
             "rigid_seed_min_singular_ratio",
+            diagnostics_path,
+        )
+        diagnostic_max_finite_drift = _scalar(
+            diagnostics["rigid_seed_max_finite_drift"],
+            "rigid_seed_max_finite_drift",
             diagnostics_path,
         )
         if (
@@ -1173,6 +1192,16 @@ def load_rigid_manifest(
         ):
             raise ValueError(
                 f"{diagnostics_path} rigid seed singular ratio differs from manifest"
+            )
+        diagnostic_drift_value = float(diagnostic_max_finite_drift.item())
+        if not np.isfinite(diagnostic_drift_value) or not np.isclose(
+            diagnostic_drift_value,
+            rigid_seed_max_finite_drift,
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError(
+                f"{diagnostics_path} rigid seed finite drift differs from manifest"
             )
         if _scalar_string(
             diagnostics["rigid_component_graph_path"],
@@ -1323,12 +1352,24 @@ def load_rigid_manifest(
             raise ValueError(
                 f"{diagnostics_path} component_singular_ratio is inconsistent"
             )
+        component_finite_drift = np.asarray(
+            diagnostics["component_finite_drift_max"], dtype=np.float32
+        )
+        if (
+            component_finite_drift.shape != (num_components,)
+            or not np.isfinite(component_finite_drift).all()
+            or np.any(component_finite_drift < 0.0)
+        ):
+            raise ValueError(
+                f"{diagnostics_path} component finite drift is invalid"
+            )
         component_selection_masks = {
             name: np.asarray(diagnostics[name])
             for name in (
                 "component_seed_retained_mask",
                 "component_valid_view_rejected_mask",
                 "component_singular_rejected_mask",
+                "component_finite_drift_rejected_mask",
             )
         }
         for name, values in component_selection_masks.items():
@@ -1343,8 +1384,13 @@ def load_rigid_manifest(
         expected_singular_rejected = (
             component_singular_ratio < rigid_seed_min_singular_ratio
         )
+        expected_finite_drift_rejected = (
+            component_finite_drift > rigid_seed_max_finite_drift
+        )
         expected_component_retained = ~(
-            expected_valid_view_rejected | expected_singular_rejected
+            expected_valid_view_rejected
+            | expected_singular_rejected
+            | expected_finite_drift_rejected
         )
         for name, expected_values in (
             (
@@ -1352,6 +1398,10 @@ def load_rigid_manifest(
                 expected_valid_view_rejected,
             ),
             ("component_singular_rejected_mask", expected_singular_rejected),
+            (
+                "component_finite_drift_rejected_mask",
+                expected_finite_drift_rejected,
+            ),
             ("component_seed_retained_mask", expected_component_retained),
         ):
             if not np.array_equal(
@@ -1687,6 +1737,7 @@ def load_rigid_manifest(
                 ),
                 component_singular_ratio=component_singular_ratio,
                 component_motion_rms=component_motion_rms,
+                component_finite_drift_max=component_finite_drift,
                 edge_component_index=expected_edge_component.astype(np.int32),
                 edge_finite_drift_max=edge_finite_drift,
             )
@@ -1698,6 +1749,7 @@ def load_rigid_manifest(
         motion_fill_enabled=motion_fill_enabled,
         rigid_seed_min_valid_views=rigid_seed_min_valid_views,
         rigid_seed_min_singular_ratio=rigid_seed_min_singular_ratio,
+        rigid_seed_max_finite_drift=rigid_seed_max_finite_drift,
         modes=tuple(loaded_modes),
     )
 
@@ -2408,6 +2460,7 @@ class ObservedGraphViewer:
                 "component residual",
                 "component rank",
                 "finite-amplitude drift",
+                "finite-drift anomaly",
                 "single-view anomaly",
                 "singular-ratio anomaly",
                 "motion-RMS anomaly",
@@ -2477,6 +2530,7 @@ class ObservedGraphViewer:
                 self.playback_fps = None
                 self.minimum_valid_views = None
                 self.minimum_log10_singular_ratio = None
+                self.maximum_finite_drift = None
                 self.motion_rms_percentile = None
                 self.show_rigid_seeds = None
                 self.show_quarantined_rigid = None
@@ -2546,6 +2600,16 @@ class ObservedGraphViewer:
                         ),
                     ),
                 )
+                self.maximum_finite_drift = server.gui.add_slider(
+                    "Maximum finite drift",
+                    min=0.0,
+                    max=max(
+                        10.0,
+                        10.0 * rigid_manifest.rigid_seed_max_finite_drift,
+                    ),
+                    step=0.1,
+                    initial_value=rigid_manifest.rigid_seed_max_finite_drift,
+                )
                 self.motion_rms_percentile = server.gui.add_slider(
                     "Motion RMS percentile",
                     min=50.0,
@@ -2603,6 +2667,7 @@ class ObservedGraphViewer:
             assert self.playback_fps is not None
             assert self.minimum_valid_views is not None
             assert self.minimum_log10_singular_ratio is not None
+            assert self.maximum_finite_drift is not None
             assert self.motion_rms_percentile is not None
             assert self.show_rigid_seeds is not None
             assert self.show_quarantined_rigid is not None
@@ -2616,6 +2681,7 @@ class ObservedGraphViewer:
             for handle in (
                 self.minimum_valid_views,
                 self.minimum_log10_singular_ratio,
+                self.maximum_finite_drift,
                 self.motion_rms_percentile,
             ):
                 handle.on_update(self._update)
@@ -2867,6 +2933,23 @@ class ObservedGraphViewer:
                             )
                         edge_colors = graph_scalar_colors(
                             rigid_mode.edge_finite_drift_max[selected_edges]
+                        )
+                    elif color_mode == "finite-drift anomaly":
+                        if (
+                            rigid_mode is None
+                            or self.maximum_finite_drift is None
+                        ):
+                            raise ValueError(
+                                "Finite drift anomaly color requires a rigid manifest"
+                            )
+                        component_anomaly = (
+                            rigid_mode.component_finite_drift_max
+                            > float(self.maximum_finite_drift.value)
+                        )
+                        edge_colors = rigid_component_anomaly_colors(
+                            component_anomaly[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ]
                         )
                     elif color_mode == "single-view anomaly":
                         if rigid_mode is None or self.minimum_valid_views is None:

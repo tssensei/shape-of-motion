@@ -72,6 +72,7 @@ from modal_surface.rigid_component_solver import (
 )
 from modal_surface.solver_cli import (
     RIGID_COMPONENT_RCOND_DEFAULT,
+    RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT,
     RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT,
     RIGID_SEED_MIN_VALID_VIEWS_DEFAULT,
     STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT,
@@ -299,6 +300,7 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     rcond = float(args.rigid_component_rcond)
     min_valid_views = int(args.rigid_seed_min_valid_views)
     min_singular_ratio = float(args.rigid_seed_min_singular_ratio)
+    max_finite_drift = float(args.rigid_seed_max_finite_drift)
     if not np.isfinite(rcond) or not (0.0 < rcond < 1.0):
         raise ValueError("--rigid-component-rcond must be finite and lie in (0,1).")
     if min_valid_views <= 0:
@@ -308,6 +310,10 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     ):
         raise ValueError(
             "--rigid-seed-min-singular-ratio must be finite and lie in [0,1]."
+        )
+    if not np.isfinite(max_finite_drift) or max_finite_drift < 0.0:
+        raise ValueError(
+            "--rigid-seed-max-finite-drift must be finite and non-negative."
         )
     if args.solve_method == "staged":
         if graph_paths:
@@ -327,6 +333,11 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         if min_singular_ratio != RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT:
             raise ValueError(
                 "A custom --rigid-seed-min-singular-ratio requires "
+                "--solve-method=rigid-components."
+            )
+        if max_finite_drift != RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT:
+            raise ValueError(
+                "A custom --rigid-seed-max-finite-drift requires "
                 "--solve-method=rigid-components."
             )
         return
@@ -846,6 +857,11 @@ def _rigid_gaussian_latent_stats(
         "singular_rejected_component_count": int(
             np.count_nonzero(seed_selection.component_singular_rejected_mask)
         ),
+        "finite_drift_rejected_component_count": int(
+            np.count_nonzero(
+                seed_selection.component_finite_drift_rejected_mask
+            )
+        ),
         "largest_rigid_component_node_count": int(
             np.max(rigid.component_node_count, initial=0)
         ),
@@ -1285,13 +1301,16 @@ def _write_rigid_solver_diagnostics(
             rigid.config.phase_samples, dtype=np.int32
         ),
         "rigid_component_seed_policy": np.array(
-            "postsolve_valid_view_and_singular_ratio_gate"
+            "postsolve_valid_view_singular_ratio_and_finite_drift_gate"
         ),
         "rigid_seed_min_valid_views": np.array(
             seed_selection.config.min_valid_views, dtype=np.int32
         ),
         "rigid_seed_min_singular_ratio": np.array(
             seed_selection.config.min_singular_ratio, dtype=np.float64
+        ),
+        "rigid_seed_max_finite_drift": np.array(
+            seed_selection.config.max_finite_drift, dtype=np.float64
         ),
         "rigid_seed_mask": rigid.rigid_seed_mask.astype(bool),
         "observed_mask": rigid.observed_mask.astype(bool),
@@ -1340,6 +1359,9 @@ def _write_rigid_solver_diagnostics(
         ),
         "component_singular_rejected_mask": (
             seed_selection.component_singular_rejected_mask.astype(bool)
+        ),
+        "component_finite_drift_rejected_mask": (
+            seed_selection.component_finite_drift_rejected_mask.astype(bool)
         ),
         "component_condition": rigid.component_condition.astype(np.float32),
         "component_weighted_residual_norm": rigid.component_weighted_residual_norm.astype(
@@ -1901,6 +1923,9 @@ def run(args: argparse.Namespace) -> None:
                     min_valid_views=int(args.rigid_seed_min_valid_views),
                     min_singular_ratio=float(
                         args.rigid_seed_min_singular_ratio
+                    ),
+                    max_finite_drift=float(
+                        args.rigid_seed_max_finite_drift
                     ),
                 ),
             )

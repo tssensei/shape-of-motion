@@ -13,6 +13,7 @@ STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT = 0.1
 RIGID_COMPONENT_RCOND_DEFAULT = 1e-8
 RIGID_SEED_MIN_VALID_VIEWS_DEFAULT = 2
 RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT = 1e-3
+RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT = 2.0
 
 
 def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
@@ -59,6 +60,15 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Minimum full-system sigma_min/sigma_max ratio required to retain "
             "a solved rigid component as a trusted seed (default: 1e-3)."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-seed-max-finite-drift",
+        type=float,
+        default=RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT,
+        help=(
+            "Maximum component finite-amplitude edge-length drift retained as "
+            "a trusted rigid seed (default: 2.0)."
         ),
     )
 
@@ -161,11 +171,14 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
         "rigid_component_finite_phase_samples": 64,
         "rigid_component_finite_rigidity": "first_order_only",
         "rigid_component_seed_policy": (
-            "postsolve_valid_view_and_singular_ratio_gate"
+            "postsolve_valid_view_singular_ratio_and_finite_drift_gate"
         ),
         "rigid_seed_min_valid_views": int(args.rigid_seed_min_valid_views),
         "rigid_seed_min_singular_ratio": float(
             args.rigid_seed_min_singular_ratio
+        ),
+        "rigid_seed_max_finite_drift": float(
+            args.rigid_seed_max_finite_drift
         ),
         "nonseed_policy": (
             "single_view_component_rigid_else_free_motion_fill"

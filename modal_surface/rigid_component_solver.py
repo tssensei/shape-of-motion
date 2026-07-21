@@ -49,6 +49,7 @@ class RigidComponentSolverConfig:
 class RigidComponentSeedSelectionConfig:
     min_valid_views: int = 2
     min_singular_ratio: float = 1.0e-3
+    max_finite_drift: float = 2.0
 
     def validate(self) -> None:
         if (
@@ -63,6 +64,10 @@ class RigidComponentSeedSelectionConfig:
         ):
             raise ValueError(
                 "rigid seed min_singular_ratio must be finite and lie in [0,1]"
+            )
+        if not np.isfinite(self.max_finite_drift) or self.max_finite_drift < 0.0:
+            raise ValueError(
+                "rigid seed max_finite_drift must be finite and non-negative"
             )
 
 
@@ -128,6 +133,7 @@ class RigidComponentSeedSelectionResult:
     component_seed_retained_mask: np.ndarray
     component_valid_view_rejected_mask: np.ndarray
     component_singular_rejected_mask: np.ndarray
+    component_finite_drift_rejected_mask: np.ndarray
     component_singular_ratio: np.ndarray
 
 
@@ -168,7 +174,17 @@ def select_trusted_rigid_component_seeds(
     singular_ratio[full_rank] = singular[full_rank, 5] / singular[full_rank, 0]
     valid_view_rejected = valid_view_count < int(config.min_valid_views)
     singular_rejected = singular_ratio < float(config.min_singular_ratio)
-    retained = ~(valid_view_rejected | singular_rejected)
+    finite_drift = np.asarray(rigid.component_finite_drift_max, dtype=np.float64)
+    if (
+        finite_drift.shape != (num_components,)
+        or not np.isfinite(finite_drift).all()
+        or np.any(finite_drift < 0.0)
+    ):
+        raise ValueError("rigid component finite drift is invalid")
+    finite_drift_rejected = finite_drift > float(config.max_finite_drift)
+    retained = ~(
+        valid_view_rejected | singular_rejected | finite_drift_rejected
+    )
 
     candidate_mask = np.asarray(rigid.rigid_seed_mask)
     point_component = np.asarray(rigid.point_component_index)
@@ -199,6 +215,7 @@ def select_trusted_rigid_component_seeds(
         component_seed_retained_mask=retained,
         component_valid_view_rejected_mask=valid_view_rejected,
         component_singular_rejected_mask=singular_rejected,
+        component_finite_drift_rejected_mask=finite_drift_rejected,
         component_singular_ratio=singular_ratio.astype(np.float32),
     )
 

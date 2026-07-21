@@ -185,3 +185,18 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   visibly incorrect components, but every selected component was flying. Motion
   RMS is therefore a high-precision, low-recall outcome diagnostic and should
   not be the primary rejection rule.
+- Rebuilt the mode-4 observed graph as
+  `/home/zs292/outputs_modal/bush4/mode4_observed_graph_exp/mode_004_0p85hz_observed_structure_graph_v2.npz`
+  with the four-node/three-edge graph-pruning contract, then ran the no-fill
+  rigid baseline in
+  `/home/zs292/outputs_modal/bush4/mode4_rigid_components_no_motion_fill_profile`.
+  The full pipeline took 25.177 s: setup 6.609 s, alpha synchronization 5.493 s,
+  rigid component solve 0.868 s, and visualization/output 11.706 s. This confirms
+  that the previous half-hour run is dominated by motion fill rather than the
+  rigid solve.
+- Viewer inspection confirmed that visibly stretched retained components align
+  with high finite-amplitude drift. A threshold sweep rejected 126 components,
+  1,063 nodes, and 1,895 edges at maximum drift 2.0, versus 201/3,923/8,484 at
+  1.0 and 277/12,942/30,573 at 0.5. The next solver revision therefore uses 2.0
+  as the default finite-drift trusted-seed cap to remove extreme deformation
+  while affecting about 0.45% of the 236,537 foreground Gaussians.
