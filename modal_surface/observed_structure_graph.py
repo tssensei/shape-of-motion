@@ -6,18 +6,133 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-import cv2
 import numpy as np
-
-from modal_surface.geometry import bilinear_sample, project_points
-from modal_surface.io import save_npz_compressed_atomic
-from modal_surface.motion_fill import query_knn_candidates
 
 
 OBSERVED_STRUCTURE_GRAPH_VERSION = 1
 OBSERVED_STRUCTURE_GRAPH_EPSILON = 1.0e-8
 _MAD_SCALE = 1.4826
 _PROFILE_BATCH_SIZE = 65536
+_OBSERVED_GRAPH_REQUIRED_FIELDS = {
+    "version",
+    "graph_type",
+    "node_selection",
+    "mode_index",
+    "freq_hz",
+    "source_checkpoint",
+    "source_observation_path",
+    "num_foreground_gaussians",
+    "node_gaussian_indices",
+    "node_points_world",
+    "node_colors_rgb",
+    "node_observed_view_mask",
+    "node_observed_view_count",
+    "edge_index",
+    "edge_distance",
+    "edge_distance_weight",
+    "edge_color_distance",
+    "edge_color_weight",
+    "edge_depth_score",
+    "edge_combined_weight",
+    "edge_view_support_mask",
+    "edge_view_support_count",
+    "edge_endpoint_gap_by_view",
+    "edge_depth_jump_by_view",
+    "degree",
+    "component_index",
+    "component_size",
+    "isolated_mask",
+    "view_ids",
+    "endpoint_gap_median_by_view",
+    "endpoint_gap_mad_by_view",
+    "endpoint_gap_threshold_by_view",
+    "depth_jump_median_by_view",
+    "depth_jump_mad_by_view",
+    "depth_jump_threshold_by_view",
+    "color_distance_median",
+    "color_distance_mad",
+    "color_distance_threshold",
+    "max_neighbors",
+    "max_distance",
+    "color_mad_multiplier",
+    "depth_mad_multiplier",
+    "depth_samples",
+    "min_shared_views",
+    "render_acc_min",
+    "epsilon",
+    "mad_scale",
+    "knn_policy",
+    "depth_source",
+    "color_space",
+    "distance_weight_method",
+    "color_weight_method",
+    "depth_weight_method",
+    "knn_directed_candidate_count",
+    "distance_rejected_directed_count",
+    "nonmutual_rejected_pair_count",
+    "mutual_distance_candidate_count",
+    "shared_observed_candidate_view_count",
+    "raw_depth_valid_candidate_view_count",
+    "endpoint_rejected_candidate_view_count",
+    "jump_rejected_candidate_view_count",
+    "supporting_candidate_view_count",
+    "color_rejected_count",
+    "color_retained_count",
+    "depth_rejected_count",
+    "depth_retained_count",
+    "retained_edge_count",
+    "component_count",
+    "observation_row_count",
+    "positive_observation_row_count",
+    "zero_weight_observation_row_count",
+    "node_count",
+    "single_view_node_count",
+    "multi_view_node_count",
+    "isolated_node_count",
+}
+_GRAPH_PARAMETER_FIELDS = (
+    "version",
+    "max_neighbors",
+    "max_distance",
+    "color_mad_multiplier",
+    "depth_mad_multiplier",
+    "depth_samples",
+    "min_shared_views",
+    "render_acc_min",
+    "epsilon",
+)
+_EXPECTED_SEMANTICS = {
+    "knn_policy": "mutual_knn",
+    "depth_source": "static_3dgs_rendered_depth",
+    "color_space": "opencv_float_rgb_to_lab",
+    "distance_weight_method": "inverse_distance",
+    "color_weight_method": "gaussian_adaptive_threshold",
+    "depth_weight_method": "supporting_view_gaussian_score",
+}
+_OBSERVED_COUNT_FIELDS = {
+    "knn_directed_candidate_count",
+    "distance_rejected_directed_count",
+    "nonmutual_rejected_pair_count",
+    "mutual_distance_candidate_count",
+    "shared_observed_candidate_view_count",
+    "raw_depth_valid_candidate_view_count",
+    "endpoint_rejected_candidate_view_count",
+    "jump_rejected_candidate_view_count",
+    "supporting_candidate_view_count",
+    "color_rejected_count",
+    "color_retained_count",
+    "depth_rejected_count",
+    "depth_retained_count",
+    "retained_edge_count",
+    "component_count",
+    "observation_row_count",
+    "positive_observation_row_count",
+    "zero_weight_observation_row_count",
+    "node_count",
+    "single_view_node_count",
+    "multi_view_node_count",
+    "isolated_node_count",
+}
 
 
 @dataclass(frozen=True)
@@ -82,7 +197,7 @@ class ObservedStructureGraphConfig:
 
 
 @dataclass(frozen=True)
-class _ObservedStructureTopology:
+class ObservedStructureTopology:
     node_gaussian_indices: np.ndarray
     node_points_world: np.ndarray
     node_colors_rgb: np.ndarray
@@ -123,8 +238,64 @@ class ObservedStructureGraph:
     node_colors_rgb: np.ndarray
     node_observed_view_mask: np.ndarray
     node_observed_view_count: np.ndarray
-    topology: _ObservedStructureTopology
+    topology: ObservedStructureTopology
     counts: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class LoadedObservedStructureGraph:
+    graph_path: Path
+    mode_index: int
+    freq_hz: float
+    source_checkpoint: str
+    source_observation_path: str
+    num_foreground_gaussians: int
+    view_ids: tuple[str, ...]
+    graph: ObservedStructureGraph
+
+    @property
+    def label(self) -> str:
+        return f"Mode {self.mode_index}: {self.freq_hz:.3f} Hz"
+
+    @property
+    def node_gaussian_indices(self) -> np.ndarray:
+        return self.graph.node_gaussian_indices
+
+    @property
+    def node_points_world(self) -> np.ndarray:
+        return self.graph.node_points_world
+
+    @property
+    def node_colors_rgb(self) -> np.ndarray:
+        return self.graph.node_colors_rgb
+
+    @property
+    def node_observed_view_mask(self) -> np.ndarray:
+        return self.graph.node_observed_view_mask
+
+    @property
+    def edge_index(self) -> np.ndarray:
+        return self.graph.topology.edge_index
+
+    @property
+    def edge_depth_score(self) -> np.ndarray:
+        return self.graph.topology.edge_depth_score
+
+    @property
+    def edge_combined_weight(self) -> np.ndarray:
+        return self.graph.topology.edge_combined_weight
+
+    @property
+    def edge_view_support_count(self) -> np.ndarray:
+        return self.graph.topology.edge_view_support_count
+
+    @property
+    def component_index(self) -> np.ndarray:
+        return self.graph.topology.component_index
+
+    @property
+    def isolated_mask(self) -> np.ndarray:
+        return self.graph.topology.isolated_mask
 
 
 def _positive_observation_masks(
@@ -204,11 +375,25 @@ def _soft_weight(
     ).astype(np.float32)
 
 
+def _rgb_to_opencv_lab(colors_rgb: np.ndarray) -> np.ndarray:
+    import cv2
+
+    colors = np.asarray(colors_rgb, dtype=np.float32)
+    if colors.shape[0] == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    return cv2.cvtColor(
+        colors.reshape(-1, 1, 3),
+        cv2.COLOR_RGB2LAB,
+    ).reshape(-1, 3)
+
+
 def _mutual_knn_edges(
     points: np.ndarray,
     max_neighbors: int,
     max_distance: float,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+    from modal_surface.motion_fill import query_knn_candidates
+
     num_points = int(points.shape[0])
     if num_points < 2:
         return (
@@ -280,6 +465,8 @@ def _sample_valid_pixels(
     pixels_xy: np.ndarray,
     valid_mask: np.ndarray,
 ) -> np.ndarray:
+    from modal_surface.geometry import bilinear_sample
+
     result = np.full(valid_mask.shape, np.nan, dtype=np.float32)
     if np.any(valid_mask):
         result[valid_mask] = bilinear_sample(
@@ -336,7 +523,9 @@ def _build_observed_topology(
     rendered_depths: list[np.ndarray],
     rendered_accs: list[np.ndarray],
     config: ObservedStructureGraphConfig,
-) -> _ObservedStructureTopology:
+) -> ObservedStructureTopology:
+    from modal_surface.geometry import bilinear_sample, project_points
+
     points = np.asarray(points_world, dtype=np.float32)
     colors = np.asarray(colors_rgb, dtype=np.float32)
     nodes = np.asarray(node_mask, dtype=bool)
@@ -386,14 +575,7 @@ def _build_observed_topology(
     )
     candidate_count = int(candidate_edges.shape[0])
 
-    lab = (
-        cv2.cvtColor(
-            node_colors.reshape(-1, 1, 3),
-            cv2.COLOR_RGB2LAB,
-        ).reshape(-1, 3)
-        if node_colors.shape[0]
-        else np.empty((0, 3), dtype=np.float32)
-    )
+    lab = _rgb_to_opencv_lab(node_colors)
     color_distances = (
         np.linalg.norm(
             lab[candidate_edges[:, 0]].astype(np.float64)
@@ -680,7 +862,7 @@ def _build_observed_topology(
         "isolated_node_count": int(np.count_nonzero(isolated)),
         "component_count": int(component_size.shape[0]),
     }
-    return _ObservedStructureTopology(
+    return ObservedStructureTopology(
         node_gaussian_indices=node_indices,
         node_points_world=node_points,
         node_colors_rgb=node_colors,
@@ -798,6 +980,8 @@ def write_observed_structure_graph(
     source_observation_path: str,
     num_foreground_gaussians: int,
 ) -> Path:
+    from modal_surface.io import save_npz_compressed_atomic
+
     topology = graph.topology
     arrays: dict[str, np.ndarray] = {
         "version": np.array(OBSERVED_STRUCTURE_GRAPH_VERSION, dtype=np.int32),
@@ -888,3 +1072,769 @@ def write_observed_structure_graph(
         {name: np.array(value, dtype=np.int64) for name, value in graph.counts.items()}
     )
     return save_npz_compressed_atomic(path, arrays)
+
+
+def _artifact_scalar(array: np.ndarray, name: str, path: Path) -> np.ndarray:
+    value = np.asarray(array)
+    if value.shape != ():
+        raise ValueError(f"{path} {name} must be scalar")
+    return value
+
+
+def _artifact_scalar_string(array: np.ndarray, name: str, path: Path) -> str:
+    value = _artifact_scalar(array, name, path).item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{path} {name} must be a non-empty scalar string")
+    return value
+
+
+def _artifact_string_vector(
+    array: np.ndarray,
+    name: str,
+    path: Path,
+) -> tuple[str, ...]:
+    values = np.asarray(array)
+    if values.ndim != 1 or values.shape[0] == 0:
+        raise ValueError(f"{path} {name} must be a non-empty 1-D array")
+    normalized = []
+    for raw_value in values:
+        value = np.asarray(raw_value).item()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{path} {name} must contain non-empty strings")
+        normalized.append(value)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{path} {name} must be unique")
+    return tuple(normalized)
+
+
+def _validate_adaptive_threshold_triplet(
+    median: np.ndarray,
+    mad: np.ndarray,
+    threshold: np.ndarray,
+    *,
+    name: str,
+    path: Path,
+) -> None:
+    median_values = np.asarray(median)
+    mad_values = np.asarray(mad)
+    threshold_values = np.asarray(threshold)
+    if not (
+        median_values.shape == mad_values.shape == threshold_values.shape
+    ):
+        raise ValueError(f"{path} {name} adaptive threshold arrays must match")
+    if any(
+        not np.issubdtype(values.dtype, np.number) or np.iscomplexobj(values)
+        for values in (median_values, mad_values, threshold_values)
+    ):
+        raise ValueError(f"{path} {name} adaptive thresholds must be real-valued")
+    all_nan = (
+        np.isnan(median_values)
+        & np.isnan(mad_values)
+        & np.isnan(threshold_values)
+    )
+    all_finite = (
+        np.isfinite(median_values)
+        & np.isfinite(mad_values)
+        & np.isfinite(threshold_values)
+    )
+    if not np.all(all_nan | all_finite):
+        raise ValueError(
+            f"{path} {name} adaptive thresholds must be all-finite or all-NaN"
+        )
+    if np.any(median_values[all_finite] < 0.0) or np.any(
+        mad_values[all_finite] < 0.0
+    ) or np.any(threshold_values[all_finite] < 0.0):
+        raise ValueError(f"{path} {name} adaptive thresholds must be non-negative")
+
+
+def _validate_adaptive_threshold_formula(
+    median: np.ndarray,
+    mad: np.ndarray,
+    threshold: np.ndarray,
+    *,
+    multiplier: float,
+    name: str,
+    path: Path,
+) -> None:
+    median_values = np.asarray(median, dtype=np.float64)
+    mad_values = np.asarray(mad, dtype=np.float64)
+    threshold_values = np.asarray(threshold, dtype=np.float64)
+    finite = np.isfinite(threshold_values)
+    expected = median_values[finite] + multiplier * _MAD_SCALE * mad_values[finite]
+    if not np.allclose(
+        threshold_values[finite],
+        expected,
+        rtol=1.0e-5,
+        atol=1.0e-7,
+    ):
+        raise ValueError(f"{path} {name} adaptive threshold is inconsistent")
+
+
+def load_observed_structure_graph(
+    path: str | Path,
+) -> LoadedObservedStructureGraph:
+    """Load and strictly validate a version-1 observed structure graph."""
+    graph_path = Path(path)
+    if not graph_path.is_file():
+        raise ValueError(f"Observed graph does not exist: {graph_path}")
+    with np.load(str(graph_path), allow_pickle=False) as archive:
+        missing = sorted(_OBSERVED_GRAPH_REQUIRED_FIELDS - set(archive.files))
+        if missing:
+            raise ValueError(f"{graph_path} missing required fields: {missing}")
+        arrays = {name: np.asarray(archive[name]) for name in archive.files}
+
+    version_value = _artifact_scalar(arrays["version"], "version", graph_path)
+    if not np.issubdtype(version_value.dtype, np.integer) or int(
+        version_value.item()
+    ) != OBSERVED_STRUCTURE_GRAPH_VERSION:
+        raise ValueError(f"{graph_path} must be a version 1 observed graph")
+    if (
+        _artifact_scalar_string(arrays["graph_type"], "graph_type", graph_path)
+        != "foreground_gaussian_observed_structure_graph"
+    ):
+        raise ValueError(f"{graph_path} graph_type is incompatible")
+    if (
+        _artifact_scalar_string(
+            arrays["node_selection"],
+            "node_selection",
+            graph_path,
+        )
+        != "positive_weight_observation_row"
+    ):
+        raise ValueError(f"{graph_path} node_selection is incompatible")
+    source_observation_path = _artifact_scalar_string(
+        arrays["source_observation_path"],
+        "source_observation_path",
+        graph_path,
+    )
+    source_checkpoint = _artifact_scalar_string(
+        arrays["source_checkpoint"],
+        "source_checkpoint",
+        graph_path,
+    )
+    mode_value = _artifact_scalar(arrays["mode_index"], "mode_index", graph_path)
+    if not np.issubdtype(mode_value.dtype, np.integer):
+        raise ValueError(f"{graph_path} mode_index must be an integer scalar")
+    mode_index = int(mode_value.item())
+    if mode_index < 0:
+        raise ValueError(f"{graph_path} mode_index must be non-negative")
+    freq_value = _artifact_scalar(arrays["freq_hz"], "freq_hz", graph_path)
+    if (
+        not np.issubdtype(freq_value.dtype, np.number)
+        or np.iscomplexobj(freq_value)
+        or not np.isfinite(freq_value.item())
+    ):
+        raise ValueError(f"{graph_path} freq_hz must be a finite real scalar")
+    freq_hz = float(freq_value.item())
+
+    for field_name, expected_value in _EXPECTED_SEMANTICS.items():
+        if (
+            _artifact_scalar_string(arrays[field_name], field_name, graph_path)
+            != expected_value
+        ):
+            raise ValueError(f"{graph_path} {field_name} is incompatible")
+    mad_scale = float(
+        _artifact_scalar(arrays["mad_scale"], "mad_scale", graph_path).item()
+    )
+    if not np.isclose(mad_scale, _MAD_SCALE, rtol=1e-6, atol=1e-8):
+        raise ValueError(f"{graph_path} mad_scale is incompatible")
+
+    numeric_parameters = {
+        field_name: _artifact_scalar(
+            arrays[field_name],
+            field_name,
+            graph_path,
+        ).item()
+        for field_name in _GRAPH_PARAMETER_FIELDS
+    }
+    for field_name in ("max_neighbors", "depth_samples", "min_shared_views"):
+        if not np.issubdtype(arrays[field_name].dtype, np.integer):
+            raise ValueError(f"{graph_path} {field_name} must be an integer scalar")
+    config = ObservedStructureGraphConfig(
+        max_neighbors=int(numeric_parameters["max_neighbors"]),
+        max_distance=float(numeric_parameters["max_distance"]),
+        color_mad_multiplier=float(numeric_parameters["color_mad_multiplier"]),
+        depth_mad_multiplier=float(numeric_parameters["depth_mad_multiplier"]),
+        depth_samples=int(numeric_parameters["depth_samples"]),
+        min_shared_views=int(numeric_parameters["min_shared_views"]),
+        render_acc_min=float(numeric_parameters["render_acc_min"]),
+        epsilon=float(numeric_parameters["epsilon"]),
+    )
+
+    num_gaussians_value = _artifact_scalar(
+        arrays["num_foreground_gaussians"],
+        "num_foreground_gaussians",
+        graph_path,
+    )
+    if not np.issubdtype(num_gaussians_value.dtype, np.integer):
+        raise ValueError(
+            f"{graph_path} num_foreground_gaussians must be an integer scalar"
+        )
+    num_gaussians = int(num_gaussians_value.item())
+    if num_gaussians < 0:
+        raise ValueError(
+            f"{graph_path} num_foreground_gaussians must be non-negative"
+        )
+
+    node_indices = arrays["node_gaussian_indices"]
+    if node_indices.ndim != 1 or not np.issubdtype(node_indices.dtype, np.integer):
+        raise ValueError(f"{graph_path} node_gaussian_indices must be 1-D integers")
+    node_indices = node_indices.astype(np.int64)
+    if np.any(node_indices < 0) or np.any(node_indices >= num_gaussians):
+        raise ValueError(f"{graph_path} node_gaussian_indices are out of range")
+    if node_indices.size > 1 and np.any(np.diff(node_indices) <= 0):
+        raise ValueError(
+            f"{graph_path} node_gaussian_indices must be strictly increasing"
+        )
+    num_nodes = int(node_indices.shape[0])
+    points = arrays["node_points_world"].astype(np.float32)
+    colors = arrays["node_colors_rgb"].astype(np.float32)
+    if points.shape != (num_nodes, 3) or not np.isfinite(points).all():
+        raise ValueError(f"{graph_path} node_points_world must be finite (N,3)")
+    if colors.shape != (num_nodes, 3) or not np.isfinite(colors).all():
+        raise ValueError(f"{graph_path} node_colors_rgb must be finite (N,3)")
+    if np.any(colors < 0.0) or np.any(colors > 1.0):
+        raise ValueError(f"{graph_path} node_colors_rgb must lie in [0,1]")
+
+    view_ids = _artifact_string_vector(arrays["view_ids"], "view_ids", graph_path)
+    num_views = len(view_ids)
+    config.validate(num_nodes, num_views)
+    observed_view_mask = arrays["node_observed_view_mask"]
+    if (
+        observed_view_mask.shape != (num_nodes, num_views)
+        or observed_view_mask.dtype != np.bool_
+    ):
+        raise ValueError(
+            f"{graph_path} node_observed_view_mask must be boolean "
+            f"({num_nodes},{num_views})"
+        )
+    observed_view_count = arrays["node_observed_view_count"]
+    if (
+        observed_view_count.shape != (num_nodes,)
+        or not np.issubdtype(observed_view_count.dtype, np.integer)
+        or not np.array_equal(observed_view_count, observed_view_mask.sum(axis=1))
+        or np.any(observed_view_count <= 0)
+    ):
+        raise ValueError(f"{graph_path} node_observed_view_count is inconsistent")
+    observed_view_count = observed_view_count.astype(np.int32)
+
+    endpoint_median = arrays["endpoint_gap_median_by_view"]
+    endpoint_mad = arrays["endpoint_gap_mad_by_view"]
+    endpoint_threshold = arrays["endpoint_gap_threshold_by_view"]
+    jump_median = arrays["depth_jump_median_by_view"]
+    jump_mad = arrays["depth_jump_mad_by_view"]
+    jump_threshold = arrays["depth_jump_threshold_by_view"]
+    for field_name in (
+        "endpoint_gap_median_by_view",
+        "endpoint_gap_mad_by_view",
+        "endpoint_gap_threshold_by_view",
+        "depth_jump_median_by_view",
+        "depth_jump_mad_by_view",
+        "depth_jump_threshold_by_view",
+    ):
+        if arrays[field_name].shape != (num_views,):
+            raise ValueError(
+                f"{graph_path} {field_name} must have shape ({num_views},)"
+            )
+    _validate_adaptive_threshold_triplet(
+        endpoint_median,
+        endpoint_mad,
+        endpoint_threshold,
+        name="endpoint gap",
+        path=graph_path,
+    )
+    _validate_adaptive_threshold_formula(
+        endpoint_median,
+        endpoint_mad,
+        endpoint_threshold,
+        multiplier=config.depth_mad_multiplier,
+        name="endpoint gap",
+        path=graph_path,
+    )
+    _validate_adaptive_threshold_triplet(
+        jump_median,
+        jump_mad,
+        jump_threshold,
+        name="depth jump",
+        path=graph_path,
+    )
+    _validate_adaptive_threshold_formula(
+        jump_median,
+        jump_mad,
+        jump_threshold,
+        multiplier=config.depth_mad_multiplier,
+        name="depth jump",
+        path=graph_path,
+    )
+    color_median = _artifact_scalar(
+        arrays["color_distance_median"],
+        "color_distance_median",
+        graph_path,
+    )
+    color_mad = _artifact_scalar(
+        arrays["color_distance_mad"],
+        "color_distance_mad",
+        graph_path,
+    )
+    color_threshold = _artifact_scalar(
+        arrays["color_distance_threshold"],
+        "color_distance_threshold",
+        graph_path,
+    )
+    _validate_adaptive_threshold_triplet(
+        color_median,
+        color_mad,
+        color_threshold,
+        name="color distance",
+        path=graph_path,
+    )
+    _validate_adaptive_threshold_formula(
+        color_median,
+        color_mad,
+        color_threshold,
+        multiplier=config.color_mad_multiplier,
+        name="color distance",
+        path=graph_path,
+    )
+    edges = arrays["edge_index"]
+    if (
+        edges.ndim != 2
+        or edges.shape[1] != 2
+        or not np.issubdtype(edges.dtype, np.integer)
+    ):
+        raise ValueError(f"{graph_path} edge_index must be integer (E,2)")
+    edges = edges.astype(np.int64)
+    num_edges = int(edges.shape[0])
+    if (
+        np.any(edges < 0)
+        or np.any(edges >= num_nodes)
+        or np.any(edges[:, 0] >= edges[:, 1])
+    ):
+        raise ValueError(f"{graph_path} edge_index must contain ordered local pairs")
+    if num_edges > 1:
+        expected_order = np.lexsort((edges[:, 1], edges[:, 0]))
+        if not np.array_equal(expected_order, np.arange(num_edges)):
+            raise ValueError(
+                f"{graph_path} edge_index must be lexicographically sorted"
+            )
+        if np.any(np.all(edges[1:] == edges[:-1], axis=1)):
+            raise ValueError(f"{graph_path} edge_index contains duplicate edges")
+    edge_vector_names = (
+        "edge_distance",
+        "edge_distance_weight",
+        "edge_color_distance",
+        "edge_color_weight",
+        "edge_depth_score",
+        "edge_combined_weight",
+        "edge_view_support_count",
+    )
+    for field_name in edge_vector_names:
+        if arrays[field_name].shape != (num_edges,):
+            raise ValueError(
+                f"{graph_path} {field_name} must have shape ({num_edges},)"
+            )
+    for field_name in edge_vector_names[:-1]:
+        if not np.issubdtype(
+            arrays[field_name].dtype, np.number
+        ) or np.iscomplexobj(arrays[field_name]):
+            raise ValueError(f"{graph_path} {field_name} must be real-valued")
+        if not np.isfinite(arrays[field_name]).all():
+            raise ValueError(f"{graph_path} {field_name} must be finite")
+        if np.any(arrays[field_name] < 0.0):
+            raise ValueError(f"{graph_path} {field_name} must be non-negative")
+    edge_distance = arrays["edge_distance"].astype(np.float32)
+    if np.any(edge_distance > config.max_distance + config.epsilon):
+        raise ValueError(f"{graph_path} edge_distance exceeds max_distance")
+    expected_distance = (
+        np.linalg.norm(
+            points[edges[:, 0]].astype(np.float64)
+            - points[edges[:, 1]].astype(np.float64),
+            axis=1,
+        )
+        if num_edges
+        else np.empty((0,), dtype=np.float64)
+    )
+    if not np.allclose(edge_distance, expected_distance, rtol=1e-5, atol=1e-7):
+        raise ValueError(f"{graph_path} edge_distance is inconsistent with nodes")
+    expected_distance_weight = 1.0 / np.maximum(
+        expected_distance, config.epsilon
+    )
+    if not np.allclose(
+        arrays["edge_distance_weight"],
+        expected_distance_weight,
+        rtol=2.0e-5,
+        atol=1.0e-7,
+    ):
+        raise ValueError(f"{graph_path} edge_distance_weight is inconsistent")
+    edge_color_distance = arrays["edge_color_distance"].astype(np.float64)
+    if num_edges and not np.all(
+        _threshold_pass(
+            edge_color_distance,
+            float(color_threshold.item()),
+            config.epsilon,
+        )
+    ):
+        raise ValueError(f"{graph_path} contains an edge above the color threshold")
+    expected_color_weight = _soft_weight(
+        edge_color_distance,
+        float(color_threshold.item()),
+        config.epsilon,
+    )
+    if not np.allclose(
+        arrays["edge_color_weight"],
+        expected_color_weight,
+        rtol=2.0e-5,
+        atol=1.0e-7,
+    ):
+        raise ValueError(f"{graph_path} edge_color_weight is inconsistent")
+
+    support_count = arrays["edge_view_support_count"]
+    if not np.issubdtype(support_count.dtype, np.integer):
+        raise ValueError(
+            f"{graph_path} edge_view_support_count must be integer-valued"
+        )
+    support_count = support_count.astype(np.int32)
+    support_mask = arrays["edge_view_support_mask"]
+    if support_mask.dtype != np.bool_ or support_mask.shape != (
+        num_edges,
+        num_views,
+    ):
+        raise ValueError(f"{graph_path} edge_view_support_mask has invalid shape")
+    if not np.array_equal(support_mask.sum(axis=1), support_count):
+        raise ValueError(f"{graph_path} edge view support count is inconsistent")
+    if np.any(support_count < config.min_shared_views):
+        raise ValueError(f"{graph_path} contains an edge below min_shared_views")
+    if num_edges and np.any(
+        support_mask
+        & ~(
+            observed_view_mask[edges[:, 0]]
+            & observed_view_mask[edges[:, 1]]
+        )
+    ):
+        raise ValueError(f"{graph_path} edge support uses a non-shared observed view")
+    for field_name in ("edge_endpoint_gap_by_view", "edge_depth_jump_by_view"):
+        if arrays[field_name].shape != (num_edges, num_views):
+            raise ValueError(f"{graph_path} {field_name} has invalid shape")
+        if not np.issubdtype(
+            arrays[field_name].dtype, np.number
+        ) or np.iscomplexobj(arrays[field_name]):
+            raise ValueError(f"{graph_path} {field_name} must be real-valued")
+        finite_values = arrays[field_name][np.isfinite(arrays[field_name])]
+        if np.any(finite_values < 0.0):
+            raise ValueError(f"{graph_path} {field_name} contains negative values")
+        if np.any(np.isinf(arrays[field_name])):
+            raise ValueError(f"{graph_path} {field_name} contains infinite values")
+        if not np.isfinite(arrays[field_name][support_mask]).all():
+            raise ValueError(
+                f"{graph_path} {field_name} is invalid on supporting views"
+            )
+
+    endpoint_gap = arrays["edge_endpoint_gap_by_view"].astype(np.float64)
+    depth_jump = arrays["edge_depth_jump_by_view"].astype(np.float64)
+    expected_support = np.zeros((num_edges, num_views), dtype=bool)
+    expected_view_depth_score = np.zeros((num_edges, num_views), dtype=np.float64)
+    for view_index in range(num_views):
+        expected_support[:, view_index] = _threshold_pass(
+            endpoint_gap[:, view_index],
+            float(endpoint_threshold[view_index]),
+            config.epsilon,
+        ) & _threshold_pass(
+            depth_jump[:, view_index],
+            float(jump_threshold[view_index]),
+            config.epsilon,
+        )
+        selected = expected_support[:, view_index]
+        if np.any(selected):
+            expected_view_depth_score[selected, view_index] = (
+                _soft_weight(
+                    endpoint_gap[selected, view_index],
+                    float(endpoint_threshold[view_index]),
+                    config.epsilon,
+                ).astype(np.float64)
+                * _soft_weight(
+                    depth_jump[selected, view_index],
+                    float(jump_threshold[view_index]),
+                    config.epsilon,
+                ).astype(np.float64)
+            )
+    if not np.array_equal(support_mask, expected_support):
+        raise ValueError(f"{graph_path} edge_view_support_mask is inconsistent")
+    expected_depth_score = np.divide(
+        expected_view_depth_score.sum(axis=1),
+        support_count,
+        out=np.zeros((num_edges,), dtype=np.float64),
+        where=support_count > 0,
+    )
+    if not np.allclose(
+        arrays["edge_depth_score"],
+        expected_depth_score,
+        rtol=2.0e-5,
+        atol=1.0e-7,
+    ):
+        raise ValueError(f"{graph_path} edge_depth_score is inconsistent")
+
+    combined_weight = arrays["edge_combined_weight"].astype(np.float64)
+    expected_combined_weight = (
+        arrays["edge_distance_weight"].astype(np.float64)
+        * arrays["edge_color_weight"].astype(np.float64)
+        * arrays["edge_depth_score"].astype(np.float64)
+    )
+    if not np.allclose(
+        combined_weight,
+        expected_combined_weight,
+        rtol=2e-5,
+        atol=1e-7,
+    ):
+        raise ValueError(f"{graph_path} edge_combined_weight is inconsistent")
+
+    expected_degree, expected_components, expected_sizes, expected_isolated = (
+        _component_data(num_nodes, edges)
+    )
+    degree = arrays["degree"]
+    components = arrays["component_index"]
+    sizes = arrays["component_size"]
+    if not all(
+        np.issubdtype(array.dtype, np.integer)
+        for array in (degree, components, sizes)
+    ):
+        raise ValueError(
+            f"{graph_path} degree/component arrays must be integer-valued"
+        )
+    if not np.array_equal(degree, expected_degree):
+        raise ValueError(f"{graph_path} degree is inconsistent with edge_index")
+    if not np.array_equal(components, expected_components):
+        raise ValueError(
+            f"{graph_path} component_index is inconsistent with edge_index"
+        )
+    if not np.array_equal(sizes, expected_sizes):
+        raise ValueError(
+            f"{graph_path} component_size is inconsistent with edge_index"
+        )
+    isolated = arrays["isolated_mask"]
+    if (
+        isolated.dtype != np.bool_
+        or isolated.shape != (num_nodes,)
+        or not np.array_equal(isolated, expected_isolated)
+    ):
+        raise ValueError(f"{graph_path} isolated_mask is inconsistent with degree")
+
+    count_values: dict[str, int] = {}
+    for field_name in _OBSERVED_COUNT_FIELDS:
+        count_value = _artifact_scalar(arrays[field_name], field_name, graph_path)
+        if not np.issubdtype(count_value.dtype, np.integer):
+            raise ValueError(f"{graph_path} {field_name} must be an integer scalar")
+        count_values[field_name] = int(count_value.item())
+        if count_values[field_name] < 0:
+            raise ValueError(f"{graph_path} {field_name} must be non-negative")
+    if count_values["node_count"] != num_nodes:
+        raise ValueError(f"{graph_path} node_count is inconsistent")
+    if count_values["retained_edge_count"] != num_edges:
+        raise ValueError(f"{graph_path} retained_edge_count is inconsistent")
+    if count_values["isolated_node_count"] != int(isolated.sum()):
+        raise ValueError(f"{graph_path} isolated_node_count is inconsistent")
+    if count_values["component_count"] != expected_sizes.shape[0]:
+        raise ValueError(f"{graph_path} component_count is inconsistent")
+    if count_values["single_view_node_count"] != int(
+        np.count_nonzero(observed_view_count == 1)
+    ):
+        raise ValueError(f"{graph_path} single_view_node_count is inconsistent")
+    if count_values["multi_view_node_count"] != int(
+        np.count_nonzero(observed_view_count >= 2)
+    ):
+        raise ValueError(f"{graph_path} multi_view_node_count is inconsistent")
+    if count_values["single_view_node_count"] + count_values[
+        "multi_view_node_count"
+    ] != num_nodes:
+        raise ValueError(f"{graph_path} observed node counts are inconsistent")
+    if count_values["observation_row_count"] != (
+        count_values["positive_observation_row_count"]
+        + count_values["zero_weight_observation_row_count"]
+    ):
+        raise ValueError(f"{graph_path} observation row counts are inconsistent")
+    if count_values["color_rejected_count"] + count_values[
+        "color_retained_count"
+    ] != count_values["mutual_distance_candidate_count"]:
+        raise ValueError(f"{graph_path} color filtering counts are inconsistent")
+    if count_values["depth_rejected_count"] + count_values[
+        "depth_retained_count"
+    ] != count_values["color_retained_count"]:
+        raise ValueError(f"{graph_path} depth filtering counts are inconsistent")
+    if count_values["depth_retained_count"] != num_edges:
+        raise ValueError(f"{graph_path} retained depth count is inconsistent")
+    if count_values["raw_depth_valid_candidate_view_count"] != (
+        count_values["endpoint_rejected_candidate_view_count"]
+        + count_values["jump_rejected_candidate_view_count"]
+        + count_values["supporting_candidate_view_count"]
+    ):
+        raise ValueError(f"{graph_path} depth-view filtering counts are inconsistent")
+    retained_support_count = int(np.count_nonzero(support_mask))
+    if count_values["supporting_candidate_view_count"] < retained_support_count:
+        raise ValueError(
+            f"{graph_path} supporting_candidate_view_count is inconsistent"
+        )
+
+    topology = ObservedStructureTopology(
+        node_gaussian_indices=node_indices,
+        node_points_world=points,
+        node_colors_rgb=colors,
+        node_observed_view_mask=observed_view_mask,
+        edge_index=edges.astype(np.int32),
+        edge_distance=edge_distance,
+        edge_distance_weight=arrays["edge_distance_weight"].astype(np.float32),
+        edge_color_distance=arrays["edge_color_distance"].astype(np.float32),
+        edge_color_weight=arrays["edge_color_weight"].astype(np.float32),
+        edge_depth_score=arrays["edge_depth_score"].astype(np.float32),
+        edge_combined_weight=arrays["edge_combined_weight"].astype(np.float32),
+        edge_view_support_mask=support_mask,
+        edge_view_support_count=support_count,
+        edge_endpoint_gap_by_view=arrays["edge_endpoint_gap_by_view"].astype(
+            np.float32
+        ),
+        edge_depth_jump_by_view=arrays["edge_depth_jump_by_view"].astype(np.float32),
+        degree=degree.astype(np.int32),
+        component_index=components.astype(np.int32),
+        component_size=sizes.astype(np.int32),
+        isolated_mask=isolated,
+        view_ids=np.asarray(view_ids),
+        endpoint_gap_median_by_view=endpoint_median.astype(np.float32),
+        endpoint_gap_mad_by_view=endpoint_mad.astype(np.float32),
+        endpoint_gap_threshold_by_view=endpoint_threshold.astype(np.float32),
+        depth_jump_median_by_view=jump_median.astype(np.float32),
+        depth_jump_mad_by_view=jump_mad.astype(np.float32),
+        depth_jump_threshold_by_view=jump_threshold.astype(np.float32),
+        color_distance_median=float(color_median.item()),
+        color_distance_mad=float(color_mad.item()),
+        color_distance_threshold=float(color_threshold.item()),
+        counts=count_values,
+        config=config,
+    )
+    graph = ObservedStructureGraph(
+        node_gaussian_indices=node_indices,
+        node_points_world=points,
+        node_colors_rgb=colors,
+        node_observed_view_mask=observed_view_mask,
+        node_observed_view_count=observed_view_count,
+        topology=topology,
+        counts=count_values,
+    )
+    return LoadedObservedStructureGraph(
+        graph_path=graph_path,
+        mode_index=mode_index,
+        freq_hz=freq_hz,
+        source_checkpoint=source_checkpoint,
+        source_observation_path=source_observation_path,
+        num_foreground_gaussians=num_gaussians,
+        view_ids=view_ids,
+        graph=graph,
+    )
+
+
+def validate_observed_structure_graph_sources(
+    loaded: LoadedObservedStructureGraph,
+    *,
+    points_world: np.ndarray,
+    gaussian_indices: np.ndarray,
+    source_checkpoint: str,
+    source_observation_path: str | Path,
+    mode_index: int,
+    freq_hz: float,
+    view_ids: np.ndarray,
+    obs_point_index: np.ndarray,
+    obs_view_index: np.ndarray,
+    obs_weights: np.ndarray,
+    freq_tolerance_hz: float = 1.0e-6,
+) -> None:
+    """Cross-check a loaded graph against its checkpoint and observation source."""
+    if not np.isfinite(freq_tolerance_hz) or freq_tolerance_hz < 0.0:
+        raise ValueError("freq_tolerance_hz must be finite and non-negative")
+    if loaded.source_checkpoint != str(source_checkpoint):
+        raise ValueError(
+            f"{loaded.graph_path} source_checkpoint does not match the checkpoint"
+        )
+    if loaded.source_observation_path != str(source_observation_path):
+        raise ValueError(
+            f"{loaded.graph_path} source_observation_path does not match the "
+            "observation artifact"
+        )
+    if loaded.mode_index != int(mode_index):
+        raise ValueError(f"{loaded.graph_path} mode_index does not match observations")
+    if not np.isfinite(freq_hz) or not np.isclose(
+        loaded.freq_hz,
+        float(freq_hz),
+        rtol=0.0,
+        atol=freq_tolerance_hz,
+    ):
+        raise ValueError(f"{loaded.graph_path} frequency does not match observations")
+
+    points = np.asarray(points_world)
+    if (
+        points.shape != (loaded.num_foreground_gaussians, 3)
+        or not np.isfinite(points).all()
+    ):
+        raise ValueError(
+            "observed graph source points_world must be a finite foreground (N,3) "
+            "array"
+        )
+    indices = np.asarray(gaussian_indices)
+    expected_indices = np.arange(loaded.num_foreground_gaussians, dtype=np.int64)
+    if (
+        indices.shape != expected_indices.shape
+        or not np.issubdtype(indices.dtype, np.integer)
+        or not np.array_equal(indices, expected_indices)
+    ):
+        raise ValueError(
+            "observed graph source gaussian_indices must be the canonical foreground "
+            "index order"
+        )
+    node_source_points = points[loaded.node_gaussian_indices]
+    if not np.allclose(
+        node_source_points,
+        loaded.node_points_world,
+        rtol=1e-5,
+        atol=1e-6,
+    ):
+        raise ValueError(
+            f"{loaded.graph_path} node positions do not match source points_world"
+        )
+
+    normalized_view_ids = tuple(np.asarray(view_ids).astype(str).tolist())
+    if normalized_view_ids != loaded.view_ids:
+        raise ValueError(f"{loaded.graph_path} view_ids do not match observations")
+    node_mask, point_view_mask, positive_row_count = _positive_observation_masks(
+        num_points=loaded.num_foreground_gaussians,
+        num_views=len(loaded.view_ids),
+        obs_point_index=obs_point_index,
+        obs_view_index=obs_view_index,
+        obs_weights=obs_weights,
+    )
+    expected_node_indices = np.flatnonzero(node_mask)
+    if not np.array_equal(expected_node_indices, loaded.node_gaussian_indices):
+        raise ValueError(
+            f"{loaded.graph_path} nodes do not match positive observation rows"
+        )
+    if not np.array_equal(
+        point_view_mask[expected_node_indices],
+        loaded.node_observed_view_mask,
+    ):
+        raise ValueError(
+            f"{loaded.graph_path} node view mask does not match observations"
+        )
+    observation_row_count = int(np.asarray(obs_weights).shape[0])
+    if loaded.graph.counts["observation_row_count"] != observation_row_count:
+        raise ValueError(
+            f"{loaded.graph_path} observation row count does not match observations"
+        )
+    if loaded.graph.counts["positive_observation_row_count"] != positive_row_count:
+        raise ValueError(
+            f"{loaded.graph_path} positive observation row count does not match"
+        )
+    if loaded.graph.counts["zero_weight_observation_row_count"] != (
+        observation_row_count - positive_row_count
+    ):
+        raise ValueError(
+            f"{loaded.graph_path} zero-weight observation row count does not match"
+        )

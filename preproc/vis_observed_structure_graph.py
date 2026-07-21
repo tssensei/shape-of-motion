@@ -8,6 +8,7 @@ environment used by the main Shape-of-Motion viewer.
 from __future__ import annotations
 
 import argparse
+import json
 import threading
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -16,130 +17,10 @@ from typing import Any
 
 import numpy as np
 
-
-_OBSERVED_GRAPH_REQUIRED_FIELDS = {
-    "version",
-    "graph_type",
-    "node_selection",
-    "mode_index",
-    "freq_hz",
-    "source_checkpoint",
-    "source_observation_path",
-    "num_foreground_gaussians",
-    "node_gaussian_indices",
-    "node_points_world",
-    "node_colors_rgb",
-    "node_observed_view_mask",
-    "node_observed_view_count",
-    "edge_index",
-    "edge_distance",
-    "edge_distance_weight",
-    "edge_color_distance",
-    "edge_color_weight",
-    "edge_depth_score",
-    "edge_combined_weight",
-    "edge_view_support_mask",
-    "edge_view_support_count",
-    "edge_endpoint_gap_by_view",
-    "edge_depth_jump_by_view",
-    "degree",
-    "component_index",
-    "component_size",
-    "isolated_mask",
-    "view_ids",
-    "endpoint_gap_median_by_view",
-    "endpoint_gap_mad_by_view",
-    "endpoint_gap_threshold_by_view",
-    "depth_jump_median_by_view",
-    "depth_jump_mad_by_view",
-    "depth_jump_threshold_by_view",
-    "color_distance_median",
-    "color_distance_mad",
-    "color_distance_threshold",
-    "max_neighbors",
-    "max_distance",
-    "color_mad_multiplier",
-    "depth_mad_multiplier",
-    "depth_samples",
-    "min_shared_views",
-    "render_acc_min",
-    "epsilon",
-    "mad_scale",
-    "knn_policy",
-    "depth_source",
-    "color_space",
-    "distance_weight_method",
-    "color_weight_method",
-    "depth_weight_method",
-    "knn_directed_candidate_count",
-    "distance_rejected_directed_count",
-    "nonmutual_rejected_pair_count",
-    "mutual_distance_candidate_count",
-    "shared_observed_candidate_view_count",
-    "raw_depth_valid_candidate_view_count",
-    "endpoint_rejected_candidate_view_count",
-    "jump_rejected_candidate_view_count",
-    "supporting_candidate_view_count",
-    "color_rejected_count",
-    "color_retained_count",
-    "depth_rejected_count",
-    "depth_retained_count",
-    "retained_edge_count",
-    "component_count",
-    "observation_row_count",
-    "positive_observation_row_count",
-    "zero_weight_observation_row_count",
-    "node_count",
-    "single_view_node_count",
-    "multi_view_node_count",
-    "isolated_node_count",
-}
-
-_GRAPH_PARAMETER_FIELDS = (
-    "version",
-    "max_neighbors",
-    "max_distance",
-    "color_mad_multiplier",
-    "depth_mad_multiplier",
-    "depth_samples",
-    "min_shared_views",
-    "render_acc_min",
-    "epsilon",
+from modal_surface.observed_structure_graph import (
+    LoadedObservedStructureGraph as ObservedGraphViewData,
+    load_observed_structure_graph,
 )
-
-_EXPECTED_SEMANTICS = {
-    "knn_policy": "mutual_knn",
-    "depth_source": "static_3dgs_rendered_depth",
-    "color_space": "opencv_float_rgb_to_lab",
-    "distance_weight_method": "inverse_distance",
-    "color_weight_method": "gaussian_adaptive_threshold",
-    "depth_weight_method": "supporting_view_gaussian_score",
-}
-
-_OBSERVED_COUNT_FIELDS = {
-    "knn_directed_candidate_count",
-    "distance_rejected_directed_count",
-    "nonmutual_rejected_pair_count",
-    "mutual_distance_candidate_count",
-    "shared_observed_candidate_view_count",
-    "raw_depth_valid_candidate_view_count",
-    "endpoint_rejected_candidate_view_count",
-    "jump_rejected_candidate_view_count",
-    "supporting_candidate_view_count",
-    "color_rejected_count",
-    "color_retained_count",
-    "depth_rejected_count",
-    "depth_retained_count",
-    "retained_edge_count",
-    "component_count",
-    "observation_row_count",
-    "positive_observation_row_count",
-    "zero_weight_observation_row_count",
-    "node_count",
-    "single_view_node_count",
-    "multi_view_node_count",
-    "isolated_node_count",
-}
 
 _GAUSSIAN_BASE_REQUIRED_FIELDS = {
     "version",
@@ -293,31 +174,48 @@ _STAGED_ANCHOR_STATUS = 0
 _STAGED_PARTIAL_STATUS = 3
 _STAGED_POINT_STATUS_COUNT = 8
 _PARTIAL_POINT_COLOR = np.asarray((1.0, 0.0, 1.0), dtype=np.float32)
+_RIGID_LATENT_REQUIRED_FIELDS = {
+    "points_world",
+    "phi",
+    "gaussian_indices",
+    "freq_hz",
+    "mode_index",
+    "obs_count_per_point",
+    "point_type",
+    "source_checkpoint",
+}
+_RIGID_DIAGNOSTIC_REQUIRED_FIELDS = {
+    "solver_method",
+    "solver_diagnostics_type",
+    "rigidity_model",
+    "rigid_component_connectivity_policy",
+    "rigid_component_graph_path",
+    "rigid_component_graph_source_path",
+    "rigid_seed_mask",
+    "observed_mask",
+    "fill_target_mask",
+    "completion_mask",
+    "point_component_index",
+    "final_phi",
+    "component_graph_index",
+    "component_node_count",
+    "component_edge_count",
+    "component_rank",
+    "component_rank_deficient_mask",
+    "component_normalized_weighted_residual",
+    "edge_component_index",
+    "edge_finite_drift_max",
+}
+_MOTION_FILL_ROLE_NAMES = (
+    "fixed_anchor",
+    "constrained_variable",
+    "free_variable",
+    "excluded",
+)
+_RIGID_SEED_COLOR = np.asarray((0.0, 1.0, 1.0), dtype=np.float32)
+_COMPLETED_FILL_COLOR = np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
+_UNRESOLVED_FILL_COLOR = np.asarray((1.0, 0.0, 1.0), dtype=np.float32)
 
-
-@dataclass(frozen=True)
-class ObservedGraphViewData:
-    mode_index: int
-    freq_hz: float
-    graph_path: Path
-    source_checkpoint: str
-    source_observation_path: str
-    num_foreground_gaussians: int
-    view_ids: tuple[str, ...]
-    node_gaussian_indices: np.ndarray
-    node_points_world: np.ndarray
-    node_colors_rgb: np.ndarray
-    node_observed_view_mask: np.ndarray
-    edge_index: np.ndarray
-    edge_depth_score: np.ndarray
-    edge_combined_weight: np.ndarray
-    edge_view_support_count: np.ndarray
-    component_index: np.ndarray
-    isolated_mask: np.ndarray
-
-    @property
-    def label(self) -> str:
-        return f"Mode {self.mode_index}: {self.freq_hz:.3f} Hz"
 
 @dataclass(frozen=True)
 class GaussianSplatGroup:
@@ -365,6 +263,35 @@ class AnchorResidualViewData:
     anchor_mask: np.ndarray
     partial_mask: np.ndarray
     residual_source_class: np.ndarray
+
+
+@dataclass(frozen=True)
+class RigidModeViewData:
+    manifest_path: Path
+    mode_index: int
+    freq_hz: float
+    latent_path: Path
+    diagnostics_path: Path
+    graph_path: Path
+    graph_source_path: str
+    points_world: np.ndarray
+    phi: np.ndarray
+    rigid_seed_mask: np.ndarray
+    completed_fill_mask: np.ndarray
+    unresolved_fill_mask: np.ndarray
+    point_component_index: np.ndarray
+    component_normalized_weighted_residual: np.ndarray
+    component_rank: np.ndarray
+    edge_component_index: np.ndarray
+    edge_finite_drift_max: np.ndarray
+
+
+@dataclass(frozen=True)
+class RigidManifestViewData:
+    manifest_path: Path
+    source_checkpoint: str
+    motion_fill_enabled: bool
+    modes: tuple[RigidModeViewData, ...]
 
 
 def stable_uniform_indices(count: int, maximum: int) -> np.ndarray:
@@ -608,366 +535,10 @@ def _string_vector(array: np.ndarray, name: str, path: Path) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _component_data(
-    num_nodes: int,
-    edge_index: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    degree = np.zeros((num_nodes,), dtype=np.int32)
-    if edge_index.shape[0]:
-        np.add.at(degree, edge_index[:, 0], 1)
-        np.add.at(degree, edge_index[:, 1], 1)
-    parent = np.arange(num_nodes, dtype=np.int32)
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = int(parent[index])
-        return index
-
-    for start, end in edge_index:
-        start_root = find(int(start))
-        end_root = find(int(end))
-        if start_root != end_root:
-            parent[max(start_root, end_root)] = min(start_root, end_root)
-    roots = np.asarray([find(index) for index in range(num_nodes)], dtype=np.int32)
-    _, components = np.unique(roots, return_inverse=True)
-    components = components.astype(np.int32)
-    sizes = (
-        np.bincount(
-            components,
-            minlength=int(components.max()) + 1,
-        ).astype(np.int32)
-        if num_nodes
-        else np.empty((0,), dtype=np.int32)
-    )
-    return degree, components, sizes
-
-
 def _load_observed_graph_archive(
     graph_path: Path,
 ) -> ObservedGraphViewData:
-    if not graph_path.is_file():
-        raise ValueError(f"Observed graph does not exist: {graph_path}")
-    with np.load(str(graph_path), allow_pickle=False) as archive:
-        missing = sorted(_OBSERVED_GRAPH_REQUIRED_FIELDS - set(archive.files))
-        if missing:
-            raise ValueError(f"{graph_path} missing required fields: {missing}")
-        graph = {name: np.asarray(archive[name]) for name in archive.files}
-
-    version_value = _scalar(graph["version"], "version", graph_path)
-    if not np.issubdtype(version_value.dtype, np.integer) or int(
-        version_value.item()
-    ) != 1:
-        raise ValueError(f"{graph_path} must be a version 1 observed graph")
-    if (
-        _scalar_string(graph["graph_type"], "graph_type", graph_path)
-        != "foreground_gaussian_observed_structure_graph"
-    ):
-        raise ValueError(f"{graph_path} graph_type is incompatible")
-    if (
-        _scalar_string(graph["node_selection"], "node_selection", graph_path)
-        != "positive_weight_observation_row"
-    ):
-        raise ValueError(f"{graph_path} node_selection is incompatible")
-    source_observation_path = _scalar_string(
-        graph["source_observation_path"],
-        "source_observation_path",
-        graph_path,
-    )
-    mode_value = _scalar(graph["mode_index"], "mode_index", graph_path)
-    if not np.issubdtype(mode_value.dtype, np.integer):
-        raise ValueError(f"{graph_path} mode_index must be an integer scalar")
-    mode_index = int(mode_value.item())
-    freq_value = _scalar(graph["freq_hz"], "freq_hz", graph_path)
-    if (
-        not np.issubdtype(freq_value.dtype, np.number)
-        or np.iscomplexobj(freq_value)
-        or not np.isfinite(freq_value.item())
-    ):
-        raise ValueError(f"{graph_path} freq_hz must be a finite real scalar")
-    freq_hz = float(freq_value.item())
-    source_checkpoint = _scalar_string(
-        graph["source_checkpoint"],
-        "source_checkpoint",
-        graph_path,
-    )
-    for field_name, expected_value in _EXPECTED_SEMANTICS.items():
-        if _scalar_string(graph[field_name], field_name, graph_path) != expected_value:
-            raise ValueError(f"{graph_path} {field_name} is incompatible")
-    mad_scale = float(_scalar(graph["mad_scale"], "mad_scale", graph_path).item())
-    if not np.isclose(mad_scale, 1.4826, rtol=1e-6, atol=1e-8):
-        raise ValueError(f"{graph_path} mad_scale is incompatible")
-
-    numeric_parameters = {
-        artifact_name: _scalar(graph[artifact_name], artifact_name, graph_path).item()
-        for artifact_name in _GRAPH_PARAMETER_FIELDS
-    }
-    for field_name in ("max_neighbors", "depth_samples", "min_shared_views"):
-        parameter_array = _scalar(graph[field_name], field_name, graph_path)
-        if not np.issubdtype(parameter_array.dtype, np.integer):
-            raise ValueError(f"{graph_path} {field_name} must be an integer scalar")
-    max_neighbors = int(numeric_parameters["max_neighbors"])
-    max_distance = float(numeric_parameters["max_distance"])
-    color_mad_multiplier = float(numeric_parameters["color_mad_multiplier"])
-    depth_mad_multiplier = float(numeric_parameters["depth_mad_multiplier"])
-    depth_samples = int(numeric_parameters["depth_samples"])
-    min_shared_views = int(numeric_parameters["min_shared_views"])
-    render_acc_min = float(numeric_parameters["render_acc_min"])
-    epsilon = float(numeric_parameters["epsilon"])
-    if max_neighbors <= 0:
-        raise ValueError(f"{graph_path} max_neighbors must be positive")
-    if not np.isfinite(max_distance) or max_distance <= 0.0:
-        raise ValueError(f"{graph_path} max_distance must be finite and positive")
-    if not np.isfinite(color_mad_multiplier) or color_mad_multiplier < 0.0:
-        raise ValueError(
-            f"{graph_path} color_mad_multiplier must be finite and non-negative"
-        )
-    if not np.isfinite(depth_mad_multiplier) or depth_mad_multiplier < 0.0:
-        raise ValueError(
-            f"{graph_path} depth_mad_multiplier must be finite and non-negative"
-        )
-    if depth_samples < 2:
-        raise ValueError(f"{graph_path} depth_samples must be at least 2")
-    if min_shared_views <= 0:
-        raise ValueError(f"{graph_path} min_shared_views must be positive")
-    if not np.isfinite(render_acc_min) or not 0.0 <= render_acc_min <= 1.0:
-        raise ValueError(f"{graph_path} render_acc_min must lie in [0,1]")
-    if not np.isfinite(epsilon) or epsilon <= 0.0:
-        raise ValueError(f"{graph_path} epsilon must be finite and positive")
-    num_gaussians_value = _scalar(
-        graph["num_foreground_gaussians"],
-        "num_foreground_gaussians",
-        graph_path,
-    )
-    if not np.issubdtype(num_gaussians_value.dtype, np.integer):
-        raise ValueError(
-            f"{graph_path} num_foreground_gaussians must be an integer scalar"
-        )
-    num_gaussians = int(num_gaussians_value.item())
-    if num_gaussians < 0:
-        raise ValueError(f"{graph_path} num_foreground_gaussians must be non-negative")
-
-    node_indices = graph["node_gaussian_indices"]
-    if node_indices.ndim != 1 or not np.issubdtype(node_indices.dtype, np.integer):
-        raise ValueError(f"{graph_path} node_gaussian_indices must be 1-D integers")
-    node_indices = node_indices.astype(np.int64)
-    if np.any(node_indices < 0) or np.any(node_indices >= num_gaussians):
-        raise ValueError(f"{graph_path} node_gaussian_indices are out of range")
-    if node_indices.size > 1 and np.any(np.diff(node_indices) <= 0):
-        raise ValueError(
-            f"{graph_path} node_gaussian_indices must be strictly increasing"
-        )
-    num_nodes = int(node_indices.shape[0])
-    points = graph["node_points_world"].astype(np.float32)
-    colors = graph["node_colors_rgb"].astype(np.float32)
-    if points.shape != (num_nodes, 3) or not np.isfinite(points).all():
-        raise ValueError(f"{graph_path} node_points_world must be finite (N,3)")
-    if colors.shape != (num_nodes, 3) or not np.isfinite(colors).all():
-        raise ValueError(f"{graph_path} node_colors_rgb must be finite (N,3)")
-    if np.any(colors < 0.0) or np.any(colors > 1.0):
-        raise ValueError(f"{graph_path} node_colors_rgb must lie in [0,1]")
-
-    normalized_view_ids = _string_vector(graph["view_ids"], "view_ids", graph_path)
-    num_views = len(normalized_view_ids)
-    if min_shared_views > num_views:
-        raise ValueError(
-            f"{graph_path} min_shared_views cannot exceed the number of views"
-        )
-    observed_view_mask = graph["node_observed_view_mask"]
-    if (
-        observed_view_mask.shape != (num_nodes, num_views)
-        or observed_view_mask.dtype != np.bool_
-    ):
-        raise ValueError(
-            f"{graph_path} node_observed_view_mask must be boolean "
-            f"({num_nodes},{num_views})"
-        )
-    observed_view_count = graph["node_observed_view_count"]
-    if (
-        observed_view_count.shape != (num_nodes,)
-        or not np.issubdtype(observed_view_count.dtype, np.integer)
-        or not np.array_equal(
-            observed_view_count,
-            observed_view_mask.sum(axis=1),
-        )
-        or np.any(observed_view_count <= 0)
-    ):
-        raise ValueError(
-            f"{graph_path} node_observed_view_count is inconsistent"
-        )
-    for field_name in (
-        "endpoint_gap_median_by_view",
-        "endpoint_gap_mad_by_view",
-        "endpoint_gap_threshold_by_view",
-        "depth_jump_median_by_view",
-        "depth_jump_mad_by_view",
-        "depth_jump_threshold_by_view",
-    ):
-        if graph[field_name].shape != (num_views,):
-            raise ValueError(
-                f"{graph_path} {field_name} must have shape ({num_views},)"
-            )
-
-    edges = graph["edge_index"]
-    if edges.ndim != 2 or edges.shape[1] != 2 or not np.issubdtype(
-        edges.dtype,
-        np.integer,
-    ):
-        raise ValueError(f"{graph_path} edge_index must be integer (E,2)")
-    edges = edges.astype(np.int64)
-    num_edges = int(edges.shape[0])
-    if (
-        np.any(edges < 0)
-        or np.any(edges >= num_nodes)
-        or np.any(edges[:, 0] >= edges[:, 1])
-    ):
-        raise ValueError(f"{graph_path} edge_index must contain ordered local pairs")
-    if num_edges > 1:
-        expected_order = np.lexsort((edges[:, 1], edges[:, 0]))
-        if not np.array_equal(expected_order, np.arange(num_edges)):
-            raise ValueError(
-                f"{graph_path} edge_index must be lexicographically sorted"
-            )
-        if np.any(np.all(edges[1:] == edges[:-1], axis=1)):
-            raise ValueError(f"{graph_path} edge_index contains duplicate edges")
-
-    edge_vectors = (
-        "edge_distance",
-        "edge_distance_weight",
-        "edge_color_distance",
-        "edge_color_weight",
-        "edge_depth_score",
-        "edge_combined_weight",
-        "edge_view_support_count",
-    )
-    for field_name in edge_vectors:
-        if graph[field_name].shape != (num_edges,):
-            raise ValueError(
-                f"{graph_path} {field_name} must have shape ({num_edges},)"
-            )
-    for field_name in edge_vectors[:-1]:
-        if not np.isfinite(graph[field_name]).all():
-            raise ValueError(f"{graph_path} {field_name} must be finite")
-    for field_name in (
-        "edge_distance",
-        "edge_distance_weight",
-        "edge_color_distance",
-        "edge_color_weight",
-        "edge_depth_score",
-        "edge_combined_weight",
-    ):
-        if np.any(graph[field_name] < 0.0):
-            raise ValueError(f"{graph_path} {field_name} must be non-negative")
-    if np.any(graph["edge_distance"] > max_distance + epsilon):
-        raise ValueError(f"{graph_path} edge_distance exceeds max_distance")
-    support_count = graph["edge_view_support_count"]
-    if not np.issubdtype(support_count.dtype, np.integer):
-        raise ValueError(
-            f"{graph_path} edge_view_support_count must be integer-valued"
-        )
-    support_count = support_count.astype(np.int32)
-    support_mask = graph["edge_view_support_mask"]
-    if support_mask.dtype != np.bool_ or support_mask.shape != (
-        num_edges,
-        num_views,
-    ):
-        raise ValueError(f"{graph_path} edge_view_support_mask has invalid shape")
-    if not np.array_equal(support_mask.sum(axis=1), support_count):
-        raise ValueError(f"{graph_path} edge view support count is inconsistent")
-    if np.any(support_count < min_shared_views):
-        raise ValueError(f"{graph_path} contains an edge below min_shared_views")
-    for field_name in (
-        "edge_endpoint_gap_by_view",
-        "edge_depth_jump_by_view",
-    ):
-        if graph[field_name].shape != (num_edges, num_views):
-            raise ValueError(f"{graph_path} {field_name} has invalid shape")
-        if not np.isfinite(graph[field_name][support_mask]).all():
-            raise ValueError(
-                f"{graph_path} {field_name} is invalid on supporting views"
-            )
-
-    expected_degree, expected_components, expected_sizes = _component_data(
-        num_nodes,
-        edges,
-    )
-    degree = graph["degree"]
-    components = graph["component_index"]
-    sizes = graph["component_size"]
-    if not all(
-        np.issubdtype(array.dtype, np.integer)
-        for array in (degree, components, sizes)
-    ):
-        raise ValueError(
-            f"{graph_path} degree/component arrays must be integer-valued"
-        )
-    if not np.array_equal(degree, expected_degree):
-        raise ValueError(f"{graph_path} degree is inconsistent with edge_index")
-    if not np.array_equal(components, expected_components):
-        raise ValueError(
-            f"{graph_path} component_index is inconsistent with edge_index"
-        )
-    if not np.array_equal(sizes, expected_sizes):
-        raise ValueError(
-            f"{graph_path} component_size is inconsistent with edge_index"
-        )
-    isolated = graph["isolated_mask"]
-    if (
-        isolated.dtype != np.bool_
-        or isolated.shape != (num_nodes,)
-        or not np.array_equal(isolated, expected_degree == 0)
-    ):
-        raise ValueError(f"{graph_path} isolated_mask is inconsistent with degree")
-
-    count_values: dict[str, int] = {}
-    for field_name in _OBSERVED_COUNT_FIELDS:
-        count_value = _scalar(graph[field_name], field_name, graph_path)
-        if not np.issubdtype(count_value.dtype, np.integer):
-            raise ValueError(f"{graph_path} {field_name} must be an integer scalar")
-        count_values[field_name] = int(count_value.item())
-        if count_values[field_name] < 0:
-            raise ValueError(f"{graph_path} {field_name} must be non-negative")
-    if count_values["node_count"] != num_nodes:
-        raise ValueError(f"{graph_path} node_count is inconsistent")
-    if count_values["retained_edge_count"] != num_edges:
-        raise ValueError(f"{graph_path} retained_edge_count is inconsistent")
-    if count_values["isolated_node_count"] != int(isolated.sum()):
-        raise ValueError(f"{graph_path} isolated_node_count is inconsistent")
-    if count_values["component_count"] != expected_sizes.shape[0]:
-        raise ValueError(f"{graph_path} component_count is inconsistent")
-    if count_values["single_view_node_count"] != int(
-        np.count_nonzero(observed_view_count == 1)
-    ):
-        raise ValueError(f"{graph_path} single_view_node_count is inconsistent")
-    if count_values["multi_view_node_count"] != int(
-        np.count_nonzero(observed_view_count >= 2)
-    ):
-        raise ValueError(f"{graph_path} multi_view_node_count is inconsistent")
-    if count_values["observation_row_count"] != (
-        count_values["positive_observation_row_count"]
-        + count_values["zero_weight_observation_row_count"]
-    ):
-        raise ValueError(f"{graph_path} observation row counts are inconsistent")
-
-    return ObservedGraphViewData(
-        mode_index=mode_index,
-        freq_hz=freq_hz,
-        graph_path=graph_path,
-        source_checkpoint=source_checkpoint,
-        source_observation_path=source_observation_path,
-        num_foreground_gaussians=num_gaussians,
-        view_ids=normalized_view_ids,
-        node_gaussian_indices=node_indices,
-        node_points_world=points,
-        node_colors_rgb=colors,
-        node_observed_view_mask=observed_view_mask,
-        edge_index=edges.astype(np.int32),
-        edge_depth_score=graph["edge_depth_score"].astype(np.float32),
-        edge_combined_weight=graph["edge_combined_weight"].astype(np.float32),
-        edge_view_support_count=support_count,
-        component_index=components.astype(np.int32),
-        isolated_mask=isolated,
-    )
+    return load_observed_structure_graph(graph_path)
 
 
 def observed_world_center(
@@ -998,6 +569,620 @@ def center_world_points(
     if center.shape != (3,) or not np.isfinite(center).all():
         raise ValueError("world_center must be finite (3,)")
     return points - center
+
+
+def deform_modal_points(
+    points_world: np.ndarray,
+    phi: np.ndarray,
+    phase: float,
+    motion_scale: float,
+) -> np.ndarray:
+    points = np.asarray(points_world, dtype=np.float32)
+    field = np.asarray(phi)
+    if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+        raise ValueError("Modal points_world must be a finite (N,3) array")
+    if field.shape != points.shape or not np.issubdtype(
+        field.dtype, np.complexfloating
+    ):
+        raise ValueError("Modal phi must be a complex (N,3) array")
+    if not np.isfinite(field).all():
+        raise ValueError("Modal phi must be finite")
+    if not np.isfinite(phase):
+        raise ValueError("Modal phase must be finite")
+    if not np.isfinite(motion_scale) or motion_scale < 0.0:
+        raise ValueError("Modal motion scale must be finite and non-negative")
+    coefficient = np.exp(1j * float(phase))
+    return (
+        points.astype(np.float64)
+        + float(motion_scale) * np.real(coefficient * field.astype(np.complex128))
+    ).astype(np.float32)
+
+
+def _manifest_string(value: Any, name: str, path: Path) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{path} {name} must be a non-empty string")
+    return value
+
+
+def _manifest_integer(value: Any, name: str, path: Path) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{path} {name} must be an integer")
+    return int(value)
+
+
+def _manifest_number(value: Any, name: str, path: Path) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{path} {name} must be a number")
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"{path} {name} must be finite")
+    return result
+
+
+def _manifest_artifact_path(
+    manifest_path: Path,
+    value: Any,
+    name: str,
+) -> Path:
+    raw_path = Path(_manifest_string(value, name, manifest_path))
+    return raw_path if raw_path.is_absolute() else manifest_path.parent / raw_path
+
+
+def _normalized_path(path: str | Path) -> Path:
+    return Path(path).expanduser().resolve(strict=False)
+
+
+def _load_npz_arrays(path: Path, required: set[str]) -> dict[str, np.ndarray]:
+    if not path.is_file():
+        raise ValueError(f"Artifact does not exist: {path}")
+    with np.load(str(path), allow_pickle=False) as archive:
+        missing = sorted(required - set(archive.files))
+        if missing:
+            raise ValueError(f"{path} missing required fields: {missing}")
+        return {name: np.asarray(archive[name]) for name in archive.files}
+
+
+def _assert_observed_graph_identity(
+    expected: ObservedGraphViewData,
+    actual: ObservedGraphViewData,
+) -> None:
+    if expected.mode_index != actual.mode_index:
+        raise ValueError(f"{actual.graph_path} mode_index does not match loaded graph")
+    if not np.isclose(expected.freq_hz, actual.freq_hz, rtol=0.0, atol=1.0e-6):
+        raise ValueError(f"{actual.graph_path} frequency does not match loaded graph")
+    for field_name in (
+        "source_checkpoint",
+        "source_observation_path",
+        "num_foreground_gaussians",
+        "view_ids",
+    ):
+        if getattr(expected, field_name) != getattr(actual, field_name):
+            raise ValueError(
+                f"{actual.graph_path} {field_name} does not match loaded graph"
+            )
+    for field_name in (
+        "node_gaussian_indices",
+        "node_observed_view_mask",
+        "edge_index",
+        "component_index",
+        "isolated_mask",
+    ):
+        if not np.array_equal(
+            getattr(expected, field_name), getattr(actual, field_name)
+        ):
+            raise ValueError(
+                f"{actual.graph_path} {field_name} does not match loaded graph"
+            )
+    if not np.allclose(
+        expected.node_points_world,
+        actual.node_points_world,
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    ):
+        raise ValueError(
+            f"{actual.graph_path} node positions do not match loaded graph"
+        )
+    for field_name in ("edge_depth_score", "edge_combined_weight"):
+        if not np.allclose(
+            getattr(expected, field_name),
+            getattr(actual, field_name),
+            rtol=1.0e-5,
+            atol=1.0e-7,
+        ):
+            raise ValueError(
+                f"{actual.graph_path} {field_name} does not match loaded graph"
+            )
+
+
+def load_rigid_manifest(
+    path: str | Path,
+    graphs: tuple[ObservedGraphViewData, ...],
+    gaussians: GaussianVisualizationData | None = None,
+) -> RigidManifestViewData:
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise ValueError(f"Rigid manifest does not exist: {manifest_path}")
+    if not graphs:
+        raise ValueError("Rigid manifest validation requires an observed graph")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{manifest_path} root must be an object")
+    if _manifest_integer(
+        manifest.get("version"), "version", manifest_path
+    ) != 1:
+        raise ValueError(f"{manifest_path} must be version 1")
+    if manifest.get("point_type") != "foreground_gaussian_center":
+        raise ValueError(f"{manifest_path} point_type is incompatible")
+    source_checkpoint = _manifest_string(
+        manifest.get("source_checkpoint"),
+        "source_checkpoint",
+        manifest_path,
+    )
+    parameters = manifest.get("parameters")
+    if not isinstance(parameters, dict):
+        raise ValueError(f"{manifest_path} parameters must be an object")
+    motion_fill_enabled = parameters.get("motion_fill_enabled")
+    if not isinstance(motion_fill_enabled, bool):
+        raise ValueError(
+            f"{manifest_path} motion_fill_enabled must be a boolean"
+        )
+    expected_parameters = {
+        "solver": "rigid_components",
+        "rigidity_model": "complex_infinitesimal_se3",
+        "rigid_component_selection": "observed_graph_degree_positive",
+        "rigid_component_connectivity_policy": (
+            "accepted_edge_transitive_components_bridges_merge"
+        ),
+        "rigid_component_rank_policy": "truncated_svd_minimum_norm_no_rejection",
+        "rigid_component_residual_policy": "diagnostic_only",
+        "rigid_component_edge_weight_use": "topology_only",
+        "rigid_component_finite_rigidity": "first_order_only",
+        "nonseed_policy": (
+            "free_motion_fill"
+            if motion_fill_enabled
+            else "zero_without_motion_fill"
+        ),
+    }
+    for name, expected_value in expected_parameters.items():
+        if parameters.get(name) != expected_value:
+            raise ValueError(f"{manifest_path} parameter {name} is incompatible")
+    raw_modes = manifest.get("modes")
+    raw_mode_indices = manifest.get("mode_indices")
+    if not isinstance(raw_modes, list) or not raw_modes:
+        raise ValueError(f"{manifest_path} modes must be a non-empty list")
+    if not isinstance(raw_mode_indices, list):
+        raise ValueError(f"{manifest_path} mode_indices must be a list")
+    mode_entries: dict[int, dict[str, Any]] = {}
+    listed_indices: list[int] = []
+    for entry_index, entry in enumerate(raw_modes):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{manifest_path} modes[{entry_index}] must be an object")
+        mode_index = _manifest_integer(
+            entry.get("mode_index"),
+            f"modes[{entry_index}].mode_index",
+            manifest_path,
+        )
+        if mode_index in mode_entries:
+            raise ValueError(f"{manifest_path} contains duplicate mode {mode_index}")
+        mode_entries[mode_index] = entry
+        listed_indices.append(mode_index)
+    normalized_mode_indices = [
+        _manifest_integer(value, f"mode_indices[{index}]", manifest_path)
+        for index, value in enumerate(raw_mode_indices)
+    ]
+    if normalized_mode_indices != listed_indices:
+        raise ValueError(f"{manifest_path} mode_indices do not match modes")
+    graph_mode_indices = [graph.mode_index for graph in graphs]
+    if len(set(graph_mode_indices)) != len(graph_mode_indices):
+        raise ValueError("Observed graph inputs contain duplicate modes")
+    if set(mode_entries) != set(graph_mode_indices):
+        raise ValueError(
+            f"{manifest_path} modes do not exactly match observed graph inputs"
+        )
+
+    loaded_modes: list[RigidModeViewData] = []
+    for graph in graphs:
+        if graph.source_checkpoint != source_checkpoint:
+            raise ValueError(
+                f"{manifest_path} source_checkpoint does not match {graph.graph_path}"
+            )
+        if graph.mode_index not in mode_entries:
+            raise ValueError(
+                f"{manifest_path} does not contain observed graph mode "
+                f"{graph.mode_index}"
+            )
+        entry = mode_entries[graph.mode_index]
+        mode_freq = _manifest_number(
+            entry.get("freq_hz"),
+            f"mode {graph.mode_index} freq_hz",
+            manifest_path,
+        )
+        if not np.isclose(mode_freq, graph.freq_hz, rtol=0.0, atol=1.0e-6):
+            raise ValueError(
+                f"{manifest_path} mode {graph.mode_index} frequency does not "
+                "match graph"
+            )
+        if _manifest_string(
+            entry.get("source_observation_path"),
+            f"mode {graph.mode_index} source_observation_path",
+            manifest_path,
+        ) != graph.source_observation_path:
+            raise ValueError(
+                f"{manifest_path} mode {graph.mode_index} source observation "
+                "does not match graph"
+            )
+
+        graph_path_value = _manifest_string(
+            entry.get("rigid_component_graph_path"),
+            f"mode {graph.mode_index} rigid_component_graph_path",
+            manifest_path,
+        )
+        graph_path = _manifest_artifact_path(
+            manifest_path,
+            graph_path_value,
+            f"mode {graph.mode_index} rigid_component_graph_path",
+        )
+        graph_source_path = _manifest_string(
+            entry.get("rigid_component_graph_source_path"),
+            f"mode {graph.mode_index} rigid_component_graph_source_path",
+            manifest_path,
+        )
+        local_graph = _load_observed_graph_archive(graph_path)
+        _assert_observed_graph_identity(graph, local_graph)
+        allowed_graph_paths = {
+            _normalized_path(graph_path),
+            _normalized_path(graph_source_path),
+        }
+        if _normalized_path(graph.graph_path) not in allowed_graph_paths:
+            raise ValueError(
+                f"{graph.graph_path} is neither the manifest graph nor its source graph"
+            )
+
+        latent_path = _manifest_artifact_path(
+            manifest_path,
+            entry.get("latent_path"),
+            f"mode {graph.mode_index} latent_path",
+        )
+        diagnostics_path = _manifest_artifact_path(
+            manifest_path,
+            entry.get("diagnostics_path"),
+            f"mode {graph.mode_index} diagnostics_path",
+        )
+        component_diagnostics_path = _manifest_artifact_path(
+            manifest_path,
+            entry.get("component_diagnostics_path"),
+            f"mode {graph.mode_index} component_diagnostics_path",
+        )
+        if _normalized_path(diagnostics_path) != _normalized_path(
+            component_diagnostics_path
+        ):
+            raise ValueError(
+                f"{manifest_path} mode {graph.mode_index} component diagnostics "
+                "path differs"
+            )
+        latent = _load_npz_arrays(latent_path, _RIGID_LATENT_REQUIRED_FIELDS)
+        diagnostics = _load_npz_arrays(
+            diagnostics_path,
+            _RIGID_DIAGNOSTIC_REQUIRED_FIELDS,
+        )
+
+        num_points = graph.num_foreground_gaussians
+        points = np.asarray(latent["points_world"], dtype=np.float32)
+        phi = np.asarray(latent["phi"])
+        indices = np.asarray(latent["gaussian_indices"])
+        if points.shape != (num_points, 3) or not np.isfinite(points).all():
+            raise ValueError(
+                f"{latent_path} points_world must be finite ({num_points},3)"
+            )
+        if (
+            phi.shape != (num_points, 3)
+            or not np.issubdtype(phi.dtype, np.complexfloating)
+            or not np.isfinite(phi).all()
+        ):
+            raise ValueError(
+                f"{latent_path} phi must be finite complex ({num_points},3)"
+            )
+        if (
+            indices.shape != (num_points,)
+            or not np.issubdtype(indices.dtype, np.integer)
+            or not np.array_equal(indices, np.arange(num_points))
+        ):
+            raise ValueError(f"{latent_path} gaussian_indices must be canonical")
+        if _scalar_string(
+            latent["source_checkpoint"], "source_checkpoint", latent_path
+        ) != source_checkpoint:
+            raise ValueError(f"{latent_path} source_checkpoint does not match manifest")
+        if _scalar_string(latent["point_type"], "point_type", latent_path) != (
+            "foreground_gaussian_center"
+        ):
+            raise ValueError(f"{latent_path} point_type is incompatible")
+        latent_mode = _scalar(latent["mode_index"], "mode_index", latent_path)
+        if not np.issubdtype(latent_mode.dtype, np.integer) or int(
+            latent_mode.item()
+        ) != graph.mode_index:
+            raise ValueError(f"{latent_path} mode_index does not match graph")
+        latent_freq = float(
+            _scalar(latent["freq_hz"], "freq_hz", latent_path).item()
+        )
+        if not np.isfinite(latent_freq) or not np.isclose(
+            latent_freq, graph.freq_hz, rtol=0.0, atol=1.0e-6
+        ):
+            raise ValueError(f"{latent_path} frequency does not match graph")
+        obs_count = np.asarray(latent["obs_count_per_point"])
+        if (
+            obs_count.shape != (num_points,)
+            or not np.issubdtype(obs_count.dtype, np.integer)
+            or np.any(obs_count < 0)
+        ):
+            raise ValueError(f"{latent_path} obs_count_per_point is invalid")
+        if not np.allclose(
+            points[graph.node_gaussian_indices],
+            graph.node_points_world,
+            rtol=1.0e-5,
+            atol=1.0e-6,
+        ):
+            raise ValueError(f"{latent_path} points do not match observed graph nodes")
+        if gaussians is not None:
+            if gaussians.source_checkpoint != source_checkpoint:
+                raise ValueError(
+                    f"{latent_path} checkpoint does not match Gaussian sidecar"
+                )
+            if not np.allclose(
+                points,
+                gaussians.foreground.centers,
+                rtol=1.0e-5,
+                atol=1.0e-6,
+            ):
+                raise ValueError(
+                    f"{latent_path} points do not match Gaussian sidecar centers"
+                )
+
+        optional_role_fields = {
+            "motion_fill_role",
+            "motion_fill_role_names",
+            "completion_mask",
+        }
+        present_role_fields = optional_role_fields & set(latent)
+        if motion_fill_enabled and present_role_fields != optional_role_fields:
+            raise ValueError(f"{latent_path} is missing rigid motion-fill role fields")
+        if not motion_fill_enabled and present_role_fields:
+            raise ValueError(f"{latent_path} unexpectedly contains motion-fill roles")
+
+        for name, expected_value in (
+            ("solver_method", "rigid_components"),
+            ("solver_diagnostics_type", "rigid_component_twist_v1"),
+            ("rigidity_model", "complex_infinitesimal_se3"),
+            (
+                "rigid_component_connectivity_policy",
+                "accepted_edge_transitive_components_bridges_merge",
+            ),
+        ):
+            if (
+                _scalar_string(diagnostics[name], name, diagnostics_path)
+                != expected_value
+            ):
+                raise ValueError(f"{diagnostics_path} {name} is incompatible")
+        if _scalar_string(
+            diagnostics["rigid_component_graph_path"],
+            "rigid_component_graph_path",
+            diagnostics_path,
+        ) != graph_path_value:
+            raise ValueError(f"{diagnostics_path} graph path does not match manifest")
+        if _scalar_string(
+            diagnostics["rigid_component_graph_source_path"],
+            "rigid_component_graph_source_path",
+            diagnostics_path,
+        ) != graph_source_path:
+            raise ValueError(
+                f"{diagnostics_path} graph source path does not match manifest"
+            )
+
+        mask_names = (
+            "rigid_seed_mask",
+            "observed_mask",
+            "fill_target_mask",
+            "completion_mask",
+        )
+        for name in mask_names:
+            if (
+                diagnostics[name].shape != (num_points,)
+                or diagnostics[name].dtype != np.bool_
+            ):
+                raise ValueError(
+                    f"{diagnostics_path} {name} must be boolean ({num_points},)"
+                )
+        rigid_seed_mask = diagnostics["rigid_seed_mask"]
+        observed_mask = diagnostics["observed_mask"]
+        fill_target_mask = diagnostics["fill_target_mask"]
+        completion_mask = diagnostics["completion_mask"]
+        expected_observed = np.zeros((num_points,), dtype=bool)
+        expected_observed[graph.node_gaussian_indices] = True
+        expected_seed = np.zeros((num_points,), dtype=bool)
+        rigid_node_mask = graph.graph.topology.degree > 0
+        expected_seed[graph.node_gaussian_indices[rigid_node_mask]] = True
+        if not np.array_equal(observed_mask, expected_observed):
+            raise ValueError(f"{diagnostics_path} observed_mask does not match graph")
+        if not np.array_equal(rigid_seed_mask, expected_seed):
+            raise ValueError(f"{diagnostics_path} rigid_seed_mask does not match graph")
+        if not np.array_equal(fill_target_mask, ~expected_seed):
+            raise ValueError(f"{diagnostics_path} fill_target_mask is inconsistent")
+        if np.any(completion_mask & ~fill_target_mask):
+            raise ValueError(f"{diagnostics_path} completes a rigid seed")
+        if not np.array_equal(diagnostics["final_phi"], phi):
+            raise ValueError(f"{diagnostics_path} final_phi does not match latent")
+
+        selected_graph_components = np.unique(
+            graph.component_index[rigid_node_mask]
+        ).astype(np.int32)
+        num_components = int(selected_graph_components.shape[0])
+        graph_to_rigid = np.full(
+            (graph.graph.topology.component_size.shape[0],),
+            -1,
+            dtype=np.int32,
+        )
+        graph_to_rigid[selected_graph_components] = np.arange(
+            num_components, dtype=np.int32
+        )
+        expected_point_component = np.full((num_points,), -1, dtype=np.int32)
+        expected_point_component[graph.node_gaussian_indices[rigid_node_mask]] = (
+            graph_to_rigid[graph.component_index[rigid_node_mask]]
+        )
+        point_component = np.asarray(diagnostics["point_component_index"])
+        if not np.issubdtype(point_component.dtype, np.integer) or not np.array_equal(
+            point_component, expected_point_component
+        ):
+            raise ValueError(
+                f"{diagnostics_path} point_component_index does not match graph"
+            )
+        component_graph_index = np.asarray(diagnostics["component_graph_index"])
+        if not np.issubdtype(
+            component_graph_index.dtype, np.integer
+        ) or not np.array_equal(component_graph_index, selected_graph_components):
+            raise ValueError(
+                f"{diagnostics_path} component_graph_index does not match graph"
+            )
+        expected_node_count = np.bincount(
+            expected_point_component[expected_point_component >= 0],
+            minlength=num_components,
+        )
+        expected_edge_component = graph_to_rigid[
+            graph.component_index[graph.edge_index[:, 0]]
+        ]
+        expected_edge_count = np.bincount(
+            expected_edge_component,
+            minlength=num_components,
+        )
+        for name, expected_values in (
+            ("component_node_count", expected_node_count),
+            ("component_edge_count", expected_edge_count),
+            ("edge_component_index", expected_edge_component),
+        ):
+            values = np.asarray(diagnostics[name])
+            if not np.issubdtype(values.dtype, np.integer) or not np.array_equal(
+                values, expected_values
+            ):
+                raise ValueError(f"{diagnostics_path} {name} does not match graph")
+        component_rank = np.asarray(diagnostics["component_rank"])
+        if (
+            component_rank.shape != (num_components,)
+            or not np.issubdtype(component_rank.dtype, np.integer)
+            or np.any(component_rank < 0)
+            or np.any(component_rank > 6)
+        ):
+            raise ValueError(f"{diagnostics_path} component_rank is invalid")
+        rank_deficient = np.asarray(diagnostics["component_rank_deficient_mask"])
+        if rank_deficient.dtype != np.bool_ or not np.array_equal(
+            rank_deficient, component_rank < 6
+        ):
+            raise ValueError(
+                f"{diagnostics_path} component_rank_deficient_mask is inconsistent"
+            )
+        component_residual = np.asarray(
+            diagnostics["component_normalized_weighted_residual"],
+            dtype=np.float32,
+        )
+        edge_finite_drift = np.asarray(
+            diagnostics["edge_finite_drift_max"],
+            dtype=np.float32,
+        )
+        if (
+            component_residual.shape != (num_components,)
+            or not np.isfinite(component_residual).all()
+            or np.any(component_residual < 0.0)
+        ):
+            raise ValueError(f"{diagnostics_path} component residual is invalid")
+        if (
+            edge_finite_drift.shape != (graph.edge_index.shape[0],)
+            or not np.isfinite(edge_finite_drift).all()
+            or np.any(edge_finite_drift < 0.0)
+        ):
+            raise ValueError(f"{diagnostics_path} finite edge drift is invalid")
+
+        if motion_fill_enabled:
+            role_names = _string_vector(
+                latent["motion_fill_role_names"],
+                "motion_fill_role_names",
+                latent_path,
+            )
+            if role_names != _MOTION_FILL_ROLE_NAMES:
+                raise ValueError(
+                    f"{latent_path} motion_fill_role_names is incompatible"
+                )
+            role = np.asarray(latent["motion_fill_role"])
+            latent_completion = np.asarray(latent["completion_mask"])
+            expected_role = np.full((num_points,), 2, dtype=np.int8)
+            expected_role[expected_seed] = 0
+            if (
+                not np.issubdtype(role.dtype, np.integer)
+                or not np.array_equal(role, expected_role)
+            ):
+                raise ValueError(f"{latent_path} motion_fill_role is inconsistent")
+            if latent_completion.dtype != np.bool_ or not np.array_equal(
+                latent_completion, completion_mask
+            ):
+                raise ValueError(f"{latent_path} completion_mask is inconsistent")
+            for name in (
+                "motion_fill_method",
+                "motion_fill_role",
+                "completion_connected_to_anchor",
+            ):
+                if name not in diagnostics:
+                    raise ValueError(f"{diagnostics_path} is missing {name}")
+            if _scalar_string(
+                diagnostics["motion_fill_method"],
+                "motion_fill_method",
+                diagnostics_path,
+            ) != "rigid_seed_joint_knn_fullspace_lsmr":
+                raise ValueError(
+                    f"{diagnostics_path} motion_fill_method is incompatible"
+                )
+            if not np.array_equal(diagnostics["motion_fill_role"], role):
+                raise ValueError(
+                    f"{diagnostics_path} motion_fill_role differs from latent"
+                )
+            connected = np.asarray(diagnostics["completion_connected_to_anchor"])
+            if (
+                connected.shape != (num_points,)
+                or connected.dtype != np.bool_
+                or not np.array_equal(completion_mask, connected & ~expected_seed)
+            ):
+                raise ValueError(
+                    f"{diagnostics_path} completion connectivity is inconsistent"
+                )
+        elif np.any(completion_mask):
+            raise ValueError(
+                f"{diagnostics_path} completion_mask is nonzero without motion fill"
+            )
+
+        loaded_modes.append(
+            RigidModeViewData(
+                manifest_path=manifest_path,
+                mode_index=graph.mode_index,
+                freq_hz=graph.freq_hz,
+                latent_path=latent_path,
+                diagnostics_path=diagnostics_path,
+                graph_path=graph_path,
+                graph_source_path=graph_source_path,
+                points_world=points,
+                phi=phi.astype(np.complex64),
+                rigid_seed_mask=rigid_seed_mask,
+                completed_fill_mask=completion_mask,
+                unresolved_fill_mask=fill_target_mask & ~completion_mask,
+                point_component_index=point_component.astype(np.int32),
+                component_normalized_weighted_residual=component_residual,
+                component_rank=component_rank.astype(np.int8),
+                edge_component_index=expected_edge_component.astype(np.int32),
+                edge_finite_drift_max=edge_finite_drift,
+            )
+        )
+
+    return RigidManifestViewData(
+        manifest_path=manifest_path,
+        source_checkpoint=source_checkpoint,
+        motion_fill_enabled=motion_fill_enabled,
+        modes=tuple(loaded_modes),
+    )
 
 
 def _load_gaussian_splat_group(
@@ -1664,6 +1849,7 @@ class ObservedGraphViewer:
         observed_point_size: float,
         isolated_point_size: float,
         world_center: np.ndarray,
+        rigid_manifest: RigidManifestViewData | None = None,
     ) -> None:
         if not graphs:
             raise ValueError("Observed graph viewer requires at least one graph")
@@ -1671,6 +1857,15 @@ class ObservedGraphViewer:
         self.graphs = graphs
         self.labels = tuple(graph.label for graph in graphs)
         self.scene_prefix = "/observed_structure_graph"
+        self.rigid_modes = (
+            {mode.mode_index: mode for mode in rigid_manifest.modes}
+            if rigid_manifest is not None
+            else {}
+        )
+        if rigid_manifest is not None and set(self.rigid_modes) != {
+            graph.mode_index for graph in graphs
+        }:
+            raise ValueError("Rigid manifest modes do not match observed graphs")
         self.world_center = np.asarray(world_center, dtype=np.float32)
         if self.world_center.shape != (3,) or not np.isfinite(
             self.world_center
@@ -1679,10 +1874,22 @@ class ObservedGraphViewer:
         self._line_handle = None
         self._node_handle = None
         self._isolated_handle = None
+        self._rigid_seed_handle = None
+        self._completed_fill_handle = None
+        self._unresolved_fill_handle = None
         self._update_lock = threading.Lock()
 
         max_edges = max(int(graph.edge_index.shape[0]) for graph in graphs)
         edge_step = max(max_edges // 200, 1)
+        rigid_color_options = (
+            (
+                "component residual",
+                "component rank",
+                "finite-amplitude drift",
+            )
+            if rigid_manifest is not None
+            else ()
+        )
         with server.gui.add_folder("Observed Gaussian structure graph"):
             self.show_graph = server.gui.add_checkbox("Show graph", True)
             self.mode = server.gui.add_dropdown(
@@ -1692,7 +1899,12 @@ class ObservedGraphViewer:
             )
             self.edge_color = server.gui.add_dropdown(
                 "Edge color",
-                options=("component", "depth support", "combined weight"),
+                options=(
+                    "component",
+                    "depth support",
+                    "combined weight",
+                )
+                + rigid_color_options,
                 initial_value="component",
             )
             self.max_visible_edges = server.gui.add_slider(
@@ -1731,6 +1943,49 @@ class ObservedGraphViewer:
                 step=0.0001,
                 initial_value=isolated_point_size,
             )
+            if rigid_manifest is None:
+                self.graph_geometry = None
+                self.phase = None
+                self.motion_scale = None
+                self.show_rigid_seeds = None
+                self.show_completed_fill = None
+                self.show_unresolved_fill = None
+            else:
+                self.graph_geometry = server.gui.add_dropdown(
+                    "Graph geometry",
+                    options=("canonical", "deformed"),
+                    initial_value="canonical",
+                )
+                self.phase = server.gui.add_slider(
+                    "Phase (rad)",
+                    min=0.0,
+                    max=float(2.0 * np.pi),
+                    step=float(2.0 * np.pi / 128.0),
+                    initial_value=0.0,
+                )
+                self.motion_scale = server.gui.add_slider(
+                    "Motion scale",
+                    min=0.0,
+                    max=3.0,
+                    step=0.05,
+                    initial_value=1.0,
+                )
+                self.show_rigid_seeds = server.gui.add_checkbox(
+                    "Show rigid seeds",
+                    False,
+                )
+                if rigid_manifest.motion_fill_enabled:
+                    self.show_completed_fill = server.gui.add_checkbox(
+                        "Show completed fill",
+                        False,
+                    )
+                    self.show_unresolved_fill = server.gui.add_checkbox(
+                        "Show unresolved fill",
+                        False,
+                    )
+                else:
+                    self.show_completed_fill = None
+                    self.show_unresolved_fill = None
         handles = (
             self.show_graph,
             self.mode,
@@ -1744,6 +1999,23 @@ class ObservedGraphViewer:
         )
         for handle in handles:
             handle.on_update(self._update)
+        if rigid_manifest is not None:
+            assert self.graph_geometry is not None
+            assert self.phase is not None
+            assert self.motion_scale is not None
+            assert self.show_rigid_seeds is not None
+            rigid_handles = [
+                self.graph_geometry,
+                self.phase,
+                self.motion_scale,
+                self.show_rigid_seeds,
+            ]
+            if self.show_completed_fill is not None:
+                rigid_handles.append(self.show_completed_fill)
+            if self.show_unresolved_fill is not None:
+                rigid_handles.append(self.show_unresolved_fill)
+            for handle in rigid_handles:
+                handle.on_update(self._update)
         self._update()
 
     def _selected_graph(self) -> ObservedGraphViewData:
@@ -1752,8 +2024,21 @@ class ObservedGraphViewer:
             raise ValueError(f"Unknown observed graph mode: {selected}")
         return self.graphs[self.labels.index(selected)]
 
+    def _selected_rigid_mode(
+        self,
+        graph: ObservedGraphViewData,
+    ) -> RigidModeViewData | None:
+        return self.rigid_modes.get(graph.mode_index)
+
     def _remove_scene_nodes(self) -> None:
-        for attribute in ("_line_handle", "_node_handle", "_isolated_handle"):
+        for attribute in (
+            "_line_handle",
+            "_node_handle",
+            "_isolated_handle",
+            "_rigid_seed_handle",
+            "_completed_fill_handle",
+            "_unresolved_fill_handle",
+        ):
             handle = getattr(self, attribute)
             if handle is not None:
                 handle.remove()
@@ -1763,8 +2048,34 @@ class ObservedGraphViewer:
         with self._update_lock:
             self._remove_scene_nodes()
             graph = self._selected_graph()
+            rigid_mode = self._selected_rigid_mode(graph)
+            all_display_points = (
+                rigid_mode.points_world
+                if rigid_mode is not None
+                else None
+            )
+            if rigid_mode is not None:
+                assert self.graph_geometry is not None
+                assert self.phase is not None
+                assert self.motion_scale is not None
+                if str(self.graph_geometry.value) == "deformed":
+                    all_display_points = deform_modal_points(
+                        rigid_mode.points_world,
+                        rigid_mode.phi,
+                        float(self.phase.value),
+                        float(self.motion_scale.value),
+                    )
+                elif str(self.graph_geometry.value) != "canonical":
+                    raise ValueError(
+                        f"Unknown graph geometry: {self.graph_geometry.value}"
+                    )
+            graph_points = (
+                graph.node_points_world
+                if all_display_points is None
+                else all_display_points[graph.node_gaussian_indices]
+            )
             centered_points = center_world_points(
-                graph.node_points_world,
+                graph_points,
                 self.world_center,
             )
             if bool(self.show_graph.value):
@@ -1786,6 +2097,34 @@ class ObservedGraphViewer:
                     elif color_mode == "combined weight":
                         edge_colors = graph_scalar_colors(
                             np.log1p(graph.edge_combined_weight[selected_edges])
+                        )
+                    elif color_mode == "component residual":
+                        if rigid_mode is None:
+                            raise ValueError(
+                                "Component residual color requires a rigid manifest"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            rigid_mode.component_normalized_weighted_residual[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ]
+                        )
+                    elif color_mode == "component rank":
+                        if rigid_mode is None:
+                            raise ValueError(
+                                "Component rank color requires a rigid manifest"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            rigid_mode.component_rank[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ].astype(np.float32)
+                        )
+                    elif color_mode == "finite-amplitude drift":
+                        if rigid_mode is None:
+                            raise ValueError(
+                                "Finite drift color requires a rigid manifest"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            rigid_mode.edge_finite_drift_max[selected_edges]
                         )
                     else:
                         raise ValueError(
@@ -1819,6 +2158,57 @@ class ObservedGraphViewer:
                         point_size=float(self.isolated_point_size.value),
                         point_shape="circle",
                     )
+            if rigid_mode is not None:
+                assert all_display_points is not None
+                assert self.show_rigid_seeds is not None
+                centered_all_points = center_world_points(
+                    all_display_points,
+                    self.world_center,
+                )
+                overlays = [
+                    (
+                        self.show_rigid_seeds,
+                        rigid_mode.rigid_seed_mask,
+                        _RIGID_SEED_COLOR,
+                        "rigid_seeds",
+                        "_rigid_seed_handle",
+                    )
+                ]
+                if self.show_completed_fill is not None:
+                    overlays.append((
+                        self.show_completed_fill,
+                        rigid_mode.completed_fill_mask,
+                        _COMPLETED_FILL_COLOR,
+                        "completed_fill",
+                        "_completed_fill_handle",
+                    ))
+                if self.show_unresolved_fill is not None:
+                    overlays.append((
+                        self.show_unresolved_fill,
+                        rigid_mode.unresolved_fill_mask,
+                        _UNRESOLVED_FILL_COLOR,
+                        "unresolved_fill",
+                        "_unresolved_fill_handle",
+                    ))
+                for show_handle, mask, color, scene_name, attribute in overlays:
+                    selected_points = centered_all_points[mask]
+                    if bool(show_handle.value) and selected_points.shape[0]:
+                        setattr(
+                            self,
+                            attribute,
+                            self.server.scene.add_point_cloud(
+                                f"{self.scene_prefix}/{scene_name}",
+                                points=selected_points,
+                                colors=np.broadcast_to(
+                                    color,
+                                    (selected_points.shape[0], 3),
+                                ),
+                                point_size=float(self.node_point_size.value),
+                                point_shape="circle",
+                            ),
+                        )
+
+
 class ObservationCoverageViewer:
     def __init__(
         self,
@@ -2119,8 +2509,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--observed-graph-npz",
         type=Path,
+        action="append",
         required=True,
-        help="Single version-1 observed Gaussian structure graph NPZ artifact",
+        help=(
+            "Version-1 observed Gaussian structure graph NPZ artifact. Repeat "
+            "once per mode when viewing a multi-mode rigid manifest."
+        ),
     )
     parser.add_argument(
         "--gaussian-npz",
@@ -2139,6 +2533,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--residual-diagnostics-npz",
         type=Path,
         help="Optional version-1 anchor residual decomposition diagnostic",
+    )
+    parser.add_argument(
+        "--rigid-manifest",
+        type=Path,
+        help=(
+            "Optional version-1 rigid-components modal manifest for deformed "
+            "graph and solve-result diagnostics"
+        ),
     )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
@@ -2182,7 +2584,13 @@ def _validate_args(args: argparse.Namespace) -> None:
 def main() -> None:
     args = build_parser().parse_args()
     _validate_args(args)
-    graphs = (_load_observed_graph_archive(args.observed_graph_npz),)
+    graphs = tuple(
+        _load_observed_graph_archive(path)
+        for path in args.observed_graph_npz
+    )
+    mode_indices = [graph.mode_index for graph in graphs]
+    if len(set(mode_indices)) != len(mode_indices):
+        raise ValueError("--observed-graph-npz inputs contain duplicate modes")
     world_center = observed_world_center(graphs)
     gaussians = (
         load_gaussian_visualization_sidecar(args.gaussian_npz, graphs)
@@ -2201,6 +2609,11 @@ def main() -> None:
             graphs,
             gaussians,
         )
+    rigid_manifest = (
+        load_rigid_manifest(args.rigid_manifest, graphs, gaussians)
+        if args.rigid_manifest is not None
+        else None
+    )
 
     try:
         import viser
@@ -2248,6 +2661,7 @@ def main() -> None:
         observed_point_size=args.observed_point_size,
         isolated_point_size=args.isolated_point_size,
         world_center=world_center,
+        rigid_manifest=rigid_manifest,
     )
     if coverage is not None:
         ObservationCoverageViewer(
@@ -2297,6 +2711,17 @@ def main() -> None:
             f"{residual_diagnostics.freq_hz:.6g} Hz with "
             f"{int(np.count_nonzero(residual_diagnostics.partial_mask))} "
             "staged partial Gaussian(s)."
+        )
+    if rigid_manifest is not None:
+        mode = rigid_manifest.modes[0]
+        print(
+            "Loaded rigid component result for mode "
+            f"{mode.mode_index} at {mode.freq_hz:.6g} Hz with "
+            f"{int(np.count_nonzero(mode.rigid_seed_mask))} rigid seed(s), "
+            f"{int(np.count_nonzero(mode.completed_fill_mask))} completed fill "
+            "point(s), and "
+            f"{int(np.count_nonzero(mode.unresolved_fill_mask))} unresolved fill "
+            "point(s)."
         )
     print(
         f"Viser {viser_version} listening on {server.get_host()}:{server.get_port()}"

@@ -7,8 +7,11 @@ from pathlib import Path
 import numpy as np
 
 from modal_surface.observed_structure_graph import (
+    LoadedObservedStructureGraph,
     ObservedStructureGraphConfig,
     build_observed_structure_graph,
+    load_observed_structure_graph,
+    validate_observed_structure_graph_sources,
     write_observed_structure_graph,
 )
 
@@ -247,6 +250,97 @@ class ObservedStructureGraphTests(unittest.TestCase):
         )
         self.assertEqual(int(arrays["node_count"]), 3)
         self.assertFalse(any(name.startswith("anchor_") for name in arrays))
+
+    def test_public_loader_and_source_cross_validation(self) -> None:
+        points = self._points([6.0, 8.0, 10.0])
+        colors = np.full(points.shape, 0.8, dtype=np.float32)
+        depth = np.full((24, 24), 2.0, dtype=np.float32)
+        obs_point_index = np.arange(points.shape[0], dtype=np.int32)
+        obs_view_index = np.zeros(points.shape[0], dtype=np.int32)
+        obs_weights = np.ones(points.shape[0], dtype=np.float32)
+        graph = self._build(
+            points,
+            colors,
+            [depth],
+            np.ones((points.shape[0], 1), dtype=bool),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_observed_structure_graph(
+                Path(tmp) / "observed_graph.npz",
+                graph,
+                mode_index=4,
+                freq_hz=0.85,
+                source_checkpoint="source.ckpt",
+                source_observation_path="observations/mode.npz",
+                num_foreground_gaussians=points.shape[0],
+            )
+            loaded = load_observed_structure_graph(path)
+            self.assertIsInstance(loaded, LoadedObservedStructureGraph)
+            np.testing.assert_array_equal(
+                loaded.graph.topology.edge_index,
+                graph.topology.edge_index,
+            )
+            validate_observed_structure_graph_sources(
+                loaded,
+                points_world=points,
+                gaussian_indices=np.arange(points.shape[0], dtype=np.int32),
+                source_checkpoint="source.ckpt",
+                source_observation_path="observations/mode.npz",
+                mode_index=4,
+                freq_hz=0.85,
+                view_ids=np.asarray(["view0"]),
+                obs_point_index=obs_point_index,
+                obs_view_index=obs_view_index,
+                obs_weights=obs_weights,
+            )
+            with np.load(path, allow_pickle=False) as archive:
+                graph_arrays = {
+                    name: np.asarray(archive[name]) for name in archive.files
+                }
+            corruptions = {
+                "threshold": (
+                    "color_distance_threshold",
+                    graph_arrays["color_distance_threshold"] + 0.25,
+                    "adaptive threshold",
+                ),
+                "distance_weight": (
+                    "edge_distance_weight",
+                    graph_arrays["edge_distance_weight"] * 2.0,
+                    "edge_distance_weight",
+                ),
+                "color_weight": (
+                    "edge_color_weight",
+                    graph_arrays["edge_color_weight"] * 0.5,
+                    "edge_color_weight",
+                ),
+                "depth_score": (
+                    "edge_depth_score",
+                    graph_arrays["edge_depth_score"] * 0.5,
+                    "edge_depth_score",
+                ),
+            }
+            for label, (field, value, message) in corruptions.items():
+                with self.subTest(corruption=label):
+                    corrupted = dict(graph_arrays)
+                    corrupted[field] = value
+                    corrupted_path = Path(tmp) / f"corrupted_{label}.npz"
+                    np.savez_compressed(corrupted_path, **corrupted)
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_observed_structure_graph(corrupted_path)
+            with self.assertRaisesRegex(ValueError, "nodes do not match"):
+                validate_observed_structure_graph_sources(
+                    loaded,
+                    points_world=points,
+                    gaussian_indices=np.arange(points.shape[0], dtype=np.int32),
+                    source_checkpoint="source.ckpt",
+                    source_observation_path="observations/mode.npz",
+                    mode_index=4,
+                    freq_hz=0.85,
+                    view_ids=np.asarray(["view0"]),
+                    obs_point_index=obs_point_index,
+                    obs_view_index=obs_view_index,
+                    obs_weights=np.asarray([1.0, 0.0, 1.0], dtype=np.float32),
+                )
 
     def test_negative_observation_weight_fails_fast(self) -> None:
         points = self._points([8.0, 10.0])

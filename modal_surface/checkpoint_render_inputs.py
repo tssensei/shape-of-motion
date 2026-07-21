@@ -9,6 +9,36 @@ import numpy as np
 from modal_surface.io import load_view_config
 
 
+def load_fg_means_from_checkpoint(path: str) -> np.ndarray:
+    """Load only canonical foreground centers without rendering camera inputs."""
+    import torch
+    from flow3d.scene_model import SceneModel
+
+    ckpt_path = Path(path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("model")
+    if not isinstance(state, dict):
+        raise ValueError(f"{path} does not contain a model state")
+    scene_model = SceneModel.init_from_state_dict(state)
+    fg_means = (
+        scene_model.fg.params["means"]
+        .detach()
+        .cpu()
+        .float()
+        .numpy()
+        .astype(np.float32)
+    )
+    if fg_means.ndim != 2 or fg_means.shape[1] != 3:
+        raise ValueError(
+            f"fg.params.means must have shape (N,3), got {fg_means.shape}"
+        )
+    if not np.all(np.isfinite(fg_means)):
+        raise ValueError(f"{path} contains non-finite foreground Gaussian centers")
+    return fg_means
+
+
 def load_fg_pixel_candidate_inputs_from_checkpoint(
     path: str,
     view_config_paths: list[str],

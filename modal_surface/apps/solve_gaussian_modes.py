@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any, Mapping, SupportsFloat
 
 import numpy as np
 
 from modal_surface.checkpoint_render_inputs import (
+    load_fg_means_from_checkpoint,
     load_fg_pixel_candidate_inputs_from_checkpoint,
 )
 from modal_surface.gaussian_observations import build_gaussian_observation_graph
@@ -24,26 +28,51 @@ from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_METHOD,
     MOTION_FILL_ROLE_NAMES,
     MOTION_FILL_VERSION,
+    RIGID_SEED_MOTION_FILL_METHOD,
     GaussianMotionFillResult,
+    RigidSeedMotionFillResult,
     apply_gaussian_motion_fill,
+    apply_rigid_seed_motion_fill,
     write_motion_fill_diagnostics,
     write_motion_fill_graph,
 )
 from modal_surface.io import (
+    load_view_config,
     load_modal_freqs,
     save_npz_compressed_atomic,
 )
 from modal_surface.motion_fill import KnnGraph, build_knn_graph, query_knn_candidates
+from modal_surface.observed_structure_graph import (
+    LoadedObservedStructureGraph,
+    load_observed_structure_graph,
+    validate_observed_structure_graph_sources,
+)
 from modal_surface.optimization_staged import (
     ANCHOR_CONDITION_MAX,
     POINT_STATUS_NAMES,
+    AlphaSyncResult,
+    PreparedObservations,
     StagedSolveResult,
+    compute_prediction_and_residuals,
     enforce_alpha_failure,
     optimize_multi_view_staged,
+    prepare_observations,
+    solve_alpha_sync,
 )
 from modal_surface.optimization_visualization import write_solve_visualizations
+from modal_surface.optimization_visualization import write_prepared_solve_visualizations
+from modal_surface.rigid_component_solver import (
+    RigidComponentSolveResult,
+    RigidComponentSolverConfig,
+    solve_rigid_components,
+)
 from modal_surface.solver_cli import (
+    RIGID_COMPONENT_RCOND_DEFAULT,
+    STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT,
+    STAGED_ANCHOR_SVD_RATIO_DEFAULT,
+    add_solve_method_arguments,
     add_staged_solver_arguments,
+    rigid_component_manifest_parameters,
     staged_solver_config,
     staged_solver_manifest_parameters,
 )
@@ -134,13 +163,50 @@ def json_float(value: SupportsFloat) -> float | None:
     return result
 
 
+def _alpha_view_frequencies(prepared: PreparedObservations) -> np.ndarray:
+    if "view_freqs_hz" in prepared.arrays:
+        frequencies = np.asarray(prepared.arrays["view_freqs_hz"], dtype=np.float32)
+    else:
+        frequencies = np.full(
+            (prepared.num_views,),
+            float(np.asarray(prepared.arrays["freq_hz"]).item()),
+            dtype=np.float32,
+        )
+    if frequencies.shape != (prepared.num_views,):
+        raise ValueError(
+            "Observation view_freqs_hz does not match the prepared view count."
+        )
+    return frequencies
+
+
+def _unidentifiable_observed_view_indices(
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
+) -> np.ndarray:
+    observed = np.zeros((prepared.num_views,), dtype=bool)
+    positive_rows = prepared.obs_weights > 0.0
+    observed[np.unique(prepared.obs_view_index[positive_rows])] = True
+    return np.where(observed & ~alpha.identifiable_mask)[0].astype(np.int64)
+
+
 def alpha_by_view_diagnostics(
     staged: StagedSolveResult,
 ) -> list[dict[str, Any]]:
-    alpha = staged.alpha
-    view_ids = [str(v) for v in staged.prepared.view_ids.tolist()]
+    return _alpha_by_view_diagnostics(
+        staged.prepared,
+        staged.alpha,
+        staged.alpha_view_freqs_hz,
+    )
+
+
+def _alpha_by_view_diagnostics(
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
+    alpha_view_freqs_hz: np.ndarray,
+) -> list[dict[str, Any]]:
+    view_ids = [str(v) for v in prepared.view_ids.tolist()]
     alphas = alpha.alphas.astype(np.complex64).reshape(-1)
-    freqs_hz = staged.alpha_view_freqs_hz.astype(np.float32).reshape(-1)
+    freqs_hz = np.asarray(alpha_view_freqs_hz, dtype=np.float32).reshape(-1)
     if alphas.shape[0] != len(view_ids):
         raise ValueError("Alpha count does not match view_ids.")
     if freqs_hz.shape[0] != len(view_ids):
@@ -201,7 +267,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--motion-fill",
         action="store_true",
-        help="Fill accepted Gaussian nullspaces and truly unobserved Gaussians after the staged solve.",
+        help=(
+            "Run the existing staged nullspace fill, or propagate rigid-component "
+            "seeds to every non-seed Gaussian in rigid-components mode."
+        ),
     )
     parser.add_argument(
         "--motion-fill-k",
@@ -215,7 +284,331 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Required maximum KNN edge distance in scene units when --motion-fill is enabled.",
     )
+    add_solve_method_arguments(parser)
     add_staged_solver_arguments(parser)
+
+
+def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
+    graph_paths = list(args.rigid_component_graph)
+    rcond = float(args.rigid_component_rcond)
+    if not np.isfinite(rcond) or not (0.0 < rcond < 1.0):
+        raise ValueError("--rigid-component-rcond must be finite and lie in (0,1).")
+    if args.solve_method == "staged":
+        if graph_paths:
+            raise ValueError(
+                "--rigid-component-graph requires --solve-method=rigid-components."
+            )
+        if rcond != RIGID_COMPONENT_RCOND_DEFAULT:
+            raise ValueError(
+                "A custom --rigid-component-rcond requires "
+                "--solve-method=rigid-components."
+            )
+        return
+    if not graph_paths:
+        raise ValueError(
+            "--solve-method=rigid-components requires --rigid-component-graph."
+        )
+    if float(args.anchor_svd_ratio_min) != STAGED_ANCHOR_SVD_RATIO_DEFAULT:
+        raise ValueError(
+            "--anchor-svd-ratio-min is unavailable for rigid component solves; "
+            "component rank is diagnostic only."
+        )
+    if float(args.anchor_residual_max) != STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT:
+        raise ValueError(
+            "--anchor-residual-max is unavailable for rigid component solves; "
+            "component residual is diagnostic only."
+        )
+
+
+def _copy_file_atomic(source: Path, destination: Path) -> Path:
+    source_resolved = source.resolve(strict=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and destination.resolve() == source_resolved:
+        return destination
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        shutil.copyfile(source_resolved, temporary)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return destination
+
+
+def _load_npz_arrays(path: Path) -> dict[str, np.ndarray]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with np.load(str(path), allow_pickle=False) as archive:
+        return {key: np.asarray(archive[key]) for key in archive.files}
+
+
+def _scalar_value(
+    arrays: Mapping[str, np.ndarray],
+    key: str,
+    path: Path,
+) -> object:
+    if key not in arrays:
+        raise ValueError(f"{path} is missing required field {key}.")
+    value = np.asarray(arrays[key])
+    if value.shape != ():
+        raise ValueError(f"{path} field {key} must be scalar, got {value.shape}.")
+    return value.item()
+
+
+def _load_rigid_component_graphs(
+    graph_paths: list[str],
+    mode_indices: list[int],
+) -> dict[int, LoadedObservedStructureGraph]:
+    loaded_by_mode: dict[int, LoadedObservedStructureGraph] = {}
+    for raw_path in graph_paths:
+        loaded = load_observed_structure_graph(raw_path)
+        if loaded.mode_index in loaded_by_mode:
+            previous = loaded_by_mode[loaded.mode_index].graph_path
+            raise ValueError(
+                "Duplicate rigid component graph for mode "
+                f"{loaded.mode_index}: {previous} and {loaded.graph_path}."
+            )
+        loaded_by_mode[loaded.mode_index] = loaded
+    requested = set(mode_indices)
+    supplied = set(loaded_by_mode)
+    missing = sorted(requested - supplied)
+    extra = sorted(supplied - requested)
+    if missing or extra:
+        raise ValueError(
+            "Rigid component graphs must match requested modes exactly: "
+            f"missing={missing}, extra={extra}."
+        )
+    return loaded_by_mode
+
+
+def _validate_rigid_source_observations(
+    loaded_graph: LoadedObservedStructureGraph,
+    observations: Mapping[str, np.ndarray],
+    *,
+    args: argparse.Namespace,
+    view_config_paths: list[str],
+    modal_npz_paths: list[str],
+    freqs_per_view: list[np.ndarray],
+    mode_index: int,
+    reference_freq: float,
+    foreground_points: np.ndarray,
+) -> PreparedObservations:
+    source_path = Path(loaded_graph.source_observation_path)
+    required = {
+        "points_world",
+        "gaussian_indices",
+        "point_type",
+        "source_checkpoint",
+        "source_view_configs",
+        "source_modal_npzs",
+        "view_ids",
+        "view_freqs_hz",
+        "freq_hz",
+        "mode_index",
+        "candidate_point_count",
+        "preserved_all_points",
+        "mask_erode_iters",
+        "pixel_sample_stride",
+        "pixel_candidate_k",
+        "pixel_preselect_k",
+        "pixel_render_acc_min",
+        "pixel_min_contribution",
+        "obs_point_index",
+        "obs_view_index",
+        "obs_pixels_xy",
+        "obs_y",
+        "obs_J",
+        "obs_count_per_point",
+        "obs_sample_count_per_point",
+        "obs_contribution_weight",
+        "obs_contribution_score",
+        "obs_contribution_sum",
+        "observations_per_view",
+        "pixel_candidate_method",
+        "view_image_width",
+        "view_image_height",
+    }
+    missing = sorted(required - set(observations))
+    if missing:
+        raise ValueError(f"{source_path} missing rigid-solve fields: {missing}.")
+    if str(_scalar_value(observations, "point_type", source_path)) != (
+        "foreground_gaussian_center"
+    ):
+        raise ValueError(f"{source_path} point_type is incompatible.")
+    if str(_scalar_value(observations, "source_checkpoint", source_path)) != str(
+        args.input_ckpt
+    ):
+        raise ValueError(f"{source_path} source_checkpoint does not match --input-ckpt.")
+    expected_view_configs = np.asarray(view_config_paths).astype(str)
+    if not np.array_equal(
+        np.asarray(observations["source_view_configs"]).astype(str),
+        expected_view_configs,
+    ):
+        raise ValueError(
+            f"{source_path} source_view_configs do not match --view-config arguments."
+        )
+    expected_modal_npzs = np.asarray(modal_npz_paths).astype(str)
+    if not np.array_equal(
+        np.asarray(observations["source_modal_npzs"]).astype(str),
+        expected_modal_npzs,
+    ):
+        raise ValueError(
+            f"{source_path} source_modal_npzs do not match --modal-npz arguments."
+        )
+    expected_view_ids = np.asarray(
+        [load_view_config(path).view_id for path in view_config_paths]
+    ).astype(str)
+    observation_view_ids = np.asarray(observations["view_ids"]).astype(str)
+    if not np.array_equal(observation_view_ids, expected_view_ids):
+        raise ValueError(f"{source_path} view_ids do not match --view-config order.")
+    num_views = int(observation_view_ids.shape[0])
+    obs_view_index = np.asarray(observations["obs_view_index"])
+    if obs_view_index.ndim != 1 or not np.issubdtype(
+        obs_view_index.dtype, np.integer
+    ):
+        raise ValueError(f"{source_path} obs_view_index must be 1-D integers.")
+    if np.any(obs_view_index < 0) or np.any(obs_view_index >= num_views):
+        raise ValueError(f"{source_path} obs_view_index is out of range.")
+    observations_per_view = np.asarray(observations["observations_per_view"])
+    expected_observations_per_view = np.bincount(
+        obs_view_index.astype(np.int64), minlength=num_views
+    )
+    if (
+        observations_per_view.shape != (num_views,)
+        or not np.issubdtype(observations_per_view.dtype, np.integer)
+        or not np.array_equal(
+            observations_per_view.astype(np.int64),
+            expected_observations_per_view,
+        )
+    ):
+        raise ValueError(f"{source_path} observations_per_view is inconsistent.")
+    for key in ("view_image_width", "view_image_height"):
+        values = np.asarray(observations[key])
+        if (
+            values.shape != (num_views,)
+            or not np.issubdtype(values.dtype, np.integer)
+            or np.any(values <= 0)
+        ):
+            raise ValueError(f"{source_path} {key} must be positive per-view integers.")
+    if str(_scalar_value(observations, "pixel_candidate_method", source_path)) != (
+        "rendered_depth_gaussian_contribution"
+    ):
+        raise ValueError(f"{source_path} pixel_candidate_method is incompatible.")
+    num_observations = int(obs_view_index.shape[0])
+    for key in (
+        "obs_contribution_weight",
+        "obs_contribution_score",
+        "obs_contribution_sum",
+    ):
+        values = np.asarray(observations[key])
+        if (
+            values.shape != (num_observations,)
+            or not np.issubdtype(values.dtype, np.number)
+            or np.iscomplexobj(values)
+            or not np.isfinite(values).all()
+            or np.any(values < 0.0)
+        ):
+            raise ValueError(
+                f"{source_path} {key} must be finite non-negative observation values."
+            )
+    if int(_scalar_value(observations, "mode_index", source_path)) != mode_index:
+        raise ValueError(f"{source_path} mode_index does not match the requested mode.")
+    observation_freq = float(_scalar_value(observations, "freq_hz", source_path))
+    if not np.isclose(
+        observation_freq,
+        reference_freq,
+        rtol=0.0,
+        atol=float(args.freq_tolerance_hz),
+    ):
+        raise ValueError(
+            f"{source_path} frequency does not match the requested modal frequency."
+        )
+    expected_view_freqs = np.asarray(
+        [float(freqs[mode_index]) for freqs in freqs_per_view], dtype=np.float64
+    )
+    observation_view_freqs = np.asarray(
+        observations["view_freqs_hz"], dtype=np.float64
+    )
+    if observation_view_freqs.shape != expected_view_freqs.shape or not np.allclose(
+        observation_view_freqs,
+        expected_view_freqs,
+        rtol=0.0,
+        atol=float(args.freq_tolerance_hz),
+    ):
+        raise ValueError(
+            f"{source_path} view_freqs_hz do not match the selected modal frequencies."
+        )
+    points = np.asarray(observations["points_world"], dtype=np.float32)
+    if points.shape != foreground_points.shape or not np.allclose(
+        points,
+        foreground_points,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    ):
+        raise ValueError(
+            f"{source_path} foreground Gaussian centers do not match the checkpoint."
+        )
+    indices = np.asarray(observations["gaussian_indices"])
+    expected_indices = np.arange(points.shape[0], dtype=np.int64)
+    if (
+        indices.shape != expected_indices.shape
+        or not np.issubdtype(indices.dtype, np.integer)
+        or not np.array_equal(indices, expected_indices)
+    ):
+        raise ValueError(
+            f"{source_path} gaussian_indices must preserve checkpoint order."
+        )
+    if int(_scalar_value(observations, "candidate_point_count", source_path)) != int(
+        points.shape[0]
+    ):
+        raise ValueError(f"{source_path} candidate_point_count is inconsistent.")
+    if not bool(_scalar_value(observations, "preserved_all_points", source_path)):
+        raise ValueError(f"{source_path} must preserve all foreground Gaussians.")
+
+    integer_parameters = {
+        "mask_erode_iters": int(args.mask_erode_iters),
+        "pixel_sample_stride": int(args.pixel_sample_stride),
+        "pixel_candidate_k": int(args.pixel_candidate_k),
+        "pixel_preselect_k": int(args.pixel_preselect_k),
+    }
+    for key, expected in integer_parameters.items():
+        if int(_scalar_value(observations, key, source_path)) != expected:
+            raise ValueError(
+                f"{source_path} {key} does not match the current CLI value."
+            )
+    float_parameters = {
+        "pixel_render_acc_min": float(args.pixel_render_acc_min),
+        "pixel_min_contribution": float(args.pixel_min_contribution),
+    }
+    for key, expected in float_parameters.items():
+        value = float(_scalar_value(observations, key, source_path))
+        tolerance = max(abs(expected), 1.0e-12) * 1.0e-6
+        if not np.isclose(value, expected, rtol=1.0e-6, atol=tolerance):
+            raise ValueError(
+                f"{source_path} {key} does not match the current CLI value."
+            )
+
+    validate_observed_structure_graph_sources(
+        loaded_graph,
+        points_world=points,
+        gaussian_indices=indices,
+        source_checkpoint=str(args.input_ckpt),
+        source_observation_path=loaded_graph.source_observation_path,
+        mode_index=mode_index,
+        freq_hz=observation_freq,
+        view_ids=observation_view_ids,
+        obs_point_index=observations["obs_point_index"],
+        obs_view_index=observations["obs_view_index"],
+        obs_weights=observations["obs_contribution_weight"],
+        freq_tolerance_hz=float(args.freq_tolerance_hz),
+    )
+    return prepare_observations(observations)
 
 
 def _validate_motion_fill_arguments(
@@ -310,6 +703,105 @@ def _gaussian_latent_stats(
     return stats
 
 
+def _rigid_gaussian_latent_stats(
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
+    rigid: RigidComponentSolveResult,
+    motion_fill: RigidSeedMotionFillResult | None,
+    observations: Mapping[str, np.ndarray],
+    num_fg: int,
+) -> dict[str, Any]:
+    if motion_fill is None:
+        _, obs_residual, obs_valid, point_residual, point_valid = (
+            compute_prediction_and_residuals(prepared, alpha, rigid.phi)
+        )
+    else:
+        obs_residual = motion_fill.obs_residual
+        obs_valid = motion_fill.obs_residual_valid_mask
+        point_residual = motion_fill.point_residual
+        point_valid = motion_fill.point_residual_valid_mask
+    valid_obs_residual = np.asarray(obs_residual)[np.asarray(obs_valid, dtype=bool)]
+    valid_point_residual = np.asarray(point_residual)[
+        np.asarray(point_valid, dtype=bool)
+    ]
+    component_residual = rigid.component_normalized_weighted_residual
+    component_drift = rigid.component_finite_drift_max
+    stats: dict[str, Any] = {
+        "num_foreground_gaussians": int(num_fg),
+        "num_output_points": int(prepared.points.shape[0]),
+        "num_observations": int(prepared.obs_point_index.shape[0]),
+        "observations_per_view": observations["observations_per_view"].astype(
+            int
+        ).tolist(),
+        "solver_method": "rigid_component_twist",
+        "rigidity_model": "complex_infinitesimal_se3",
+        "alpha_identifiable_count": int(np.count_nonzero(alpha.identifiable_mask)),
+        "alpha_optimizer_success": bool(alpha.optimizer_success),
+        "observed_point_count": int(np.count_nonzero(rigid.observed_mask)),
+        "rigid_seed_count": int(np.count_nonzero(rigid.rigid_seed_mask)),
+        "isolated_observed_count": int(
+            np.count_nonzero(rigid.observed_mask & ~rigid.rigid_seed_mask)
+        ),
+        "fill_target_count": int(np.count_nonzero(rigid.fill_target_mask)),
+        "unobserved_point_count": int(
+            np.count_nonzero(prepared.obs_count_per_point == 0)
+        ),
+        "rigid_component_count": int(rigid.num_components),
+        "rank_deficient_component_count": int(
+            np.count_nonzero(rigid.component_rank < 6)
+        ),
+        "largest_rigid_component_node_count": int(
+            np.max(rigid.component_node_count, initial=0)
+        ),
+        "largest_rigid_component_edge_count": int(
+            np.max(rigid.component_edge_count, initial=0)
+        ),
+        "component_residual_p50": _finite_percentile(component_residual, 50),
+        "component_residual_p90": _finite_percentile(component_residual, 90),
+        "component_residual_max": _finite_percentile(component_residual, 100),
+        "component_finite_drift_p50": _finite_percentile(component_drift, 50),
+        "component_finite_drift_p90": _finite_percentile(component_drift, 90),
+        "component_finite_drift_max": _finite_percentile(component_drift, 100),
+        "obs_residual_median": _finite_percentile(valid_obs_residual, 50),
+        "obs_residual_p90": _finite_percentile(valid_obs_residual, 90),
+        "point_residual_median": _finite_percentile(valid_point_residual, 50),
+        "point_residual_p90": _finite_percentile(valid_point_residual, 90),
+        "gaussian_indices_contiguous": bool(
+            np.array_equal(
+                np.asarray(prepared.arrays["gaussian_indices"]),
+                np.arange(prepared.points.shape[0], dtype=np.int32),
+            )
+        ),
+        "preserved_all_points": bool(
+            np.asarray(observations["preserved_all_points"]).item()
+        ),
+        "pixel_candidate_method": str(
+            np.asarray(observations["pixel_candidate_method"]).item()
+        ),
+    }
+    for name in (
+        "obs_contribution_weight",
+        "obs_contribution_score",
+        "obs_contribution_sum",
+    ):
+        values = np.asarray(observations[name], dtype=np.float32)
+        label = name.removeprefix("obs_")
+        stats[f"{label}_p50"] = _finite_percentile(values, 50)
+        stats[f"{label}_p90"] = _finite_percentile(values, 90)
+        stats[f"{label}_max"] = _finite_percentile(values, 100)
+    if motion_fill is not None:
+        stats.update(
+            {
+                "motion_fill_method": RIGID_SEED_MOTION_FILL_METHOD,
+                "effective_field_method": (
+                    "rigid_component_twist+rigid_seed_joint_knn_fullspace_lsmr"
+                ),
+                "motion_fill": motion_fill.diagnostics,
+            }
+        )
+    return stats
+
+
 def _required_scalar_array(
     arrays: Mapping[str, np.ndarray],
     key: str,
@@ -328,7 +820,26 @@ def _write_compact_gaussian_latent(
     staged: StagedSolveResult,
     motion_fill: GaussianMotionFillResult | None,
 ) -> Path:
-    prepared = staged.prepared
+    phi = staged.observable.phi if motion_fill is None else motion_fill.motion.phi
+    roles = None if motion_fill is None else motion_fill.roles.role
+    completion = None if motion_fill is None else motion_fill.motion.completion_mask
+    return _write_compact_gaussian_latent_arrays(
+        out_path,
+        staged.prepared,
+        phi,
+        motion_fill_role=roles,
+        completion_mask=completion,
+    )
+
+
+def _write_compact_gaussian_latent_arrays(
+    out_path: str | Path,
+    prepared: PreparedObservations,
+    phi: np.ndarray,
+    *,
+    motion_fill_role: np.ndarray | None = None,
+    completion_mask: np.ndarray | None = None,
+) -> Path:
     num_points = int(prepared.points.shape[0])
     if "gaussian_indices" not in prepared.arrays:
         raise ValueError("Gaussian observations are missing gaussian_indices.")
@@ -337,7 +848,6 @@ def _write_compact_gaussian_latent(
         raise ValueError(
             f"gaussian_indices must have shape ({num_points},), got {gaussian_indices.shape}."
         )
-    phi = staged.observable.phi if motion_fill is None else motion_fill.motion.phi
     phi = np.asarray(phi)
     if phi.shape != (num_points, 3):
         raise ValueError(f"Final phi must have shape ({num_points},3), got {phi.shape}.")
@@ -354,12 +864,26 @@ def _write_compact_gaussian_latent(
             prepared.arrays, "source_checkpoint", str
         ),
     }
-    if motion_fill is not None:
+    if (motion_fill_role is None) != (completion_mask is None):
+        raise ValueError(
+            "motion_fill_role and completion_mask must either both be supplied or both be omitted."
+        )
+    if motion_fill_role is not None and completion_mask is not None:
+        role = np.asarray(motion_fill_role)
+        completion = np.asarray(completion_mask)
+        if role.shape != (num_points,) or not np.issubdtype(role.dtype, np.integer):
+            raise ValueError(
+                f"motion_fill_role must contain ({num_points},) integers."
+            )
+        if completion.shape != (num_points,) or completion.dtype != np.bool_:
+            raise ValueError(
+                f"completion_mask must contain ({num_points},) booleans."
+            )
         arrays.update(
             {
-                "motion_fill_role": motion_fill.roles.role.astype(np.int8),
+                "motion_fill_role": role.astype(np.int8),
                 "motion_fill_role_names": np.asarray(MOTION_FILL_ROLE_NAMES),
-                "completion_mask": motion_fill.motion.completion_mask.astype(bool),
+                "completion_mask": completion.astype(bool),
             }
         )
     return save_npz_compressed_atomic(out_path, arrays)
@@ -380,6 +904,47 @@ def _motion_fill_solver_arrays(prefix: str, metadata: Any) -> dict[str, np.ndarr
             float(metadata.condition_estimate), dtype=np.float64
         ),
         f"{prefix}_solution_norm": np.array(float(metadata.solution_norm), dtype=np.float64),
+    }
+
+
+def _alpha_diagnostic_arrays(
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
+    alpha_view_freqs_hz: np.ndarray,
+) -> dict[str, np.ndarray]:
+    return {
+        "alphas": alpha.alphas.astype(np.complex64),
+        "alpha_reference_view_index": np.array(0, dtype=np.int32),
+        "alpha_view_freqs_hz": np.asarray(
+            alpha_view_freqs_hz, dtype=np.float32
+        ),
+        "alpha_identifiable_mask": alpha.identifiable_mask.astype(bool),
+        "alpha_reference_connected_mask": alpha.reference_connected_mask.astype(bool),
+        "alpha_exclusion_reason": alpha.exclusion_reason,
+        "alpha_shared_point_count": alpha.shared_point_count.astype(np.int32),
+        "alpha_edge_point_count": alpha.edge_point_count.astype(np.int32),
+        "alpha_edge_information": alpha.edge_information.astype(np.float32),
+        "alpha_constraint_count_per_view": alpha.constraint_count_per_view.astype(
+            np.int32
+        ),
+        "alpha_information_matrix": alpha.information_matrix.astype(np.complex64),
+        "alpha_parameter_information": alpha.parameter_information.astype(np.float32),
+        "alpha_parameter_view_indices": alpha.parameter_view_indices.astype(np.int32),
+        "alpha_parameter_order": np.array(alpha.parameter_order),
+        "alpha_singular_values": alpha.singular_values.astype(np.float32),
+        "alpha_rank_ratio": np.array(alpha.rank_ratio, dtype=np.float32),
+        "alpha_information_ratio": np.array(alpha.information_ratio, dtype=np.float32),
+        "alpha_condition": np.array(alpha.condition, dtype=np.float32),
+        "alpha_consistency_residual": np.array(
+            alpha.consistency_residual, dtype=np.float32
+        ),
+        "alpha_phase_std": alpha.phase_std.astype(np.float32),
+        "alpha_log_gain_std": alpha.log_gain_std.astype(np.float32),
+        "alpha_gain_bound_active_mask": alpha.gain_bound_active_mask.astype(bool),
+        "alpha_optimizer_success": np.array(alpha.optimizer_success),
+        "alpha_optimizer_status": np.array(alpha.optimizer_status, dtype=np.int32),
+        "alpha_optimizer_message": np.array(alpha.optimizer_message),
+        "alpha_information_kind": np.array(alpha.information_kind),
     }
 
 
@@ -408,34 +973,11 @@ def _write_solver_diagnostics(
         else motion_fill.point_residual_valid_mask
     )
     arrays: dict[str, np.ndarray] = {
-        "alphas": alpha.alphas.astype(np.complex64),
-        "alpha_reference_view_index": np.array(0, dtype=np.int32),
-        "alpha_view_freqs_hz": staged.alpha_view_freqs_hz.astype(np.float32),
-        "alpha_identifiable_mask": alpha.identifiable_mask.astype(bool),
-        "alpha_reference_connected_mask": alpha.reference_connected_mask.astype(bool),
-        "alpha_exclusion_reason": alpha.exclusion_reason,
-        "alpha_shared_point_count": alpha.shared_point_count.astype(np.int32),
-        "alpha_edge_point_count": alpha.edge_point_count.astype(np.int32),
-        "alpha_edge_information": alpha.edge_information.astype(np.float32),
-        "alpha_constraint_count_per_view": alpha.constraint_count_per_view.astype(np.int32),
-        "alpha_information_matrix": alpha.information_matrix.astype(np.complex64),
-        "alpha_parameter_information": alpha.parameter_information.astype(np.float32),
-        "alpha_parameter_view_indices": alpha.parameter_view_indices.astype(np.int32),
-        "alpha_parameter_order": np.array(alpha.parameter_order),
-        "alpha_singular_values": alpha.singular_values.astype(np.float32),
-        "alpha_rank_ratio": np.array(alpha.rank_ratio, dtype=np.float32),
-        "alpha_information_ratio": np.array(alpha.information_ratio, dtype=np.float32),
-        "alpha_condition": np.array(alpha.condition, dtype=np.float32),
-        "alpha_consistency_residual": np.array(
-            alpha.consistency_residual, dtype=np.float32
+        **_alpha_diagnostic_arrays(
+            staged.prepared,
+            alpha,
+            staged.alpha_view_freqs_hz,
         ),
-        "alpha_phase_std": alpha.phase_std.astype(np.float32),
-        "alpha_log_gain_std": alpha.log_gain_std.astype(np.float32),
-        "alpha_gain_bound_active_mask": alpha.gain_bound_active_mask.astype(bool),
-        "alpha_optimizer_success": np.array(alpha.optimizer_success),
-        "alpha_optimizer_status": np.array(alpha.optimizer_status, dtype=np.int32),
-        "alpha_optimizer_message": np.array(alpha.optimizer_message),
-        "alpha_information_kind": np.array(alpha.information_kind),
         "point_singular_values": observable.singular_values.astype(np.float32),
         "point_observable_rank": observable.observable_rank.astype(np.int8),
         "point_nullity": observable.nullity.astype(np.int8),
@@ -574,6 +1116,211 @@ def _write_solver_diagnostics(
     return save_npz_compressed_atomic(out_path, arrays)
 
 
+def _write_rigid_pre_solve_diagnostics(
+    out_path: str | Path,
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
+    alpha_view_freqs_hz: np.ndarray,
+    diagnostics_type: str,
+) -> Path:
+    arrays = {
+        **_alpha_diagnostic_arrays(prepared, alpha, alpha_view_freqs_hz),
+        "solver_method": np.array("rigid_components"),
+        "solver_diagnostics_type": np.array(diagnostics_type),
+        "view_ids": prepared.view_ids.astype(str),
+    }
+    return save_npz_compressed_atomic(out_path, arrays)
+
+
+def _write_rigid_solver_diagnostics(
+    out_path: str | Path,
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
+    alpha_view_freqs_hz: np.ndarray,
+    rigid: RigidComponentSolveResult,
+    *,
+    rigid_graph_path: str,
+    rigid_graph_source_path: str,
+    motion_fill: RigidSeedMotionFillResult | None = None,
+    motion_fill_graph: KnnGraph | None = None,
+    motion_fill_graph_path: str | None = None,
+) -> Path:
+    if motion_fill is None:
+        final_phi = rigid.phi
+        _, _, _, point_residual, point_residual_valid = (
+            compute_prediction_and_residuals(prepared, alpha, final_phi)
+        )
+        completion_mask = np.zeros(rigid.rigid_seed_mask.shape, dtype=bool)
+    else:
+        final_phi = motion_fill.motion.phi
+        point_residual = motion_fill.point_residual
+        point_residual_valid = motion_fill.point_residual_valid_mask
+        completion_mask = motion_fill.motion.completion_mask
+    arrays: dict[str, np.ndarray] = {
+        **_alpha_diagnostic_arrays(prepared, alpha, alpha_view_freqs_hz),
+        "solver_method": np.array("rigid_components"),
+        "solver_diagnostics_type": np.array("rigid_component_twist_v1"),
+        "view_ids": prepared.view_ids.astype(str),
+        "rigidity_model": np.array("complex_infinitesimal_se3"),
+        "rigid_component_connectivity_policy": np.array(
+            "accepted_edge_transitive_components_bridges_merge"
+        ),
+        "rigid_component_graph_path": np.array(rigid_graph_path),
+        "rigid_component_graph_source_path": np.array(rigid_graph_source_path),
+        "rigid_component_rcond": np.array(rigid.config.rcond, dtype=np.float64),
+        "rigid_component_first_order_rtol": np.array(
+            rigid.config.first_order_rtol, dtype=np.float64
+        ),
+        "rigid_component_phase_samples": np.array(
+            rigid.config.phase_samples, dtype=np.int32
+        ),
+        "rigid_seed_mask": rigid.rigid_seed_mask.astype(bool),
+        "observed_mask": rigid.observed_mask.astype(bool),
+        "fill_target_mask": rigid.fill_target_mask.astype(bool),
+        "completion_mask": np.asarray(completion_mask, dtype=bool),
+        "point_component_index": rigid.point_component_index.astype(np.int32),
+        "rigid_phi_pre_fill": rigid.phi.astype(np.complex64),
+        "final_phi": np.asarray(final_phi, dtype=np.complex64),
+        "point_residual": np.asarray(point_residual, dtype=np.float32),
+        "point_residual_valid_mask": np.asarray(point_residual_valid, dtype=bool),
+        "obs_count_per_point": prepared.obs_count_per_point.astype(np.int32),
+        "obs_sample_count_per_point": prepared.obs_sample_count_per_point.astype(
+            np.int32
+        ),
+        "component_graph_index": rigid.component_graph_index.astype(np.int32),
+        "component_node_count": rigid.component_node_count.astype(np.int32),
+        "component_edge_count": rigid.component_edge_count.astype(np.int32),
+        "component_centroid": rigid.component_centroid.astype(np.float32),
+        "component_radius": rigid.component_radius.astype(np.float32),
+        "component_usable_observation_row_count": rigid.component_usable_observation_row_count.astype(
+            np.int32
+        ),
+        "component_distinct_valid_view_count": rigid.component_distinct_valid_view_count.astype(
+            np.int32
+        ),
+        "component_singular_values": rigid.component_singular_values.astype(
+            np.float32
+        ),
+        "component_rank": rigid.component_rank.astype(np.int8),
+        "component_rank_deficient_mask": (rigid.component_rank < 6),
+        "component_condition": rigid.component_condition.astype(np.float32),
+        "component_weighted_residual_norm": rigid.component_weighted_residual_norm.astype(
+            np.float32
+        ),
+        "component_weighted_measurement_norm": rigid.component_weighted_measurement_norm.astype(
+            np.float32
+        ),
+        "component_normalized_weighted_residual": rigid.component_normalized_weighted_residual.astype(
+            np.float32
+        ),
+        "component_translation": rigid.component_translation.astype(np.complex64),
+        "component_rotation": rigid.component_rotation.astype(np.complex64),
+        "edge_component_index": rigid.edge_component_index.astype(np.int32),
+        "edge_first_order_axial_real": rigid.edge_first_order_axial_real.astype(
+            np.float32
+        ),
+        "edge_first_order_axial_imag": rigid.edge_first_order_axial_imag.astype(
+            np.float32
+        ),
+        "edge_first_order_relative_real": rigid.edge_first_order_relative_real.astype(
+            np.float32
+        ),
+        "edge_first_order_relative_imag": rigid.edge_first_order_relative_imag.astype(
+            np.float32
+        ),
+        "finite_drift_phase_angles": rigid.phase_angles.astype(np.float32),
+        "edge_finite_drift_p50": rigid.edge_finite_drift_p50.astype(np.float32),
+        "edge_finite_drift_p90": rigid.edge_finite_drift_p90.astype(np.float32),
+        "edge_finite_drift_max": rigid.edge_finite_drift_max.astype(np.float32),
+        "component_finite_drift_p50": rigid.component_finite_drift_p50.astype(
+            np.float32
+        ),
+        "component_finite_drift_p90": rigid.component_finite_drift_p90.astype(
+            np.float32
+        ),
+        "component_finite_drift_max": rigid.component_finite_drift_max.astype(
+            np.float32
+        ),
+    }
+    if motion_fill is not None:
+        if motion_fill_graph is None or motion_fill_graph_path is None:
+            raise ValueError("Rigid motion-fill diagnostics require graph metadata.")
+        motion = motion_fill.motion
+        arrays.update(
+            {
+                "motion_fill_method": np.array(RIGID_SEED_MOTION_FILL_METHOD),
+                "motion_fill_version": np.array(MOTION_FILL_VERSION, dtype=np.int32),
+                "motion_fill_graph_path": np.array(motion_fill_graph_path),
+                "motion_fill_graph_k": np.array(
+                    motion_fill_graph.k, dtype=np.int32
+                ),
+                "motion_fill_graph_max_distance": np.array(
+                    motion_fill_graph.max_distance, dtype=np.float64
+                ),
+                "motion_fill_graph_epsilon": np.array(
+                    motion_fill_graph.epsilon, dtype=np.float64
+                ),
+                "motion_fill_role": motion_fill.roles.role.astype(np.int8),
+                "motion_fill_excluded_reason": motion_fill.roles.excluded_reason.astype(
+                    np.int8
+                ),
+                "motion_fill_point_numerical_nullity": motion_fill.numerical_nullity.astype(
+                    np.int8
+                ),
+                "motion_fill_observed_mask": motion_fill.observed_mask.astype(bool),
+                "motion_fill_usable_observed_mask": motion_fill.usable_observed_mask.astype(
+                    bool
+                ),
+                "phi_nullspace_correction": motion.phi_nullspace_correction.astype(
+                    np.complex64
+                ),
+                "completion_connected_to_anchor": motion.completion_connected_to_anchor.astype(
+                    bool
+                ),
+                "point_active_component_index": motion.connectivity.component_index.astype(
+                    np.int32
+                ),
+                "point_anchor_hop_distance": motion.connectivity.hop_distance.astype(
+                    np.int32
+                ),
+                "active_component_sizes": motion.connectivity.component_sizes.astype(
+                    np.int32
+                ),
+                "active_component_has_anchor": motion.connectivity.component_has_anchor.astype(
+                    bool
+                ),
+                "active_component_anchor_count": motion.connectivity.component_anchor_count.astype(
+                    np.int32
+                ),
+                "motion_fill_system_row_count": np.array(
+                    motion.system_row_count, dtype=np.int64
+                ),
+                "motion_fill_system_column_count": np.array(
+                    motion.system_column_count, dtype=np.int64
+                ),
+                "motion_fill_active_edge_count": np.array(
+                    motion.active_edge_count, dtype=np.int64
+                ),
+                "motion_fill_lsmr_atol": np.array(
+                    MOTION_FILL_LSMR_ATOL, dtype=np.float64
+                ),
+                "motion_fill_lsmr_btol": np.array(
+                    MOTION_FILL_LSMR_BTOL, dtype=np.float64
+                ),
+                "motion_fill_lsmr_conlim": np.array(
+                    MOTION_FILL_LSMR_CONLIM, dtype=np.float64
+                ),
+                **_motion_fill_solver_arrays(
+                    "motion_fill_lsmr_real", motion.real_solver
+                ),
+                **_motion_fill_solver_arrays(
+                    "motion_fill_lsmr_imaginary", motion.imag_solver
+                ),
+            }
+        )
+    return save_npz_compressed_atomic(out_path, arrays)
+
+
 def _print_observation_sanity(
     observations: Mapping[str, np.ndarray],
     num_fg: int,
@@ -599,28 +1346,39 @@ def _print_observation_sanity(
 
 
 def run(args: argparse.Namespace) -> None:
+    _validate_solve_method_arguments(args)
     _validate_motion_fill_arguments(args)
     view_configs_paths = list(args.view_config)
     modal_npzs_paths = list(args.modal_npz)
     if len(view_configs_paths) != len(modal_npzs_paths):
         raise ValueError("--view-config and --modal-npz must be supplied the same number of times.")
     
-    (
-        fg_means,
-        fg_scales,
-        fg_quats,
-        fg_opacities,
-        _fg_colors,
-        rendered_depths,
-        rendered_accs,
-    ) = load_fg_pixel_candidate_inputs_from_checkpoint(
-        args.input_ckpt,
-        view_configs_paths,
-    )
+    if args.solve_method == "rigid-components":
+        fg_means = load_fg_means_from_checkpoint(args.input_ckpt)
+        fg_scales = None
+        fg_quats = None
+        fg_opacities = None
+        rendered_depths = None
+        rendered_accs = None
+    else:
+        (
+            fg_means,
+            fg_scales,
+            fg_quats,
+            fg_opacities,
+            _fg_colors,
+            rendered_depths,
+            rendered_accs,
+        ) = load_fg_pixel_candidate_inputs_from_checkpoint(
+            args.input_ckpt,
+            view_configs_paths,
+        )
 
-    from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
+    gaussian_tree = None
+    if args.solve_method == "staged" or args.motion_fill:
+        from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
 
-    gaussian_tree = cKDTree(fg_means.astype(np.float64))
+        gaussian_tree = cKDTree(fg_means.astype(np.float64))
 
     _validate_motion_fill_arguments(args, fg_means.shape[0])
     
@@ -630,6 +1388,14 @@ def run(args: argparse.Namespace) -> None:
     # np.array([0.359, 0.711]),  # view 2
     # np.array([0.356, 0.716]),  # view 3 ]
     mode_indices = parse_mode_indices(args.mode_indices, int(freqs_per_view[0].shape[0]))
+    rigid_graphs = (
+        _load_rigid_component_graphs(
+            list(args.rigid_component_graph),
+            mode_indices,
+        )
+        if args.solve_method == "rigid-components"
+        else {}
+    )
     out_dir = Path(args.out_dir)
     obs_dir = out_dir / "observations"
     latent_dir = out_dir / "latents"
@@ -645,6 +1411,7 @@ def run(args: argparse.Namespace) -> None:
     motion_fill_graph_path: Path | None = None
     motion_fill_mode_diagnostics: dict[str, Any] = {}
     if args.motion_fill:
+        assert gaussian_tree is not None
         candidates = query_knn_candidates(
             fg_means,
             int(args.motion_fill_k),
@@ -673,7 +1440,181 @@ def run(args: argparse.Namespace) -> None:
         mode_vis_dir = vis_dir / mode_name
         print(f"Solving Gaussian mode {mode_name}")
         latent_path.unlink(missing_ok=True)
+        if args.solve_method == "rigid-components":
+            loaded_graph = rigid_graphs[mode_index]
+            source_observation_path = Path(loaded_graph.source_observation_path)
+            observations = _load_npz_arrays(source_observation_path)
+            prepared = _validate_rigid_source_observations(
+                loaded_graph,
+                observations,
+                args=args,
+                view_config_paths=view_configs_paths,
+                modal_npz_paths=modal_npzs_paths,
+                freqs_per_view=freqs_per_view,
+                mode_index=mode_index,
+                reference_freq=reference_freq,
+                foreground_points=fg_means,
+            )
+            _print_observation_sanity(observations, fg_means.shape[0])
+            _copy_file_atomic(source_observation_path, obs_path)
+            rigid_graph_local_path = _copy_file_atomic(
+                loaded_graph.graph_path,
+                out_dir / "rigid_components" / "graphs" / f"{mode_name}.npz",
+            )
+            alpha_config = staged_solver_config(args)
+            alpha = solve_alpha_sync(prepared, alpha_config, enforce_failure=False)
+            alpha_view_freqs_hz = _alpha_view_frequencies(prepared)
+            invalid_alpha_views = _unidentifiable_observed_view_indices(
+                prepared, alpha
+            )
+            if alpha_config.alpha_failure == "error" and invalid_alpha_views.size:
+                _write_rigid_pre_solve_diagnostics(
+                    diagnostics_path,
+                    prepared,
+                    alpha,
+                    alpha_view_freqs_hz,
+                    "rigid_component_alpha_failure_v1",
+                )
+                labels = [
+                    str(prepared.view_ids[index])
+                    for index in invalid_alpha_views.tolist()
+                ]
+                raise ValueError(
+                    "Unidentifiable alpha for observed views after writing "
+                    f"diagnostics to {diagnostics_path}: {labels}."
+                )
+            try:
+                rigid = solve_rigid_components(
+                    prepared,
+                    alpha,
+                    loaded_graph.graph,
+                    RigidComponentSolverConfig(
+                        rcond=float(args.rigid_component_rcond),
+                    ),
+                )
+            except Exception:
+                _write_rigid_pre_solve_diagnostics(
+                    diagnostics_path,
+                    prepared,
+                    alpha,
+                    alpha_view_freqs_hz,
+                    "rigid_component_solve_failure_v1",
+                )
+                raise
+
+            rigid_motion_fill = None
+            motion_fill_relative_path = (
+                relative_path(motion_fill_graph_path, out_dir)
+                if motion_fill_graph_path is not None
+                else None
+            )
+            if motion_fill_graph is not None:
+                assert motion_fill_relative_path is not None
+                try:
+                    rigid_motion_fill = apply_rigid_seed_motion_fill(
+                        prepared,
+                        alpha,
+                        rigid.phi,
+                        rigid.rigid_seed_mask,
+                        motion_fill_graph,
+                        motion_fill_relative_path,
+                    )
+                except Exception:
+                    _write_rigid_solver_diagnostics(
+                        diagnostics_path,
+                        prepared,
+                        alpha,
+                        alpha_view_freqs_hz,
+                        rigid,
+                        rigid_graph_path=relative_path(
+                            rigid_graph_local_path, out_dir
+                        ),
+                        rigid_graph_source_path=str(loaded_graph.graph_path),
+                    )
+                    raise
+                motion_fill_mode_diagnostics[mode_name] = (
+                    rigid_motion_fill.diagnostics
+                )
+
+            if rigid_motion_fill is None:
+                final_phi = rigid.phi
+                final_prediction, _, final_residual_valid, _, _ = (
+                    compute_prediction_and_residuals(prepared, alpha, final_phi)
+                )
+                motion_fill_role = None
+                completion_mask = None
+            else:
+                final_phi = rigid_motion_fill.motion.phi
+                final_prediction = rigid_motion_fill.obs_pred_y
+                final_residual_valid = rigid_motion_fill.obs_residual_valid_mask
+                motion_fill_role = rigid_motion_fill.roles.role
+                completion_mask = rigid_motion_fill.motion.completion_mask
+            write_prepared_solve_visualizations(
+                prepared,
+                final_phi,
+                final_prediction,
+                final_residual_valid,
+                mode_vis_dir,
+            )
+            _write_rigid_solver_diagnostics(
+                diagnostics_path,
+                prepared,
+                alpha,
+                alpha_view_freqs_hz,
+                rigid,
+                rigid_graph_path=relative_path(rigid_graph_local_path, out_dir),
+                rigid_graph_source_path=str(loaded_graph.graph_path),
+                motion_fill=rigid_motion_fill,
+                motion_fill_graph=motion_fill_graph,
+                motion_fill_graph_path=motion_fill_relative_path,
+            )
+            _write_compact_gaussian_latent_arrays(
+                latent_path,
+                prepared,
+                final_phi,
+                motion_fill_role=motion_fill_role,
+                completion_mask=completion_mask,
+            )
+            mode_stats = _rigid_gaussian_latent_stats(
+                prepared,
+                alpha,
+                rigid,
+                rigid_motion_fill,
+                observations,
+                fg_means.shape[0],
+            )
+            freqs_by_view = [
+                float(freqs[mode_index]) for freqs in freqs_per_view
+            ]
+            modes.append(
+                {
+                    "mode_index": int(mode_index),
+                    "freq_hz": reference_freq,
+                    "freqs_hz_by_view": freqs_by_view,
+                    "label": f"{mode_index}: {reference_freq:.6f} Hz",
+                    "observation_path": relative_path(obs_path, out_dir),
+                    "source_observation_path": loaded_graph.source_observation_path,
+                    "latent_path": relative_path(latent_path, out_dir),
+                    "diagnostics_path": relative_path(diagnostics_path, out_dir),
+                    "component_diagnostics_path": relative_path(
+                        diagnostics_path, out_dir
+                    ),
+                    "rigid_component_graph_path": relative_path(
+                        rigid_graph_local_path, out_dir
+                    ),
+                    "rigid_component_graph_source_path": str(
+                        loaded_graph.graph_path
+                    ),
+                    "vis_dir": relative_path(mode_vis_dir, out_dir),
+                    "alpha_by_view": _alpha_by_view_diagnostics(
+                        prepared, alpha, alpha_view_freqs_hz
+                    ),
+                    "stats": mode_stats,
+                }
+            )
+            continue
         build_gaussian_observation_graph(
+            # Staged mode loaded the static render inputs and Gaussian tree above.
             points_world=fg_means,
             view_config_paths=view_configs_paths,
             modal_npz_paths=modal_npzs_paths,
@@ -775,6 +1716,11 @@ def run(args: argparse.Namespace) -> None:
         }
         modes.append(mode_entry)
 
+    solver_manifest_parameters = (
+        rigid_component_manifest_parameters(args)
+        if args.solve_method == "rigid-components"
+        else staged_solver_manifest_parameters(args)
+    )
     manifest_parameters = {
         "mask_erode_iters": int(args.mask_erode_iters),
         "pixel_sample_stride": int(args.pixel_sample_stride),
@@ -786,27 +1732,50 @@ def run(args: argparse.Namespace) -> None:
         "alpha_model": "per_view_per_mode",
         "alpha_reference_view_index": 0,
         "motion_fill_enabled": bool(args.motion_fill),
-        **staged_solver_manifest_parameters(args),
+        **solver_manifest_parameters,
     }
-    if motion_fill_graph is not None:
-        assert motion_fill_graph_path is not None
+    if args.solve_method == "rigid-components":
         manifest_parameters.update(
             {
-                "motion_fill_method": MOTION_FILL_METHOD,
+                "rigid_component_graph_count": len(rigid_graphs),
+                "rigid_component_observation_policy": (
+                    "reuse_graph_source_observation_no_rebuild"
+                ),
+            }
+        )
+    if motion_fill_graph is not None:
+        assert motion_fill_graph_path is not None
+        motion_fill_method = (
+            RIGID_SEED_MOTION_FILL_METHOD
+            if args.solve_method == "rigid-components"
+            else MOTION_FILL_METHOD
+        )
+        manifest_parameters.update(
+            {
+                "motion_fill_method": motion_fill_method,
                 "motion_fill_k": int(motion_fill_graph.k),
                 "motion_fill_max_distance": float(motion_fill_graph.max_distance),
                 "motion_fill_epsilon": float(motion_fill_graph.epsilon),
-                "motion_fill_nullspace_operator_rtol": MOTION_FILL_NULLSPACE_RTOL,
-                "motion_fill_observation_drift_rtol": MOTION_FILL_OBSERVATION_DRIFT_RTOL,
                 "motion_fill_graph_path": relative_path(motion_fill_graph_path, out_dir),
-                "motion_fill_excluded_policy": "retain_observable_exclude_from_graph",
+                "motion_fill_excluded_policy": (
+                    "none_all_nonseed_free"
+                    if args.solve_method == "rigid-components"
+                    else "retain_observable_exclude_from_graph"
+                ),
             }
         )
+        if args.solve_method == "staged":
+            manifest_parameters.update(
+                {
+                    "motion_fill_nullspace_operator_rtol": MOTION_FILL_NULLSPACE_RTOL,
+                    "motion_fill_observation_drift_rtol": MOTION_FILL_OBSERVATION_DRIFT_RTOL,
+                }
+            )
         write_motion_fill_diagnostics(
             out_dir / "motion_fill" / "diagnostics.json",
             {
                 "version": 1,
-                "method": MOTION_FILL_METHOD,
+                "method": motion_fill_method,
                 "graph_path": relative_path(motion_fill_graph_path, out_dir),
                 "graph": {
                     "k": int(motion_fill_graph.k),

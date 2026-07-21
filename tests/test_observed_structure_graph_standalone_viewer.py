@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,12 +20,14 @@ from preproc.vis_observed_structure_graph import (
     anchor_residual_view_colors,
     build_parser,
     center_world_points,
+    deform_modal_points,
     gaussian_covariances,
     graph_component_colors,
     graph_scalar_colors,
     load_anchor_residual_diagnostics,
     load_gaussian_visualization_sidecar,
     load_observation_coverage,
+    load_rigid_manifest,
     observation_coverage_colors,
     observed_world_center,
     scale_gaussian_opacities,
@@ -83,6 +86,121 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
             source_observation_path="observations/mode_004_0p85hz.npz",
             num_foreground_gaussians=self.points.shape[0],
         )
+
+    def _write_rigid_result(
+        self,
+        root: Path,
+        graph_path: Path,
+    ) -> tuple[Path, Path, Path, np.ndarray]:
+        latent_path = root / "modes" / "mode_004.npz"
+        diagnostics_path = root / "diagnostics" / "mode_004.npz"
+        latent_path.parent.mkdir(parents=True)
+        diagnostics_path.parent.mkdir(parents=True)
+        phi = np.zeros(self.points.shape, dtype=np.complex64)
+        phi[:, 0] = np.complex64(0.1 + 0.2j)
+        rigid_seed = np.asarray([True, True, True, False], dtype=bool)
+        observed = np.asarray([True, True, True, False], dtype=bool)
+        fill_target = ~rigid_seed
+        completion = np.asarray([False, False, False, True], dtype=bool)
+        role = np.asarray([0, 0, 0, 2], dtype=np.int8)
+        np.savez_compressed(
+            latent_path,
+            points_world=self.points,
+            phi=phi,
+            gaussian_indices=np.arange(self.points.shape[0], dtype=np.int32),
+            freq_hz=np.array(0.85, dtype=np.float32),
+            mode_index=np.array(4, dtype=np.int32),
+            obs_count_per_point=np.asarray([1, 2, 1, 0], dtype=np.int32),
+            point_type=np.array("foreground_gaussian_center"),
+            source_checkpoint=np.array("source.ckpt"),
+            motion_fill_role=role,
+            motion_fill_role_names=np.asarray(
+                [
+                    "fixed_anchor",
+                    "constrained_variable",
+                    "free_variable",
+                    "excluded",
+                ]
+            ),
+            completion_mask=completion,
+        )
+        np.savez_compressed(
+            diagnostics_path,
+            solver_method=np.array("rigid_components"),
+            solver_diagnostics_type=np.array("rigid_component_twist_v1"),
+            rigidity_model=np.array("complex_infinitesimal_se3"),
+            rigid_component_connectivity_policy=np.array(
+                "accepted_edge_transitive_components_bridges_merge"
+            ),
+            rigid_component_graph_path=np.array(graph_path.name),
+            rigid_component_graph_source_path=np.array(str(graph_path)),
+            rigid_seed_mask=rigid_seed,
+            observed_mask=observed,
+            fill_target_mask=fill_target,
+            completion_mask=completion,
+            point_component_index=np.asarray([0, 0, 0, -1], dtype=np.int32),
+            final_phi=phi,
+            component_graph_index=np.asarray([0], dtype=np.int32),
+            component_node_count=np.asarray([3], dtype=np.int32),
+            component_edge_count=np.asarray([2], dtype=np.int32),
+            component_rank=np.asarray([6], dtype=np.int8),
+            component_rank_deficient_mask=np.asarray([False], dtype=bool),
+            component_normalized_weighted_residual=np.asarray(
+                [0.1], dtype=np.float32
+            ),
+            edge_component_index=np.asarray([0, 0], dtype=np.int32),
+            edge_finite_drift_max=np.asarray([0.01, 0.02], dtype=np.float32),
+            motion_fill_method=np.array(
+                "rigid_seed_joint_knn_fullspace_lsmr"
+            ),
+            motion_fill_role=role,
+            completion_connected_to_anchor=np.ones(
+                (self.points.shape[0],), dtype=bool
+            ),
+        )
+        manifest_path = root / "modal_modes_manifest.json"
+        manifest = {
+            "version": 1,
+            "source_checkpoint": "source.ckpt",
+            "point_type": "foreground_gaussian_center",
+            "mode_indices": [4],
+            "parameters": {
+                "solver": "rigid_components",
+                "rigidity_model": "complex_infinitesimal_se3",
+                "rigid_component_selection": "observed_graph_degree_positive",
+                "rigid_component_connectivity_policy": (
+                    "accepted_edge_transitive_components_bridges_merge"
+                ),
+                "rigid_component_rank_policy": (
+                    "truncated_svd_minimum_norm_no_rejection"
+                ),
+                "rigid_component_residual_policy": "diagnostic_only",
+                "rigid_component_edge_weight_use": "topology_only",
+                "rigid_component_finite_rigidity": "first_order_only",
+                "nonseed_policy": "free_motion_fill",
+                "motion_fill_enabled": True,
+            },
+            "modes": [
+                {
+                    "mode_index": 4,
+                    "freq_hz": 0.85,
+                    "source_observation_path": (
+                        "observations/mode_004_0p85hz.npz"
+                    ),
+                    "latent_path": str(latent_path.relative_to(root)),
+                    "diagnostics_path": str(
+                        diagnostics_path.relative_to(root)
+                    ),
+                    "component_diagnostics_path": str(
+                        diagnostics_path.relative_to(root)
+                    ),
+                    "rigid_component_graph_path": graph_path.name,
+                    "rigid_component_graph_source_path": str(graph_path),
+                }
+            ],
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest_path, latent_path, diagnostics_path, phi
 
     def _write_sidecar(
         self,
@@ -577,6 +695,60 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
         )
         np.testing.assert_allclose(view_colors[2], [0.45, 0.45, 0.45])
 
+    def test_rigid_manifest_loading_deformation_and_masks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph_path = self._write_graph(root / "observed_graph.npz")
+            graph = _load_observed_graph_archive(graph_path)
+            manifest_path, _, diagnostics_path, phi = self._write_rigid_result(
+                root,
+                graph_path,
+            )
+            rigid = load_rigid_manifest(manifest_path, (graph,))
+            self.assertTrue(rigid.motion_fill_enabled)
+            self.assertEqual(len(rigid.modes), 1)
+            mode = rigid.modes[0]
+            np.testing.assert_array_equal(
+                mode.rigid_seed_mask,
+                [True, True, True, False],
+            )
+            np.testing.assert_array_equal(
+                mode.completed_fill_mask,
+                [False, False, False, True],
+            )
+            np.testing.assert_array_equal(
+                mode.unresolved_fill_mask,
+                [False, False, False, False],
+            )
+            np.testing.assert_allclose(
+                deform_modal_points(self.points, phi, 0.0, 2.0),
+                self.points + 2.0 * phi.real,
+            )
+            np.testing.assert_allclose(
+                deform_modal_points(self.points, phi, np.pi / 2.0, 1.0),
+                self.points - phi.imag,
+                atol=1.0e-6,
+            )
+            with np.load(diagnostics_path, allow_pickle=False) as archive:
+                malformed = {
+                    name: np.asarray(archive[name]) for name in archive.files
+                }
+            malformed["rigid_component_graph_source_path"] = np.array(
+                "other_graph.npz"
+            )
+            np.savez_compressed(diagnostics_path, **malformed)
+            with self.assertRaisesRegex(ValueError, "graph source path"):
+                load_rigid_manifest(manifest_path, (graph,))
+
+    def test_deform_modal_points_rejects_invalid_field(self) -> None:
+        with self.assertRaisesRegex(ValueError, "complex"):
+            deform_modal_points(
+                self.points,
+                np.zeros(self.points.shape, dtype=np.float32),
+                0.0,
+                1.0,
+            )
+
     def test_cli_requires_observed_graph_and_validates_display_ranges(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -589,11 +761,20 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
                 "coverage.npz",
                 "--residual-diagnostics-npz",
                 "residuals.npz",
+                "--rigid-manifest",
+                "modal_modes_manifest.json",
             ]
         )
         _validate_args(args)
-        self.assertEqual(args.observed_graph_npz, Path("observed_graph.npz"))
+        self.assertEqual(
+            args.observed_graph_npz,
+            [Path("observed_graph.npz")],
+        )
         self.assertEqual(args.gaussian_npz, Path("gaussians.npz"))
+        self.assertEqual(
+            args.rigid_manifest,
+            Path("modal_modes_manifest.json"),
+        )
         self.assertEqual(args.observed_point_size, 0.0009)
         with self.assertRaises(SystemExit):
             parser.parse_args([])

@@ -5,7 +5,9 @@ import unittest
 
 from modal_surface.optimization_staged import StagedSolverConfig
 from modal_surface.solver_cli import (
+    add_solve_method_arguments,
     add_staged_solver_arguments,
+    rigid_component_manifest_parameters,
     staged_solver_config,
     staged_solver_manifest_parameters,
 )
@@ -14,6 +16,7 @@ from modal_surface.solver_cli import (
 class SolverCliTests(unittest.TestCase):
     def _standalone_parser(self) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser()
+        add_solve_method_arguments(parser)
         add_staged_solver_arguments(parser)
         return parser
 
@@ -38,6 +41,25 @@ class SolverCliTests(unittest.TestCase):
         parameters = staged_solver_manifest_parameters(args)
         self.assertEqual(parameters["solver"], "staged")
         self.assertEqual(parameters["alpha_solver_model"], "phase")
+
+    def test_rigid_component_options_and_manifest(self) -> None:
+        args = self._standalone_parser().parse_args(
+            [
+                "--solve-method",
+                "rigid-components",
+                "--rigid-component-graph",
+                "mode4.npz",
+                "--rigid-component-rcond",
+                "1e-7",
+            ]
+        )
+        self.assertEqual(args.solve_method, "rigid-components")
+        self.assertEqual(args.rigid_component_graph, ["mode4.npz"])
+        parameters = rigid_component_manifest_parameters(args)
+        self.assertEqual(parameters["solver"], "rigid_components")
+        self.assertEqual(parameters["rigidity_model"], "complex_infinitesimal_se3")
+        self.assertEqual(parameters["rigid_component_rcond"], 1e-7)
+        self.assertEqual(parameters["nonseed_policy"], "zero_without_motion_fill")
 
     def test_legacy_solver_options_are_not_registered(self) -> None:
         parser = self._standalone_parser()

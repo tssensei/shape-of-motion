@@ -1,4 +1,4 @@
-"""Production motion-fill post-processing for staged Gaussian modal fields."""
+"""Production motion-fill post-processing for Gaussian modal fields."""
 
 from __future__ import annotations
 
@@ -60,6 +60,7 @@ MOTION_FILL_LSMR_BTOL = 1e-10
 MOTION_FILL_LSMR_CONLIM = 1e8
 MOTION_FILL_NULLSPACE_RTOL = 1e-4
 MOTION_FILL_OBSERVATION_DRIFT_RTOL = 1e-4
+RIGID_SEED_MOTION_FILL_METHOD = "rigid_seed_joint_knn_fullspace_lsmr"
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,24 @@ class GaussianMotionFillResult:
     numerical_nullity: np.ndarray
     staged_nullity_refined_mask: np.ndarray
     point_solution_status: np.ndarray
+    obs_pred_y: np.ndarray
+    obs_residual: np.ndarray
+    obs_residual_valid_mask: np.ndarray
+    point_residual: np.ndarray
+    point_residual_valid_mask: np.ndarray
+    diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RigidSeedMotionFillResult:
+    """Full-space completion from fixed rigid-component seed motions."""
+
+    motion: MotionFillResult
+    roles: GaussianMotionFillRoles
+    numerical_nullity: np.ndarray
+    observed_mask: np.ndarray
+    usable_observed_mask: np.ndarray
+    fill_target_mask: np.ndarray
     obs_pred_y: np.ndarray
     obs_residual: np.ndarray
     obs_residual_valid_mask: np.ndarray
@@ -207,6 +226,37 @@ def derive_gaussian_motion_fill_roles(
         constrained_variable_mask=constrained,
         free_variable_mask=free,
         excluded_mask=excluded,
+    )
+
+
+def derive_rigid_seed_motion_fill_roles(
+    rigid_seed_mask: np.ndarray,
+) -> GaussianMotionFillRoles:
+    """Assign rigid seeds as fixed anchors and every other point as free."""
+
+    mask_source = np.asarray(rigid_seed_mask)
+    if mask_source.ndim != 1:
+        raise ValueError(
+            f"rigid_seed_mask must be a 1-D array, got {mask_source.shape}."
+        )
+    seed = _require_boolean_mask(
+        mask_source, "rigid_seed_mask", int(mask_source.shape[0])
+    )
+    if not np.any(seed):
+        raise ValueError("rigid_seed_mask must contain at least one fixed seed.")
+    free = ~seed
+    empty = np.zeros(seed.shape, dtype=bool)
+    role = np.full(seed.shape, MOTION_FILL_ROLE_FREE_VARIABLE, dtype=np.int8)
+    role[seed] = MOTION_FILL_ROLE_FIXED_ANCHOR
+    return GaussianMotionFillRoles(
+        role=role,
+        excluded_reason=np.full(
+            seed.shape, MOTION_FILL_EXCLUDED_NONE, dtype=np.int8
+        ),
+        fixed_anchor_mask=seed,
+        constrained_variable_mask=empty.copy(),
+        free_variable_mask=free,
+        excluded_mask=empty,
     )
 
 
@@ -605,6 +655,175 @@ def apply_gaussian_motion_fill(
         numerical_nullity=subspaces.nullity,
         staged_nullity_refined_mask=refined_partial_mask,
         point_solution_status=point_status,
+        obs_pred_y=pred,
+        obs_residual=obs_residual,
+        obs_residual_valid_mask=obs_residual_valid,
+        point_residual=point_residual,
+        point_residual_valid_mask=point_residual_valid,
+        diagnostics=diagnostics,
+    )
+
+
+def apply_rigid_seed_motion_fill(
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
+    rigid_seed_phi: np.ndarray,
+    rigid_seed_mask: np.ndarray,
+    graph: KnnGraph,
+    graph_path: str,
+) -> RigidSeedMotionFillResult:
+    """Propagate fixed rigid-component motions to every non-seed Gaussian."""
+
+    if not graph_path:
+        raise ValueError("graph_path must be non-empty.")
+    points = np.asarray(prepared.points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points_world must have shape (N,3), got {points.shape}.")
+    num_points = int(points.shape[0])
+    if graph.num_points != num_points:
+        raise ValueError(
+            f"Motion-fill graph has {graph.num_points} points, expected {num_points}."
+        )
+
+    roles = derive_rigid_seed_motion_fill_roles(rigid_seed_mask)
+    if roles.role.shape != (num_points,):
+        raise ValueError(
+            f"rigid_seed_mask must have shape ({num_points},), got "
+            f"{roles.role.shape}."
+        )
+    phi_source = np.asarray(rigid_seed_phi)
+    if phi_source.shape != (num_points, 3):
+        raise ValueError(
+            f"rigid_seed_phi must have shape ({num_points},3), got "
+            f"{phi_source.shape}."
+        )
+    if not np.issubdtype(phi_source.dtype, np.complexfloating):
+        raise ValueError(
+            f"rigid_seed_phi must have complex dtype, got {phi_source.dtype}."
+        )
+    if not np.all(np.isfinite(phi_source)):
+        raise ValueError("rigid_seed_phi must contain only finite values.")
+    if np.any(phi_source[roles.free_variable_mask] != 0):
+        raise ValueError("rigid_seed_phi must be exactly zero at every non-seed point.")
+
+    point_nullspace_basis = np.broadcast_to(
+        np.eye(3, dtype=np.float64), (num_points, 3, 3)
+    ).copy()
+    numerical_nullity = np.full((num_points,), 3, dtype=np.int8)
+    numerical_nullity[roles.fixed_anchor_mask] = 0
+    operator = _build_observation_operator(prepared, alpha)
+    motion = fill_nullspace_motion(
+        graph,
+        phi_source,
+        point_nullspace_basis,
+        numerical_nullity,
+        roles.fixed_anchor_mask,
+        roles.constrained_variable_mask,
+        roles.free_variable_mask,
+        excluded_mask=roles.excluded_mask,
+        lsmr_atol=MOTION_FILL_LSMR_ATOL,
+        lsmr_btol=MOTION_FILL_LSMR_BTOL,
+        lsmr_conlim=MOTION_FILL_LSMR_CONLIM,
+    )
+    if not np.array_equal(
+        motion.phi[roles.fixed_anchor_mask],
+        phi_source[roles.fixed_anchor_mask],
+    ):
+        raise RuntimeError("Motion fill changed a rigid seed.")
+    if np.any(motion.phi_nullspace_correction[roles.fixed_anchor_mask] != 0):
+        raise RuntimeError("Motion fill assigned a correction to a rigid seed.")
+
+    pred, obs_residual, obs_residual_valid, point_residual, point_residual_valid = (
+        compute_prediction_and_residuals(prepared, alpha, motion.phi)
+    )
+    observed_mask = np.zeros((num_points,), dtype=bool)
+    positive_rows = operator.weight > 0.0
+    observed_mask[np.unique(operator.point_index[positive_rows])] = True
+    usable_observed_mask = np.zeros((num_points,), dtype=bool)
+    usable_observed_mask[np.unique(operator.point_index[operator.valid_rows])] = True
+    fill_target_mask = roles.free_variable_mask.copy()
+    completed_observed = (
+        motion.completion_mask & fill_target_mask & observed_mask
+    )
+    completed_unobserved = (
+        motion.completion_mask & fill_target_mask & ~observed_mask
+    )
+    unresolved_observed = fill_target_mask & observed_mask & ~motion.completion_mask
+    unresolved_unobserved = fill_target_mask & ~observed_mask & ~motion.completion_mask
+
+    role_counts = {
+        name: int(np.count_nonzero(roles.role == index))
+        for index, name in enumerate(MOTION_FILL_ROLE_NAMES)
+    }
+    diagnostics = {
+        "method": RIGID_SEED_MOTION_FILL_METHOD,
+        "version": MOTION_FILL_VERSION,
+        "graph_path": graph_path,
+        "role_counts": role_counts,
+        "numerical_subspace": {
+            "policy": "rigid_seed_nullity_zero_nonseed_identity_fullspace",
+            "nullity_counts": {
+                str(dimension): int(
+                    np.count_nonzero(numerical_nullity == dimension)
+                )
+                for dimension in range(4)
+            },
+        },
+        "observability": {
+            "observed_point_count": int(np.count_nonzero(observed_mask)),
+            "usable_observed_point_count": int(
+                np.count_nonzero(usable_observed_mask)
+            ),
+            "observed_fill_target_count": int(
+                np.count_nonzero(fill_target_mask & observed_mask)
+            ),
+            "unobserved_fill_target_count": int(
+                np.count_nonzero(fill_target_mask & ~observed_mask)
+            ),
+        },
+        "completion": {
+            "count": int(np.count_nonzero(motion.completion_mask)),
+            "completed_observed_fill_target_count": int(
+                np.count_nonzero(completed_observed)
+            ),
+            "completed_unobserved_fill_target_count": int(
+                np.count_nonzero(completed_unobserved)
+            ),
+            "unresolved_observed_fill_target_count": int(
+                np.count_nonzero(unresolved_observed)
+            ),
+            "unresolved_unobserved_fill_target_count": int(
+                np.count_nonzero(unresolved_unobserved)
+            ),
+            "anchor_connected_point_count": int(
+                np.count_nonzero(motion.completion_connected_to_anchor)
+            ),
+        },
+        "connectivity": {
+            "component_count": int(motion.connectivity.component_sizes.shape[0]),
+            "anchor_connected_component_count": int(
+                np.count_nonzero(motion.connectivity.component_has_anchor)
+            ),
+            "seed_free_component_count": int(
+                np.count_nonzero(~motion.connectivity.component_has_anchor)
+            ),
+        },
+        "system": {
+            "row_count": int(motion.system_row_count),
+            "column_count": int(motion.system_column_count),
+            "active_edge_count": int(motion.active_edge_count),
+            "eligible_edge_count": int(graph.edge_index.shape[0]),
+        },
+        "lsmr_real": _solver_diagnostics(motion.real_solver),
+        "lsmr_imaginary": _solver_diagnostics(motion.imag_solver),
+    }
+    return RigidSeedMotionFillResult(
+        motion=motion,
+        roles=roles,
+        numerical_nullity=numerical_nullity,
+        observed_mask=observed_mask,
+        usable_observed_mask=usable_observed_mask,
+        fill_target_mask=fill_target_mask,
         obs_pred_y=pred,
         obs_residual=obs_residual,
         obs_residual_valid_mask=obs_residual_valid,
