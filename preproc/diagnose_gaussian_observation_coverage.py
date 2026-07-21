@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from modal_surface.apps.solve_gaussian_modes import (
+from modal_surface.checkpoint_render_inputs import (
     load_fg_pixel_candidate_inputs_from_checkpoint,
 )
 from modal_surface.io import load_view_config

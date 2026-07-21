@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from modal_surface.apps.solve_gaussian_modes import (
+from modal_surface.checkpoint_render_inputs import (
     load_fg_pixel_candidate_inputs_from_checkpoint,
 )
 from modal_surface.io import load_view_config
@@ -169,7 +169,7 @@ def main() -> None:
         min_shared_views=args.min_shared_views,
         render_acc_min=render_acc_min,
     )
-    config.validate(num_anchors=0, num_views=len(configs))
+    config.validate(num_nodes=0, num_views=len(configs))
 
     (
         fg_means,

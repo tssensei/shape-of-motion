@@ -12,10 +12,19 @@ from unittest import mock
 
 import numpy as np
 
+from modal_surface.checkpoint_render_inputs import (
+    load_fg_pixel_candidate_inputs_from_checkpoint as neutral_checkpoint_loader,
+)
 from preproc import build_observed_gaussian_structure_graph as app
 
 
 class BuildObservedGaussianStructureGraphTests(unittest.TestCase):
+    def test_checkpoint_loader_is_decoupled_from_formal_solver(self) -> None:
+        self.assertIs(
+            app.load_fg_pixel_candidate_inputs_from_checkpoint,
+            neutral_checkpoint_loader,
+        )
+
     @staticmethod
     def _points() -> np.ndarray:
         return np.asarray(

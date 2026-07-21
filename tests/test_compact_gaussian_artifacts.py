@@ -6,7 +6,6 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -170,7 +169,6 @@ def _formal_run_args(
     *,
     alpha_failure: str,
     motion_fill: bool = False,
-    anchor_graph: bool = False,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     gaussian_solver_app.add_arguments(parser)
@@ -205,16 +203,6 @@ def _formal_run_args(
                 "--motion-fill-k",
                 "2",
                 "--motion-fill-max-distance",
-                "0.11",
-            ]
-        )
-    if anchor_graph:
-        argv.extend(
-            [
-                "--anchor-graph",
-                "--anchor-graph-max-neighbors",
-                "2",
-                "--anchor-graph-max-distance",
                 "0.11",
             ]
         )
@@ -404,108 +392,6 @@ class CompactGaussianArtifactTests(unittest.TestCase):
             diagnostics["final_point_solution_status"],
             diagnostics["staged_point_solution_status"],
         )
-
-    def test_anchor_graph_switch_preserves_existing_solver_artifacts_and_manifest_fields(self) -> None:
-        observations = _formal_observations()
-        manifests = []
-        latents = []
-        with tempfile.TemporaryDirectory() as tmp:
-            for name, anchor_graph_enabled in (
-                ("baseline", False),
-                ("anchor_graph", True),
-            ):
-                out_dir = Path(tmp) / name
-                args = _formal_run_args(
-                    out_dir,
-                    alpha_failure="exclude",
-                    anchor_graph=anchor_graph_enabled,
-                )
-                fake_graph = SimpleNamespace(
-                    counts={
-                        "retained_edge_count": 2,
-                        "isolated_anchor_count": 0,
-                    }
-                )
-
-                def fake_view_config(path: str) -> SimpleNamespace:
-                    return SimpleNamespace(
-                        view_id=Path(path).stem,
-                        K=np.eye(3, dtype=np.float32),
-                        world_to_camera=np.eye(4, dtype=np.float32),
-                    )
-
-                with (
-                    patch.object(
-                        gaussian_solver_app,
-                        "load_fg_pixel_candidate_inputs_from_checkpoint",
-                        return_value=_checkpoint_inputs(observations["points_world"]),
-                    ),
-                    patch.object(
-                        gaussian_solver_app,
-                        "load_modal_freqs",
-                        return_value=[
-                            np.asarray([2.5], dtype=np.float32),
-                            np.asarray([2.5], dtype=np.float32),
-                        ],
-                    ),
-                    patch.object(
-                        gaussian_solver_app,
-                        "build_gaussian_observation_graph",
-                        side_effect=_observation_writer(observations),
-                    ),
-                    patch.object(gaussian_solver_app, "_print_observation_sanity"),
-                    patch.object(gaussian_solver_app, "write_solve_visualizations"),
-                    patch.object(
-                        gaussian_solver_app,
-                        "load_view_config",
-                        side_effect=fake_view_config,
-                    ),
-                    patch.object(
-                        gaussian_solver_app,
-                        "build_anchor_structure_graph",
-                        return_value=fake_graph,
-                    ) as graph_builder,
-                    patch.object(
-                        gaussian_solver_app,
-                        "write_anchor_structure_graph",
-                        side_effect=lambda path, *_args, **_kwargs: Path(path),
-                    ),
-                ):
-                    gaussian_solver_app.run(args)
-
-                self.assertEqual(
-                    graph_builder.call_count,
-                    1 if anchor_graph_enabled else 0,
-                )
-                latents.append(
-                    _load_archive(out_dir / "latents" / "mode_000_2p5hz.npz")
-                )
-                manifests.append(
-                    json.loads(
-                        (out_dir / "modal_modes_manifest.json").read_text(
-                            encoding="utf-8"
-                        )
-                    )
-                )
-
-        self.assertEqual(set(latents[0]), set(latents[1]))
-        for key in latents[0]:
-            np.testing.assert_array_equal(latents[0][key], latents[1][key])
-        baseline_parameters = {
-            key: value
-            for key, value in manifests[0]["parameters"].items()
-            if not key.startswith("anchor_graph")
-        }
-        graph_parameters = {
-            key: value
-            for key, value in manifests[1]["parameters"].items()
-            if not key.startswith("anchor_graph")
-        }
-        self.assertEqual(baseline_parameters, graph_parameters)
-        baseline_mode = dict(manifests[0]["modes"][0])
-        graph_mode = dict(manifests[1]["modes"][0])
-        graph_mode.pop("anchor_graph_path")
-        self.assertEqual(baseline_mode, graph_mode)
 
     def test_run_motion_fill_failure_writes_staged_only_diagnostics(self) -> None:
         observations = _formal_observations()

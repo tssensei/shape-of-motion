@@ -9,12 +9,8 @@ from typing import Any, Mapping, SupportsFloat
 
 import numpy as np
 
-from modal_surface.anchor_structure_graph import (
-    ANCHOR_STRUCTURE_GRAPH_EPSILON,
-    ANCHOR_STRUCTURE_GRAPH_VERSION,
-    AnchorStructureGraphConfig,
-    build_anchor_structure_graph,
-    write_anchor_structure_graph,
+from modal_surface.checkpoint_render_inputs import (
+    load_fg_pixel_candidate_inputs_from_checkpoint,
 )
 from modal_surface.gaussian_observations import build_gaussian_observation_graph
 from modal_surface.gaussian_motion_fill import (
@@ -35,7 +31,6 @@ from modal_surface.gaussian_motion_fill import (
 )
 from modal_surface.io import (
     load_modal_freqs,
-    load_view_config,
     save_npz_compressed_atomic,
 )
 from modal_surface.motion_fill import KnnGraph, build_knn_graph, query_knn_candidates
@@ -55,11 +50,6 @@ from modal_surface.solver_cli import (
 
 
 _DEFAULT_MOTION_FILL_K = 8
-_DEFAULT_ANCHOR_GRAPH_MAX_NEIGHBORS = 8
-_DEFAULT_ANCHOR_GRAPH_COLOR_MAD_MULTIPLIER = 3.0
-_DEFAULT_ANCHOR_GRAPH_DEPTH_MAD_MULTIPLIER = 3.0
-_DEFAULT_ANCHOR_GRAPH_DEPTH_SAMPLES = 5
-_DEFAULT_ANCHOR_GRAPH_MIN_SHARED_VIEWS = 1
 
 
 def parse_mode_indices(raw: str, num_modes: int) -> list[int]:
@@ -225,47 +215,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Required maximum KNN edge distance in scene units when --motion-fill is enabled.",
     )
-    parser.add_argument(
-        "--anchor-graph",
-        action="store_true",
-        help="Build a diagnostic color-depth structure graph over solved full-rank anchors.",
-    )
-    parser.add_argument(
-        "--anchor-graph-max-distance",
-        type=float,
-        default=None,
-        help="Required maximum mutual-KNN edge distance in scene units when --anchor-graph is enabled.",
-    )
-    parser.add_argument(
-        "--anchor-graph-max-neighbors",
-        type=int,
-        default=_DEFAULT_ANCHOR_GRAPH_MAX_NEIGHBORS,
-        help="Maximum mutual-KNN neighbor count when --anchor-graph is enabled (default: 8).",
-    )
-    parser.add_argument(
-        "--anchor-graph-color-mad-multiplier",
-        type=float,
-        default=_DEFAULT_ANCHOR_GRAPH_COLOR_MAD_MULTIPLIER,
-        help="Robust Lab color threshold MAD multiplier (default: 3.0).",
-    )
-    parser.add_argument(
-        "--anchor-graph-depth-mad-multiplier",
-        type=float,
-        default=_DEFAULT_ANCHOR_GRAPH_DEPTH_MAD_MULTIPLIER,
-        help="Robust surface-depth threshold MAD multiplier (default: 3.0).",
-    )
-    parser.add_argument(
-        "--anchor-graph-depth-samples",
-        type=int,
-        default=_DEFAULT_ANCHOR_GRAPH_DEPTH_SAMPLES,
-        help="Number of rendered-depth samples per candidate edge (default: 5).",
-    )
-    parser.add_argument(
-        "--anchor-graph-min-shared-views",
-        type=int,
-        default=_DEFAULT_ANCHOR_GRAPH_MIN_SHARED_VIEWS,
-        help="Minimum supporting common views required per accepted edge (default: 1).",
-    )
     add_staged_solver_arguments(parser)
 
 
@@ -294,131 +243,6 @@ def _validate_motion_fill_arguments(
         raise ValueError(
             f"--motion-fill-k must be smaller than the foreground Gaussian count ({num_points})."
         )
-
-
-def _validate_anchor_graph_arguments(
-    args: argparse.Namespace,
-    num_views: int | None = None,
-) -> None:
-    if not bool(args.anchor_graph):
-        custom_arguments = (
-            args.anchor_graph_max_distance is not None
-            or args.anchor_graph_max_neighbors != _DEFAULT_ANCHOR_GRAPH_MAX_NEIGHBORS
-            or args.anchor_graph_color_mad_multiplier
-            != _DEFAULT_ANCHOR_GRAPH_COLOR_MAD_MULTIPLIER
-            or args.anchor_graph_depth_mad_multiplier
-            != _DEFAULT_ANCHOR_GRAPH_DEPTH_MAD_MULTIPLIER
-            or args.anchor_graph_depth_samples != _DEFAULT_ANCHOR_GRAPH_DEPTH_SAMPLES
-            or args.anchor_graph_min_shared_views
-            != _DEFAULT_ANCHOR_GRAPH_MIN_SHARED_VIEWS
-        )
-        if custom_arguments:
-            raise ValueError("Anchor graph parameters require --anchor-graph.")
-        return
-    if args.anchor_graph_max_distance is None:
-        raise ValueError(
-            "--anchor-graph requires --anchor-graph-max-distance in scene units."
-        )
-    config = AnchorStructureGraphConfig(
-        max_neighbors=args.anchor_graph_max_neighbors,
-        max_distance=args.anchor_graph_max_distance,
-        color_mad_multiplier=args.anchor_graph_color_mad_multiplier,
-        depth_mad_multiplier=args.anchor_graph_depth_mad_multiplier,
-        depth_samples=args.anchor_graph_depth_samples,
-        min_shared_views=args.anchor_graph_min_shared_views,
-        render_acc_min=args.pixel_render_acc_min,
-    )
-    config.validate(
-        num_anchors=0,
-        num_views=(
-            int(config.min_shared_views) if num_views is None else int(num_views)
-        ),
-    )
-
-
-def load_fg_pixel_candidate_inputs_from_checkpoint(
-    path: str,
-    view_config_paths: list[str],
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    list[np.ndarray],
-    list[np.ndarray],
-]:
-    import torch
-    from flow3d.scene_model import SceneModel
-    ckpt_path = Path(path)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(ckpt_path)
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state = ckpt.get("model")
-    if not isinstance(state, dict):
-        raise ValueError(f"{path} does not contain a model state")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sceneModel = SceneModel.init_from_state_dict(state).to(device)
-    sceneModel.eval()
-    fg_means = sceneModel.fg.params["means"].detach().cpu().float().numpy().astype(np.float32)
-    fg_scales = sceneModel.fg.get_scales().detach().cpu().float().numpy().astype(np.float32)
-    fg_quats = sceneModel.fg.get_quats().detach().cpu().float().numpy().astype(np.float32)
-    fg_opacities = sceneModel.fg.get_opacities().detach().cpu().float().numpy().reshape(-1).astype(np.float32)
-    fg_colors = sceneModel.fg.get_colors().detach().cpu().float().numpy().astype(np.float32)
-    if fg_means.ndim != 2 or fg_means.shape[1] != 3:
-        raise ValueError(f"fg.params.means must have shape (N,3), got {fg_means.shape}")
-    if fg_scales.shape != fg_means.shape:
-        raise ValueError(f"activated foreground scales must have shape {fg_means.shape}, got {fg_scales.shape}")
-    if fg_quats.shape != (fg_means.shape[0], 4):
-        raise ValueError(f"activated foreground quats must have shape ({fg_means.shape[0]},4), got {fg_quats.shape}")
-    if fg_opacities.shape != (fg_means.shape[0],):
-        raise ValueError(f"activated foreground opacities must have shape ({fg_means.shape[0]},), got {fg_opacities.shape}")
-    if fg_colors.shape != fg_means.shape:
-        raise ValueError(
-            f"activated foreground RGB must have shape {fg_means.shape}, got {fg_colors.shape}"
-        )
-    if not np.all(np.isfinite(fg_means)):
-        raise ValueError(f"{path} contains non-finite foreground Gaussian centers")
-    if not np.all(np.isfinite(fg_colors)) or np.any(fg_colors < 0.0) or np.any(fg_colors > 1.0):
-        raise ValueError(f"{path} contains invalid activated foreground Gaussian RGB")
-
-    rendered_depths: list[np.ndarray] = []
-    rendered_accs: list[np.ndarray] = []
-    with torch.no_grad():
-        for cfg_path in view_config_paths:
-            cfg = load_view_config(cfg_path)
-            w2c = torch.from_numpy(cfg.world_to_camera).to(device=device, dtype=torch.float32)[None]
-            K = torch.from_numpy(cfg.K).to(device=device, dtype=torch.float32)[None]
-            rendered = sceneModel.render(
-                None,
-                w2c,
-                K,
-                (cfg.image_width, cfg.image_height),
-                return_depth=True,
-                return_mask=False,
-                fg_only=True,
-            )
-            depth = rendered["depth"][0, ..., 0].detach().cpu().float().numpy().astype(np.float32)
-            acc_tensor = rendered["acc"][0]
-            if acc_tensor.ndim == 3:
-                acc_tensor = acc_tensor[..., 0]
-            acc = acc_tensor.detach().cpu().float().numpy().astype(np.float32)
-            if depth.shape != (cfg.image_height, cfg.image_width):
-                raise ValueError(f"Rendered depth for {cfg.view_id} has unexpected shape {depth.shape}.")
-            if acc.shape != (cfg.image_height, cfg.image_width):
-                raise ValueError(f"Rendered alpha for {cfg.view_id} has unexpected shape {acc.shape}.")
-            rendered_depths.append(depth)
-            rendered_accs.append(acc)
-    return (
-        fg_means,
-        fg_scales,
-        fg_quats,
-        fg_opacities,
-        fg_colors,
-        rendered_depths,
-        rendered_accs,
-    )
 
 
 def _gaussian_latent_stats(
@@ -776,19 +600,17 @@ def _print_observation_sanity(
 
 def run(args: argparse.Namespace) -> None:
     _validate_motion_fill_arguments(args)
-    _validate_anchor_graph_arguments(args)
     view_configs_paths = list(args.view_config)
     modal_npzs_paths = list(args.modal_npz)
     if len(view_configs_paths) != len(modal_npzs_paths):
         raise ValueError("--view-config and --modal-npz must be supplied the same number of times.")
-    _validate_anchor_graph_arguments(args, len(view_configs_paths))
     
     (
         fg_means,
         fg_scales,
         fg_quats,
         fg_opacities,
-        fg_colors,
+        _fg_colors,
         rendered_depths,
         rendered_accs,
     ) = load_fg_pixel_candidate_inputs_from_checkpoint(
@@ -813,36 +635,10 @@ def run(args: argparse.Namespace) -> None:
     latent_dir = out_dir / "latents"
     diagnostics_dir = out_dir / "diagnostics"
     vis_dir = out_dir / "vis"
-    anchor_graph_dir = out_dir / "anchor_graphs"
     obs_dir.mkdir(parents=True, exist_ok=True)
     latent_dir.mkdir(parents=True, exist_ok=True)
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
-    if args.anchor_graph:
-        anchor_graph_dir.mkdir(parents=True, exist_ok=True)
-
-    anchor_graph_config = None
-    anchor_graph_Ks = None
-    anchor_graph_world_to_cameras = None
-    anchor_graph_view_ids = None
-    if args.anchor_graph:
-        anchor_graph_config = AnchorStructureGraphConfig(
-            max_neighbors=int(args.anchor_graph_max_neighbors),
-            max_distance=float(args.anchor_graph_max_distance),
-            color_mad_multiplier=float(args.anchor_graph_color_mad_multiplier),
-            depth_mad_multiplier=float(args.anchor_graph_depth_mad_multiplier),
-            depth_samples=int(args.anchor_graph_depth_samples),
-            min_shared_views=int(args.anchor_graph_min_shared_views),
-            render_acc_min=float(args.pixel_render_acc_min),
-        )
-        graph_view_configs = [load_view_config(path) for path in view_configs_paths]
-        anchor_graph_Ks = np.stack([cfg.K for cfg in graph_view_configs], axis=0)
-        anchor_graph_world_to_cameras = np.stack(
-            [cfg.world_to_camera for cfg in graph_view_configs], axis=0
-        )
-        anchor_graph_view_ids = np.asarray(
-            [cfg.view_id for cfg in graph_view_configs]
-        ).astype(str)
 
     # Build KNN graph from gaussian centers
     motion_fill_graph = None
@@ -912,43 +708,6 @@ def run(args: argparse.Namespace) -> None:
             _write_solver_diagnostics(diagnostics_path, staged, None)
             enforce_alpha_failure(staged, diagnostics_path)
 
-        anchor_graph = None
-        anchor_graph_path: Path | None = None
-        if anchor_graph_config is not None:
-            assert anchor_graph_Ks is not None
-            assert anchor_graph_world_to_cameras is not None
-            assert anchor_graph_view_ids is not None
-            if not np.array_equal(
-                staged.prepared.view_ids.astype(str),
-                anchor_graph_view_ids,
-            ):
-                raise ValueError(
-                    "Staged observation view_ids do not match --view-config order."
-                )
-            anchor_graph = build_anchor_structure_graph(
-                points_world=fg_means,
-                colors_rgb=fg_colors,
-                anchor_mask=staged.observable.anchor_mask,
-                obs_point_index=staged.prepared.obs_point_index,
-                obs_view_index=staged.prepared.obs_view_index,
-                obs_weights=staged.prepared.obs_weights,
-                alpha_identifiable_mask=staged.alpha.identifiable_mask,
-                view_ids=staged.prepared.view_ids,
-                Ks=anchor_graph_Ks,
-                world_to_cameras=anchor_graph_world_to_cameras,
-                rendered_depths=rendered_depths,
-                rendered_accs=rendered_accs,
-                config=anchor_graph_config,
-            )
-            anchor_graph_path = write_anchor_structure_graph(
-                anchor_graph_dir / f"{mode_name}.npz",
-                anchor_graph,
-                mode_index=mode_index,
-                freq_hz=reference_freq,
-                source_checkpoint=str(args.input_ckpt),
-                num_foreground_gaussians=fg_means.shape[0],
-            )
-
         motion_fill_result = None
         if motion_fill_graph is not None:
             assert motion_fill_graph_path is not None
@@ -1014,11 +773,6 @@ def run(args: argparse.Namespace) -> None:
             "alpha_by_view": alpha_by_view_diagnostics(staged),
             "stats": mode_stats,
         }
-        if anchor_graph_path is not None:
-            mode_entry["anchor_graph_path"] = relative_path(
-                anchor_graph_path,
-                out_dir,
-            )
         modes.append(mode_entry)
 
     manifest_parameters = {
@@ -1032,31 +786,8 @@ def run(args: argparse.Namespace) -> None:
         "alpha_model": "per_view_per_mode",
         "alpha_reference_view_index": 0,
         "motion_fill_enabled": bool(args.motion_fill),
-        "anchor_graph_enabled": bool(args.anchor_graph),
         **staged_solver_manifest_parameters(args),
     }
-    if anchor_graph_config is not None:
-        manifest_parameters.update(
-            {
-                "anchor_graph_version": ANCHOR_STRUCTURE_GRAPH_VERSION,
-                "anchor_graph_max_neighbors": int(anchor_graph_config.max_neighbors),
-                "anchor_graph_max_distance": float(anchor_graph_config.max_distance),
-                "anchor_graph_color_mad_multiplier": float(
-                    anchor_graph_config.color_mad_multiplier
-                ),
-                "anchor_graph_depth_mad_multiplier": float(
-                    anchor_graph_config.depth_mad_multiplier
-                ),
-                "anchor_graph_depth_samples": int(anchor_graph_config.depth_samples),
-                "anchor_graph_min_shared_views": int(
-                    anchor_graph_config.min_shared_views
-                ),
-                "anchor_graph_render_acc_min": float(
-                    anchor_graph_config.render_acc_min
-                ),
-                "anchor_graph_epsilon": ANCHOR_STRUCTURE_GRAPH_EPSILON,
-            }
-        )
     if motion_fill_graph is not None:
         assert motion_fill_graph_path is not None
         manifest_parameters.update(

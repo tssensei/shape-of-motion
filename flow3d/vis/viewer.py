@@ -9,12 +9,9 @@ from viser import Icon, ViserServer
 import viser.transforms as vtf
 
 from flow3d.modal_utils import (
-    AnchorStructureGraphData,
     MOTION_FILL_DISPLAY_NAMES,
-    anchor_graph_component_colors,
     motion_fill_display_colors,
     select_motion_fill_display_indices,
-    stable_uniform_edge_indices,
 )
 from flow3d.vis.playback_panel import add_gui_playback_group
 from flow3d.vis.render_panel import populate_render_tab
@@ -99,7 +96,6 @@ class DynamicViewer(Viewer):
         modal_anchor_count: int = 0,
         modal_anchor_role_classes: np.ndarray | None = None,
         modal_anchor_role_mode_labels: tuple[str, ...] = (),
-        anchor_structure_graphs: tuple[AnchorStructureGraphData, ...] | None = None,
     ):
         self.num_frames = num_frames
         self.work_dir = Path(work_dir)
@@ -147,21 +143,8 @@ class DynamicViewer(Viewer):
             raise ValueError(
                 "Modal anchor role mode labels require modal anchor role classes"
             )
-        self.anchor_structure_graphs = (
-            () if anchor_structure_graphs is None else tuple(anchor_structure_graphs)
-        )
-        self.anchor_structure_graph_mode_labels = tuple(
-            f"Mode {graph.mode_index}: {graph.freq_hz:.3f} Hz"
-            for graph in self.anchor_structure_graphs
-        )
-        if len(set(self.anchor_structure_graph_mode_labels)) != len(
-            self.anchor_structure_graph_mode_labels
-        ):
-            raise ValueError("Anchor structure graph mode labels must be unique")
         self._modal_anchor_handle = None
         self._modal_anchor_cache_key = None
-        self._anchor_graph_line_handle = None
-        self._anchor_graph_isolated_handle = None
         for group in self.playback_groups:
             if len(group.global_timestamps) == 0:
                 raise ValueError(f"Playback group {group.label!r} has no frames")
@@ -225,7 +208,6 @@ class DynamicViewer(Viewer):
         self._define_modal_playback_guis()
         self._define_gaussian_color_guis()
         self._define_debug_point_guis()
-        self._define_anchor_structure_graph_guis()
         self._define_camera_guis()
 
         tabs = server.gui.add_tab_group()
@@ -456,148 +438,6 @@ class DynamicViewer(Viewer):
             anchor_role_mode.on_update(_on_update)
         for role_filter in anchor_role_filters:
             role_filter.on_update(_on_update)
-
-    def _define_anchor_structure_graph_guis(self) -> None:
-        self._anchor_structure_graph_handles = None
-        if not self.anchor_structure_graphs:
-            return
-        max_edges = max(
-            int(graph.edge_index.shape[0]) for graph in self.anchor_structure_graphs
-        )
-        edge_step = max(max_edges // 200, 1)
-        with self.server.gui.add_folder("Anchor structure graph"):
-            show_graph = self.server.gui.add_checkbox("Show graph", False)
-            mode = self.server.gui.add_dropdown(
-                "Mode",
-                options=self.anchor_structure_graph_mode_labels,
-                initial_value=self.anchor_structure_graph_mode_labels[0],
-            )
-            edge_color = self.server.gui.add_dropdown(
-                "Edge color",
-                options=("component", "depth support", "combined weight"),
-                initial_value="component",
-            )
-            max_visible_edges = self.server.gui.add_slider(
-                "Max visible edges",
-                min=0,
-                max=max(max_edges, 1),
-                step=edge_step,
-                initial_value=min(20000, max_edges),
-            )
-            line_width = self.server.gui.add_slider(
-                "Line width",
-                min=0.1,
-                max=10.0,
-                step=0.1,
-                initial_value=1.0,
-            )
-            show_isolated = self.server.gui.add_checkbox(
-                "Show isolated anchors",
-                False,
-            )
-            isolated_point_size = self.server.gui.add_slider(
-                "Isolated-anchor point size",
-                min=0.0002,
-                max=0.008,
-                step=0.0001,
-                initial_value=0.002,
-            )
-        self._anchor_structure_graph_handles = {
-            "show_graph": show_graph,
-            "mode": mode,
-            "edge_color": edge_color,
-            "max_visible_edges": max_visible_edges,
-            "line_width": line_width,
-            "show_isolated": show_isolated,
-            "isolated_point_size": isolated_point_size,
-        }
-        for handle in self._anchor_structure_graph_handles.values():
-            handle.on_update(self._update_anchor_structure_graph)
-
-    def _remove_anchor_structure_graph(self) -> None:
-        if self._anchor_graph_line_handle is not None:
-            self._anchor_graph_line_handle.remove()
-            self._anchor_graph_line_handle = None
-        if self._anchor_graph_isolated_handle is not None:
-            self._anchor_graph_isolated_handle.remove()
-            self._anchor_graph_isolated_handle = None
-
-    def _selected_anchor_structure_graph(self) -> AnchorStructureGraphData:
-        handles = self._anchor_structure_graph_handles
-        if handles is None:
-            raise ValueError("Anchor structure graph controls are unavailable")
-        selected = str(handles["mode"].value)
-        if selected not in self.anchor_structure_graph_mode_labels:
-            raise ValueError(f"Unknown anchor structure graph mode: {selected}")
-        return self.anchor_structure_graphs[
-            self.anchor_structure_graph_mode_labels.index(selected)
-        ]
-
-    @staticmethod
-    def _anchor_graph_scalar_colors(values: np.ndarray) -> np.ndarray:
-        values = np.asarray(values, dtype=np.float32)
-        if values.ndim != 1 or not np.isfinite(values).all():
-            raise ValueError("Anchor graph color metric must be a finite 1-D array")
-        if values.size == 0:
-            return np.empty((0, 3), dtype=np.float32)
-        minimum = float(values.min())
-        maximum = float(values.max())
-        if maximum == minimum:
-            normalized = np.ones(values.shape, dtype=np.float32)
-        else:
-            normalized = (values - minimum) / (maximum - minimum)
-        return np.column_stack(
-            [1.0 - normalized, 0.25 + 0.75 * normalized, normalized]
-        ).astype(np.float32)
-
-    def _update_anchor_structure_graph(self, _event=None) -> None:
-        handles = self._anchor_structure_graph_handles
-        if handles is None:
-            return
-        self._remove_anchor_structure_graph()
-        if not bool(handles["show_graph"].value):
-            return
-        graph = self._selected_anchor_structure_graph()
-        selected_edges = stable_uniform_edge_indices(
-            graph.edge_index.shape[0],
-            int(handles["max_visible_edges"].value),
-        )
-        edges = graph.edge_index[selected_edges]
-        if edges.shape[0]:
-            color_mode = str(handles["edge_color"].value)
-            if color_mode == "component":
-                edge_colors = anchor_graph_component_colors(
-                    graph.component_index[edges[:, 0]]
-                )
-            elif color_mode == "depth support":
-                edge_colors = self._anchor_graph_scalar_colors(
-                    graph.edge_depth_score[selected_edges]
-                )
-            elif color_mode == "combined weight":
-                edge_colors = self._anchor_graph_scalar_colors(
-                    np.log1p(graph.edge_combined_weight[selected_edges])
-                )
-            else:
-                raise ValueError(f"Unknown anchor graph edge color: {color_mode}")
-            self._anchor_graph_line_handle = self.server.scene.add_line_segments(
-                "/debug/anchor_structure_graph/edges",
-                points=graph.anchor_points_world[edges],
-                colors=np.repeat(edge_colors[:, None, :], 2, axis=1),
-                line_width=float(handles["line_width"].value),
-            )
-        if bool(handles["show_isolated"].value):
-            isolated_points = graph.anchor_points_world[graph.isolated_mask]
-            if isolated_points.shape[0]:
-                self._anchor_graph_isolated_handle = self.server.scene.add_point_cloud(
-                    "/debug/anchor_structure_graph/isolated",
-                    points=isolated_points,
-                    colors=np.full(
-                        (isolated_points.shape[0], 3),
-                        [1.0, 0.0, 0.0],
-                        dtype=np.float32,
-                    ),
-                    point_size=float(handles["isolated_point_size"].value),
-                )
 
     def _remove_modal_anchor_cloud(self) -> None:
         if self._modal_anchor_handle is not None:
