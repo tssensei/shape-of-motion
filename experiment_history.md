@@ -120,3 +120,27 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   multi-pixel/multi-view modal observations failing the single-3D-phi residual
   test, not graph construction. Increasing candidate K may add coverage but
   does not by itself address this consistency bottleneck.
+
+### Exact anchor-residual decomposition
+
+- Diagnostic artifact: `/home/zs292/outputs_modal/bush4/mode4_anchor_graph_exp/anchor_residual_decomposition_mode4.npz`
+- Exact replay reproduced the saved `point_precompletion_residual`, the 21,766
+  residual candidates, 17,798 residual rejects, and 3,968 accepted anchors.
+- Of the residual-rejected Gaussians, 15,607 (87.69%) were cross-view dominated,
+  1,047 (5.88%) were within-view dominated, 1,049 (5.89%) were mixed, and only
+  95 (0.53%) had robustly low modal energy.
+- Cross-view disagreement contributed 4.48587e6 weighted SSE (94.52%) versus
+  260,194 (5.48%) from within-view pixel-mode dispersion. Median rejected-point
+  total, within-view, and cross-view normalized residuals were 0.287349,
+  0.0280773, and 0.264511, respectively; the median within-SSE fraction was
+  0.00903953.
+- Per-view rejected cross SSE was 1.52938e6, 1.88883e6, and 1.06765e6 for views
+  1, 2, and 3, but these raw totals are not normalized for each view's signal
+  energy or observation mass and therefore do not by themselves identify a bad
+  camera.
+- Conclusion: the anchor bottleneck is overwhelmingly a cross-view compatibility
+  failure under the current shared 3D phi, synchronized alpha, and projection
+  model. Broad within-view denoising alone is unlikely to recover most rejected
+  anchors; the next diagnosis should separate a global/view-level synchronization
+  error from spatially local correspondence, occlusion, or same-frequency mode
+  mixing errors.
