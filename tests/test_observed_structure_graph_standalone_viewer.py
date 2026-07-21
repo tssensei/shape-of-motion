@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -15,6 +16,7 @@ from modal_surface.observed_structure_graph import (
 from preproc.vis_observed_structure_graph import (
     _load_observed_graph_archive,
     _validate_args,
+    ObservedGraphViewer,
     advance_playback_phase,
     anchor_residual_fraction_colors,
     anchor_residual_source_colors,
@@ -36,6 +38,79 @@ from preproc.vis_observed_structure_graph import (
     stable_uniform_indices,
     staged_partial_mask,
 )
+
+
+class _FakeGuiHandle:
+    def __init__(self, value: object) -> None:
+        self.value = value
+        self.callbacks = []
+
+    def on_update(self, callback):
+        self.callbacks.append(callback)
+        return callback
+
+
+class _FakeFolder:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+
+class _FakeGui:
+    def add_folder(self, _label: str) -> _FakeFolder:
+        return _FakeFolder()
+
+    def add_checkbox(self, _label: str, initial_value: bool) -> _FakeGuiHandle:
+        return _FakeGuiHandle(initial_value)
+
+    def add_dropdown(
+        self,
+        _label: str,
+        *,
+        options,
+        initial_value: str,
+    ) -> _FakeGuiHandle:
+        del options
+        return _FakeGuiHandle(initial_value)
+
+    def add_slider(self, _label: str, **kwargs) -> _FakeGuiHandle:
+        return _FakeGuiHandle(kwargs["initial_value"])
+
+
+class _FakeSceneHandle:
+    def __init__(self, **kwargs) -> None:
+        self.points = np.asarray(kwargs["points"]).copy()
+        self.colors = np.asarray(kwargs["colors"]).copy()
+        self.line_width = kwargs.get("line_width")
+        self.point_size = kwargs.get("point_size")
+        self.remove_count = 0
+
+    def remove(self) -> None:
+        self.remove_count += 1
+
+
+class _FakeScene:
+    def __init__(self) -> None:
+        self.line_handles = []
+        self.point_handles = []
+
+    def add_line_segments(self, _name: str, **kwargs) -> _FakeSceneHandle:
+        handle = _FakeSceneHandle(**kwargs)
+        self.line_handles.append(handle)
+        return handle
+
+    def add_point_cloud(self, _name: str, **kwargs) -> _FakeSceneHandle:
+        handle = _FakeSceneHandle(**kwargs)
+        self.point_handles.append(handle)
+        return handle
+
+
+class _FakeServer:
+    def __init__(self) -> None:
+        self.gui = _FakeGui()
+        self.scene = _FakeScene()
 
 
 class StandaloneObservedGraphViewerTests(unittest.TestCase):
@@ -767,6 +842,66 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, message):
                 advance_playback_phase(*values)
+
+    def test_phase_updates_existing_scene_handle_points_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph_path = self._write_graph(root / "observed_graph.npz")
+            graph = _load_observed_graph_archive(graph_path)
+            manifest_path, _, _, _ = self._write_rigid_result(root, graph_path)
+            rigid = load_rigid_manifest(manifest_path, (graph,))
+            server = _FakeServer()
+            with patch(
+                "preproc.vis_observed_structure_graph.threading.Thread"
+            ) as thread_type:
+                viewer = ObservedGraphViewer(
+                    server,
+                    (graph,),
+                    max_visible_edges=graph.edge_index.shape[0],
+                    line_width=1.0,
+                    observed_point_size=0.0009,
+                    isolated_point_size=0.0008,
+                    world_center=observed_world_center((graph,)),
+                    rigid_manifest=rigid,
+                )
+            thread_type.return_value.start.assert_called_once_with()
+
+            line_handle = viewer._line_handle
+            node_handle = viewer._node_handle
+            self.assertIsNotNone(line_handle)
+            self.assertIsNotNone(node_handle)
+            assert line_handle is not None
+            assert node_handle is not None
+            canonical_lines = line_handle.points.copy()
+            canonical_nodes = node_handle.points.copy()
+
+            assert viewer.graph_geometry is not None
+            assert viewer.phase is not None
+            viewer.graph_geometry.value = "deformed"
+            viewer.phase.value = 0.0
+            viewer._update_geometry()
+
+            self.assertIs(viewer._line_handle, line_handle)
+            self.assertIs(viewer._node_handle, node_handle)
+            self.assertEqual(line_handle.remove_count, 0)
+            self.assertEqual(node_handle.remove_count, 0)
+            self.assertEqual(len(server.scene.line_handles), 1)
+            self.assertEqual(len(server.scene.point_handles), 1)
+            self.assertFalse(np.array_equal(line_handle.points, canonical_lines))
+            self.assertFalse(np.array_equal(node_handle.points, canonical_nodes))
+
+            viewer.line_width.value = 2.0
+            viewer.node_point_size.value = 0.0015
+            viewer._update_style()
+            self.assertEqual(line_handle.line_width, 2.0)
+            self.assertEqual(node_handle.point_size, 0.0015)
+
+            viewer.max_visible_edges.value = 1
+            viewer._update()
+            self.assertEqual(line_handle.remove_count, 1)
+            self.assertEqual(node_handle.remove_count, 1)
+            self.assertIsNot(viewer._line_handle, line_handle)
+            self.assertIsNot(viewer._node_handle, node_handle)
 
     def test_cli_requires_observed_graph_and_validates_display_ranges(self) -> None:
         parser = build_parser()

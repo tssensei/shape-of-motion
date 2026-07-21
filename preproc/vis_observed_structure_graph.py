@@ -1913,6 +1913,8 @@ class ObservedGraphViewer:
         self._unresolved_fill_handle = None
         self._update_lock = threading.Lock()
         self._playback_thread = None
+        self._display_mode_index = None
+        self._selected_edge_indices = np.empty((0,), dtype=np.int64)
 
         max_edges = max(int(graph.edge_index.shape[0]) for graph in graphs)
         edge_step = max(max_edges // 200, 1)
@@ -2039,19 +2041,22 @@ class ObservedGraphViewer:
                 else:
                     self.show_completed_fill = None
                     self.show_unresolved_fill = None
-        handles = (
+        rebuild_handles = (
             self.show_graph,
             self.mode,
             self.edge_color,
             self.max_visible_edges,
-            self.line_width,
             self.show_nodes,
-            self.node_point_size,
             self.show_isolated,
-            self.isolated_point_size,
         )
-        for handle in handles:
+        for handle in rebuild_handles:
             handle.on_update(self._update)
+        for handle in (
+            self.line_width,
+            self.node_point_size,
+            self.isolated_point_size,
+        ):
+            handle.on_update(self._update_style)
         if rigid_manifest is not None:
             assert self.graph_geometry is not None
             assert self.phase is not None
@@ -2060,17 +2065,19 @@ class ObservedGraphViewer:
             assert self.playback_speed is not None
             assert self.playback_fps is not None
             assert self.show_rigid_seeds is not None
-            rigid_handles = [
+            geometry_handles = [
                 self.graph_geometry,
                 self.phase,
                 self.motion_scale,
-                self.show_rigid_seeds,
             ]
+            for handle in geometry_handles:
+                handle.on_update(self._update_geometry)
+            rigid_visibility_handles = [self.show_rigid_seeds]
             if self.show_completed_fill is not None:
-                rigid_handles.append(self.show_completed_fill)
+                rigid_visibility_handles.append(self.show_completed_fill)
             if self.show_unresolved_fill is not None:
-                rigid_handles.append(self.show_unresolved_fill)
-            for handle in rigid_handles:
+                rigid_visibility_handles.append(self.show_unresolved_fill)
+            for handle in rigid_visibility_handles:
                 handle.on_update(self._update)
             self.play.on_update(self._on_playback_toggle)
         self._update()
@@ -2136,6 +2143,47 @@ class ObservedGraphViewer:
                 )
                 raise
 
+    def _current_display_geometry(
+        self,
+    ) -> tuple[
+        ObservedGraphViewData,
+        RigidModeViewData | None,
+        np.ndarray,
+        np.ndarray | None,
+    ]:
+        graph = self._selected_graph()
+        rigid_mode = self._selected_rigid_mode(graph)
+        all_display_points = (
+            rigid_mode.points_world if rigid_mode is not None else None
+        )
+        if rigid_mode is not None:
+            assert self.graph_geometry is not None
+            assert self.phase is not None
+            assert self.motion_scale is not None
+            if str(self.graph_geometry.value) == "deformed":
+                all_display_points = deform_modal_points(
+                    rigid_mode.points_world,
+                    rigid_mode.phi,
+                    float(self.phase.value),
+                    float(self.motion_scale.value),
+                )
+            elif str(self.graph_geometry.value) != "canonical":
+                raise ValueError(
+                    f"Unknown graph geometry: {self.graph_geometry.value}"
+                )
+        graph_points = (
+            graph.node_points_world
+            if all_display_points is None
+            else all_display_points[graph.node_gaussian_indices]
+        )
+        centered_points = center_world_points(graph_points, self.world_center)
+        centered_all_points = (
+            None
+            if all_display_points is None
+            else center_world_points(all_display_points, self.world_center)
+        )
+        return graph, rigid_mode, centered_points, centered_all_points
+
     def _remove_scene_nodes(self) -> None:
         for attribute in (
             "_line_handle",
@@ -2150,45 +2198,67 @@ class ObservedGraphViewer:
                 handle.remove()
                 setattr(self, attribute, None)
 
+    def _update_geometry(self, _event: Any = None) -> None:
+        with self._update_lock:
+            graph, rigid_mode, centered_points, centered_all_points = (
+                self._current_display_geometry()
+            )
+            if self._display_mode_index != graph.mode_index:
+                # A mode-change rebuild callback may still be queued while the
+                # playback thread advances phase. The rebuild owns that mode
+                # transition; the following playback tick will update it.
+                return
+            if self._line_handle is not None:
+                edges = graph.edge_index[self._selected_edge_indices]
+                self._line_handle.points = centered_points[edges]
+            if self._node_handle is not None:
+                self._node_handle.points = centered_points
+            if self._isolated_handle is not None:
+                self._isolated_handle.points = centered_points[graph.isolated_mask]
+            if rigid_mode is None:
+                return
+            assert centered_all_points is not None
+            for attribute, mask in (
+                ("_rigid_seed_handle", rigid_mode.rigid_seed_mask),
+                ("_completed_fill_handle", rigid_mode.completed_fill_mask),
+                ("_unresolved_fill_handle", rigid_mode.unresolved_fill_mask),
+            ):
+                handle = getattr(self, attribute)
+                if handle is not None:
+                    handle.points = centered_all_points[mask]
+
+    def _update_style(self, _event: Any = None) -> None:
+        with self._update_lock:
+            if self._line_handle is not None:
+                self._line_handle.line_width = float(self.line_width.value)
+            for attribute in (
+                "_node_handle",
+                "_rigid_seed_handle",
+                "_completed_fill_handle",
+                "_unresolved_fill_handle",
+            ):
+                handle = getattr(self, attribute)
+                if handle is not None:
+                    handle.point_size = float(self.node_point_size.value)
+            if self._isolated_handle is not None:
+                self._isolated_handle.point_size = float(
+                    self.isolated_point_size.value
+                )
+
     def _update(self, _event: Any = None) -> None:
         with self._update_lock:
             self._remove_scene_nodes()
-            graph = self._selected_graph()
-            rigid_mode = self._selected_rigid_mode(graph)
-            all_display_points = (
-                rigid_mode.points_world
-                if rigid_mode is not None
-                else None
+            graph, rigid_mode, centered_points, centered_all_points = (
+                self._current_display_geometry()
             )
-            if rigid_mode is not None:
-                assert self.graph_geometry is not None
-                assert self.phase is not None
-                assert self.motion_scale is not None
-                if str(self.graph_geometry.value) == "deformed":
-                    all_display_points = deform_modal_points(
-                        rigid_mode.points_world,
-                        rigid_mode.phi,
-                        float(self.phase.value),
-                        float(self.motion_scale.value),
-                    )
-                elif str(self.graph_geometry.value) != "canonical":
-                    raise ValueError(
-                        f"Unknown graph geometry: {self.graph_geometry.value}"
-                    )
-            graph_points = (
-                graph.node_points_world
-                if all_display_points is None
-                else all_display_points[graph.node_gaussian_indices]
-            )
-            centered_points = center_world_points(
-                graph_points,
-                self.world_center,
-            )
+            self._display_mode_index = graph.mode_index
+            self._selected_edge_indices = np.empty((0,), dtype=np.int64)
             if bool(self.show_graph.value):
                 selected_edges = stable_uniform_edge_indices(
                     graph.edge_index.shape[0],
                     int(self.max_visible_edges.value),
                 )
+                self._selected_edge_indices = selected_edges
                 edges = graph.edge_index[selected_edges]
                 if edges.shape[0]:
                     color_mode = str(self.edge_color.value)
@@ -2265,12 +2335,8 @@ class ObservedGraphViewer:
                         point_shape="circle",
                     )
             if rigid_mode is not None:
-                assert all_display_points is not None
+                assert centered_all_points is not None
                 assert self.show_rigid_seeds is not None
-                centered_all_points = center_world_points(
-                    all_display_points,
-                    self.world_center,
-                )
                 overlays = [
                     (
                         self.show_rigid_seeds,
