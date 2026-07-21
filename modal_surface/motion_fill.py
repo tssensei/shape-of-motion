@@ -9,12 +9,22 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import numpy as np
 
 
 _CONVERGED_LSMR_STOP_CODES = frozenset({0, 1, 2, 4, 5})
+
+
+def _record_timing(
+    timings: dict[str, float] | None,
+    name: str,
+    started: float,
+) -> None:
+    if timings is not None:
+        timings[name] = float(perf_counter() - started)
 
 
 @dataclass(frozen=True)
@@ -787,9 +797,12 @@ def fill_grouped_affine_motion(
     lsmr_btol: float = 1e-10,
     lsmr_conlim: float = 1e8,
     lsmr_maxiter: int | None = None,
+    timings: dict[str, float] | None = None,
 ) -> MotionFillResult:
     """Fill pointwise motion and shared affine groups in one KNN LSMR system."""
 
+    total_started = perf_counter()
+    stage_started = perf_counter()
     _validate_graph(graph)
     phi_source = np.asarray(phi_fixed)
     if (
@@ -831,12 +844,17 @@ def fill_grouped_affine_motion(
         raise ValueError(
             "shared_group_point_blocks must be finite with shape (num_points,3,6)"
         )
+    _record_timing(timings, "input_validation_seconds", stage_started)
 
+    stage_started = perf_counter()
     connectivity = _compute_grouped_anchor_connectivity(
         graph,
         anchor,
         shared_groups,
     )
+    _record_timing(timings, "connectivity_seconds", stage_started)
+
+    stage_started = perf_counter()
     ordinary_points = np.flatnonzero((shared_groups < 0) & ~anchor)
     point_group_index = np.full((graph.num_points,), -1, dtype=np.int32)
     point_group_index[shared_groups >= 0] = shared_groups[shared_groups >= 0]
@@ -873,7 +891,9 @@ def fill_grouped_affine_motion(
         dtype=np.int64,
     )
     coefficient_offsets[1:] = np.cumsum(active_dimensions, dtype=np.int64)
+    _record_timing(timings, "variable_layout_seconds", stage_started)
 
+    stage_started = perf_counter()
     active_edge_mask = (
         connectivity.connected_to_anchor[graph.edge_index[:, 0]]
         & connectivity.connected_to_anchor[graph.edge_index[:, 1]]
@@ -939,6 +959,7 @@ def fill_grouped_affine_motion(
         matrix = coo_matrix(
             (row_count, column_count), dtype=np.float64
         ).tocsr()
+    _record_timing(timings, "system_assembly_seconds", stage_started)
 
     for tolerance, name in ((lsmr_atol, "lsmr_atol"), (lsmr_btol, "lsmr_btol")):
         if not np.isfinite(tolerance) or tolerance < 0.0:
@@ -948,6 +969,7 @@ def fill_grouped_affine_motion(
     if lsmr_maxiter is not None:
         lsmr_maxiter = _require_positive_integer(lsmr_maxiter, "lsmr_maxiter")
     if column_count:
+        stage_started = perf_counter()
         real_coefficients, real_solver = _run_lsmr(
             matrix,
             right_hand_side.real,
@@ -956,6 +978,8 @@ def fill_grouped_affine_motion(
             conlim=float(lsmr_conlim),
             maxiter=lsmr_maxiter,
         )
+        _record_timing(timings, "lsmr_real_seconds", stage_started)
+        stage_started = perf_counter()
         imaginary_coefficients, imag_solver = _run_lsmr(
             matrix,
             right_hand_side.imag,
@@ -964,6 +988,7 @@ def fill_grouped_affine_motion(
             conlim=float(lsmr_conlim),
             maxiter=lsmr_maxiter,
         )
+        _record_timing(timings, "lsmr_imaginary_seconds", stage_started)
         if not real_solver.converged or not imag_solver.converged:
             raise RuntimeError(
                 "Grouped motion-fill LSMR did not converge: "
@@ -975,7 +1000,11 @@ def fill_grouped_affine_motion(
         coefficient_values = np.empty((0,), dtype=np.complex128)
         real_solver = _empty_solve_metadata(right_hand_side.real)
         imag_solver = _empty_solve_metadata(right_hand_side.imag)
+        if timings is not None:
+            timings["lsmr_real_seconds"] = 0.0
+            timings["lsmr_imaginary_seconds"] = 0.0
 
+    stage_started = perf_counter()
     output_dtype = np.dtype(phi_source.dtype)
     phi_filled = phi_source.astype(output_dtype, copy=True)
     correction = np.zeros((graph.num_points, 3), dtype=output_dtype)
@@ -992,7 +1021,7 @@ def fill_grouped_affine_motion(
         phi_filled[point] = point_correction.astype(output_dtype, copy=False)
     phi_filled[anchor] = phi_source[anchor]
     completion_mask = connected_variable
-    return MotionFillResult(
+    result = MotionFillResult(
         phi=phi_filled,
         phi_observable=phi_source.astype(output_dtype, copy=True),
         phi_nullspace_correction=correction,
@@ -1011,6 +1040,9 @@ def fill_grouped_affine_motion(
         point_coefficient_group_index=point_group_index,
         coefficient_group_dimensions=group_dimensions,
     )
+    _record_timing(timings, "reconstruction_seconds", stage_started)
+    _record_timing(timings, "linear_fill_total_seconds", total_started)
+    return result
 
 
 def fill_nullspace_motion(

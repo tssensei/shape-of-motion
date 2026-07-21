@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Mapping
 
 import numpy as np
@@ -697,9 +698,13 @@ def apply_rigid_seed_motion_fill(
     observed_graph: ObservedStructureGraph,
     graph: KnnGraph,
     graph_path: str,
+    *,
+    timings: dict[str, float] | None = None,
 ) -> RigidSeedMotionFillResult:
     """Jointly fill single-view rigid groups and ordinary non-seed points."""
 
+    total_started = perf_counter()
+    preparation_started = perf_counter()
     if not graph_path:
         raise ValueError("graph_path must be non-empty.")
     points = np.asarray(prepared.points)
@@ -824,6 +829,10 @@ def apply_rigid_seed_motion_fill(
     numerical_nullity = np.full((num_points,), 3, dtype=np.int8)
     numerical_nullity[roles.fixed_anchor_mask] = 0
     operator = _build_observation_operator(prepared, alpha)
+    if timings is not None:
+        timings["preparation_seconds"] = float(
+            perf_counter() - preparation_started
+        )
     motion = fill_grouped_affine_motion(
         graph,
         phi_source,
@@ -834,7 +843,9 @@ def apply_rigid_seed_motion_fill(
         lsmr_atol=MOTION_FILL_LSMR_ATOL,
         lsmr_btol=MOTION_FILL_LSMR_BTOL,
         lsmr_conlim=MOTION_FILL_LSMR_CONLIM,
+        timings=timings,
     )
+    validation_started = perf_counter()
     if not np.array_equal(
         motion.phi[roles.fixed_anchor_mask],
         phi_source[roles.fixed_anchor_mask],
@@ -1040,7 +1051,7 @@ def apply_rigid_seed_motion_fill(
         "lsmr_real": _solver_diagnostics(motion.real_solver),
         "lsmr_imaginary": _solver_diagnostics(motion.imag_solver),
     }
-    return RigidSeedMotionFillResult(
+    result = RigidSeedMotionFillResult(
         motion=motion,
         roles=roles,
         numerical_nullity=numerical_nullity,
@@ -1064,6 +1075,12 @@ def apply_rigid_seed_motion_fill(
         point_residual_valid_mask=point_residual_valid,
         diagnostics=diagnostics,
     )
+    if timings is not None:
+        timings["validation_and_residual_seconds"] = float(
+            perf_counter() - validation_started
+        )
+        timings["total_seconds"] = float(perf_counter() - total_started)
+    return result
 
 
 def write_motion_fill_graph(

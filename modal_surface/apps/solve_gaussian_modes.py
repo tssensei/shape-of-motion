@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from time import perf_counter
 from typing import Any, Mapping, SupportsFloat
 
 import numpy as np
@@ -364,6 +365,28 @@ def _copy_file_atomic(source: Path, destination: Path) -> Path:
         if temporary.exists():
             temporary.unlink()
     return destination
+
+
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, indent=2, allow_nan=False)
+        assert temporary is not None
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+    return path
 
 
 def _load_npz_arrays(path: Path) -> dict[str, np.ndarray]:
@@ -1509,14 +1532,162 @@ def _print_observation_sanity(
     )
 
 
+def _write_time_profile(
+    out_dir: Path,
+    *,
+    solve_method: str,
+    pipeline_total_seconds: float,
+    global_output_seconds: float,
+    setup: Mapping[str, float],
+    motion_fill_graph: Mapping[str, Any],
+    modes: Mapping[str, Mapping[str, Any]],
+) -> Path:
+    mode_profiles = list(modes.values())
+    observation_seconds = float(
+        sum(
+            float(profile["observation_input_seconds"])
+            for profile in mode_profiles
+        )
+    )
+    alpha_seconds = float(
+        sum(float(profile["alpha_sync_seconds"]) for profile in mode_profiles)
+    )
+    rigid_seconds = float(
+        sum(float(profile["rigid_component_solve_seconds"]) for profile in mode_profiles)
+    )
+    seed_seconds = float(
+        sum(float(profile["seed_selection_seconds"]) for profile in mode_profiles)
+    )
+    solve_seconds = alpha_seconds + rigid_seconds + seed_seconds
+    motion_fill_mode_seconds = float(
+        sum(
+            float(profile["motion_fill"]["total_seconds"])
+            for profile in mode_profiles
+        )
+    )
+    motion_fill_graph_seconds = float(motion_fill_graph["total_seconds"])
+    motion_fill_seconds = motion_fill_graph_seconds + motion_fill_mode_seconds
+    mode_output_seconds = float(
+        sum(
+            float(profile["visualization_and_output_seconds"])
+            for profile in mode_profiles
+        )
+    )
+    output_seconds = mode_output_seconds + global_output_seconds
+    accounted_mode_seconds = (
+        observation_seconds
+        + solve_seconds
+        + motion_fill_mode_seconds
+        + mode_output_seconds
+    )
+    solve_and_fill_seconds = solve_seconds + motion_fill_seconds
+    summary = {
+        "mode_count": len(mode_profiles),
+        "observation_input_seconds": observation_seconds,
+        "alpha_sync_seconds": alpha_seconds,
+        "rigid_component_solve_seconds": rigid_seconds,
+        "seed_selection_seconds": seed_seconds,
+        "solve_total_seconds": solve_seconds,
+        "motion_fill_graph_seconds": motion_fill_graph_seconds,
+        "motion_fill_per_mode_total_seconds": motion_fill_mode_seconds,
+        "motion_fill_total_seconds": motion_fill_seconds,
+        "mode_visualization_and_output_seconds": mode_output_seconds,
+        "global_output_seconds": global_output_seconds,
+        "visualization_and_output_total_seconds": output_seconds,
+        "accounted_mode_seconds": accounted_mode_seconds,
+        "solve_share_of_accounted_mode": (
+            solve_seconds / accounted_mode_seconds if accounted_mode_seconds else 0.0
+        ),
+        "motion_fill_share_of_accounted_mode": (
+            motion_fill_mode_seconds / accounted_mode_seconds
+            if accounted_mode_seconds
+            else 0.0
+        ),
+        "solve_and_motion_fill_seconds": solve_and_fill_seconds,
+        "solve_share_of_solve_and_motion_fill": (
+            solve_seconds / solve_and_fill_seconds if solve_and_fill_seconds else 0.0
+        ),
+        "motion_fill_share_of_solve_and_motion_fill": (
+            motion_fill_seconds / solve_and_fill_seconds
+            if solve_and_fill_seconds
+            else 0.0
+        ),
+    }
+    payload = {
+        "version": 1,
+        "clock": "time.perf_counter",
+        "units": "wall_seconds",
+        "motion_fill_substages_are_inclusive_in_total": True,
+        "solve_method": solve_method,
+        "pipeline_total_seconds": float(pipeline_total_seconds),
+        "global_output_seconds": float(global_output_seconds),
+        "setup": dict(setup),
+        "motion_fill_graph": dict(motion_fill_graph),
+        "modes": dict(modes),
+        "summary": summary,
+    }
+    path = _write_json_atomic(out_dir / "time_profile.json", payload)
+    print("Timing summary (wall clock)")
+    print(f"  pipeline total              {pipeline_total_seconds:10.3f} s")
+    print(f"  setup total                 {float(setup['total_seconds']):10.3f} s")
+    print(
+        "  motion-fill graph          "
+        f"{float(motion_fill_graph['total_seconds']):10.3f} s"
+    )
+    print(f"  solve total                 {solve_seconds:10.3f} s")
+    print(f"  motion fill total           {motion_fill_seconds:10.3f} s")
+    print(f"  visualization/output        {output_seconds:10.3f} s")
+    print(
+        "  solve / fill share          "
+        f"{100.0 * float(summary['solve_share_of_solve_and_motion_fill']):.1f}% / "
+        f"{100.0 * float(summary['motion_fill_share_of_solve_and_motion_fill']):.1f}%"
+    )
+    for mode_name, profile in modes.items():
+        motion = profile["motion_fill"]
+        print(f"  {mode_name} total {float(profile['total_seconds']):.3f} s")
+        print(
+            "    alpha / rigid / fill      "
+            f"{float(profile['alpha_sync_seconds']):.3f} / "
+            f"{float(profile['rigid_component_solve_seconds']):.3f} / "
+            f"{float(motion['total_seconds']):.3f} s"
+        )
+        if bool(motion["enabled"]):
+            print(
+                "    fill prep/connect/assemble "
+                f"{float(motion['preparation_seconds']):.3f} / "
+                f"{float(motion['connectivity_seconds']):.3f} / "
+                f"{float(motion['system_assembly_seconds']):.3f} s"
+            )
+            print(
+                "    fill LSMR real/imag        "
+                f"{float(motion['lsmr_real_seconds']):.3f} / "
+                f"{float(motion['lsmr_imaginary_seconds']):.3f} s"
+            )
+            print(
+                "    fill layout/recon/validate "
+                f"{float(motion['variable_layout_seconds']):.3f} / "
+                f"{float(motion['reconstruction_seconds']):.3f} / "
+                f"{float(motion['validation_and_residual_seconds']):.3f} s"
+            )
+    print(f"Saved time profile -> {path}")
+    return path
+
+
 def run(args: argparse.Namespace) -> None:
+    pipeline_started = perf_counter()
+    setup_timings: dict[str, float] = {}
+    stage_started = perf_counter()
     _validate_solve_method_arguments(args)
     _validate_motion_fill_arguments(args)
     view_configs_paths = list(args.view_config)
     modal_npzs_paths = list(args.modal_npz)
     if len(view_configs_paths) != len(modal_npzs_paths):
         raise ValueError("--view-config and --modal-npz must be supplied the same number of times.")
+    setup_timings["argument_validation_seconds"] = float(
+        perf_counter() - stage_started
+    )
     
+    stage_started = perf_counter()
     if args.solve_method == "rigid-components":
         fg_means = load_fg_means_from_checkpoint(args.input_ckpt)
         fg_scales = None
@@ -1537,15 +1708,27 @@ def run(args: argparse.Namespace) -> None:
             args.input_ckpt,
             view_configs_paths,
         )
+    setup_timings["checkpoint_input_seconds"] = float(
+        perf_counter() - stage_started
+    )
 
     gaussian_tree = None
+    stage_started = perf_counter()
     if args.solve_method == "staged" or args.motion_fill:
         from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
 
         gaussian_tree = cKDTree(fg_means.astype(np.float64))
+    setup_timings["gaussian_tree_seconds"] = float(
+        perf_counter() - stage_started
+    )
 
+    stage_started = perf_counter()
     _validate_motion_fill_arguments(args, fg_means.shape[0])
+    setup_timings["point_count_validation_seconds"] = float(
+        perf_counter() - stage_started
+    )
     
+    stage_started = perf_counter()
     freqs_per_view = load_modal_freqs(modal_npzs_paths)
     # e.g. freqs_per_view = [
     # np.array([0.357, 0.714]),  # view 1
@@ -1560,6 +1743,10 @@ def run(args: argparse.Namespace) -> None:
         if args.solve_method == "rigid-components"
         else {}
     )
+    setup_timings["frequency_and_rigid_graph_loading_seconds"] = float(
+        perf_counter() - stage_started
+    )
+    stage_started = perf_counter()
     out_dir = Path(args.out_dir)
     obs_dir = out_dir / "observations"
     latent_dir = out_dir / "latents"
@@ -1569,33 +1756,61 @@ def run(args: argparse.Namespace) -> None:
     latent_dir.mkdir(parents=True, exist_ok=True)
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
+    setup_timings["output_directory_seconds"] = float(
+        perf_counter() - stage_started
+    )
 
     # Build KNN graph from gaussian centers
     motion_fill_graph = None
     motion_fill_graph_path: Path | None = None
     motion_fill_mode_diagnostics: dict[str, Any] = {}
+    motion_fill_graph_profile: dict[str, Any] = {
+        "enabled": bool(args.motion_fill),
+        "query_candidates_seconds": 0.0,
+        "build_graph_seconds": 0.0,
+        "write_graph_seconds": 0.0,
+        "total_seconds": 0.0,
+    }
     if args.motion_fill:
+        graph_started = perf_counter()
         assert gaussian_tree is not None
+        stage_started = perf_counter()
         candidates = query_knn_candidates(
             fg_means,
             int(args.motion_fill_k),
             tree=gaussian_tree,
         )
+        motion_fill_graph_profile["query_candidates_seconds"] = float(
+            perf_counter() - stage_started
+        )
+        stage_started = perf_counter()
         motion_fill_graph = build_knn_graph(
             candidates,
             int(args.motion_fill_k),
             float(args.motion_fill_max_distance),
             MOTION_FILL_EPSILON,
         )
+        motion_fill_graph_profile["build_graph_seconds"] = float(
+            perf_counter() - stage_started
+        )
+        stage_started = perf_counter()
         motion_fill_graph_path = write_motion_fill_graph(
             out_dir / "motion_fill" / "graph.npz",
             fg_means,
             candidates,
             motion_fill_graph,
         )
+        motion_fill_graph_profile["write_graph_seconds"] = float(
+            perf_counter() - stage_started
+        )
+        motion_fill_graph_profile["total_seconds"] = float(
+            perf_counter() - graph_started
+        )
 
     modes: list[dict[str, Any]] = []
+    mode_time_profiles: dict[str, dict[str, Any]] = {}
     for mode_index in mode_indices:
+        mode_started = perf_counter()
         reference_freq = float(freqs_per_view[0][mode_index])
         mode_name = f"mode_{mode_index:03d}_{freq_slug(reference_freq)}hz"
         obs_path = obs_dir / f"{mode_name}.npz"
@@ -1605,6 +1820,8 @@ def run(args: argparse.Namespace) -> None:
         print(f"Solving Gaussian mode {mode_name}")
         latent_path.unlink(missing_ok=True)
         if args.solve_method == "rigid-components":
+            mode_profile: dict[str, Any] = {}
+            stage_started = perf_counter()
             loaded_graph = rigid_graphs[mode_index]
             source_observation_path = Path(loaded_graph.source_observation_path)
             observations = _load_npz_arrays(source_observation_path)
@@ -1625,8 +1842,15 @@ def run(args: argparse.Namespace) -> None:
                 loaded_graph.graph_path,
                 out_dir / "rigid_components" / "graphs" / f"{mode_name}.npz",
             )
+            mode_profile["observation_input_seconds"] = float(
+                perf_counter() - stage_started
+            )
             alpha_config = staged_solver_config(args)
+            stage_started = perf_counter()
             alpha = solve_alpha_sync(prepared, alpha_config, enforce_failure=False)
+            mode_profile["alpha_sync_seconds"] = float(
+                perf_counter() - stage_started
+            )
             alpha_view_freqs_hz = _alpha_view_frequencies(prepared)
             invalid_alpha_views = _unidentifiable_observed_view_indices(
                 prepared, alpha
@@ -1647,6 +1871,7 @@ def run(args: argparse.Namespace) -> None:
                     "Unidentifiable alpha for observed views after writing "
                     f"diagnostics to {diagnostics_path}: {labels}."
                 )
+            stage_started = perf_counter()
             try:
                 rigid = solve_rigid_components(
                     prepared,
@@ -1665,7 +1890,11 @@ def run(args: argparse.Namespace) -> None:
                     "rigid_component_solve_failure_v1",
                 )
                 raise
+            mode_profile["rigid_component_solve_seconds"] = float(
+                perf_counter() - stage_started
+            )
 
+            stage_started = perf_counter()
             seed_selection = select_trusted_rigid_component_seeds(
                 rigid,
                 RigidComponentSeedSelectionConfig(
@@ -1675,8 +1904,12 @@ def run(args: argparse.Namespace) -> None:
                     ),
                 ),
             )
+            mode_profile["seed_selection_seconds"] = float(
+                perf_counter() - stage_started
+            )
 
             rigid_motion_fill = None
+            motion_fill_timings: dict[str, float] = {}
             motion_fill_relative_path = (
                 relative_path(motion_fill_graph_path, out_dir)
                 if motion_fill_graph_path is not None
@@ -1699,6 +1932,7 @@ def run(args: argparse.Namespace) -> None:
                         loaded_graph.graph,
                         motion_fill_graph,
                         motion_fill_relative_path,
+                        timings=motion_fill_timings,
                     )
                 except Exception:
                     _write_rigid_solver_diagnostics(
@@ -1717,7 +1951,13 @@ def run(args: argparse.Namespace) -> None:
                 motion_fill_mode_diagnostics[mode_name] = (
                     rigid_motion_fill.diagnostics
                 )
+            mode_profile["motion_fill"] = {
+                "enabled": motion_fill_graph is not None,
+                "total_seconds": 0.0,
+                **motion_fill_timings,
+            }
 
+            stage_started = perf_counter()
             if rigid_motion_fill is None:
                 final_phi = seed_selection.phi
                 final_prediction, _, final_residual_valid, _, _ = (
@@ -1796,6 +2036,18 @@ def run(args: argparse.Namespace) -> None:
                     "stats": mode_stats,
                 }
             )
+            mode_profile["visualization_and_output_seconds"] = float(
+                perf_counter() - stage_started
+            )
+            mode_profile["solve_total_seconds"] = float(
+                mode_profile["alpha_sync_seconds"]
+                + mode_profile["rigid_component_solve_seconds"]
+                + mode_profile["seed_selection_seconds"]
+            )
+            mode_profile["total_seconds"] = float(
+                perf_counter() - mode_started
+            )
+            mode_time_profiles[mode_name] = mode_profile
             continue
         build_gaussian_observation_graph(
             # Staged mode loaded the static render inputs and Gaussian tree above.
@@ -1900,6 +2152,7 @@ def run(args: argparse.Namespace) -> None:
         }
         modes.append(mode_entry)
 
+    global_output_started = perf_counter()
     solver_manifest_parameters = (
         rigid_component_manifest_parameters(args)
         if args.solve_method == "rigid-components"
@@ -1992,3 +2245,15 @@ def run(args: argparse.Namespace) -> None:
     with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"Saved Gaussian modal modes manifest -> {manifest_path}")
+    if args.solve_method == "rigid-components":
+        global_output_seconds = float(perf_counter() - global_output_started)
+        setup_timings["total_seconds"] = float(sum(setup_timings.values()))
+        _write_time_profile(
+            out_dir,
+            solve_method=str(args.solve_method),
+            pipeline_total_seconds=float(perf_counter() - pipeline_started),
+            global_output_seconds=global_output_seconds,
+            setup=setup_timings,
+            motion_fill_graph=motion_fill_graph_profile,
+            modes=mode_time_profiles,
+        )
