@@ -198,6 +198,84 @@ _COVERAGE_CATEGORY_COLORS = np.asarray(
     dtype=np.float32,
 )
 
+_RESIDUAL_REQUIRED_FIELDS = {
+    "version",
+    "point_type",
+    "source_checkpoint",
+    "source_observation_path",
+    "source_solver_diagnostics_path",
+    "num_foreground_gaussians",
+    "gaussian_indices",
+    "points_world",
+    "view_ids",
+    "mode_index",
+    "freq_hz",
+    "alphas",
+    "alpha_identifiable_mask",
+    "point_observable_rank",
+    "point_condition",
+    "point_distinct_view_count",
+    "point_distinct_valid_view_count",
+    "point_precompletion_residual",
+    "staged_point_solution_status",
+    "anchor_residual_threshold",
+    "anchor_condition_max",
+    "view_sample_count",
+    "view_effective_weight",
+    "view_mode_mean",
+    "view_signal_energy",
+    "view_within_sse",
+    "view_cross_sse",
+    "view_within_residual",
+    "view_cross_residual",
+    "point_effective_weight",
+    "point_signal_energy",
+    "point_signal_rms",
+    "point_within_sse",
+    "point_cross_sse",
+    "point_total_sse",
+    "point_within_residual",
+    "point_cross_residual",
+    "point_replayed_total_residual",
+    "point_within_fraction",
+    "point_worst_within_view",
+    "point_worst_cross_view",
+    "selected_multiview_mask",
+    "residual_candidate_mask",
+    "residual_rejected_mask",
+    "anchor_mask",
+    "low_modal_energy_mask",
+    "residual_source_class",
+    "residual_source_names",
+    "low_modal_energy_threshold",
+    "dominance_ratio",
+    "mad_scale",
+    "effective_weight_method",
+    "decomposition_method",
+    "replay_validation",
+}
+
+_RESIDUAL_SOURCE_NAMES = (
+    "other",
+    "accepted_anchor",
+    "low_modal_energy",
+    "within_view_dominated",
+    "cross_view_dominated",
+    "mixed",
+)
+
+_RESIDUAL_SOURCE_COLORS = np.asarray(
+    (
+        (0.45, 0.45, 0.45),
+        (0.0, 0.45, 1.0),
+        (0.8, 0.0, 0.8),
+        (1.0, 0.15, 0.0),
+        (0.0, 0.8, 0.2),
+        (1.0, 0.65, 0.0),
+    ),
+    dtype=np.float32,
+)
+
 
 @dataclass(frozen=True)
 class AnchorGraphViewData:
@@ -247,6 +325,27 @@ class ObservationCoverageViewData:
     category_by_k: np.ndarray
 
 
+@dataclass(frozen=True)
+class AnchorResidualViewData:
+    artifact_path: Path
+    source_checkpoint: str
+    mode_index: int
+    freq_hz: float
+    points_world: np.ndarray
+    view_ids: np.ndarray
+    point_precompletion_residual: np.ndarray
+    point_within_residual: np.ndarray
+    point_cross_residual: np.ndarray
+    point_within_fraction: np.ndarray
+    point_signal_rms: np.ndarray
+    point_worst_within_view: np.ndarray
+    point_worst_cross_view: np.ndarray
+    selected_multiview_mask: np.ndarray
+    residual_rejected_mask: np.ndarray
+    anchor_mask: np.ndarray
+    residual_source_class: np.ndarray
+
+
 def stable_uniform_indices(count: int, maximum: int) -> np.ndarray:
     if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or count < 0:
         raise ValueError("count must be a non-negative integer")
@@ -286,6 +385,56 @@ def observation_coverage_colors(category: np.ndarray) -> np.ndarray:
     if np.any(values < 0) or np.any(values >= len(_COVERAGE_CATEGORY_NAMES)):
         raise ValueError("Coverage category contains an unknown value")
     return _COVERAGE_CATEGORY_COLORS[values]
+
+
+def anchor_residual_source_colors(source_class: np.ndarray) -> np.ndarray:
+    values = np.asarray(source_class)
+    if values.ndim != 1 or not np.issubdtype(values.dtype, np.integer):
+        raise ValueError("Residual source class must be a 1-D integer array")
+    if np.any(values < 0) or np.any(values >= len(_RESIDUAL_SOURCE_NAMES)):
+        raise ValueError("Residual source class contains an unknown value")
+    return _RESIDUAL_SOURCE_COLORS[values]
+
+
+def anchor_residual_fraction_colors(values: np.ndarray) -> np.ndarray:
+    fraction = np.asarray(values, dtype=np.float32)
+    if fraction.ndim != 1 or not np.isfinite(fraction).all():
+        raise ValueError("Residual fraction must be a finite 1-D array")
+    fraction = np.clip(fraction, 0.0, 1.0)
+    return np.column_stack(
+        [fraction, np.full(fraction.shape, 0.2), 1.0 - fraction]
+    ).astype(np.float32)
+
+
+def anchor_residual_scalar_colors(
+    values: np.ndarray,
+    *,
+    logarithmic: bool,
+) -> np.ndarray:
+    metric = np.asarray(values, dtype=np.float32)
+    if metric.ndim != 1:
+        raise ValueError("Residual metric must be a 1-D array")
+    colors = np.full((metric.shape[0], 3), 0.45, dtype=np.float32)
+    finite = np.isfinite(metric)
+    if np.any(finite):
+        finite_values = metric[finite]
+        if logarithmic:
+            if np.any(finite_values < 0.0):
+                raise ValueError("Logarithmic residual metric must be non-negative")
+            finite_values = np.log1p(finite_values)
+        colors[finite] = anchor_graph_scalar_colors(finite_values)
+    return colors
+
+
+def anchor_residual_view_colors(view_indices: np.ndarray) -> np.ndarray:
+    indices = np.asarray(view_indices)
+    if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+        raise ValueError("Worst-view index must be a 1-D integer array")
+    colors = np.full((indices.shape[0], 3), 0.45, dtype=np.float32)
+    valid = indices >= 0
+    if np.any(valid):
+        colors[valid] = anchor_graph_component_colors(indices[valid])
+    return colors
 
 
 def anchor_graph_component_colors(component_index: np.ndarray) -> np.ndarray:
@@ -1199,6 +1348,198 @@ def load_observation_coverage(
     )
 
 
+def load_anchor_residual_diagnostics(
+    path: Path,
+    graphs: tuple[AnchorGraphViewData, ...],
+    gaussians: GaussianVisualizationData | None = None,
+) -> AnchorResidualViewData:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with np.load(path, allow_pickle=False) as archive:
+        missing = sorted(_RESIDUAL_REQUIRED_FIELDS - set(archive.files))
+        if missing:
+            raise ValueError(f"{path} missing required fields: {missing}")
+        arrays = {name: archive[name] for name in archive.files}
+    version_value = int(_scalar(arrays["version"], "version", path))
+    if version_value != 1:
+        raise ValueError(f"{path} has unsupported version={version_value}")
+    point_type = _scalar_string(arrays["point_type"], "point_type", path)
+    if point_type != "foreground_gaussian_anchor_residual_decomposition":
+        raise ValueError(f"{path} has unsupported point_type={point_type!r}")
+    for name, expected in (
+        (
+            "effective_weight_method",
+            "contribution_divided_by_point_view_multiplicity",
+        ),
+        (
+            "decomposition_method",
+            "exact_weighted_point_view_mean_sse_identity",
+        ),
+        ("replay_validation", "point_precompletion_residual_exact"),
+    ):
+        if _scalar_string(arrays[name], name, path) != expected:
+            raise ValueError(f"{path} has unsupported {name}")
+    source_checkpoint = _scalar_string(
+        arrays["source_checkpoint"],
+        "source_checkpoint",
+        path,
+    )
+    num_points = int(
+        _scalar(
+            arrays["num_foreground_gaussians"],
+            "num_foreground_gaussians",
+            path,
+        )
+    )
+    points = np.asarray(arrays["points_world"], dtype=np.float32)
+    if points.shape != (num_points, 3) or not np.isfinite(points).all():
+        raise ValueError(f"{path} points_world must be finite ({num_points},3)")
+    indices = np.asarray(arrays["gaussian_indices"])
+    if indices.shape != (num_points,) or not np.array_equal(
+        indices,
+        np.arange(num_points, dtype=indices.dtype),
+    ):
+        raise ValueError(f"{path} gaussian_indices must be contiguous")
+    view_ids = np.asarray(arrays["view_ids"]).astype(str)
+    if view_ids.ndim != 1 or view_ids.shape[0] == 0:
+        raise ValueError(f"{path} view_ids must be a non-empty 1-D array")
+    num_views = int(view_ids.shape[0])
+    mode_index = int(_scalar(arrays["mode_index"], "mode_index", path))
+    freq_hz = float(_scalar(arrays["freq_hz"], "freq_hz", path))
+    matching_graphs = [graph for graph in graphs if graph.mode_index == mode_index]
+    if len(matching_graphs) != 1:
+        raise ValueError(
+            f"{path} mode_index={mode_index} must match exactly one loaded graph"
+        )
+    matching_graph = matching_graphs[0]
+    if not np.isclose(freq_hz, matching_graph.freq_hz, rtol=0.0, atol=1.0e-6):
+        raise ValueError(f"{path} frequency does not match its anchor graph")
+    source_names = tuple(
+        str(value) for value in np.asarray(arrays["residual_source_names"]).tolist()
+    )
+    if source_names != _RESIDUAL_SOURCE_NAMES:
+        raise ValueError(f"{path} has unsupported residual source names")
+    expected_shapes = {
+        "alphas": (num_views,),
+        "alpha_identifiable_mask": (num_views,),
+        "point_observable_rank": (num_points,),
+        "point_condition": (num_points,),
+        "point_distinct_view_count": (num_points,),
+        "point_distinct_valid_view_count": (num_points,),
+        "point_precompletion_residual": (num_points,),
+        "staged_point_solution_status": (num_points,),
+        "view_sample_count": (num_points, num_views),
+        "view_effective_weight": (num_points, num_views),
+        "view_mode_mean": (num_points, num_views, 2),
+        "view_signal_energy": (num_points, num_views),
+        "view_within_sse": (num_points, num_views),
+        "view_cross_sse": (num_points, num_views),
+        "view_within_residual": (num_points, num_views),
+        "view_cross_residual": (num_points, num_views),
+        "point_effective_weight": (num_points,),
+        "point_signal_energy": (num_points,),
+        "point_signal_rms": (num_points,),
+        "point_within_sse": (num_points,),
+        "point_cross_sse": (num_points,),
+        "point_total_sse": (num_points,),
+        "point_within_residual": (num_points,),
+        "point_cross_residual": (num_points,),
+        "point_replayed_total_residual": (num_points,),
+        "point_within_fraction": (num_points,),
+        "point_worst_within_view": (num_points,),
+        "point_worst_cross_view": (num_points,),
+        "selected_multiview_mask": (num_points,),
+        "residual_candidate_mask": (num_points,),
+        "residual_rejected_mask": (num_points,),
+        "anchor_mask": (num_points,),
+        "low_modal_energy_mask": (num_points,),
+        "residual_source_class": (num_points,),
+    }
+    for name, expected_shape in expected_shapes.items():
+        if np.asarray(arrays[name]).shape != expected_shape:
+            raise ValueError(f"{path} field {name} must have shape {expected_shape}")
+    for name in (
+        "alpha_identifiable_mask",
+        "selected_multiview_mask",
+        "residual_candidate_mask",
+        "residual_rejected_mask",
+        "anchor_mask",
+        "low_modal_energy_mask",
+    ):
+        if np.asarray(arrays[name]).dtype != np.bool_:
+            raise ValueError(f"{path} field {name} must be boolean")
+    source_class = np.asarray(arrays["residual_source_class"])
+    if (
+        not np.issubdtype(source_class.dtype, np.integer)
+        or np.any(source_class < 0)
+        or np.any(source_class >= len(_RESIDUAL_SOURCE_NAMES))
+    ):
+        raise ValueError(f"{path} residual_source_class contains invalid values")
+    for graph in graphs:
+        if graph.source_checkpoint != source_checkpoint:
+            raise ValueError(f"{path} source_checkpoint does not match graph")
+        if graph.num_foreground_gaussians != num_points:
+            raise ValueError(f"{path} foreground count does not match graph")
+    if matching_graph.anchor_gaussian_indices.shape[0] and not np.allclose(
+        points[matching_graph.anchor_gaussian_indices],
+        matching_graph.anchor_points_world,
+        rtol=1.0e-6,
+        atol=1.0e-5,
+    ):
+        raise ValueError(f"{path} Gaussian centers do not match graph anchors")
+    anchor_mask = np.asarray(arrays["anchor_mask"], dtype=bool)
+    if not np.array_equal(
+        np.flatnonzero(anchor_mask),
+        matching_graph.anchor_gaussian_indices,
+    ):
+        raise ValueError(f"{path} anchor_mask does not match anchor graph nodes")
+    if gaussians is not None:
+        if gaussians.source_checkpoint != source_checkpoint:
+            raise ValueError(f"{path} source_checkpoint does not match sidecar")
+        if not np.allclose(
+            points,
+            gaussians.foreground.centers,
+            rtol=1.0e-6,
+            atol=1.0e-5,
+        ):
+            raise ValueError(f"{path} Gaussian centers do not match sidecar")
+    return AnchorResidualViewData(
+        artifact_path=path,
+        source_checkpoint=source_checkpoint,
+        mode_index=mode_index,
+        freq_hz=freq_hz,
+        points_world=points,
+        view_ids=view_ids,
+        point_precompletion_residual=np.asarray(
+            arrays["point_precompletion_residual"], dtype=np.float32
+        ),
+        point_within_residual=np.asarray(
+            arrays["point_within_residual"], dtype=np.float32
+        ),
+        point_cross_residual=np.asarray(
+            arrays["point_cross_residual"], dtype=np.float32
+        ),
+        point_within_fraction=np.asarray(
+            arrays["point_within_fraction"], dtype=np.float32
+        ),
+        point_signal_rms=np.asarray(arrays["point_signal_rms"], dtype=np.float32),
+        point_worst_within_view=np.asarray(
+            arrays["point_worst_within_view"], dtype=np.int8
+        ),
+        point_worst_cross_view=np.asarray(
+            arrays["point_worst_cross_view"], dtype=np.int8
+        ),
+        selected_multiview_mask=np.asarray(
+            arrays["selected_multiview_mask"], dtype=bool
+        ),
+        residual_rejected_mask=np.asarray(
+            arrays["residual_rejected_mask"], dtype=bool
+        ),
+        anchor_mask=anchor_mask,
+        residual_source_class=source_class.astype(np.int8),
+    )
+
+
 class StaticGaussianViewer:
     def __init__(
         self,
@@ -1562,6 +1903,144 @@ class ObservationCoverageViewer:
             )
 
 
+class AnchorResidualDiagnosticViewer:
+    def __init__(
+        self,
+        server: Any,
+        diagnostics: AnchorResidualViewData,
+        *,
+        max_visible_points: int,
+        point_size: float,
+        world_center: np.ndarray,
+    ) -> None:
+        self.server = server
+        self.diagnostics = diagnostics
+        self.world_center = np.asarray(world_center, dtype=np.float32)
+        self._point_handle = None
+        self._update_lock = threading.Lock()
+        num_points = int(diagnostics.points_world.shape[0])
+        point_step = max(num_points // 200, 1)
+        with server.gui.add_folder("Anchor residual diagnostics"):
+            self.show_diagnostics = server.gui.add_checkbox(
+                "Show residual diagnostics",
+                True,
+            )
+            self.filter = server.gui.add_dropdown(
+                "Filter",
+                options=(
+                    "residual rejected",
+                    "accepted anchors",
+                    "all selected multiview",
+                ),
+                initial_value="residual rejected",
+            )
+            self.metric = server.gui.add_dropdown(
+                "Color metric",
+                options=(
+                    "source class",
+                    "within fraction",
+                    "total residual",
+                    "within residual",
+                    "cross residual",
+                    "modal signal RMS",
+                    "worst within view",
+                    "worst cross view",
+                ),
+                initial_value="within fraction",
+            )
+            self.max_visible_points = server.gui.add_slider(
+                "Max residual points",
+                min=0,
+                max=max(num_points, 1),
+                step=point_step,
+                initial_value=min(max_visible_points, num_points),
+            )
+            self.point_size = server.gui.add_slider(
+                "Residual point size",
+                min=0.0001,
+                max=0.008,
+                step=0.0001,
+                initial_value=point_size,
+            )
+        for handle in (
+            self.show_diagnostics,
+            self.filter,
+            self.metric,
+            self.max_visible_points,
+            self.point_size,
+        ):
+            handle.on_update(self._update)
+        self._update()
+
+    def _selected_indices(self) -> np.ndarray:
+        selected_filter = str(self.filter.value)
+        if selected_filter == "residual rejected":
+            mask = self.diagnostics.residual_rejected_mask
+        elif selected_filter == "accepted anchors":
+            mask = self.diagnostics.anchor_mask
+        elif selected_filter == "all selected multiview":
+            mask = self.diagnostics.selected_multiview_mask
+        else:
+            raise ValueError(f"Unknown residual diagnostic filter: {selected_filter}")
+        indices = np.flatnonzero(mask)
+        visible = stable_uniform_indices(
+            indices.shape[0],
+            int(self.max_visible_points.value),
+        )
+        return indices[visible]
+
+    def _colors(self, indices: np.ndarray) -> np.ndarray:
+        metric = str(self.metric.value)
+        if metric == "source class":
+            return anchor_residual_source_colors(
+                self.diagnostics.residual_source_class[indices]
+            )
+        if metric == "within fraction":
+            return anchor_residual_fraction_colors(
+                self.diagnostics.point_within_fraction[indices]
+            )
+        if metric == "total residual":
+            values = self.diagnostics.point_precompletion_residual[indices]
+        elif metric == "within residual":
+            values = self.diagnostics.point_within_residual[indices]
+        elif metric == "cross residual":
+            values = self.diagnostics.point_cross_residual[indices]
+        elif metric == "modal signal RMS":
+            values = self.diagnostics.point_signal_rms[indices]
+        elif metric == "worst within view":
+            return anchor_residual_view_colors(
+                self.diagnostics.point_worst_within_view[indices]
+            )
+        elif metric == "worst cross view":
+            return anchor_residual_view_colors(
+                self.diagnostics.point_worst_cross_view[indices]
+            )
+        else:
+            raise ValueError(f"Unknown residual diagnostic metric: {metric}")
+        return anchor_residual_scalar_colors(values, logarithmic=True)
+
+    def _update(self, _event: Any = None) -> None:
+        with self._update_lock:
+            if self._point_handle is not None:
+                self._point_handle.remove()
+                self._point_handle = None
+            if not bool(self.show_diagnostics.value):
+                return
+            indices = self._selected_indices()
+            if indices.shape[0] == 0:
+                return
+            self._point_handle = self.server.scene.add_point_cloud(
+                "/anchor_residual_diagnostics/points",
+                points=center_world_points(
+                    self.diagnostics.points_world[indices],
+                    self.world_center,
+                ),
+                colors=self._colors(indices),
+                point_size=float(self.point_size.value),
+                point_shape="circle",
+            )
+
+
 def _configure_initial_camera(
     server: Any,
     graphs: tuple[AnchorGraphViewData, ...],
@@ -1613,6 +2092,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional version-1 Gaussian observation coverage diagnostic",
     )
+    parser.add_argument(
+        "--residual-diagnostics-npz",
+        type=Path,
+        help="Optional version-1 anchor residual decomposition diagnostic",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--max-visible-edges", type=int, default=20000)
@@ -1622,6 +2106,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gaussian-scale", type=float, default=1.0)
     parser.add_argument("--coverage-max-visible-points", type=int, default=50000)
     parser.add_argument("--coverage-point-size", type=float, default=0.0009)
+    parser.add_argument("--residual-max-visible-points", type=int, default=50000)
+    parser.add_argument("--residual-point-size", type=float, default=0.0009)
     return parser
 
 
@@ -1632,6 +2118,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-visible-edges must be non-negative")
     if args.coverage_max_visible_points < 0:
         raise ValueError("--coverage-max-visible-points must be non-negative")
+    if args.residual_max_visible_points < 0:
+        raise ValueError("--residual-max-visible-points must be non-negative")
     if not np.isfinite(args.line_width) or not 0.1 <= args.line_width <= 10.0:
         raise ValueError("--line-width must lie in [0.1,10.0]")
     if not np.isfinite(args.gaussian_scale) or not 0.1 <= args.gaussian_scale <= 3.0:
@@ -1640,6 +2128,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "anchor_point_size",
         "isolated_point_size",
         "coverage_point_size",
+        "residual_point_size",
     ):
         value = float(getattr(args, name))
         if not np.isfinite(value) or not 0.0001 <= value <= 0.008:
@@ -1663,6 +2152,15 @@ def main() -> None:
     coverage = (
         load_observation_coverage(args.coverage_npz, graphs, gaussians)
         if args.coverage_npz is not None
+        else None
+    )
+    residual_diagnostics = (
+        load_anchor_residual_diagnostics(
+            args.residual_diagnostics_npz,
+            graphs,
+            gaussians,
+        )
+        if args.residual_diagnostics_npz is not None
         else None
     )
 
@@ -1721,6 +2219,14 @@ def main() -> None:
             point_size=args.coverage_point_size,
             world_center=world_center,
         )
+    if residual_diagnostics is not None:
+        AnchorResidualDiagnosticViewer(
+            server,
+            residual_diagnostics,
+            max_visible_points=args.residual_max_visible_points,
+            point_size=args.residual_point_size,
+            world_center=world_center,
+        )
     print(
         "Loaded "
         f"{len(graphs)} mode(s), "
@@ -1746,6 +2252,12 @@ def main() -> None:
         print(
             f"Loaded observation coverage for {coverage.points_world.shape[0]} "
             f"Gaussians at K={coverage.k_values.tolist()}."
+        )
+    if residual_diagnostics is not None:
+        print(
+            "Loaded anchor residual decomposition for mode "
+            f"{residual_diagnostics.mode_index} at "
+            f"{residual_diagnostics.freq_hz:.6g} Hz."
         )
     print(
         f"Viser {viser_version} listening on {server.get_host()}:{server.get_port()}"

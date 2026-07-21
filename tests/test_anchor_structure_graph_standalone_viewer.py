@@ -9,6 +9,9 @@ import numpy as np
 
 from preproc.vis_anchor_structure_graph import (
     _validate_args,
+    anchor_residual_fraction_colors,
+    anchor_residual_source_colors,
+    anchor_residual_view_colors,
     anchor_graph_component_colors,
     anchor_graph_scalar_colors,
     anchor_world_center,
@@ -17,6 +20,7 @@ from preproc.vis_anchor_structure_graph import (
     gaussian_covariances,
     load_anchor_graph_source,
     load_anchor_graphs_from_manifest,
+    load_anchor_residual_diagnostics,
     load_gaussian_visualization_sidecar,
     load_observation_coverage,
     observation_coverage_colors,
@@ -252,6 +256,117 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
             replay_validation=np.array("exact_reference_counts"),
         )
 
+    def _write_residual_diagnostics(
+        self,
+        path: Path,
+        *,
+        source_checkpoint: str = "source.ckpt",
+    ) -> None:
+        points = np.array(
+            [[0.0, 0.0, 0.0], [0.004, 0.0, 0.0], [0.02, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        num_points = 3
+        num_views = 2
+        np.savez_compressed(
+            path,
+            version=np.array(1, dtype=np.int32),
+            point_type=np.array(
+                "foreground_gaussian_anchor_residual_decomposition"
+            ),
+            source_checkpoint=np.array(source_checkpoint),
+            source_observation_path=np.array("observations/mode.npz"),
+            source_solver_diagnostics_path=np.array("diagnostics/mode.npz"),
+            num_foreground_gaussians=np.array(num_points, dtype=np.int64),
+            gaussian_indices=np.arange(num_points, dtype=np.int64),
+            points_world=points,
+            view_ids=np.array(["view1", "view2"]),
+            mode_index=np.array(4, dtype=np.int32),
+            freq_hz=np.array(0.85, dtype=np.float32),
+            alphas=np.ones((num_views,), dtype=np.complex64),
+            alpha_identifiable_mask=np.ones((num_views,), dtype=bool),
+            point_observable_rank=np.full((num_points,), 3, dtype=np.int8),
+            point_condition=np.ones((num_points,), dtype=np.float32),
+            point_distinct_view_count=np.full((num_points,), 2, dtype=np.int32),
+            point_distinct_valid_view_count=np.full(
+                (num_points,), 2, dtype=np.int32
+            ),
+            point_precompletion_residual=np.full(
+                (num_points,), 0.05, dtype=np.float32
+            ),
+            staged_point_solution_status=np.zeros((num_points,), dtype=np.int8),
+            anchor_residual_threshold=np.array(0.1, dtype=np.float32),
+            anchor_condition_max=np.array(100.0, dtype=np.float32),
+            view_sample_count=np.ones((num_points, num_views), dtype=np.int32),
+            view_effective_weight=np.ones(
+                (num_points, num_views), dtype=np.float32
+            ),
+            view_mode_mean=np.ones(
+                (num_points, num_views, 2), dtype=np.complex64
+            ),
+            view_signal_energy=np.ones(
+                (num_points, num_views), dtype=np.float32
+            ),
+            view_within_sse=np.full(
+                (num_points, num_views), 0.25, dtype=np.float32
+            ),
+            view_cross_sse=np.full(
+                (num_points, num_views), 0.75, dtype=np.float32
+            ),
+            view_within_residual=np.full(
+                (num_points, num_views), 0.5, dtype=np.float32
+            ),
+            view_cross_residual=np.full(
+                (num_points, num_views), np.sqrt(0.75), dtype=np.float32
+            ),
+            point_effective_weight=np.full((num_points,), 2.0, dtype=np.float32),
+            point_signal_energy=np.full((num_points,), 2.0, dtype=np.float32),
+            point_signal_rms=np.ones((num_points,), dtype=np.float32),
+            point_within_sse=np.full((num_points,), 0.5, dtype=np.float32),
+            point_cross_sse=np.full((num_points,), 1.5, dtype=np.float32),
+            point_total_sse=np.full((num_points,), 2.0, dtype=np.float32),
+            point_within_residual=np.full(
+                (num_points,), 0.5, dtype=np.float32
+            ),
+            point_cross_residual=np.full(
+                (num_points,), np.sqrt(0.75), dtype=np.float32
+            ),
+            point_replayed_total_residual=np.ones(
+                (num_points,), dtype=np.float32
+            ),
+            point_within_fraction=np.array(
+                [0.0, 0.5, 1.0], dtype=np.float32
+            ),
+            point_worst_within_view=np.array([0, 1, -1], dtype=np.int8),
+            point_worst_cross_view=np.array([1, 0, -1], dtype=np.int8),
+            selected_multiview_mask=np.ones((num_points,), dtype=bool),
+            residual_candidate_mask=np.ones((num_points,), dtype=bool),
+            residual_rejected_mask=np.zeros((num_points,), dtype=bool),
+            anchor_mask=np.ones((num_points,), dtype=bool),
+            low_modal_energy_mask=np.zeros((num_points,), dtype=bool),
+            residual_source_class=np.ones((num_points,), dtype=np.int8),
+            residual_source_names=np.array(
+                [
+                    "other",
+                    "accepted_anchor",
+                    "low_modal_energy",
+                    "within_view_dominated",
+                    "cross_view_dominated",
+                    "mixed",
+                ]
+            ),
+            low_modal_energy_threshold=np.array(np.nan, dtype=np.float32),
+            dominance_ratio=np.array(2.0, dtype=np.float32),
+            mad_scale=np.array(1.4826, dtype=np.float32),
+            effective_weight_method=np.array(
+                "contribution_divided_by_point_view_multiplicity"
+            ),
+            decomposition_method=np.array(
+                "exact_weighted_point_view_mean_sse_identity"
+            ),
+            replay_validation=np.array("point_precompletion_residual_exact"),
+        )
+
     def test_direct_artifact_and_display_helpers_are_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             graph_path = Path(tmp) / "graph.npz"
@@ -407,6 +522,41 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "centers do not match"):
                 load_observation_coverage(coverage_path, graphs, gaussians)
 
+    def test_anchor_residual_loading_and_color_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph_path = root / "graph.npz"
+            sidecar_path = root / "gaussians.npz"
+            residual_path = root / "residuals.npz"
+            self._write_graph(graph_path)
+            self._write_gaussian_sidecar(sidecar_path)
+            self._write_residual_diagnostics(residual_path)
+            graphs = load_anchor_graph_source(
+                manifest_path=None,
+                graph_path=graph_path,
+            )
+            gaussians = load_gaussian_visualization_sidecar(sidecar_path, graphs)
+            residuals = load_anchor_residual_diagnostics(
+                residual_path,
+                graphs,
+                gaussians,
+            )
+        self.assertEqual(residuals.mode_index, 4)
+        np.testing.assert_allclose(
+            anchor_residual_fraction_colors(
+                np.array([0.0, 0.5, 1.0], dtype=np.float32)
+            ),
+            [[0.0, 0.2, 1.0], [0.5, 0.2, 0.5], [1.0, 0.2, 0.0]],
+        )
+        np.testing.assert_allclose(
+            anchor_residual_source_colors(np.array([1, 3, 4], dtype=np.int8)),
+            [[0.0, 0.45, 1.0], [1.0, 0.15, 0.0], [0.0, 0.8, 0.2]],
+        )
+        view_colors = anchor_residual_view_colors(
+            np.array([0, 1, -1], dtype=np.int8)
+        )
+        np.testing.assert_allclose(view_colors[2], [0.45, 0.45, 0.45])
+
     def test_cli_requires_one_source_and_validates_display_ranges(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -417,11 +567,17 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
                 "gaussians.npz",
                 "--coverage-npz",
                 "coverage.npz",
+                "--residual-diagnostics-npz",
+                "residuals.npz",
             ]
         )
         _validate_args(args)
         self.assertEqual(args.gaussian_npz, Path("gaussians.npz"))
         self.assertEqual(args.coverage_npz, Path("coverage.npz"))
+        self.assertEqual(
+            args.residual_diagnostics_npz,
+            Path("residuals.npz"),
+        )
         with self.assertRaises(SystemExit):
             parser.parse_args([])
         with self.assertRaises(SystemExit):
