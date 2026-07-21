@@ -236,6 +236,7 @@ _RIGID_DIAGNOSTIC_ANOMALY_COLOR = np.asarray(
     (1.0, 0.0, 0.0), dtype=np.float32
 )
 _QUARANTINED_RIGID_COLOR = np.asarray((1.0, 0.55, 0.0), dtype=np.float32)
+_SINGLE_VIEW_RIGID_FILL_COLOR = np.asarray((0.15, 0.45, 1.0), dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -299,6 +300,7 @@ class RigidModeViewData:
     phi: np.ndarray
     rigid_seed_mask: np.ndarray
     quarantined_rigid_mask: np.ndarray
+    single_view_rigid_fill_mask: np.ndarray
     completed_fill_mask: np.ndarray
     unresolved_fill_mask: np.ndarray
     point_component_index: np.ndarray
@@ -909,9 +911,14 @@ def load_rigid_manifest(
             "postsolve_valid_view_and_singular_ratio_gate"
         ),
         "nonseed_policy": (
-            "free_motion_fill"
+            "single_view_component_rigid_else_free_motion_fill"
             if motion_fill_enabled
             else "zero_without_motion_fill"
+        ),
+        "single_view_component_fill_policy": (
+            "shared_unknown_normalized_infinitesimal_se3_twist"
+            if motion_fill_enabled
+            else "disabled"
         ),
     }
     for name, expected_value in expected_parameters.items():
@@ -1431,8 +1438,174 @@ def load_rigid_manifest(
                 )
             role = np.asarray(latent["motion_fill_role"])
             latent_completion = np.asarray(latent["completion_mask"])
+            grouped_required = {
+                "component_centroid",
+                "single_view_component_fill_policy",
+                "single_view_component_fill_mask",
+                "single_view_rigid_fill_point_mask",
+                "single_view_component_completion_mask",
+                "single_view_component_translation",
+                "single_view_component_rotation",
+                "single_view_component_first_order_relative_max",
+            }
+            grouped_missing = sorted(grouped_required - set(diagnostics))
+            if grouped_missing:
+                raise ValueError(
+                    f"{diagnostics_path} is missing grouped rigid-fill fields: "
+                    f"{grouped_missing}"
+                )
+            if _scalar_string(
+                diagnostics["single_view_component_fill_policy"],
+                "single_view_component_fill_policy",
+                diagnostics_path,
+            ) != "shared_unknown_normalized_infinitesimal_se3_twist":
+                raise ValueError(
+                    f"{diagnostics_path} single-view fill policy is incompatible"
+                )
+            single_view_component_fill = np.asarray(
+                diagnostics["single_view_component_fill_mask"]
+            )
+            expected_single_view_component_fill = (
+                (component_valid_view_count == 1)
+                & ~component_selection_masks["component_seed_retained_mask"]
+            )
+            if (
+                single_view_component_fill.dtype != np.bool_
+                or single_view_component_fill.shape != (num_components,)
+                or not np.array_equal(
+                    single_view_component_fill,
+                    expected_single_view_component_fill,
+                )
+            ):
+                raise ValueError(
+                    f"{diagnostics_path} single-view component fill mask is inconsistent"
+                )
+            single_view_fill_points = np.asarray(
+                diagnostics["single_view_rigid_fill_point_mask"]
+            )
+            expected_single_view_fill_points = np.zeros(
+                (num_points,), dtype=bool
+            )
+            component_points = point_component >= 0
+            expected_single_view_fill_points[component_points] = (
+                single_view_component_fill[point_component[component_points]]
+            )
+            if (
+                single_view_fill_points.dtype != np.bool_
+                or single_view_fill_points.shape != (num_points,)
+                or not np.array_equal(
+                    single_view_fill_points,
+                    expected_single_view_fill_points,
+                )
+            ):
+                raise ValueError(
+                    f"{diagnostics_path} single-view rigid-fill point mask is inconsistent"
+                )
+            single_view_component_completion = np.asarray(
+                diagnostics["single_view_component_completion_mask"]
+            )
+            if (
+                single_view_component_completion.dtype != np.bool_
+                or single_view_component_completion.shape != (num_components,)
+                or np.any(
+                    single_view_component_completion
+                    & ~single_view_component_fill
+                )
+            ):
+                raise ValueError(
+                    f"{diagnostics_path} single-view component completion is invalid"
+                )
+            for component_idx in np.flatnonzero(
+                single_view_component_fill
+            ).tolist():
+                member_completion = completion_mask[
+                    point_component == component_idx
+                ]
+                if (
+                    member_completion.size == 0
+                    or np.any(member_completion) != np.all(member_completion)
+                    or bool(np.all(member_completion))
+                    != bool(single_view_component_completion[component_idx])
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} component {component_idx} has partial "
+                        "or inconsistent grouped completion"
+                    )
+            component_centroid = np.asarray(
+                diagnostics["component_centroid"], dtype=np.float64
+            )
+            component_translation = np.asarray(
+                diagnostics["single_view_component_translation"]
+            )
+            component_rotation = np.asarray(
+                diagnostics["single_view_component_rotation"]
+            )
+            component_first_order = np.asarray(
+                diagnostics[
+                    "single_view_component_first_order_relative_max"
+                ]
+            )
+            if (
+                component_centroid.shape != (num_components, 3)
+                or not np.isfinite(component_centroid).all()
+            ):
+                raise ValueError(
+                    f"{diagnostics_path} component centroids are invalid"
+                )
+            for name, values in (
+                ("single_view_component_translation", component_translation),
+                ("single_view_component_rotation", component_rotation),
+            ):
+                if (
+                    values.shape != (num_components, 3)
+                    or not np.issubdtype(values.dtype, np.complexfloating)
+                    or not np.isfinite(values).all()
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} {name} must be finite complex "
+                        f"({num_components},3)"
+                    )
+                if np.any(values[~single_view_component_completion] != 0):
+                    raise ValueError(
+                        f"{diagnostics_path} {name} is nonzero outside completed "
+                        "single-view components"
+                    )
+            if (
+                component_first_order.shape != (num_components,)
+                or not np.isfinite(component_first_order).all()
+                or np.any(component_first_order < 0.0)
+            ):
+                raise ValueError(
+                    f"{diagnostics_path} single-view rigidity error is invalid"
+                )
+            if np.any(component_first_order[~single_view_component_fill] != 0):
+                raise ValueError(
+                    f"{diagnostics_path} single-view rigidity error is nonzero "
+                    "outside selected components"
+                )
+            for component_idx in np.flatnonzero(
+                single_view_component_completion
+            ).tolist():
+                members = np.flatnonzero(point_component == component_idx)
+                centered = points[members].astype(np.float64) - component_centroid[
+                    component_idx
+                ]
+                expected_phi = (
+                    component_translation[component_idx]
+                    + np.cross(
+                        component_rotation[component_idx][None], centered
+                    )
+                )
+                if not np.allclose(
+                    phi[members], expected_phi, rtol=1.0e-5, atol=1.0e-6
+                ):
+                    raise ValueError(
+                        f"{latent_path} component {component_idx} is not represented "
+                        "by its filled rigid twist"
+                    )
             expected_role = np.full((num_points,), 2, dtype=np.int8)
             expected_role[trusted_seed_mask] = 0
+            expected_role[single_view_fill_points] = 1
             if (
                 not np.issubdtype(role.dtype, np.integer)
                 or not np.array_equal(role, expected_role)
@@ -1453,7 +1626,7 @@ def load_rigid_manifest(
                 diagnostics["motion_fill_method"],
                 "motion_fill_method",
                 diagnostics_path,
-            ) != "rigid_seed_joint_knn_fullspace_lsmr":
+            ) != "rigid_seed_single_view_component_grouped_knn_lsmr":
                 raise ValueError(
                     f"{diagnostics_path} motion_fill_method is incompatible"
                 )
@@ -1497,6 +1670,11 @@ def load_rigid_manifest(
                 phi=phi.astype(np.complex64),
                 rigid_seed_mask=trusted_seed_mask,
                 quarantined_rigid_mask=rigid_seed_mask & ~trusted_seed_mask,
+                single_view_rigid_fill_mask=(
+                    single_view_fill_points & completion_mask
+                    if motion_fill_enabled
+                    else np.zeros((num_points,), dtype=bool)
+                ),
                 completed_fill_mask=completion_mask,
                 unresolved_fill_mask=(
                     effective_fill_target_mask & ~completion_mask
@@ -2215,6 +2393,7 @@ class ObservedGraphViewer:
         self._isolated_handle = None
         self._rigid_seed_handle = None
         self._quarantined_rigid_handle = None
+        self._single_view_rigid_fill_handle = None
         self._completed_fill_handle = None
         self._unresolved_fill_handle = None
         self._update_lock = threading.Lock()
@@ -2301,6 +2480,7 @@ class ObservedGraphViewer:
                 self.motion_rms_percentile = None
                 self.show_rigid_seeds = None
                 self.show_quarantined_rigid = None
+                self.show_single_view_rigid_fill = None
                 self.show_completed_fill = None
                 self.show_unresolved_fill = None
             else:
@@ -2382,6 +2562,10 @@ class ObservedGraphViewer:
                     False,
                 )
                 if rigid_manifest.motion_fill_enabled:
+                    self.show_single_view_rigid_fill = server.gui.add_checkbox(
+                        "Show single-view rigid fill",
+                        False,
+                    )
                     self.show_completed_fill = server.gui.add_checkbox(
                         "Show completed fill",
                         False,
@@ -2391,6 +2575,7 @@ class ObservedGraphViewer:
                         False,
                     )
                 else:
+                    self.show_single_view_rigid_fill = None
                     self.show_completed_fill = None
                     self.show_unresolved_fill = None
         rebuild_handles = (
@@ -2438,6 +2623,10 @@ class ObservedGraphViewer:
                 self.show_rigid_seeds,
                 self.show_quarantined_rigid,
             ]
+            if self.show_single_view_rigid_fill is not None:
+                rigid_visibility_handles.append(
+                    self.show_single_view_rigid_fill
+                )
             if self.show_completed_fill is not None:
                 rigid_visibility_handles.append(self.show_completed_fill)
             if self.show_unresolved_fill is not None:
@@ -2556,6 +2745,7 @@ class ObservedGraphViewer:
             "_isolated_handle",
             "_rigid_seed_handle",
             "_quarantined_rigid_handle",
+            "_single_view_rigid_fill_handle",
             "_completed_fill_handle",
             "_unresolved_fill_handle",
         ):
@@ -2590,6 +2780,10 @@ class ObservedGraphViewer:
                     "_quarantined_rigid_handle",
                     rigid_mode.quarantined_rigid_mask,
                 ),
+                (
+                    "_single_view_rigid_fill_handle",
+                    rigid_mode.single_view_rigid_fill_mask,
+                ),
                 ("_completed_fill_handle", rigid_mode.completed_fill_mask),
                 ("_unresolved_fill_handle", rigid_mode.unresolved_fill_mask),
             ):
@@ -2605,6 +2799,7 @@ class ObservedGraphViewer:
                 "_node_handle",
                 "_rigid_seed_handle",
                 "_quarantined_rigid_handle",
+                "_single_view_rigid_fill_handle",
                 "_completed_fill_handle",
                 "_unresolved_fill_handle",
             ):
@@ -2777,6 +2972,14 @@ class ObservedGraphViewer:
                         "_quarantined_rigid_handle",
                     ),
                 ]
+                if self.show_single_view_rigid_fill is not None:
+                    overlays.append((
+                        self.show_single_view_rigid_fill,
+                        rigid_mode.single_view_rigid_fill_mask,
+                        _SINGLE_VIEW_RIGID_FILL_COLOR,
+                        "single_view_rigid_fill",
+                        "_single_view_rigid_fill_handle",
+                    ))
                 if self.show_completed_fill is not None:
                     overlays.append((
                         self.show_completed_fill,

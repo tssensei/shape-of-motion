@@ -168,9 +168,14 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
             args.rigid_seed_min_singular_ratio
         ),
         "nonseed_policy": (
-            "free_motion_fill"
+            "single_view_component_rigid_else_free_motion_fill"
             if bool(getattr(args, "motion_fill", False))
             else "zero_without_motion_fill"
+        ),
+        "single_view_component_fill_policy": (
+            "shared_unknown_normalized_infinitesimal_se3_twist"
+            if bool(getattr(args, "motion_fill", False))
+            else "disabled"
         ),
         "alpha_solver_model": str(args.alpha_model),
         "alpha_gain_min": float(args.alpha_gain_min),

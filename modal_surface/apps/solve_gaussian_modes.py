@@ -874,7 +874,7 @@ def _rigid_gaussian_latent_stats(
             {
                 "motion_fill_method": RIGID_SEED_MOTION_FILL_METHOD,
                 "effective_field_method": (
-                    "rigid_component_twist+rigid_seed_joint_knn_fullspace_lsmr"
+                    "rigid_component_twist+single_view_grouped_rigid_knn_lsmr"
                 ),
                 "motion_fill": motion_fill.diagnostics,
             }
@@ -1403,6 +1403,31 @@ def _write_rigid_solver_diagnostics(
                 "motion_fill_excluded_reason": motion_fill.roles.excluded_reason.astype(
                     np.int8
                 ),
+                "single_view_component_fill_policy": np.array(
+                    "shared_unknown_normalized_infinitesimal_se3_twist"
+                ),
+                "single_view_component_fill_mask": (
+                    motion_fill.single_view_component_fill_mask.astype(bool)
+                ),
+                "single_view_rigid_fill_point_mask": (
+                    motion_fill.single_view_rigid_fill_point_mask.astype(bool)
+                ),
+                "single_view_component_completion_mask": (
+                    motion_fill.single_view_component_completion_mask.astype(bool)
+                ),
+                "single_view_component_translation": (
+                    motion_fill.single_view_component_translation.astype(
+                        np.complex64
+                    )
+                ),
+                "single_view_component_rotation": (
+                    motion_fill.single_view_component_rotation.astype(np.complex64)
+                ),
+                "single_view_component_first_order_relative_max": (
+                    motion_fill.single_view_component_first_order_relative_max.astype(
+                        np.float32
+                    )
+                ),
                 "motion_fill_point_numerical_nullity": motion_fill.numerical_nullity.astype(
                     np.int8
                 ),
@@ -1669,8 +1694,9 @@ def run(args: argparse.Namespace) -> None:
                     rigid_motion_fill = apply_rigid_seed_motion_fill(
                         prepared,
                         alpha,
-                        seed_selection.phi,
-                        seed_selection.trusted_rigid_seed_mask,
+                        rigid,
+                        seed_selection,
+                        loaded_graph.graph,
                         motion_fill_graph,
                         motion_fill_relative_path,
                     )
