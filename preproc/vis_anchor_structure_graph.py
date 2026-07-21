@@ -1,4 +1,4 @@
-"""Standalone browser viewer for observed anchor structure graph artifacts.
+"""Standalone browser viewer for anchor or observed structure graph artifacts.
 
 This tool intentionally depends only on NumPy and a modern Viser release. It is
 designed to run in an isolated environment instead of the legacy Nerfview
@@ -127,6 +127,52 @@ _COUNT_FIELDS = {
     "isolated_anchor_count",
     "component_count",
 }
+
+_OBSERVED_GRAPH_REQUIRED_FIELDS = (
+    _GRAPH_REQUIRED_FIELDS
+    - {
+        "anchor_gaussian_indices",
+        "anchor_points_world",
+        "anchor_colors_rgb",
+        "anchor_observed_view_mask",
+        "anchor_count",
+        "isolated_anchor_count",
+    }
+    | {
+        "graph_type",
+        "node_selection",
+        "source_observation_path",
+        "node_gaussian_indices",
+        "node_points_world",
+        "node_colors_rgb",
+        "node_observed_view_mask",
+        "node_observed_view_count",
+        "observation_row_count",
+        "positive_observation_row_count",
+        "zero_weight_observation_row_count",
+        "node_count",
+        "single_view_node_count",
+        "multi_view_node_count",
+        "isolated_node_count",
+    }
+)
+
+_OBSERVED_COUNT_FIELDS = (
+    _COUNT_FIELDS
+    - {
+        "anchor_count",
+        "isolated_anchor_count",
+    }
+    | {
+        "observation_row_count",
+        "positive_observation_row_count",
+        "zero_weight_observation_row_count",
+        "node_count",
+        "single_view_node_count",
+        "multi_view_node_count",
+        "isolated_node_count",
+    }
+)
 
 _GAUSSIAN_BASE_REQUIRED_FIELDS = {
     "version",
@@ -302,6 +348,43 @@ class AnchorGraphViewData:
     @property
     def label(self) -> str:
         return f"Mode {self.mode_index}: {self.freq_hz:.3f} Hz"
+
+    @property
+    def node_gaussian_indices(self) -> np.ndarray:
+        return self.anchor_gaussian_indices
+
+    @property
+    def node_points_world(self) -> np.ndarray:
+        return self.anchor_points_world
+
+    @property
+    def node_colors_rgb(self) -> np.ndarray:
+        return self.anchor_colors_rgb
+
+
+@dataclass(frozen=True)
+class ObservedGraphViewData:
+    mode_index: int
+    freq_hz: float
+    graph_path: Path
+    source_checkpoint: str
+    num_foreground_gaussians: int
+    node_gaussian_indices: np.ndarray
+    node_points_world: np.ndarray
+    node_colors_rgb: np.ndarray
+    edge_index: np.ndarray
+    edge_depth_score: np.ndarray
+    edge_combined_weight: np.ndarray
+    edge_view_support_count: np.ndarray
+    component_index: np.ndarray
+    isolated_mask: np.ndarray
+
+    @property
+    def label(self) -> str:
+        return f"Mode {self.mode_index}: {self.freq_hz:.3f} Hz"
+
+
+StructureGraphViewData = AnchorGraphViewData | ObservedGraphViewData
 
 
 @dataclass(frozen=True)
@@ -947,6 +1030,342 @@ def _load_graph_archive(
     )
 
 
+def _load_observed_graph_archive(
+    graph_path: Path,
+) -> ObservedGraphViewData:
+    if not graph_path.is_file():
+        raise ValueError(f"Observed graph does not exist: {graph_path}")
+    with np.load(str(graph_path), allow_pickle=False) as archive:
+        missing = sorted(_OBSERVED_GRAPH_REQUIRED_FIELDS - set(archive.files))
+        if missing:
+            raise ValueError(f"{graph_path} missing required fields: {missing}")
+        graph = {name: np.asarray(archive[name]) for name in archive.files}
+
+    version_value = _scalar(graph["version"], "version", graph_path)
+    if not np.issubdtype(version_value.dtype, np.integer) or int(
+        version_value.item()
+    ) != 1:
+        raise ValueError(f"{graph_path} must be a version 1 observed graph")
+    if (
+        _scalar_string(graph["graph_type"], "graph_type", graph_path)
+        != "foreground_gaussian_observed_structure_graph"
+    ):
+        raise ValueError(f"{graph_path} graph_type is incompatible")
+    if (
+        _scalar_string(graph["node_selection"], "node_selection", graph_path)
+        != "positive_weight_observation_row"
+    ):
+        raise ValueError(f"{graph_path} node_selection is incompatible")
+    _scalar_string(
+        graph["source_observation_path"],
+        "source_observation_path",
+        graph_path,
+    )
+    mode_value = _scalar(graph["mode_index"], "mode_index", graph_path)
+    if not np.issubdtype(mode_value.dtype, np.integer):
+        raise ValueError(f"{graph_path} mode_index must be an integer scalar")
+    mode_index = int(mode_value.item())
+    freq_value = _scalar(graph["freq_hz"], "freq_hz", graph_path)
+    if (
+        not np.issubdtype(freq_value.dtype, np.number)
+        or np.iscomplexobj(freq_value)
+        or not np.isfinite(freq_value.item())
+    ):
+        raise ValueError(f"{graph_path} freq_hz must be a finite real scalar")
+    freq_hz = float(freq_value.item())
+    source_checkpoint = _scalar_string(
+        graph["source_checkpoint"],
+        "source_checkpoint",
+        graph_path,
+    )
+    for field_name, expected_value in _EXPECTED_SEMANTICS.items():
+        if _scalar_string(graph[field_name], field_name, graph_path) != expected_value:
+            raise ValueError(f"{graph_path} {field_name} is incompatible")
+    mad_scale = float(_scalar(graph["mad_scale"], "mad_scale", graph_path).item())
+    if not np.isclose(mad_scale, 1.4826, rtol=1e-6, atol=1e-8):
+        raise ValueError(f"{graph_path} mad_scale is incompatible")
+
+    numeric_parameters = {
+        artifact_name: _scalar(graph[artifact_name], artifact_name, graph_path).item()
+        for artifact_name in _MANIFEST_PARAMETER_FIELDS.values()
+    }
+    for field_name in ("max_neighbors", "depth_samples", "min_shared_views"):
+        parameter_array = _scalar(graph[field_name], field_name, graph_path)
+        if not np.issubdtype(parameter_array.dtype, np.integer):
+            raise ValueError(f"{graph_path} {field_name} must be an integer scalar")
+    max_neighbors = int(numeric_parameters["max_neighbors"])
+    max_distance = float(numeric_parameters["max_distance"])
+    color_mad_multiplier = float(numeric_parameters["color_mad_multiplier"])
+    depth_mad_multiplier = float(numeric_parameters["depth_mad_multiplier"])
+    depth_samples = int(numeric_parameters["depth_samples"])
+    min_shared_views = int(numeric_parameters["min_shared_views"])
+    render_acc_min = float(numeric_parameters["render_acc_min"])
+    epsilon = float(numeric_parameters["epsilon"])
+    if max_neighbors <= 0:
+        raise ValueError(f"{graph_path} max_neighbors must be positive")
+    if not np.isfinite(max_distance) or max_distance <= 0.0:
+        raise ValueError(f"{graph_path} max_distance must be finite and positive")
+    if not np.isfinite(color_mad_multiplier) or color_mad_multiplier < 0.0:
+        raise ValueError(
+            f"{graph_path} color_mad_multiplier must be finite and non-negative"
+        )
+    if not np.isfinite(depth_mad_multiplier) or depth_mad_multiplier < 0.0:
+        raise ValueError(
+            f"{graph_path} depth_mad_multiplier must be finite and non-negative"
+        )
+    if depth_samples < 2:
+        raise ValueError(f"{graph_path} depth_samples must be at least 2")
+    if min_shared_views <= 0:
+        raise ValueError(f"{graph_path} min_shared_views must be positive")
+    if not np.isfinite(render_acc_min) or not 0.0 <= render_acc_min <= 1.0:
+        raise ValueError(f"{graph_path} render_acc_min must lie in [0,1]")
+    if not np.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError(f"{graph_path} epsilon must be finite and positive")
+    num_gaussians_value = _scalar(
+        graph["num_foreground_gaussians"],
+        "num_foreground_gaussians",
+        graph_path,
+    )
+    if not np.issubdtype(num_gaussians_value.dtype, np.integer):
+        raise ValueError(
+            f"{graph_path} num_foreground_gaussians must be an integer scalar"
+        )
+    num_gaussians = int(num_gaussians_value.item())
+    if num_gaussians < 0:
+        raise ValueError(f"{graph_path} num_foreground_gaussians must be non-negative")
+
+    node_indices = graph["node_gaussian_indices"]
+    if node_indices.ndim != 1 or not np.issubdtype(node_indices.dtype, np.integer):
+        raise ValueError(f"{graph_path} node_gaussian_indices must be 1-D integers")
+    node_indices = node_indices.astype(np.int64)
+    if np.any(node_indices < 0) or np.any(node_indices >= num_gaussians):
+        raise ValueError(f"{graph_path} node_gaussian_indices are out of range")
+    if node_indices.size > 1 and np.any(np.diff(node_indices) <= 0):
+        raise ValueError(
+            f"{graph_path} node_gaussian_indices must be strictly increasing"
+        )
+    num_nodes = int(node_indices.shape[0])
+    points = graph["node_points_world"].astype(np.float32)
+    colors = graph["node_colors_rgb"].astype(np.float32)
+    if points.shape != (num_nodes, 3) or not np.isfinite(points).all():
+        raise ValueError(f"{graph_path} node_points_world must be finite (N,3)")
+    if colors.shape != (num_nodes, 3) or not np.isfinite(colors).all():
+        raise ValueError(f"{graph_path} node_colors_rgb must be finite (N,3)")
+    if np.any(colors < 0.0) or np.any(colors > 1.0):
+        raise ValueError(f"{graph_path} node_colors_rgb must lie in [0,1]")
+
+    view_ids = graph["view_ids"]
+    if view_ids.ndim != 1 or view_ids.shape[0] == 0:
+        raise ValueError(f"{graph_path} view_ids must be non-empty and 1-D")
+    normalized_view_ids = []
+    for raw_view_id in view_ids:
+        view_id = np.asarray(raw_view_id).item()
+        if isinstance(view_id, bytes):
+            view_id = view_id.decode("utf-8")
+        if not isinstance(view_id, str) or not view_id:
+            raise ValueError(f"{graph_path} view_ids must contain non-empty strings")
+        normalized_view_ids.append(view_id)
+    if len(set(normalized_view_ids)) != len(normalized_view_ids):
+        raise ValueError(f"{graph_path} view_ids must be unique")
+    num_views = len(normalized_view_ids)
+    if min_shared_views > num_views:
+        raise ValueError(
+            f"{graph_path} min_shared_views cannot exceed the number of views"
+        )
+    observed_view_mask = graph["node_observed_view_mask"]
+    if (
+        observed_view_mask.shape != (num_nodes, num_views)
+        or observed_view_mask.dtype != np.bool_
+    ):
+        raise ValueError(
+            f"{graph_path} node_observed_view_mask must be boolean "
+            f"({num_nodes},{num_views})"
+        )
+    observed_view_count = graph["node_observed_view_count"]
+    if (
+        observed_view_count.shape != (num_nodes,)
+        or not np.issubdtype(observed_view_count.dtype, np.integer)
+        or not np.array_equal(
+            observed_view_count,
+            observed_view_mask.sum(axis=1),
+        )
+        or np.any(observed_view_count <= 0)
+    ):
+        raise ValueError(
+            f"{graph_path} node_observed_view_count is inconsistent"
+        )
+    for field_name in (
+        "endpoint_gap_median_by_view",
+        "endpoint_gap_mad_by_view",
+        "endpoint_gap_threshold_by_view",
+        "depth_jump_median_by_view",
+        "depth_jump_mad_by_view",
+        "depth_jump_threshold_by_view",
+    ):
+        if graph[field_name].shape != (num_views,):
+            raise ValueError(
+                f"{graph_path} {field_name} must have shape ({num_views},)"
+            )
+
+    edges = graph["edge_index"]
+    if edges.ndim != 2 or edges.shape[1] != 2 or not np.issubdtype(
+        edges.dtype,
+        np.integer,
+    ):
+        raise ValueError(f"{graph_path} edge_index must be integer (E,2)")
+    edges = edges.astype(np.int64)
+    num_edges = int(edges.shape[0])
+    if (
+        np.any(edges < 0)
+        or np.any(edges >= num_nodes)
+        or np.any(edges[:, 0] >= edges[:, 1])
+    ):
+        raise ValueError(f"{graph_path} edge_index must contain ordered local pairs")
+    if num_edges > 1:
+        expected_order = np.lexsort((edges[:, 1], edges[:, 0]))
+        if not np.array_equal(expected_order, np.arange(num_edges)):
+            raise ValueError(
+                f"{graph_path} edge_index must be lexicographically sorted"
+            )
+        if np.any(np.all(edges[1:] == edges[:-1], axis=1)):
+            raise ValueError(f"{graph_path} edge_index contains duplicate edges")
+
+    edge_vectors = (
+        "edge_distance",
+        "edge_distance_weight",
+        "edge_color_distance",
+        "edge_color_weight",
+        "edge_depth_score",
+        "edge_combined_weight",
+        "edge_view_support_count",
+    )
+    for field_name in edge_vectors:
+        if graph[field_name].shape != (num_edges,):
+            raise ValueError(
+                f"{graph_path} {field_name} must have shape ({num_edges},)"
+            )
+    for field_name in edge_vectors[:-1]:
+        if not np.isfinite(graph[field_name]).all():
+            raise ValueError(f"{graph_path} {field_name} must be finite")
+    for field_name in (
+        "edge_distance",
+        "edge_distance_weight",
+        "edge_color_distance",
+        "edge_color_weight",
+        "edge_depth_score",
+        "edge_combined_weight",
+    ):
+        if np.any(graph[field_name] < 0.0):
+            raise ValueError(f"{graph_path} {field_name} must be non-negative")
+    if np.any(graph["edge_distance"] > max_distance + epsilon):
+        raise ValueError(f"{graph_path} edge_distance exceeds max_distance")
+    support_count = graph["edge_view_support_count"]
+    if not np.issubdtype(support_count.dtype, np.integer):
+        raise ValueError(
+            f"{graph_path} edge_view_support_count must be integer-valued"
+        )
+    support_count = support_count.astype(np.int32)
+    support_mask = graph["edge_view_support_mask"]
+    if support_mask.dtype != np.bool_ or support_mask.shape != (
+        num_edges,
+        num_views,
+    ):
+        raise ValueError(f"{graph_path} edge_view_support_mask has invalid shape")
+    if not np.array_equal(support_mask.sum(axis=1), support_count):
+        raise ValueError(f"{graph_path} edge view support count is inconsistent")
+    if np.any(support_count < min_shared_views):
+        raise ValueError(f"{graph_path} contains an edge below min_shared_views")
+    for field_name in (
+        "edge_endpoint_gap_by_view",
+        "edge_depth_jump_by_view",
+    ):
+        if graph[field_name].shape != (num_edges, num_views):
+            raise ValueError(f"{graph_path} {field_name} has invalid shape")
+        if not np.isfinite(graph[field_name][support_mask]).all():
+            raise ValueError(
+                f"{graph_path} {field_name} is invalid on supporting views"
+            )
+
+    expected_degree, expected_components, expected_sizes = _component_data(
+        num_nodes,
+        edges,
+    )
+    degree = graph["degree"]
+    components = graph["component_index"]
+    sizes = graph["component_size"]
+    if not all(
+        np.issubdtype(array.dtype, np.integer)
+        for array in (degree, components, sizes)
+    ):
+        raise ValueError(
+            f"{graph_path} degree/component arrays must be integer-valued"
+        )
+    if not np.array_equal(degree, expected_degree):
+        raise ValueError(f"{graph_path} degree is inconsistent with edge_index")
+    if not np.array_equal(components, expected_components):
+        raise ValueError(
+            f"{graph_path} component_index is inconsistent with edge_index"
+        )
+    if not np.array_equal(sizes, expected_sizes):
+        raise ValueError(
+            f"{graph_path} component_size is inconsistent with edge_index"
+        )
+    isolated = graph["isolated_mask"]
+    if (
+        isolated.dtype != np.bool_
+        or isolated.shape != (num_nodes,)
+        or not np.array_equal(isolated, expected_degree == 0)
+    ):
+        raise ValueError(f"{graph_path} isolated_mask is inconsistent with degree")
+
+    count_values: dict[str, int] = {}
+    for field_name in _OBSERVED_COUNT_FIELDS:
+        count_value = _scalar(graph[field_name], field_name, graph_path)
+        if not np.issubdtype(count_value.dtype, np.integer):
+            raise ValueError(f"{graph_path} {field_name} must be an integer scalar")
+        count_values[field_name] = int(count_value.item())
+        if count_values[field_name] < 0:
+            raise ValueError(f"{graph_path} {field_name} must be non-negative")
+    if count_values["node_count"] != num_nodes:
+        raise ValueError(f"{graph_path} node_count is inconsistent")
+    if count_values["retained_edge_count"] != num_edges:
+        raise ValueError(f"{graph_path} retained_edge_count is inconsistent")
+    if count_values["isolated_node_count"] != int(isolated.sum()):
+        raise ValueError(f"{graph_path} isolated_node_count is inconsistent")
+    if count_values["component_count"] != expected_sizes.shape[0]:
+        raise ValueError(f"{graph_path} component_count is inconsistent")
+    if count_values["single_view_node_count"] != int(
+        np.count_nonzero(observed_view_count == 1)
+    ):
+        raise ValueError(f"{graph_path} single_view_node_count is inconsistent")
+    if count_values["multi_view_node_count"] != int(
+        np.count_nonzero(observed_view_count >= 2)
+    ):
+        raise ValueError(f"{graph_path} multi_view_node_count is inconsistent")
+    if count_values["observation_row_count"] != (
+        count_values["positive_observation_row_count"]
+        + count_values["zero_weight_observation_row_count"]
+    ):
+        raise ValueError(f"{graph_path} observation row counts are inconsistent")
+
+    return ObservedGraphViewData(
+        mode_index=mode_index,
+        freq_hz=freq_hz,
+        graph_path=graph_path,
+        source_checkpoint=source_checkpoint,
+        num_foreground_gaussians=num_gaussians,
+        node_gaussian_indices=node_indices,
+        node_points_world=points,
+        node_colors_rgb=colors,
+        edge_index=edges.astype(np.int32),
+        edge_depth_score=graph["edge_depth_score"].astype(np.float32),
+        edge_combined_weight=graph["edge_combined_weight"].astype(np.float32),
+        edge_view_support_count=support_count,
+        component_index=components.astype(np.int32),
+        isolated_mask=isolated,
+    )
+
+
 def load_anchor_graphs_from_manifest(
     manifest_path: Path,
 ) -> tuple[AnchorGraphViewData, ...]:
@@ -1044,6 +1463,23 @@ def anchor_world_center(
     return center.astype(np.float32)
 
 
+def observed_world_center(
+    graphs: tuple[ObservedGraphViewData, ...],
+) -> np.ndarray:
+    points = [
+        graph.node_points_world
+        for graph in graphs
+        if graph.node_points_world.shape[0]
+    ]
+    if not points:
+        raise ValueError("Cannot center the viewer without observed graph nodes")
+    all_points = np.concatenate(points, axis=0).astype(np.float64)
+    center = 0.5 * (all_points.min(axis=0) + all_points.max(axis=0))
+    if center.shape != (3,) or not np.isfinite(center).all():
+        raise ValueError("Observed graph world center must be finite (3,)")
+    return center.astype(np.float32)
+
+
 def center_world_points(
     points: np.ndarray,
     world_center: np.ndarray,
@@ -1124,7 +1560,7 @@ def _load_gaussian_splat_group(
 
 def load_gaussian_visualization_sidecar(
     sidecar_path: Path,
-    graphs: tuple[AnchorGraphViewData, ...],
+    graphs: tuple[StructureGraphViewData, ...],
 ) -> GaussianVisualizationData:
     if not graphs:
         raise ValueError("Gaussian sidecar validation requires at least one graph")
@@ -1194,19 +1630,19 @@ def load_gaussian_visualization_sidecar(
             raise ValueError(
                 f"{sidecar_path} foreground count does not match {graph.graph_path}"
             )
-        if graph.anchor_gaussian_indices.shape[0]:
-            sidecar_anchor_points = foreground.centers[
-                graph.anchor_gaussian_indices
+        if graph.node_gaussian_indices.shape[0]:
+            sidecar_graph_points = foreground.centers[
+                graph.node_gaussian_indices
             ]
             if not np.allclose(
-                sidecar_anchor_points,
-                graph.anchor_points_world,
+                sidecar_graph_points,
+                graph.node_points_world,
                 rtol=1e-6,
                 atol=1e-5,
             ):
                 raise ValueError(
                     f"{sidecar_path} foreground centers do not match "
-                    f"{graph.graph_path} anchors"
+                    f"{graph.graph_path} nodes"
                 )
     return GaussianVisualizationData(
         sidecar_path=sidecar_path,
@@ -1218,7 +1654,7 @@ def load_gaussian_visualization_sidecar(
 
 def load_observation_coverage(
     path: Path,
-    graphs: tuple[AnchorGraphViewData, ...],
+    graphs: tuple[StructureGraphViewData, ...],
     gaussians: GaussianVisualizationData | None = None,
 ) -> ObservationCoverageViewData:
     if not path.exists():
@@ -1336,13 +1772,13 @@ def load_observation_coverage(
             raise ValueError(f"{path} source_checkpoint does not match graph")
         if graph.num_foreground_gaussians != num_points:
             raise ValueError(f"{path} foreground count does not match graph")
-        if graph.anchor_gaussian_indices.shape[0] and not np.allclose(
-            points[graph.anchor_gaussian_indices],
-            graph.anchor_points_world,
+        if graph.node_gaussian_indices.shape[0] and not np.allclose(
+            points[graph.node_gaussian_indices],
+            graph.node_points_world,
             rtol=1.0e-6,
             atol=1.0e-5,
         ):
-            raise ValueError(f"{path} Gaussian centers do not match graph anchors")
+            raise ValueError(f"{path} Gaussian centers do not match graph nodes")
     if gaussians is not None:
         if gaussians.source_checkpoint != source_checkpoint:
             raise ValueError(f"{path} source_checkpoint does not match sidecar")
@@ -1660,19 +2096,29 @@ class AnchorGraphViewer:
     def __init__(
         self,
         server: Any,
-        graphs: tuple[AnchorGraphViewData, ...],
+        graphs: tuple[StructureGraphViewData, ...],
         *,
         max_visible_edges: int,
         line_width: float,
         anchor_point_size: float,
         isolated_point_size: float,
         world_center: np.ndarray,
+        folder_label: str = "Anchor structure graph",
+        scene_prefix: str = "/anchor_structure_graph",
+        node_singular: str = "anchor",
+        node_plural: str = "anchors",
+        node_scene_name: str = "anchors",
     ) -> None:
         if not graphs:
-            raise ValueError("Anchor graph viewer requires at least one graph")
+            raise ValueError("Structure graph viewer requires at least one graph")
         self.server = server
         self.graphs = graphs
         self.labels = tuple(graph.label for graph in graphs)
+        self.graph_label = folder_label.lower()
+        self.scene_prefix = scene_prefix.rstrip("/")
+        self.node_scene_name = node_scene_name
+        if not self.scene_prefix.startswith("/") or not self.scene_prefix[1:]:
+            raise ValueError("scene_prefix must be a non-root absolute scene path")
         self.world_center = np.asarray(world_center, dtype=np.float32)
         if self.world_center.shape != (3,) or not np.isfinite(
             self.world_center
@@ -1685,7 +2131,7 @@ class AnchorGraphViewer:
 
         max_edges = max(int(graph.edge_index.shape[0]) for graph in graphs)
         edge_step = max(max_edges // 200, 1)
-        with server.gui.add_folder("Anchor structure graph"):
+        with server.gui.add_folder(folder_label):
             self.show_graph = server.gui.add_checkbox("Show graph", True)
             self.mode = server.gui.add_dropdown(
                 "Mode",
@@ -1711,20 +2157,23 @@ class AnchorGraphViewer:
                 step=0.1,
                 initial_value=line_width,
             )
-            self.show_anchors = server.gui.add_checkbox("Show anchors", True)
+            self.show_anchors = server.gui.add_checkbox(
+                f"Show {node_plural}",
+                True,
+            )
             self.anchor_point_size = server.gui.add_slider(
-                "Anchor point size",
+                f"{node_singular.capitalize()} point size",
                 min=0.0001,
                 max=0.008,
                 step=0.0001,
                 initial_value=anchor_point_size,
             )
             self.show_isolated = server.gui.add_checkbox(
-                "Show isolated anchors",
+                f"Show isolated {node_plural}",
                 True,
             )
             self.isolated_point_size = server.gui.add_slider(
-                "Isolated-anchor point size",
+                f"Isolated-{node_singular} point size",
                 min=0.0001,
                 max=0.008,
                 step=0.0001,
@@ -1745,10 +2194,10 @@ class AnchorGraphViewer:
             handle.on_update(self._update)
         self._update()
 
-    def _selected_graph(self) -> AnchorGraphViewData:
+    def _selected_graph(self) -> StructureGraphViewData:
         selected = str(self.mode.value)
         if selected not in self.labels:
-            raise ValueError(f"Unknown anchor graph mode: {selected}")
+            raise ValueError(f"Unknown {self.graph_label} mode: {selected}")
         return self.graphs[self.labels.index(selected)]
 
     def _remove_scene_nodes(self) -> None:
@@ -1763,7 +2212,7 @@ class AnchorGraphViewer:
             self._remove_scene_nodes()
             graph = self._selected_graph()
             centered_points = center_world_points(
-                graph.anchor_points_world,
+                graph.node_points_world,
                 self.world_center,
             )
             if bool(self.show_graph.value):
@@ -1788,19 +2237,19 @@ class AnchorGraphViewer:
                         )
                     else:
                         raise ValueError(
-                            f"Unknown anchor graph edge color: {color_mode}"
+                            f"Unknown {self.graph_label} edge color: {color_mode}"
                         )
                     self._line_handle = self.server.scene.add_line_segments(
-                        "/anchor_structure_graph/edges",
+                        f"{self.scene_prefix}/edges",
                         points=centered_points[edges],
                         colors=np.repeat(edge_colors[:, None, :], 2, axis=1),
                         line_width=float(self.line_width.value),
                     )
-            if bool(self.show_anchors.value) and graph.anchor_points_world.shape[0]:
+            if bool(self.show_anchors.value) and graph.node_points_world.shape[0]:
                 self._anchor_handle = self.server.scene.add_point_cloud(
-                    "/anchor_structure_graph/anchors",
+                    f"{self.scene_prefix}/{self.node_scene_name}",
                     points=centered_points,
-                    colors=graph.anchor_colors_rgb,
+                    colors=graph.node_colors_rgb,
                     point_size=float(self.anchor_point_size.value),
                     point_shape="circle",
                 )
@@ -1808,7 +2257,7 @@ class AnchorGraphViewer:
                 isolated_points = centered_points[graph.isolated_mask]
                 if isolated_points.shape[0]:
                     self._isolated_handle = self.server.scene.add_point_cloud(
-                        "/anchor_structure_graph/isolated",
+                        f"{self.scene_prefix}/isolated",
                         points=isolated_points,
                         colors=np.full(
                             (isolated_points.shape[0], 3),
@@ -1818,6 +2267,34 @@ class AnchorGraphViewer:
                         point_size=float(self.isolated_point_size.value),
                         point_shape="circle",
                     )
+
+
+class ObservedGraphViewer(AnchorGraphViewer):
+    def __init__(
+        self,
+        server: Any,
+        graphs: tuple[ObservedGraphViewData, ...],
+        *,
+        max_visible_edges: int,
+        line_width: float,
+        observed_point_size: float,
+        isolated_point_size: float,
+        world_center: np.ndarray,
+    ) -> None:
+        super().__init__(
+            server,
+            graphs,
+            max_visible_edges=max_visible_edges,
+            line_width=line_width,
+            anchor_point_size=observed_point_size,
+            isolated_point_size=isolated_point_size,
+            world_center=world_center,
+            folder_label="Observed Gaussian structure graph",
+            scene_prefix="/observed_structure_graph",
+            node_singular="observed-node",
+            node_plural="observed nodes",
+            node_scene_name="nodes",
+        )
 
 
 class ObservationCoverageViewer:
@@ -2092,13 +2569,13 @@ class AnchorResidualDiagnosticViewer:
 
 def _configure_initial_camera(
     server: Any,
-    graphs: tuple[AnchorGraphViewData, ...],
+    graphs: tuple[StructureGraphViewData, ...],
     world_center: np.ndarray,
 ) -> None:
     nonempty = [
-        graph.anchor_points_world
+        graph.node_points_world
         for graph in graphs
-        if graph.anchor_points_world.shape[0]
+        if graph.node_points_world.shape[0]
     ]
     if not nonempty:
         return
@@ -2115,7 +2592,7 @@ def _configure_initial_camera(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="View observed anchor structure graph artifacts in modern Viser",
+        description="View anchor or observed structure graph artifacts in modern Viser",
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument(
@@ -2127,6 +2604,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--graph-npz",
         type=Path,
         help="Single version-1 anchor graph NPZ artifact",
+    )
+    source.add_argument(
+        "--observed-graph-npz",
+        type=Path,
+        help="Single version-1 observed Gaussian structure graph NPZ artifact",
     )
     parser.add_argument(
         "--gaussian-npz",
@@ -2151,6 +2633,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-visible-edges", type=int, default=20000)
     parser.add_argument("--line-width", type=float, default=1.0)
     parser.add_argument("--anchor-point-size", type=float, default=0.0009)
+    parser.add_argument("--observed-point-size", type=float, default=0.0009)
     parser.add_argument("--isolated-point-size", type=float, default=0.002)
     parser.add_argument("--gaussian-scale", type=float, default=1.0)
     parser.add_argument("--coverage-max-visible-points", type=int, default=50000)
@@ -2175,6 +2658,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--gaussian-scale must lie in [0.1,3.0]")
     for name in (
         "anchor_point_size",
+        "observed_point_size",
         "isolated_point_size",
         "coverage_point_size",
         "residual_point_size",
@@ -2188,11 +2672,27 @@ def _validate_args(args: argparse.Namespace) -> None:
 def main() -> None:
     args = build_parser().parse_args()
     _validate_args(args)
-    graphs = load_anchor_graph_source(
-        manifest_path=args.manifest,
-        graph_path=args.graph_npz,
-    )
-    world_center = anchor_world_center(graphs)
+    observed_only = args.observed_graph_npz is not None
+    if observed_only and args.residual_diagnostics_npz is not None:
+        raise ValueError(
+            "--residual-diagnostics-npz requires an anchor graph source"
+        )
+    anchor_graphs: tuple[AnchorGraphViewData, ...]
+    observed_graphs: tuple[ObservedGraphViewData, ...]
+    if observed_only:
+        assert args.observed_graph_npz is not None
+        anchor_graphs = ()
+        observed_graphs = (_load_observed_graph_archive(args.observed_graph_npz),)
+        graphs: tuple[StructureGraphViewData, ...] = observed_graphs
+        world_center = observed_world_center(observed_graphs)
+    else:
+        anchor_graphs = load_anchor_graph_source(
+            manifest_path=args.manifest,
+            graph_path=args.graph_npz,
+        )
+        observed_graphs = ()
+        graphs = anchor_graphs
+        world_center = anchor_world_center(anchor_graphs)
     gaussians = (
         load_gaussian_visualization_sidecar(args.gaussian_npz, graphs)
         if args.gaussian_npz is not None
@@ -2203,15 +2703,13 @@ def main() -> None:
         if args.coverage_npz is not None
         else None
     )
-    residual_diagnostics = (
-        load_anchor_residual_diagnostics(
+    residual_diagnostics = None
+    if args.residual_diagnostics_npz is not None:
+        residual_diagnostics = load_anchor_residual_diagnostics(
             args.residual_diagnostics_npz,
-            graphs,
+            anchor_graphs,
             gaussians,
         )
-        if args.residual_diagnostics_npz is not None
-        else None
-    )
 
     try:
         import viser
@@ -2240,7 +2738,11 @@ def main() -> None:
     server = viser.ViserServer(
         host=args.host,
         port=args.port,
-        label="Anchor structure graph",
+        label=(
+            "Observed Gaussian structure graph"
+            if observed_only
+            else "Anchor structure graph"
+        ),
     )
     server.scene.set_up_direction("+z")
     _configure_initial_camera(server, graphs, world_center)
@@ -2251,15 +2753,26 @@ def main() -> None:
             splat_scale=args.gaussian_scale,
             world_center=world_center,
         )
-    AnchorGraphViewer(
-        server,
-        graphs,
-        max_visible_edges=args.max_visible_edges,
-        line_width=args.line_width,
-        anchor_point_size=args.anchor_point_size,
-        isolated_point_size=args.isolated_point_size,
-        world_center=world_center,
-    )
+    if observed_only:
+        ObservedGraphViewer(
+            server,
+            observed_graphs,
+            max_visible_edges=args.max_visible_edges,
+            line_width=args.line_width,
+            observed_point_size=args.observed_point_size,
+            isolated_point_size=args.isolated_point_size,
+            world_center=world_center,
+        )
+    else:
+        AnchorGraphViewer(
+            server,
+            anchor_graphs,
+            max_visible_edges=args.max_visible_edges,
+            line_width=args.line_width,
+            anchor_point_size=args.anchor_point_size,
+            isolated_point_size=args.isolated_point_size,
+            world_center=world_center,
+        )
     if coverage is not None:
         ObservationCoverageViewer(
             server,
@@ -2276,16 +2789,28 @@ def main() -> None:
             point_size=args.residual_point_size,
             world_center=world_center,
         )
-    print(
-        "Loaded "
-        f"{len(graphs)} mode(s), "
-        f"{sum(graph.edge_index.shape[0] for graph in graphs)} edge(s), "
-        f"{sum(graph.anchor_points_world.shape[0] for graph in graphs)} anchor(s)."
-    )
-    print(
-        "Viewer world origin is the anchor AABB center: "
-        f"{world_center.tolist()}"
-    )
+    if observed_only:
+        print(
+            "Loaded observed graph with "
+            f"{observed_graphs[0].edge_index.shape[0]} edge(s) and "
+            f"{observed_graphs[0].node_points_world.shape[0]} observed node(s)."
+        )
+        print(
+            "Viewer world origin is the observed-node AABB center: "
+            f"{world_center.tolist()}"
+        )
+    else:
+        print(
+            "Loaded "
+            f"{len(anchor_graphs)} mode(s), "
+            f"{sum(graph.edge_index.shape[0] for graph in anchor_graphs)} edge(s), "
+            f"{sum(graph.anchor_points_world.shape[0] for graph in anchor_graphs)} "
+            "anchor(s)."
+        )
+        print(
+            "Viewer world origin is the anchor AABB center: "
+            f"{world_center.tolist()}"
+        )
     if gaussians is not None:
         background_count = (
             0

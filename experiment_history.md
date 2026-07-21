@@ -144,3 +144,20 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   anchors; the next diagnosis should separate a global/view-level synchronization
   error from spatially local correspondence, occlusion, or same-frequency mode
   mixing errors.
+
+## `mode4_anchor_graph_residual0p5`
+
+- Output directory: `/home/zs292/outputs_modal/bush4/mode4_anchor_graph_residual0p5`
+- The experiment solved only mode index 4 and relaxed the staged anchor residual
+  cap from `0.1` to `0.5`; motion fill and learned refinement were not enabled.
+- The diagnostic structure graph retained the existing mutual-KNN settings of at
+  most 8 neighbors and a `0.008` scene-unit distance cutoff, with the same Lab
+  color and rendered-depth checks.
+- The standalone Viewer reported 45,053 accepted graph edges. Visual inspection
+  showed substantially denser, locally coherent flower-head structures than the
+  residual-0.1 graph, while still leaving isolated points and incomplete regions.
+- Working conclusion: the color-depth graph construction has useful structural
+  precision on a much broader candidate set; the dominant sparsity came from
+  defining graph nodes only after the strict first-pass residual filter. This
+  motivates the next diagnostic graph over every positive-weight observed
+  Gaussian before changing the solver.
