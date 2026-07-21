@@ -132,6 +132,12 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
         "rigid_component_residual_policy": "diagnostic_only",
         "rigid_component_edge_weight_use": "topology_only",
         "rigid_component_first_order_rtol": 1e-6,
+        "rigid_component_first_order_validation": (
+            "complex128_model_strict_complex64_quantization_accounted"
+        ),
+        "rigid_component_persisted_strain_policy": (
+            "diagnostic_with_per_edge_actual_cast_error_bound"
+        ),
         "rigid_component_finite_phase_samples": 64,
         "rigid_component_finite_rigidity": "first_order_only",
         "nonseed_policy": (

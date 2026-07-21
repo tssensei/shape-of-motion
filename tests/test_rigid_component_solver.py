@@ -356,6 +356,122 @@ class RigidComponentSolverTests(unittest.TestCase):
         weak = solve_rigid_components(prepared, _alpha(), weak_graph)
         np.testing.assert_array_equal(unit.phi, weak.phi)
 
+    def test_short_edges_accept_exact_model_with_complex64_quantization(self) -> None:
+        scale = 1.0e-3
+        points = scale * np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.3, 0.2],
+                [-0.4, 0.8, -0.2],
+                [0.5, -0.2, 0.7],
+            ],
+            dtype=np.float32,
+        )
+        translation = np.asarray(
+            [
+                10.123456 + 3.234567j,
+                -8.765432 + 1.111111j,
+                2.345678 - 7.777777j,
+            ],
+            dtype=np.complex128,
+        )
+        rotation = np.asarray(
+            [0.13 + 0.07j, -0.21 + 0.11j, 0.08 - 0.09j],
+            dtype=np.complex128,
+        )
+        phi = _rigid_field(points, translation, rotation)
+        prepared = _prepare(points, phi, [[0, 1, 2]] * points.shape[0])
+        edges = np.asarray(
+            [
+                [0, 1],
+                [0, 2],
+                [0, 3],
+                [1, 2],
+                [1, 3],
+                [2, 3],
+            ],
+            dtype=np.int32,
+        )
+        graph = _graph(prepared, np.arange(points.shape[0]), edges)
+        result = solve_rigid_components(prepared, _alpha(), graph)
+
+        self.assertEqual(result.phi.dtype, np.dtype(np.complex64))
+        model_relative = np.maximum(
+            result.edge_model_first_order_relative_real,
+            result.edge_model_first_order_relative_imag,
+        )
+        persisted_relative = np.maximum(
+            result.edge_first_order_relative_real,
+            result.edge_first_order_relative_imag,
+        )
+        self.assertLessEqual(float(model_relative.max()), 1.0e-6)
+        self.assertGreater(float(persisted_relative.max()), 1.0e-6)
+
+        for persisted, model, bound in (
+            (
+                result.edge_first_order_axial_real,
+                result.edge_model_first_order_axial_real,
+                result.edge_first_order_quantization_bound_real,
+            ),
+            (
+                result.edge_first_order_axial_imag,
+                result.edge_model_first_order_axial_imag,
+                result.edge_first_order_quantization_bound_imag,
+            ),
+        ):
+            limit = np.abs(model.astype(np.float64)) + bound.astype(np.float64)
+            rounding_guard = (
+                8.0
+                * np.finfo(np.float32).eps
+                * np.maximum(limit, np.finfo(np.float32).tiny)
+            )
+            self.assertTrue(
+                np.all(np.abs(persisted.astype(np.float64)) <= limit + rounding_guard)
+            )
+
+        global_edges = graph.node_gaussian_indices[graph.topology.edge_index]
+        edge_vectors = (
+            prepared.points[global_edges[:, 1]].astype(np.float64)
+            - prepared.points[global_edges[:, 0]].astype(np.float64)
+        )
+        edge_squared_length = np.maximum(
+            np.einsum("ij,ij->i", edge_vectors, edge_vectors), 1.0e-12
+        )
+        np.testing.assert_allclose(
+            result.edge_first_order_quantization_bound_relative_real,
+            result.edge_first_order_quantization_bound_real / edge_squared_length,
+            rtol=2.0e-6,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            result.edge_first_order_quantization_bound_relative_imag,
+            result.edge_first_order_quantization_bound_imag / edge_squared_length,
+            rtol=2.0e-6,
+            atol=0.0,
+        )
+        persisted_delta = (
+            result.phi[global_edges[:, 1]].astype(np.complex128)
+            - result.phi[global_edges[:, 0]].astype(np.complex128)
+        )
+        phase = np.linspace(0.0, 2.0 * np.pi, 64, endpoint=False)
+        deformed = (
+            edge_vectors[:, None, :]
+            + persisted_delta.real[:, None, :] * np.cos(phase)[None, :, None]
+            - persisted_delta.imag[:, None, :] * np.sin(phase)[None, :, None]
+        )
+        base_length = np.linalg.norm(edge_vectors, axis=1)
+        expected_max_drift = np.max(
+            np.abs(np.linalg.norm(deformed, axis=2) - base_length[:, None])
+            / base_length[:, None],
+            axis=1,
+        )
+        np.testing.assert_allclose(
+            result.edge_finite_drift_max,
+            expected_max_drift,
+            rtol=2.0e-5,
+            atol=1.0e-8,
+        )
+
     def test_finite_playback_edge_drift_is_quadratic_at_small_amplitude(self) -> None:
         translation = np.zeros((3,), dtype=np.complex128)
         full_rotation = np.asarray([0.0, 0.0, 0.02], dtype=np.complex128)

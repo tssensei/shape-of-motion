@@ -69,10 +69,18 @@ class RigidComponentSolveResult:
     component_translation: np.ndarray
     component_rotation: np.ndarray
     edge_component_index: np.ndarray
+    edge_model_first_order_axial_real: np.ndarray
+    edge_model_first_order_axial_imag: np.ndarray
+    edge_model_first_order_relative_real: np.ndarray
+    edge_model_first_order_relative_imag: np.ndarray
     edge_first_order_axial_real: np.ndarray
     edge_first_order_axial_imag: np.ndarray
     edge_first_order_relative_real: np.ndarray
     edge_first_order_relative_imag: np.ndarray
+    edge_first_order_quantization_bound_real: np.ndarray
+    edge_first_order_quantization_bound_imag: np.ndarray
+    edge_first_order_quantization_bound_relative_real: np.ndarray
+    edge_first_order_quantization_bound_relative_imag: np.ndarray
     phase_angles: np.ndarray
     edge_finite_drift_p50: np.ndarray
     edge_finite_drift_p90: np.ndarray
@@ -482,36 +490,132 @@ def solve_rigid_components(
             )
         )
 
-    # Validate the exact complex64 field that downstream motion fill and compact
-    # latents consume, rather than only the higher-precision accumulator field.
+    # The complex128 parameterized field must itself satisfy the mathematical
+    # first-order constraint.  The downstream complex64 field is checked
+    # separately against the exact per-edge error introduced by that cast;
+    # independently rounded endpoint translations can otherwise dominate the
+    # normalized strain of a very short edge.
+    if np.any(~np.isfinite(phi.real)) or np.any(~np.isfinite(phi.imag)):
+        raise FloatingPointError("rigid component complex128 field is non-finite")
     persisted_phi = phi.astype(np.complex64)
+    if np.any(~np.isfinite(persisted_phi.real)) or np.any(
+        ~np.isfinite(persisted_phi.imag)
+    ):
+        raise FloatingPointError(
+            "rigid component field overflowed while converting to complex64"
+        )
     global_edges = node_indices[edge_index]
     edge_vectors = points[global_edges[:, 1]] - points[global_edges[:, 0]]
+    model_edge_delta_phi = phi[global_edges[:, 1]] - phi[global_edges[:, 0]]
+    model_edge_axial = np.einsum(
+        "ij,ij->i", edge_vectors, model_edge_delta_phi
+    )
     edge_delta_phi = (
         persisted_phi[global_edges[:, 1]].astype(np.complex128)
         - persisted_phi[global_edges[:, 0]].astype(np.complex128)
     )
     edge_axial = np.einsum("ij,ij->i", edge_vectors, edge_delta_phi)
     edge_squared_length = np.einsum("ij,ij->i", edge_vectors, edge_vectors)
+    edge_length_denominator = np.maximum(edge_squared_length, _EPS)
+    model_edge_relative_real = np.abs(model_edge_axial.real) / (
+        edge_length_denominator
+    )
+    model_edge_relative_imag = np.abs(model_edge_axial.imag) / (
+        edge_length_denominator
+    )
+    max_model_first_order_relative = float(
+        max(
+            np.max(model_edge_relative_real, initial=0.0),
+            np.max(model_edge_relative_imag, initial=0.0),
+        )
+    )
+    if max_model_first_order_relative > config.first_order_rtol:
+        worst_real = int(np.argmax(model_edge_relative_real))
+        worst_imag = int(np.argmax(model_edge_relative_imag))
+        raise RuntimeError(
+            "rigid component complex128 parameterization violated its "
+            "first-order edge-length constraint: "
+            f"max_relative={max_model_first_order_relative:.9g}, "
+            f"rtol={config.first_order_rtol:.9g}, "
+            f"worst_real_edge={worst_real}, worst_imag_edge={worst_imag}"
+        )
+
+    persisted_phi128 = persisted_phi.astype(np.complex128)
+    cast_error = persisted_phi128 - phi
+    source_cast_error = cast_error[global_edges[:, 0]]
+    target_cast_error = cast_error[global_edges[:, 1]]
+    absolute_edge_vectors = np.abs(edge_vectors)
+    quantization_bound_real = np.einsum(
+        "ij,ij->i",
+        absolute_edge_vectors,
+        np.abs(source_cast_error.real) + np.abs(target_cast_error.real),
+    )
+    quantization_bound_imag = np.einsum(
+        "ij,ij->i",
+        absolute_edge_vectors,
+        np.abs(source_cast_error.imag) + np.abs(target_cast_error.imag),
+    )
+    quantization_bound_relative_real = quantization_bound_real / (
+        edge_length_denominator
+    )
+    quantization_bound_relative_imag = quantization_bound_imag / (
+        edge_length_denominator
+    )
     edge_relative_real = np.abs(edge_axial.real) / np.maximum(
         edge_squared_length, _EPS
     )
     edge_relative_imag = np.abs(edge_axial.imag) / np.maximum(
         edge_squared_length, _EPS
     )
-    max_first_order_relative = float(
-        max(
-            np.max(edge_relative_real, initial=0.0),
-            np.max(edge_relative_imag, initial=0.0),
+    float64_epsilon = np.finfo(np.float64).eps
+    real_validation_scale = (
+        np.abs(model_edge_axial.real)
+        + quantization_bound_real
+        + np.einsum(
+            "ij,ij->i", absolute_edge_vectors, np.abs(model_edge_delta_phi.real)
+        )
+        + np.einsum(
+            "ij,ij->i", absolute_edge_vectors, np.abs(edge_delta_phi.real)
         )
     )
-    if max_first_order_relative > config.first_order_rtol:
-        worst_real = int(np.argmax(edge_relative_real))
-        worst_imag = int(np.argmax(edge_relative_imag))
+    imag_validation_scale = (
+        np.abs(model_edge_axial.imag)
+        + quantization_bound_imag
+        + np.einsum(
+            "ij,ij->i", absolute_edge_vectors, np.abs(model_edge_delta_phi.imag)
+        )
+        + np.einsum(
+            "ij,ij->i", absolute_edge_vectors, np.abs(edge_delta_phi.imag)
+        )
+    )
+    real_float64_guard = 64.0 * float64_epsilon * np.maximum(
+        real_validation_scale, np.finfo(np.float64).tiny
+    )
+    imag_float64_guard = 64.0 * float64_epsilon * np.maximum(
+        imag_validation_scale, np.finfo(np.float64).tiny
+    )
+    persisted_real_limit = (
+        np.abs(model_edge_axial.real)
+        + quantization_bound_real
+        + real_float64_guard
+    )
+    persisted_imag_limit = (
+        np.abs(model_edge_axial.imag)
+        + quantization_bound_imag
+        + imag_float64_guard
+    )
+    real_quantization_excess = np.abs(edge_axial.real) - persisted_real_limit
+    imag_quantization_excess = np.abs(edge_axial.imag) - persisted_imag_limit
+    max_real_excess = float(np.max(real_quantization_excess, initial=0.0))
+    max_imag_excess = float(np.max(imag_quantization_excess, initial=0.0))
+    if max_real_excess > 0.0 or max_imag_excess > 0.0:
+        worst_real = int(np.argmax(real_quantization_excess))
+        worst_imag = int(np.argmax(imag_quantization_excess))
         raise RuntimeError(
-            "rigid component parameterization violated its first-order edge-length "
-            f"constraint: max_relative={max_first_order_relative:.9g}, "
-            f"rtol={config.first_order_rtol:.9g}, "
+            "rigid component complex64 field exceeded its per-edge cast "
+            "quantization bound: "
+            f"max_real_excess={max_real_excess:.9g}, "
+            f"max_imag_excess={max_imag_excess:.9g}, "
             f"worst_real_edge={worst_real}, worst_imag_edge={worst_imag}"
         )
 
@@ -561,10 +665,30 @@ def solve_rigid_components(
         component_translation=component_translation.astype(np.complex64),
         component_rotation=component_rotation.astype(np.complex64),
         edge_component_index=edge_component_index.astype(np.int32),
+        edge_model_first_order_axial_real=model_edge_axial.real.astype(np.float32),
+        edge_model_first_order_axial_imag=model_edge_axial.imag.astype(np.float32),
+        edge_model_first_order_relative_real=model_edge_relative_real.astype(
+            np.float32
+        ),
+        edge_model_first_order_relative_imag=model_edge_relative_imag.astype(
+            np.float32
+        ),
         edge_first_order_axial_real=edge_axial.real.astype(np.float32),
         edge_first_order_axial_imag=edge_axial.imag.astype(np.float32),
         edge_first_order_relative_real=edge_relative_real.astype(np.float32),
         edge_first_order_relative_imag=edge_relative_imag.astype(np.float32),
+        edge_first_order_quantization_bound_real=quantization_bound_real.astype(
+            np.float32
+        ),
+        edge_first_order_quantization_bound_imag=quantization_bound_imag.astype(
+            np.float32
+        ),
+        edge_first_order_quantization_bound_relative_real=(
+            quantization_bound_relative_real.astype(np.float32)
+        ),
+        edge_first_order_quantization_bound_relative_imag=(
+            quantization_bound_relative_imag.astype(np.float32)
+        ),
         phase_angles=phase_angles.astype(np.float32),
         edge_finite_drift_p50=edge_drift_p50.astype(np.float32),
         edge_finite_drift_p90=edge_drift_p90.astype(np.float32),

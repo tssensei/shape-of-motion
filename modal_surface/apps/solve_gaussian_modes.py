@@ -726,6 +726,30 @@ def _rigid_gaussian_latent_stats(
     ]
     component_residual = rigid.component_normalized_weighted_residual
     component_drift = rigid.component_finite_drift_max
+    model_first_order_relative_max = float(
+        max(
+            np.max(rigid.edge_model_first_order_relative_real, initial=0.0),
+            np.max(rigid.edge_model_first_order_relative_imag, initial=0.0),
+        )
+    )
+    persisted_first_order_relative_max = float(
+        max(
+            np.max(rigid.edge_first_order_relative_real, initial=0.0),
+            np.max(rigid.edge_first_order_relative_imag, initial=0.0),
+        )
+    )
+    quantization_bound_relative_max = float(
+        max(
+            np.max(
+                rigid.edge_first_order_quantization_bound_relative_real,
+                initial=0.0,
+            ),
+            np.max(
+                rigid.edge_first_order_quantization_bound_relative_imag,
+                initial=0.0,
+            ),
+        )
+    )
     stats: dict[str, Any] = {
         "num_foreground_gaussians": int(num_fg),
         "num_output_points": int(prepared.points.shape[0]),
@@ -762,6 +786,13 @@ def _rigid_gaussian_latent_stats(
         "component_finite_drift_p50": _finite_percentile(component_drift, 50),
         "component_finite_drift_p90": _finite_percentile(component_drift, 90),
         "component_finite_drift_max": _finite_percentile(component_drift, 100),
+        "model_first_order_relative_max": model_first_order_relative_max,
+        "persisted_first_order_relative_max": (
+            persisted_first_order_relative_max
+        ),
+        "first_order_quantization_bound_relative_max": (
+            quantization_bound_relative_max
+        ),
         "obs_residual_median": _finite_percentile(valid_obs_residual, 50),
         "obs_residual_p90": _finite_percentile(valid_obs_residual, 90),
         "point_residual_median": _finite_percentile(valid_point_residual, 50),
@@ -1171,6 +1202,12 @@ def _write_rigid_solver_diagnostics(
         "rigid_component_first_order_rtol": np.array(
             rigid.config.first_order_rtol, dtype=np.float64
         ),
+        "rigid_component_first_order_validation": np.array(
+            "complex128_model_strict_complex64_quantization_accounted"
+        ),
+        "rigid_component_persisted_strain_policy": np.array(
+            "diagnostic_with_per_edge_actual_cast_error_bound"
+        ),
         "rigid_component_phase_samples": np.array(
             rigid.config.phase_samples, dtype=np.int32
         ),
@@ -1216,6 +1253,18 @@ def _write_rigid_solver_diagnostics(
         "component_translation": rigid.component_translation.astype(np.complex64),
         "component_rotation": rigid.component_rotation.astype(np.complex64),
         "edge_component_index": rigid.edge_component_index.astype(np.int32),
+        "edge_model_first_order_axial_real": rigid.edge_model_first_order_axial_real.astype(
+            np.float32
+        ),
+        "edge_model_first_order_axial_imag": rigid.edge_model_first_order_axial_imag.astype(
+            np.float32
+        ),
+        "edge_model_first_order_relative_real": rigid.edge_model_first_order_relative_real.astype(
+            np.float32
+        ),
+        "edge_model_first_order_relative_imag": rigid.edge_model_first_order_relative_imag.astype(
+            np.float32
+        ),
         "edge_first_order_axial_real": rigid.edge_first_order_axial_real.astype(
             np.float32
         ),
@@ -1226,6 +1275,18 @@ def _write_rigid_solver_diagnostics(
             np.float32
         ),
         "edge_first_order_relative_imag": rigid.edge_first_order_relative_imag.astype(
+            np.float32
+        ),
+        "edge_first_order_quantization_bound_real": rigid.edge_first_order_quantization_bound_real.astype(
+            np.float32
+        ),
+        "edge_first_order_quantization_bound_imag": rigid.edge_first_order_quantization_bound_imag.astype(
+            np.float32
+        ),
+        "edge_first_order_quantization_bound_relative_real": rigid.edge_first_order_quantization_bound_relative_real.astype(
+            np.float32
+        ),
+        "edge_first_order_quantization_bound_relative_imag": rigid.edge_first_order_quantization_bound_relative_imag.astype(
             np.float32
         ),
         "finite_drift_phase_angles": rigid.phase_angles.astype(np.float32),
