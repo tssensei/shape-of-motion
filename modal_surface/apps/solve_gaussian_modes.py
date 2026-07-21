@@ -30,10 +30,13 @@ from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_ROLE_NAMES,
     MOTION_FILL_VERSION,
     RIGID_SEED_MOTION_FILL_METHOD,
+    RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD,
+    RIGID_SINGLE_VIEW_PARTIAL_FILL_POLICY,
     GaussianMotionFillResult,
     RigidSeedMotionFillResult,
     apply_gaussian_motion_fill,
     apply_rigid_seed_motion_fill,
+    apply_single_view_component_partial_fill,
     write_motion_fill_diagnostics,
     write_motion_fill_graph,
 )
@@ -72,9 +75,12 @@ from modal_surface.rigid_component_solver import (
 )
 from modal_surface.solver_cli import (
     RIGID_COMPONENT_RCOND_DEFAULT,
+    RIGID_MOTION_FILL_STAGE_DEFAULT,
     RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT,
     RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT,
     RIGID_SEED_MIN_VALID_VIEWS_DEFAULT,
+    RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT,
+    RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT,
     STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT,
     STAGED_ANCHOR_SVD_RATIO_DEFAULT,
     add_solve_method_arguments,
@@ -301,6 +307,11 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     min_valid_views = int(args.rigid_seed_min_valid_views)
     min_singular_ratio = float(args.rigid_seed_min_singular_ratio)
     max_finite_drift = float(args.rigid_seed_max_finite_drift)
+    motion_fill_stage = str(args.rigid_motion_fill_stage)
+    observable_ratio = float(args.rigid_single_view_observable_ratio)
+    ray_direction_fraction = float(
+        args.rigid_single_view_ray_direction_min_fraction
+    )
     if not np.isfinite(rcond) or not (0.0 < rcond < 1.0):
         raise ValueError("--rigid-component-rcond must be finite and lie in (0,1).")
     if min_valid_views <= 0:
@@ -314,6 +325,24 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     if not np.isfinite(max_finite_drift) or max_finite_drift < 0.0:
         raise ValueError(
             "--rigid-seed-max-finite-drift must be finite and non-negative."
+        )
+    if not np.isfinite(observable_ratio) or not 0.0 < observable_ratio <= 1.0:
+        raise ValueError(
+            "--rigid-single-view-observable-ratio must be finite and lie in (0,1]."
+        )
+    if (
+        not np.isfinite(ray_direction_fraction)
+        or not 0.0 <= ray_direction_fraction <= 1.0
+    ):
+        raise ValueError(
+            "--rigid-single-view-ray-direction-min-fraction must be finite and "
+            "lie in [0,1]."
+        )
+    if motion_fill_stage != RIGID_MOTION_FILL_STAGE_DEFAULT and not bool(
+        args.motion_fill
+    ):
+        raise ValueError(
+            "--rigid-motion-fill-stage=single-view-components requires --motion-fill."
         )
     if args.solve_method == "staged":
         if graph_paths:
@@ -340,11 +369,43 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
                 "A custom --rigid-seed-max-finite-drift requires "
                 "--solve-method=rigid-components."
             )
+        if motion_fill_stage != RIGID_MOTION_FILL_STAGE_DEFAULT:
+            raise ValueError(
+                "A custom --rigid-motion-fill-stage requires "
+                "--solve-method=rigid-components."
+            )
+        if observable_ratio != RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT:
+            raise ValueError(
+                "A custom --rigid-single-view-observable-ratio requires "
+                "--solve-method=rigid-components."
+            )
+        if (
+            ray_direction_fraction
+            != RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT
+        ):
+            raise ValueError(
+                "A custom --rigid-single-view-ray-direction-min-fraction requires "
+                "--solve-method=rigid-components."
+            )
         return
     if not graph_paths:
         raise ValueError(
             "--solve-method=rigid-components requires --rigid-component-graph."
         )
+    if motion_fill_stage != "single-view-components":
+        if observable_ratio != RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT:
+            raise ValueError(
+                "A custom --rigid-single-view-observable-ratio requires "
+                "--rigid-motion-fill-stage=single-view-components."
+            )
+        if (
+            ray_direction_fraction
+            != RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT
+        ):
+            raise ValueError(
+                "A custom --rigid-single-view-ray-direction-min-fraction requires "
+                "--rigid-motion-fill-stage=single-view-components."
+            )
     if float(args.anchor_svd_ratio_min) != STAGED_ANCHOR_SVD_RATIO_DEFAULT:
         raise ValueError(
             "--anchor-svd-ratio-min is unavailable for rigid component solves; "
@@ -909,11 +970,14 @@ def _rigid_gaussian_latent_stats(
         stats[f"{label}_p90"] = _finite_percentile(values, 90)
         stats[f"{label}_max"] = _finite_percentile(values, 100)
     if motion_fill is not None:
+        motion_fill_method = str(motion_fill.diagnostics["method"])
         stats.update(
             {
-                "motion_fill_method": RIGID_SEED_MOTION_FILL_METHOD,
+                "motion_fill_method": motion_fill_method,
                 "effective_field_method": (
-                    "rigid_component_twist+single_view_grouped_rigid_knn_lsmr"
+                    "rigid_component_twist+single_view_partial_component_knn_lsmr"
+                    if motion_fill.single_view_partial_diagnostics is not None
+                    else "rigid_component_twist+single_view_grouped_rigid_knn_lsmr"
                 ),
                 "motion_fill": motion_fill.diagnostics,
             }
@@ -1430,9 +1494,15 @@ def _write_rigid_solver_diagnostics(
         if motion_fill_graph is None or motion_fill_graph_path is None:
             raise ValueError("Rigid motion-fill diagnostics require graph metadata.")
         motion = motion_fill.motion
+        motion_fill_method = str(motion_fill.diagnostics["method"])
+        component_fill_policy = (
+            RIGID_SINGLE_VIEW_PARTIAL_FILL_POLICY
+            if motion_fill.single_view_partial_diagnostics is not None
+            else "shared_unknown_normalized_infinitesimal_se3_twist"
+        )
         arrays.update(
             {
-                "motion_fill_method": np.array(RIGID_SEED_MOTION_FILL_METHOD),
+                "motion_fill_method": np.array(motion_fill_method),
                 "motion_fill_version": np.array(MOTION_FILL_VERSION, dtype=np.int32),
                 "motion_fill_graph_path": np.array(motion_fill_graph_path),
                 "motion_fill_graph_k": np.array(
@@ -1449,7 +1519,7 @@ def _write_rigid_solver_diagnostics(
                     np.int8
                 ),
                 "single_view_component_fill_policy": np.array(
-                    "shared_unknown_normalized_infinitesimal_se3_twist"
+                    component_fill_policy
                 ),
                 "single_view_component_fill_mask": (
                     motion_fill.single_view_component_fill_mask.astype(bool)
@@ -1527,6 +1597,53 @@ def _write_rigid_solver_diagnostics(
                 ),
             }
         )
+        partial = motion_fill.single_view_partial_diagnostics
+        if partial is not None:
+            arrays.update(
+                {
+                    "single_view_observable_singular_ratio_min": np.array(
+                        partial.observable_singular_ratio_min, dtype=np.float64
+                    ),
+                    "single_view_ray_direction_min_fraction": np.array(
+                        partial.ray_direction_min_fraction, dtype=np.float64
+                    ),
+                    "single_view_component_observable_rank": (
+                        partial.component_observable_rank.astype(np.int8)
+                    ),
+                    "single_view_component_fill_nullity": (
+                        partial.component_fill_nullity.astype(np.int8)
+                    ),
+                    "single_view_component_ray_dominated_basis_count": (
+                        partial.component_ray_dominated_basis_count.astype(np.int8)
+                    ),
+                    "single_view_component_trusted_knn_edge_count": (
+                        partial.component_trusted_knn_edge_count.astype(np.int32)
+                    ),
+                    "single_view_component_cross_knn_edge_count": (
+                        partial.component_cross_knn_edge_count.astype(np.int32)
+                    ),
+                    "single_view_component_connected_to_trusted_mask": (
+                        partial.component_connected_to_trusted_mask.astype(bool)
+                    ),
+                    "single_view_component_postfill_normalized_residual": (
+                        partial.component_postfill_normalized_residual.astype(
+                            np.float32
+                        )
+                    ),
+                    "single_view_component_ray_motion_rms": (
+                        partial.component_ray_motion_rms.astype(np.float32)
+                    ),
+                    "single_view_component_tangent_motion_rms": (
+                        partial.component_tangent_motion_rms.astype(np.float32)
+                    ),
+                    "single_view_component_ray_motion_ratio": (
+                        partial.component_ray_motion_ratio.astype(np.float32)
+                    ),
+                    "single_view_component_partial_finite_drift_max": (
+                        partial.component_finite_drift_max.astype(np.float32)
+                    ),
+                }
+            )
     return save_npz_compressed_atomic(out_path, arrays)
 
 
@@ -1949,20 +2066,39 @@ def run(args: argparse.Namespace) -> None:
                             "motion fill. Relax --rigid-seed-min-valid-views "
                             "or --rigid-seed-min-singular-ratio."
                         )
-                    rigid_motion_fill = apply_rigid_seed_motion_fill(
-                        prepared,
-                        alpha,
-                        rigid,
-                        seed_selection,
-                        loaded_graph.graph,
-                        motion_fill_graph,
-                        motion_fill_relative_path,
-                        timings=motion_fill_timings,
-                        progress=lambda message: print(
-                            f"Motion fill: {message}",
-                            flush=True,
-                        ),
-                    )
+                    def progress(message: str) -> None:
+                        print(f"Motion fill: {message}", flush=True)
+
+                    if args.rigid_motion_fill_stage == "single-view-components":
+                        rigid_motion_fill = apply_single_view_component_partial_fill(
+                            prepared,
+                            alpha,
+                            rigid,
+                            seed_selection,
+                            loaded_graph.graph,
+                            motion_fill_graph,
+                            motion_fill_relative_path,
+                            observable_singular_ratio_min=float(
+                                args.rigid_single_view_observable_ratio
+                            ),
+                            ray_direction_min_fraction=float(
+                                args.rigid_single_view_ray_direction_min_fraction
+                            ),
+                            timings=motion_fill_timings,
+                            progress=progress,
+                        )
+                    else:
+                        rigid_motion_fill = apply_rigid_seed_motion_fill(
+                            prepared,
+                            alpha,
+                            rigid,
+                            seed_selection,
+                            loaded_graph.graph,
+                            motion_fill_graph,
+                            motion_fill_relative_path,
+                            timings=motion_fill_timings,
+                            progress=progress,
+                        )
                 except Exception:
                     _write_rigid_solver_diagnostics(
                         diagnostics_path,
@@ -2212,7 +2348,10 @@ def run(args: argparse.Namespace) -> None:
     if motion_fill_graph is not None:
         assert motion_fill_graph_path is not None
         motion_fill_method = (
-            RIGID_SEED_MOTION_FILL_METHOD
+            RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD
+            if args.solve_method == "rigid-components"
+            and args.rigid_motion_fill_stage == "single-view-components"
+            else RIGID_SEED_MOTION_FILL_METHOD
             if args.solve_method == "rigid-components"
             else MOTION_FILL_METHOD
         )
@@ -2224,7 +2363,10 @@ def run(args: argparse.Namespace) -> None:
                 "motion_fill_epsilon": float(motion_fill_graph.epsilon),
                 "motion_fill_graph_path": relative_path(motion_fill_graph_path, out_dir),
                 "motion_fill_excluded_policy": (
-                    "none_all_nonseed_free"
+                    "ordinary_gaussians_zero_component_only"
+                    if args.solve_method == "rigid-components"
+                    and args.rigid_motion_fill_stage == "single-view-components"
+                    else "none_all_nonseed_free"
                     if args.solve_method == "rigid-components"
                     else "retain_observable_exclude_from_graph"
                 ),

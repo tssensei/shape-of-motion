@@ -301,6 +301,7 @@ class RigidModeViewData:
     graph_source_path: str
     points_world: np.ndarray
     phi: np.ndarray
+    raw_rigid_phi: np.ndarray
     rigid_seed_mask: np.ndarray
     quarantined_rigid_mask: np.ndarray
     single_view_rigid_fill_mask: np.ndarray
@@ -313,6 +314,11 @@ class RigidModeViewData:
     component_singular_ratio: np.ndarray
     component_motion_rms: np.ndarray
     component_finite_drift_max: np.ndarray
+    single_view_component_completion_mask: np.ndarray
+    single_view_component_observable_rank: np.ndarray | None
+    single_view_component_fill_nullity: np.ndarray | None
+    single_view_component_trusted_knn_edge_count: np.ndarray | None
+    single_view_component_ray_motion_ratio: np.ndarray | None
     edge_component_index: np.ndarray
     edge_finite_drift_max: np.ndarray
 
@@ -322,6 +328,7 @@ class RigidManifestViewData:
     manifest_path: Path
     source_checkpoint: str
     motion_fill_enabled: bool
+    rigid_motion_fill_stage: str
     rigid_seed_min_valid_views: int
     rigid_seed_min_singular_ratio: float
     rigid_seed_max_finite_drift: float
@@ -883,6 +890,27 @@ def load_rigid_manifest(
         raise ValueError(
             f"{manifest_path} motion_fill_enabled must be a boolean"
         )
+    rigid_motion_fill_stage = parameters.get("rigid_motion_fill_stage", "joint")
+    if rigid_motion_fill_stage not in {"joint", "single-view-components"}:
+        raise ValueError(
+            f"{manifest_path} rigid_motion_fill_stage is incompatible"
+        )
+    component_fill_only = motion_fill_enabled and (
+        rigid_motion_fill_stage == "single-view-components"
+    )
+    manifest_partial_observable_ratio = None
+    manifest_partial_ray_fraction = None
+    if component_fill_only:
+        manifest_partial_observable_ratio = _manifest_number(
+            parameters.get("rigid_single_view_observable_ratio"),
+            "rigid_single_view_observable_ratio",
+            manifest_path,
+        )
+        manifest_partial_ray_fraction = _manifest_number(
+            parameters.get("rigid_single_view_ray_direction_min_fraction"),
+            "rigid_single_view_ray_direction_min_fraction",
+            manifest_path,
+        )
     rigid_seed_min_valid_views = _manifest_integer(
         parameters.get("rigid_seed_min_valid_views"),
         "rigid_seed_min_valid_views",
@@ -925,12 +953,16 @@ def load_rigid_manifest(
             "postsolve_valid_view_singular_ratio_and_finite_drift_gate"
         ),
         "nonseed_policy": (
-            "single_view_component_rigid_else_free_motion_fill"
+            "single_view_partial_rigid_other_gaussians_zero"
+            if component_fill_only
+            else "single_view_component_rigid_else_free_motion_fill"
             if motion_fill_enabled
             else "zero_without_motion_fill"
         ),
         "single_view_component_fill_policy": (
-            "shared_unknown_normalized_infinitesimal_se3_twist"
+            "observable_twist_plus_knn_filled_weak_and_ray_directions"
+            if component_fill_only
+            else "shared_unknown_normalized_infinitesimal_se3_twist"
             if motion_fill_enabled
             else "disabled"
         ),
@@ -1476,6 +1508,13 @@ def load_rigid_manifest(
         ):
             raise ValueError(f"{diagnostics_path} finite edge drift is invalid")
 
+        single_view_component_completion = np.zeros(
+            (num_components,), dtype=bool
+        )
+        partial_observable_rank = None
+        partial_fill_nullity = None
+        partial_trusted_knn_count = None
+        partial_ray_motion_ratio = None
         if motion_fill_enabled:
             role_names = _string_vector(
                 latent["motion_fill_role_names"],
@@ -1504,11 +1543,16 @@ def load_rigid_manifest(
                     f"{diagnostics_path} is missing grouped rigid-fill fields: "
                     f"{grouped_missing}"
                 )
+            expected_component_fill_policy = (
+                "observable_twist_plus_knn_filled_weak_and_ray_directions"
+                if component_fill_only
+                else "shared_unknown_normalized_infinitesimal_se3_twist"
+            )
             if _scalar_string(
                 diagnostics["single_view_component_fill_policy"],
                 "single_view_component_fill_policy",
                 diagnostics_path,
-            ) != "shared_unknown_normalized_infinitesimal_se3_twist":
+            ) != expected_component_fill_policy:
                 raise ValueError(
                     f"{diagnostics_path} single-view fill policy is incompatible"
                 )
@@ -1672,11 +1716,16 @@ def load_rigid_manifest(
             ):
                 if name not in diagnostics:
                     raise ValueError(f"{diagnostics_path} is missing {name}")
+            expected_motion_fill_method = (
+                "rigid_seed_single_view_partial_component_knn_lsmr"
+                if component_fill_only
+                else "rigid_seed_single_view_component_grouped_knn_lsmr"
+            )
             if _scalar_string(
                 diagnostics["motion_fill_method"],
                 "motion_fill_method",
                 diagnostics_path,
-            ) != "rigid_seed_single_view_component_grouped_knn_lsmr":
+            ) != expected_motion_fill_method:
                 raise ValueError(
                     f"{diagnostics_path} motion_fill_method is incompatible"
                 )
@@ -1695,6 +1744,132 @@ def load_rigid_manifest(
                 raise ValueError(
                     f"{diagnostics_path} completion connectivity is inconsistent"
                 )
+            if component_fill_only:
+                partial_required = {
+                    "single_view_observable_singular_ratio_min",
+                    "single_view_ray_direction_min_fraction",
+                    "single_view_component_observable_rank",
+                    "single_view_component_fill_nullity",
+                    "single_view_component_ray_dominated_basis_count",
+                    "single_view_component_trusted_knn_edge_count",
+                    "single_view_component_cross_knn_edge_count",
+                    "single_view_component_connected_to_trusted_mask",
+                    "single_view_component_postfill_normalized_residual",
+                    "single_view_component_ray_motion_rms",
+                    "single_view_component_tangent_motion_rms",
+                    "single_view_component_ray_motion_ratio",
+                    "single_view_component_partial_finite_drift_max",
+                }
+                partial_missing = sorted(partial_required - set(diagnostics))
+                if partial_missing:
+                    raise ValueError(
+                        f"{diagnostics_path} is missing partial component fields: "
+                        f"{partial_missing}"
+                    )
+                partial_observable_ratio_min = float(
+                    _scalar(
+                        diagnostics[
+                            "single_view_observable_singular_ratio_min"
+                        ],
+                        "single_view_observable_singular_ratio_min",
+                        diagnostics_path,
+                    ).item()
+                )
+                partial_ray_direction_min_fraction = float(
+                    _scalar(
+                        diagnostics[
+                            "single_view_ray_direction_min_fraction"
+                        ],
+                        "single_view_ray_direction_min_fraction",
+                        diagnostics_path,
+                    ).item()
+                )
+                if (
+                    not np.isfinite(partial_observable_ratio_min)
+                    or not 0.0 < partial_observable_ratio_min <= 1.0
+                    or not np.isfinite(partial_ray_direction_min_fraction)
+                    or not 0.0 <= partial_ray_direction_min_fraction <= 1.0
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} partial component thresholds are invalid"
+                    )
+                if not np.isclose(
+                    partial_observable_ratio_min,
+                    float(manifest_partial_observable_ratio),
+                    rtol=0.0,
+                    atol=1.0e-12,
+                ) or not np.isclose(
+                    partial_ray_direction_min_fraction,
+                    float(manifest_partial_ray_fraction),
+                    rtol=0.0,
+                    atol=1.0e-12,
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} partial thresholds differ from manifest"
+                    )
+                partial_observable_rank = np.asarray(
+                    diagnostics["single_view_component_observable_rank"]
+                )
+                partial_fill_nullity = np.asarray(
+                    diagnostics["single_view_component_fill_nullity"]
+                )
+                partial_trusted_knn_count = np.asarray(
+                    diagnostics["single_view_component_trusted_knn_edge_count"]
+                )
+                partial_ray_motion_ratio = np.asarray(
+                    diagnostics["single_view_component_ray_motion_ratio"],
+                    dtype=np.float32,
+                )
+                for name, values in (
+                    (
+                        "single_view_component_observable_rank",
+                        partial_observable_rank,
+                    ),
+                    (
+                        "single_view_component_fill_nullity",
+                        partial_fill_nullity,
+                    ),
+                    (
+                        "single_view_component_trusted_knn_edge_count",
+                        partial_trusted_knn_count,
+                    ),
+                ):
+                    if (
+                        values.shape != (num_components,)
+                        or not np.issubdtype(values.dtype, np.integer)
+                        or np.any(values < 0)
+                    ):
+                        raise ValueError(
+                            f"{diagnostics_path} {name} is invalid"
+                        )
+                if np.any(partial_observable_rank > 6) or np.any(
+                    partial_fill_nullity > 6
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} partial component dimensions exceed six"
+                    )
+                if (
+                    partial_ray_motion_ratio.shape != (num_components,)
+                    or not np.isfinite(partial_ray_motion_ratio).all()
+                    or np.any(partial_ray_motion_ratio < 0.0)
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} partial ray-motion ratio is invalid"
+                    )
+                partial_connected = np.asarray(
+                    diagnostics[
+                        "single_view_component_connected_to_trusted_mask"
+                    ]
+                )
+                if (
+                    partial_connected.dtype != np.bool_
+                    or not np.array_equal(
+                        partial_connected, single_view_component_completion
+                    )
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} partial trusted connectivity is inconsistent"
+                    )
         else:
             if np.any(completion_mask):
                 raise ValueError(
@@ -1718,6 +1893,7 @@ def load_rigid_manifest(
                 graph_source_path=graph_source_path,
                 points_world=points,
                 phi=phi.astype(np.complex64),
+                raw_rigid_phi=raw_rigid_phi.astype(np.complex64),
                 rigid_seed_mask=trusted_seed_mask,
                 quarantined_rigid_mask=rigid_seed_mask & ~trusted_seed_mask,
                 single_view_rigid_fill_mask=(
@@ -1738,6 +1914,29 @@ def load_rigid_manifest(
                 component_singular_ratio=component_singular_ratio,
                 component_motion_rms=component_motion_rms,
                 component_finite_drift_max=component_finite_drift,
+                single_view_component_completion_mask=(
+                    single_view_component_completion.astype(bool)
+                ),
+                single_view_component_observable_rank=(
+                    None
+                    if partial_observable_rank is None
+                    else partial_observable_rank.astype(np.int8)
+                ),
+                single_view_component_fill_nullity=(
+                    None
+                    if partial_fill_nullity is None
+                    else partial_fill_nullity.astype(np.int8)
+                ),
+                single_view_component_trusted_knn_edge_count=(
+                    None
+                    if partial_trusted_knn_count is None
+                    else partial_trusted_knn_count.astype(np.int32)
+                ),
+                single_view_component_ray_motion_ratio=(
+                    None
+                    if partial_ray_motion_ratio is None
+                    else partial_ray_motion_ratio.astype(np.float32)
+                ),
                 edge_component_index=expected_edge_component.astype(np.int32),
                 edge_finite_drift_max=edge_finite_drift,
             )
@@ -1747,6 +1946,7 @@ def load_rigid_manifest(
         manifest_path=manifest_path,
         source_checkpoint=source_checkpoint,
         motion_fill_enabled=motion_fill_enabled,
+        rigid_motion_fill_stage=rigid_motion_fill_stage,
         rigid_seed_min_valid_views=rigid_seed_min_valid_views,
         rigid_seed_min_singular_ratio=rigid_seed_min_singular_ratio,
         rigid_seed_max_finite_drift=rigid_seed_max_finite_drift,
@@ -2455,6 +2655,18 @@ class ObservedGraphViewer:
 
         max_edges = max(int(graph.edge_index.shape[0]) for graph in graphs)
         edge_step = max(max_edges // 200, 1)
+        partial_component_colors = (
+            (
+                "partial fill status",
+                "partial observable rank",
+                "partial fill nullity",
+                "trusted-KNN support",
+                "partial ray-motion ratio",
+            )
+            if rigid_manifest is not None
+            and rigid_manifest.rigid_motion_fill_stage == "single-view-components"
+            else ()
+        )
         rigid_color_options = (
             (
                 "component residual",
@@ -2465,6 +2677,7 @@ class ObservedGraphViewer:
                 "singular-ratio anomaly",
                 "motion-RMS anomaly",
             )
+            + partial_component_colors
             if rigid_manifest is not None
             else ()
         )
@@ -2540,7 +2753,7 @@ class ObservedGraphViewer:
             else:
                 self.graph_geometry = server.gui.add_dropdown(
                     "Graph geometry",
-                    options=("canonical", "deformed"),
+                    options=("canonical", "raw rigid", "deformed"),
                     initial_value="canonical",
                 )
                 self.phase = server.gui.add_slider(
@@ -2787,6 +3000,13 @@ class ObservedGraphViewer:
                     float(self.phase.value),
                     float(self.motion_scale.value),
                 )
+            elif str(self.graph_geometry.value) == "raw rigid":
+                all_display_points = deform_modal_points(
+                    rigid_mode.points_world,
+                    rigid_mode.raw_rigid_phi,
+                    float(self.phase.value),
+                    float(self.motion_scale.value),
+                )
             elif str(self.graph_geometry.value) != "canonical":
                 raise ValueError(
                     f"Unknown graph geometry: {self.graph_geometry.value}"
@@ -3002,6 +3222,88 @@ class ObservedGraphViewer:
                             component_anomaly[
                                 rigid_mode.edge_component_index[selected_edges]
                             ]
+                        )
+                    elif color_mode == "partial fill status":
+                        if rigid_mode is None:
+                            raise ValueError(
+                                "Partial fill status requires a rigid manifest"
+                            )
+                        edge_components = rigid_mode.edge_component_index[
+                            selected_edges
+                        ]
+                        edge_colors = np.full(
+                            (selected_edges.size, 3),
+                            _RIGID_DIAGNOSTIC_NORMAL_COLOR,
+                            dtype=np.float32,
+                        )
+                        single_view = (
+                            rigid_mode.component_distinct_valid_view_count[
+                                edge_components
+                            ]
+                            == 1
+                        )
+                        edge_colors[single_view] = _RIGID_DIAGNOSTIC_ANOMALY_COLOR
+                        completed = rigid_mode.single_view_component_completion_mask[
+                            edge_components
+                        ]
+                        edge_colors[completed] = _SINGLE_VIEW_RIGID_FILL_COLOR
+                    elif color_mode == "partial observable rank":
+                        if (
+                            rigid_mode is None
+                            or rigid_mode.single_view_component_observable_rank is None
+                        ):
+                            raise ValueError(
+                                "Partial observable rank requires component-only fill"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            rigid_mode.single_view_component_observable_rank[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ].astype(np.float32)
+                        )
+                    elif color_mode == "partial fill nullity":
+                        if (
+                            rigid_mode is None
+                            or rigid_mode.single_view_component_fill_nullity is None
+                        ):
+                            raise ValueError(
+                                "Partial fill nullity requires component-only fill"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            rigid_mode.single_view_component_fill_nullity[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ].astype(np.float32)
+                        )
+                    elif color_mode == "trusted-KNN support":
+                        if (
+                            rigid_mode is None
+                            or rigid_mode.single_view_component_trusted_knn_edge_count
+                            is None
+                        ):
+                            raise ValueError(
+                                "Trusted-KNN support requires component-only fill"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            np.log1p(
+                                rigid_mode.single_view_component_trusted_knn_edge_count[
+                                    rigid_mode.edge_component_index[selected_edges]
+                                ]
+                            )
+                        )
+                    elif color_mode == "partial ray-motion ratio":
+                        if (
+                            rigid_mode is None
+                            or rigid_mode.single_view_component_ray_motion_ratio
+                            is None
+                        ):
+                            raise ValueError(
+                                "Partial ray-motion ratio requires component-only fill"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            np.log1p(
+                                rigid_mode.single_view_component_ray_motion_ratio[
+                                    rigid_mode.edge_component_index[selected_edges]
+                                ]
+                            )
                         )
                     else:
                         raise ValueError(

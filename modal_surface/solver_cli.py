@@ -14,6 +14,9 @@ RIGID_COMPONENT_RCOND_DEFAULT = 1e-8
 RIGID_SEED_MIN_VALID_VIEWS_DEFAULT = 2
 RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT = 1e-3
 RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT = 2.0
+RIGID_MOTION_FILL_STAGE_DEFAULT = "joint"
+RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT = 1.0e-2
+RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT = 0.8
 
 
 def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
@@ -69,6 +72,34 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Maximum component finite-amplitude edge-length drift retained as "
             "a trusted rigid seed (default: 2.0)."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-motion-fill-stage",
+        choices=["joint", "single-view-components"],
+        default=RIGID_MOTION_FILL_STAGE_DEFAULT,
+        help=(
+            "Run the existing joint component/point fill, or only complete "
+            "single-view component weak directions before any pointwise fill "
+            f"(default: {RIGID_MOTION_FILL_STAGE_DEFAULT})."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-single-view-observable-ratio",
+        type=float,
+        default=RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT,
+        help=(
+            "Minimum component observation singular-value ratio retained in "
+            "the single-view observable twist (default: 1e-2)."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-single-view-ray-direction-min-fraction",
+        type=float,
+        default=RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT,
+        help=(
+            "Minimum induced radial-motion fraction that moves a single-view "
+            "twist basis direction into KNN completion (default: 0.8)."
         ),
     )
 
@@ -150,6 +181,22 @@ def staged_solver_manifest_parameters(args: argparse.Namespace) -> dict[str, Any
 
 
 def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, Any]:
+    motion_fill_stage = str(args.rigid_motion_fill_stage)
+    motion_fill_enabled = bool(getattr(args, "motion_fill", False))
+    component_fill_only = motion_fill_enabled and (
+        motion_fill_stage == "single-view-components"
+    )
+    if component_fill_only:
+        nonseed_policy = "single_view_partial_rigid_other_gaussians_zero"
+        component_fill_policy = (
+            "observable_twist_plus_knn_filled_weak_and_ray_directions"
+        )
+    elif motion_fill_enabled:
+        nonseed_policy = "single_view_component_rigid_else_free_motion_fill"
+        component_fill_policy = "shared_unknown_normalized_infinitesimal_se3_twist"
+    else:
+        nonseed_policy = "zero_without_motion_fill"
+        component_fill_policy = "disabled"
     return {
         "solver": "rigid_components",
         "rigidity_model": "complex_infinitesimal_se3",
@@ -180,15 +227,14 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
         "rigid_seed_max_finite_drift": float(
             args.rigid_seed_max_finite_drift
         ),
-        "nonseed_policy": (
-            "single_view_component_rigid_else_free_motion_fill"
-            if bool(getattr(args, "motion_fill", False))
-            else "zero_without_motion_fill"
+        "nonseed_policy": nonseed_policy,
+        "single_view_component_fill_policy": component_fill_policy,
+        "rigid_motion_fill_stage": motion_fill_stage,
+        "rigid_single_view_observable_ratio": float(
+            args.rigid_single_view_observable_ratio
         ),
-        "single_view_component_fill_policy": (
-            "shared_unknown_normalized_infinitesimal_se3_twist"
-            if bool(getattr(args, "motion_fill", False))
-            else "disabled"
+        "rigid_single_view_ray_direction_min_fraction": float(
+            args.rigid_single_view_ray_direction_min_fraction
         ),
         "alpha_solver_model": str(args.alpha_model),
         "alpha_gain_min": float(args.alpha_gain_min),
