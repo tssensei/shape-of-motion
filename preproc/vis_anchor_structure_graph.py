@@ -144,6 +144,60 @@ _GAUSSIAN_GROUP_FIELDS = (
     "opacities",
 )
 
+_COVERAGE_REQUIRED_FIELDS = {
+    "version",
+    "point_type",
+    "source_checkpoint",
+    "reference_observation_path",
+    "num_foreground_gaussians",
+    "gaussian_indices",
+    "points_world",
+    "view_ids",
+    "k_values",
+    "baseline_k",
+    "baseline_k_index",
+    "category_names",
+    "preselect_hit_count_by_view",
+    "positive_hit_count_by_view",
+    "selected_hit_count_by_k_view",
+    "best_positive_rank_by_view",
+    "best_positive_score_by_view",
+    "best_positive_score_ratio_by_view",
+    "preselect_view_count",
+    "positive_view_count",
+    "selected_view_count_by_k",
+    "selected_sample_count_by_k",
+    "category_by_k",
+    "category_count_by_k",
+    "preselect_view_count_histogram",
+    "positive_view_count_histogram",
+    "selected_view_count_histogram_by_k",
+    "mask_erode_iters",
+    "pixel_sample_stride",
+    "pixel_preselect_k",
+    "pixel_render_acc_min",
+    "pixel_min_contribution",
+    "candidate_method",
+    "replay_validation",
+}
+
+_COVERAGE_CATEGORY_NAMES = (
+    "insufficient_preselect_views",
+    "multiview_preselect_contribution_lost",
+    "multiview_positive_topk_lost",
+    "selected_multiview",
+)
+
+_COVERAGE_CATEGORY_COLORS = np.asarray(
+    (
+        (0.45, 0.45, 0.45),
+        (1.0, 0.55, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 0.45, 1.0),
+    ),
+    dtype=np.float32,
+)
+
 
 @dataclass(frozen=True)
 class AnchorGraphViewData:
@@ -183,36 +237,55 @@ class GaussianVisualizationData:
     background: GaussianSplatGroup | None
 
 
-def stable_uniform_edge_indices(
-    edge_count: int,
-    max_visible_edges: int,
-) -> np.ndarray:
+@dataclass(frozen=True)
+class ObservationCoverageViewData:
+    artifact_path: Path
+    source_checkpoint: str
+    points_world: np.ndarray
+    k_values: np.ndarray
+    category_names: tuple[str, ...]
+    category_by_k: np.ndarray
+
+
+def stable_uniform_indices(count: int, maximum: int) -> np.ndarray:
+    if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or count < 0:
+        raise ValueError("count must be a non-negative integer")
     if (
-        isinstance(edge_count, bool)
-        or not isinstance(edge_count, (int, np.integer))
-        or edge_count < 0
+        isinstance(maximum, bool)
+        or not isinstance(maximum, (int, np.integer))
+        or maximum < 0
     ):
-        raise ValueError("edge_count must be a non-negative integer")
-    if (
-        isinstance(max_visible_edges, bool)
-        or not isinstance(max_visible_edges, (int, np.integer))
-        or max_visible_edges < 0
-    ):
-        raise ValueError("max_visible_edges must be a non-negative integer")
-    visible_count = min(int(edge_count), int(max_visible_edges))
+        raise ValueError("maximum must be a non-negative integer")
+    visible_count = min(int(count), int(maximum))
     if visible_count == 0:
         return np.empty((0,), dtype=np.int64)
-    if visible_count == int(edge_count):
-        return np.arange(edge_count, dtype=np.int64)
+    if visible_count == int(count):
+        return np.arange(count, dtype=np.int64)
     return np.floor(
         np.linspace(
             0,
-            edge_count,
+            count,
             visible_count,
             endpoint=False,
             dtype=np.float64,
         )
     ).astype(np.int64)
+
+
+def stable_uniform_edge_indices(
+    edge_count: int,
+    max_visible_edges: int,
+) -> np.ndarray:
+    return stable_uniform_indices(edge_count, max_visible_edges)
+
+
+def observation_coverage_colors(category: np.ndarray) -> np.ndarray:
+    values = np.asarray(category)
+    if values.ndim != 1 or not np.issubdtype(values.dtype, np.integer):
+        raise ValueError("Coverage category must be a 1-D integer array")
+    if np.any(values < 0) or np.any(values >= len(_COVERAGE_CATEGORY_NAMES)):
+        raise ValueError("Coverage category contains an unknown value")
+    return _COVERAGE_CATEGORY_COLORS[values]
 
 
 def anchor_graph_component_colors(component_index: np.ndarray) -> np.ndarray:
@@ -979,6 +1052,153 @@ def load_gaussian_visualization_sidecar(
     )
 
 
+def load_observation_coverage(
+    path: Path,
+    graphs: tuple[AnchorGraphViewData, ...],
+    gaussians: GaussianVisualizationData | None = None,
+) -> ObservationCoverageViewData:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with np.load(path, allow_pickle=False) as archive:
+        missing = sorted(_COVERAGE_REQUIRED_FIELDS - set(archive.files))
+        if missing:
+            raise ValueError(f"{path} missing required fields: {missing}")
+        arrays = {name: archive[name] for name in archive.files}
+    version_value = int(_scalar(arrays["version"], "version", path))
+    if version_value != 1:
+        raise ValueError(f"{path} has unsupported version={version_value}")
+    point_type = _scalar_string(arrays["point_type"], "point_type", path)
+    if point_type != "foreground_gaussian_observation_coverage":
+        raise ValueError(f"{path} has unsupported point_type={point_type!r}")
+    source_checkpoint = _scalar_string(
+        arrays["source_checkpoint"],
+        "source_checkpoint",
+        path,
+    )
+    candidate_method = _scalar_string(
+        arrays["candidate_method"],
+        "candidate_method",
+        path,
+    )
+    if candidate_method != "rendered_depth_gaussian_contribution":
+        raise ValueError(f"{path} has unsupported candidate_method")
+    replay_validation = _scalar_string(
+        arrays["replay_validation"],
+        "replay_validation",
+        path,
+    )
+    if replay_validation != "exact_reference_counts":
+        raise ValueError(f"{path} was not validated against reference counts")
+    num_points = int(
+        _scalar(
+            arrays["num_foreground_gaussians"],
+            "num_foreground_gaussians",
+            path,
+        )
+    )
+    points = np.asarray(arrays["points_world"], dtype=np.float32)
+    if points.shape != (num_points, 3) or not np.isfinite(points).all():
+        raise ValueError(f"{path} points_world must be finite ({num_points},3)")
+    indices = np.asarray(arrays["gaussian_indices"])
+    if indices.shape != (num_points,) or not np.array_equal(
+        indices,
+        np.arange(num_points, dtype=indices.dtype),
+    ):
+        raise ValueError(f"{path} gaussian_indices must be contiguous")
+    k_values = np.asarray(arrays["k_values"], dtype=np.int32)
+    if (
+        k_values.ndim != 1
+        or k_values.shape[0] == 0
+        or np.any(k_values <= 0)
+        or (k_values.shape[0] > 1 and np.any(np.diff(k_values) <= 0))
+    ):
+        raise ValueError(f"{path} k_values must be positive and increasing")
+    num_k = int(k_values.shape[0])
+    baseline_k = int(_scalar(arrays["baseline_k"], "baseline_k", path))
+    baseline_index = int(
+        _scalar(arrays["baseline_k_index"], "baseline_k_index", path)
+    )
+    if not 0 <= baseline_index < num_k or k_values[baseline_index] != baseline_k:
+        raise ValueError(f"{path} has inconsistent baseline K metadata")
+    category_names = tuple(
+        str(value) for value in np.asarray(arrays["category_names"]).tolist()
+    )
+    if category_names != _COVERAGE_CATEGORY_NAMES:
+        raise ValueError(f"{path} has unsupported coverage category names")
+    categories = np.asarray(arrays["category_by_k"])
+    if (
+        categories.shape != (num_k, num_points)
+        or not np.issubdtype(categories.dtype, np.integer)
+        or np.any(categories < 0)
+        or np.any(categories >= len(category_names))
+    ):
+        raise ValueError(f"{path} category_by_k has invalid shape or values")
+    category_counts = np.asarray(arrays["category_count_by_k"])
+    expected_category_counts = np.stack(
+        [
+            np.bincount(categories[index], minlength=len(category_names))
+            for index in range(num_k)
+        ],
+        axis=0,
+    )
+    if not np.array_equal(category_counts, expected_category_counts):
+        raise ValueError(f"{path} category_count_by_k is inconsistent")
+    view_ids = np.asarray(arrays["view_ids"])
+    if view_ids.ndim != 1 or view_ids.shape[0] == 0:
+        raise ValueError(f"{path} view_ids must be a non-empty 1-D array")
+    num_views = int(view_ids.shape[0])
+    expected_shapes = {
+        "preselect_hit_count_by_view": (num_points, num_views),
+        "positive_hit_count_by_view": (num_points, num_views),
+        "selected_hit_count_by_k_view": (num_k, num_points, num_views),
+        "best_positive_rank_by_view": (num_points, num_views),
+        "best_positive_score_by_view": (num_points, num_views),
+        "best_positive_score_ratio_by_view": (num_points, num_views),
+        "preselect_view_count": (num_points,),
+        "positive_view_count": (num_points,),
+        "selected_view_count_by_k": (num_k, num_points),
+        "selected_sample_count_by_k": (num_k, num_points),
+        "preselect_view_count_histogram": (num_views + 1,),
+        "positive_view_count_histogram": (num_views + 1,),
+        "selected_view_count_histogram_by_k": (num_k, num_views + 1),
+    }
+    for name, expected_shape in expected_shapes.items():
+        if np.asarray(arrays[name]).shape != expected_shape:
+            raise ValueError(
+                f"{path} field {name} must have shape {expected_shape}"
+            )
+    for graph in graphs:
+        if graph.source_checkpoint != source_checkpoint:
+            raise ValueError(f"{path} source_checkpoint does not match graph")
+        if graph.num_foreground_gaussians != num_points:
+            raise ValueError(f"{path} foreground count does not match graph")
+        if graph.anchor_gaussian_indices.shape[0] and not np.allclose(
+            points[graph.anchor_gaussian_indices],
+            graph.anchor_points_world,
+            rtol=1.0e-6,
+            atol=1.0e-5,
+        ):
+            raise ValueError(f"{path} Gaussian centers do not match graph anchors")
+    if gaussians is not None:
+        if gaussians.source_checkpoint != source_checkpoint:
+            raise ValueError(f"{path} source_checkpoint does not match sidecar")
+        if not np.allclose(
+            points,
+            gaussians.foreground.centers,
+            rtol=1.0e-6,
+            atol=1.0e-5,
+        ):
+            raise ValueError(f"{path} Gaussian centers do not match sidecar")
+    return ObservationCoverageViewData(
+        artifact_path=path,
+        source_checkpoint=source_checkpoint,
+        points_world=points,
+        k_values=k_values,
+        category_names=category_names,
+        category_by_k=categories.astype(np.int8),
+    )
+
+
 class StaticGaussianViewer:
     def __init__(
         self,
@@ -1239,6 +1459,109 @@ class AnchorGraphViewer:
                     )
 
 
+class ObservationCoverageViewer:
+    def __init__(
+        self,
+        server: Any,
+        coverage: ObservationCoverageViewData,
+        *,
+        max_visible_points: int,
+        point_size: float,
+        world_center: np.ndarray,
+    ) -> None:
+        self.server = server
+        self.coverage = coverage
+        self.world_center = np.asarray(world_center, dtype=np.float32)
+        self.k_labels = tuple(f"K={int(value)}" for value in coverage.k_values)
+        self.category_options = ("all categories",) + coverage.category_names
+        self._point_handle = None
+        self._update_lock = threading.Lock()
+        num_points = int(coverage.points_world.shape[0])
+        point_step = max(num_points // 200, 1)
+        with server.gui.add_folder("Observation coverage"):
+            self.show_coverage = server.gui.add_checkbox("Show coverage", True)
+            self.k_value = server.gui.add_dropdown(
+                "Candidate K",
+                options=self.k_labels,
+                initial_value=self.k_labels[0],
+            )
+            self.category = server.gui.add_dropdown(
+                "Category",
+                options=self.category_options,
+                initial_value="all categories",
+            )
+            self.max_visible_points = server.gui.add_slider(
+                "Max visible points",
+                min=0,
+                max=max(num_points, 1),
+                step=point_step,
+                initial_value=min(max_visible_points, num_points),
+            )
+            self.point_size = server.gui.add_slider(
+                "Coverage point size",
+                min=0.0001,
+                max=0.008,
+                step=0.0001,
+                initial_value=point_size,
+            )
+        for handle in (
+            self.show_coverage,
+            self.k_value,
+            self.category,
+            self.max_visible_points,
+            self.point_size,
+        ):
+            handle.on_update(self._update)
+        self._update()
+
+    def _update(self, _event: Any = None) -> None:
+        with self._update_lock:
+            if self._point_handle is not None:
+                self._point_handle.remove()
+                self._point_handle = None
+            if not bool(self.show_coverage.value):
+                return
+            selected_k = str(self.k_value.value)
+            if selected_k not in self.k_labels:
+                raise ValueError(f"Unknown coverage K: {selected_k}")
+            k_index = self.k_labels.index(selected_k)
+            categories = self.coverage.category_by_k[k_index]
+            selected_category = str(self.category.value)
+            if selected_category == "all categories":
+                gaussian_indices = np.arange(
+                    self.coverage.points_world.shape[0],
+                    dtype=np.int64,
+                )
+            elif selected_category in self.coverage.category_names:
+                category_index = self.coverage.category_names.index(
+                    selected_category
+                )
+                gaussian_indices = np.flatnonzero(categories == category_index)
+            else:
+                raise ValueError(
+                    f"Unknown coverage category: {selected_category}"
+                )
+            visible = stable_uniform_indices(
+                gaussian_indices.shape[0],
+                int(self.max_visible_points.value),
+            )
+            gaussian_indices = gaussian_indices[visible]
+            if gaussian_indices.shape[0] == 0:
+                return
+            self._point_handle = self.server.scene.add_point_cloud(
+                "/observation_coverage/points",
+                points=center_world_points(
+                    self.coverage.points_world[gaussian_indices],
+                    self.world_center,
+                ),
+                colors=observation_coverage_colors(
+                    categories[gaussian_indices]
+                ),
+                point_size=float(self.point_size.value),
+                point_shape="circle",
+            )
+
+
 def _configure_initial_camera(
     server: Any,
     graphs: tuple[AnchorGraphViewData, ...],
@@ -1285,6 +1608,11 @@ def build_parser() -> argparse.ArgumentParser:
             "export_static_gaussians_for_viser.py"
         ),
     )
+    parser.add_argument(
+        "--coverage-npz",
+        type=Path,
+        help="Optional version-1 Gaussian observation coverage diagnostic",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--max-visible-edges", type=int, default=20000)
@@ -1292,6 +1620,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-point-size", type=float, default=0.0009)
     parser.add_argument("--isolated-point-size", type=float, default=0.002)
     parser.add_argument("--gaussian-scale", type=float, default=1.0)
+    parser.add_argument("--coverage-max-visible-points", type=int, default=50000)
+    parser.add_argument("--coverage-point-size", type=float, default=0.0009)
     return parser
 
 
@@ -1300,11 +1630,17 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--port must lie in [1,65535]")
     if args.max_visible_edges < 0:
         raise ValueError("--max-visible-edges must be non-negative")
+    if args.coverage_max_visible_points < 0:
+        raise ValueError("--coverage-max-visible-points must be non-negative")
     if not np.isfinite(args.line_width) or not 0.1 <= args.line_width <= 10.0:
         raise ValueError("--line-width must lie in [0.1,10.0]")
     if not np.isfinite(args.gaussian_scale) or not 0.1 <= args.gaussian_scale <= 3.0:
         raise ValueError("--gaussian-scale must lie in [0.1,3.0]")
-    for name in ("anchor_point_size", "isolated_point_size"):
+    for name in (
+        "anchor_point_size",
+        "isolated_point_size",
+        "coverage_point_size",
+    ):
         value = float(getattr(args, name))
         if not np.isfinite(value) or not 0.0001 <= value <= 0.008:
             option = "--" + name.replace("_", "-")
@@ -1322,6 +1658,11 @@ def main() -> None:
     gaussians = (
         load_gaussian_visualization_sidecar(args.gaussian_npz, graphs)
         if args.gaussian_npz is not None
+        else None
+    )
+    coverage = (
+        load_observation_coverage(args.coverage_npz, graphs, gaussians)
+        if args.coverage_npz is not None
         else None
     )
 
@@ -1372,6 +1713,14 @@ def main() -> None:
         isolated_point_size=args.isolated_point_size,
         world_center=world_center,
     )
+    if coverage is not None:
+        ObservationCoverageViewer(
+            server,
+            coverage,
+            max_visible_points=args.coverage_max_visible_points,
+            point_size=args.coverage_point_size,
+            world_center=world_center,
+        )
     print(
         "Loaded "
         f"{len(graphs)} mode(s), "
@@ -1392,6 +1741,11 @@ def main() -> None:
             "Loaded static Gaussian sidecar with "
             f"{gaussians.foreground.centers.shape[0]} foreground and "
             f"{background_count} background splat(s)."
+        )
+    if coverage is not None:
+        print(
+            f"Loaded observation coverage for {coverage.points_world.shape[0]} "
+            f"Gaussians at K={coverage.k_values.tolist()}."
         )
     print(
         f"Viser {viser_version} listening on {server.get_host()}:{server.get_port()}"

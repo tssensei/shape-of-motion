@@ -18,8 +18,11 @@ from preproc.vis_anchor_structure_graph import (
     load_anchor_graph_source,
     load_anchor_graphs_from_manifest,
     load_gaussian_visualization_sidecar,
+    load_observation_coverage,
+    observation_coverage_colors,
     scale_gaussian_opacities,
     stable_uniform_edge_indices,
+    stable_uniform_indices,
 )
 
 
@@ -185,6 +188,70 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
             fg_opacities=np.full((3, 1), 0.8, dtype=np.float32),
         )
 
+    def _write_coverage(
+        self,
+        path: Path,
+        *,
+        source_checkpoint: str = "source.ckpt",
+        center_offset: float = 0.0,
+    ) -> None:
+        points = np.array(
+            [[0.0, 0.0, 0.0], [0.004, 0.0, 0.0], [0.02, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        points[0, 0] += center_offset
+        categories = np.array([[0, 2, 3], [0, 3, 3]], dtype=np.int8)
+        np.savez_compressed(
+            path,
+            version=np.array(1, dtype=np.int32),
+            point_type=np.array("foreground_gaussian_observation_coverage"),
+            source_checkpoint=np.array(source_checkpoint),
+            reference_observation_path=np.array("observations/mode.npz"),
+            num_foreground_gaussians=np.array(3, dtype=np.int64),
+            gaussian_indices=np.arange(3, dtype=np.int64),
+            points_world=points,
+            view_ids=np.array(["view1", "view2"]),
+            k_values=np.array([4, 8], dtype=np.int32),
+            baseline_k=np.array(4, dtype=np.int32),
+            baseline_k_index=np.array(0, dtype=np.int32),
+            category_names=np.array(
+                [
+                    "insufficient_preselect_views",
+                    "multiview_preselect_contribution_lost",
+                    "multiview_positive_topk_lost",
+                    "selected_multiview",
+                ]
+            ),
+            preselect_hit_count_by_view=np.ones((3, 2), dtype=np.int32),
+            positive_hit_count_by_view=np.ones((3, 2), dtype=np.int32),
+            selected_hit_count_by_k_view=np.ones((2, 3, 2), dtype=np.int32),
+            best_positive_rank_by_view=np.ones((3, 2), dtype=np.int16),
+            best_positive_score_by_view=np.ones((3, 2), dtype=np.float32),
+            best_positive_score_ratio_by_view=np.ones((3, 2), dtype=np.float32),
+            preselect_view_count=np.array([1, 2, 2], dtype=np.int8),
+            positive_view_count=np.array([1, 2, 2], dtype=np.int8),
+            selected_view_count_by_k=np.array(
+                [[1, 1, 2], [1, 2, 2]], dtype=np.int8
+            ),
+            selected_sample_count_by_k=np.ones((2, 3), dtype=np.int32),
+            category_by_k=categories,
+            category_count_by_k=np.array(
+                [[1, 0, 1, 1], [1, 0, 0, 2]], dtype=np.int64
+            ),
+            preselect_view_count_histogram=np.array([0, 1, 2], dtype=np.int64),
+            positive_view_count_histogram=np.array([0, 1, 2], dtype=np.int64),
+            selected_view_count_histogram_by_k=np.array(
+                [[0, 2, 1], [0, 1, 2]], dtype=np.int64
+            ),
+            mask_erode_iters=np.array(1, dtype=np.int32),
+            pixel_sample_stride=np.array(2, dtype=np.int32),
+            pixel_preselect_k=np.array(32, dtype=np.int32),
+            pixel_render_acc_min=np.array(0.05, dtype=np.float32),
+            pixel_min_contribution=np.array(1.0e-12, dtype=np.float32),
+            candidate_method=np.array("rendered_depth_gaussian_contribution"),
+            replay_validation=np.array("exact_reference_counts"),
+        )
+
     def test_direct_artifact_and_display_helpers_are_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             graph_path = Path(tmp) / "graph.npz"
@@ -200,6 +267,7 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
             stable_uniform_edge_indices(10, 4),
             [0, 2, 5, 7],
         )
+        np.testing.assert_array_equal(stable_uniform_indices(10, 4), [0, 2, 5, 7])
         component_colors = anchor_graph_component_colors(
             np.array([0, 1, 0], dtype=np.int32)
         )
@@ -311,6 +379,34 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shape"):
             scale_gaussian_opacities(source[:, 0], 0.5)
 
+    def test_observation_coverage_loading_colors_and_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph_path = root / "graph.npz"
+            sidecar_path = root / "gaussians.npz"
+            coverage_path = root / "coverage.npz"
+            self._write_graph(graph_path)
+            self._write_gaussian_sidecar(sidecar_path)
+            self._write_coverage(coverage_path)
+            graphs = load_anchor_graph_source(
+                manifest_path=None,
+                graph_path=graph_path,
+            )
+            gaussians = load_gaussian_visualization_sidecar(sidecar_path, graphs)
+            coverage = load_observation_coverage(
+                coverage_path,
+                graphs,
+                gaussians,
+            )
+            np.testing.assert_array_equal(coverage.k_values, [4, 8])
+            np.testing.assert_allclose(
+                observation_coverage_colors(coverage.category_by_k[0]),
+                [[0.45, 0.45, 0.45], [1.0, 0.0, 0.0], [0.0, 0.45, 1.0]],
+            )
+            self._write_coverage(coverage_path, center_offset=1.0e-3)
+            with self.assertRaisesRegex(ValueError, "centers do not match"):
+                load_observation_coverage(coverage_path, graphs, gaussians)
+
     def test_cli_requires_one_source_and_validates_display_ranges(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -319,10 +415,13 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
                 "graph.npz",
                 "--gaussian-npz",
                 "gaussians.npz",
+                "--coverage-npz",
+                "coverage.npz",
             ]
         )
         _validate_args(args)
         self.assertEqual(args.gaussian_npz, Path("gaussians.npz"))
+        self.assertEqual(args.coverage_npz, Path("coverage.npz"))
         with self.assertRaises(SystemExit):
             parser.parse_args([])
         with self.assertRaises(SystemExit):

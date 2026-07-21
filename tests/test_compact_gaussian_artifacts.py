@@ -359,7 +359,7 @@ class CompactGaussianArtifactTests(unittest.TestCase):
             with (
                 patch.object(
                     gaussian_solver_app,
-                    "_load_fg_pixel_candidate_inputs_from_checkpoint",
+                    "load_fg_pixel_candidate_inputs_from_checkpoint",
                     return_value=_checkpoint_inputs(observations["points_world"]),
                 ),
                 patch.object(
@@ -437,7 +437,7 @@ class CompactGaussianArtifactTests(unittest.TestCase):
                 with (
                     patch.object(
                         gaussian_solver_app,
-                        "_load_fg_pixel_candidate_inputs_from_checkpoint",
+                        "load_fg_pixel_candidate_inputs_from_checkpoint",
                         return_value=_checkpoint_inputs(observations["points_world"]),
                     ),
                     patch.object(
@@ -524,7 +524,7 @@ class CompactGaussianArtifactTests(unittest.TestCase):
             with (
                 patch.object(
                     gaussian_solver_app,
-                    "_load_fg_pixel_candidate_inputs_from_checkpoint",
+                    "load_fg_pixel_candidate_inputs_from_checkpoint",
                     return_value=_checkpoint_inputs(observations["points_world"]),
                 ),
                 patch.object(

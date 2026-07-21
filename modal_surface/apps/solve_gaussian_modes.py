@@ -336,7 +336,7 @@ def _validate_anchor_graph_arguments(
     )
 
 
-def _load_fg_pixel_candidate_inputs_from_checkpoint(
+def load_fg_pixel_candidate_inputs_from_checkpoint(
     path: str,
     view_config_paths: list[str],
 ) -> tuple[
@@ -791,7 +791,7 @@ def run(args: argparse.Namespace) -> None:
         fg_colors,
         rendered_depths,
         rendered_accs,
-    ) = _load_fg_pixel_candidate_inputs_from_checkpoint(
+    ) = load_fg_pixel_candidate_inputs_from_checkpoint(
         args.input_ckpt,
         view_configs_paths,
     )
