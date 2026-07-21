@@ -174,3 +174,14 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   complex128 first-order rigidity check from the quantization-accounted
   complex64 persistence check. Visual motion and component/fill diagnostics
   remain to be inspected in the standalone Viewer.
+- Standalone Viewer inspection found that most visibly flying components were
+  highlighted by the default single-view anomaly diagnostic, supporting
+  insufficient multi-view support as the dominant failure mode.
+- The low singular-ratio diagnostic predominantly selected very small
+  components containing only one or two accepted graph edges. These are good
+  candidates for removing from the trusted rigid-seed set rather than deleting
+  their Gaussians or changing canonical indices.
+- The P99 component-motion-RMS diagnostic selected only a small subset of the
+  visibly incorrect components, but every selected component was flying. Motion
+  RMS is therefore a high-precision, low-recall outcome diagnostic and should
+  not be the primary rejection rule.
