@@ -25,6 +25,7 @@ from preproc.vis_anchor_structure_graph import (
     load_observation_coverage,
     observation_coverage_colors,
     scale_gaussian_opacities,
+    staged_partial_mask,
     stable_uniform_edge_indices,
     stable_uniform_indices,
 )
@@ -542,6 +543,13 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
                 gaussians,
             )
         self.assertEqual(residuals.mode_index, 4)
+        np.testing.assert_array_equal(residuals.partial_mask, [False, False, False])
+        np.testing.assert_array_equal(
+            staged_partial_mask(np.array([0, 3, 5], dtype=np.int8)),
+            [False, True, False],
+        )
+        with self.assertRaisesRegex(ValueError, "unknown value"):
+            staged_partial_mask(np.array([8], dtype=np.int8))
         np.testing.assert_allclose(
             anchor_residual_fraction_colors(
                 np.array([0.0, 0.5, 1.0], dtype=np.float32)

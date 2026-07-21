@@ -276,6 +276,11 @@ _RESIDUAL_SOURCE_COLORS = np.asarray(
     dtype=np.float32,
 )
 
+_STAGED_ANCHOR_STATUS = 0
+_STAGED_PARTIAL_STATUS = 3
+_STAGED_POINT_STATUS_COUNT = 8
+_PARTIAL_POINT_COLOR = np.asarray((1.0, 0.0, 1.0), dtype=np.float32)
+
 
 @dataclass(frozen=True)
 class AnchorGraphViewData:
@@ -343,6 +348,7 @@ class AnchorResidualViewData:
     selected_multiview_mask: np.ndarray
     residual_rejected_mask: np.ndarray
     anchor_mask: np.ndarray
+    partial_mask: np.ndarray
     residual_source_class: np.ndarray
 
 
@@ -435,6 +441,15 @@ def anchor_residual_view_colors(view_indices: np.ndarray) -> np.ndarray:
     if np.any(valid):
         colors[valid] = anchor_graph_component_colors(indices[valid])
     return colors
+
+
+def staged_partial_mask(point_status: np.ndarray) -> np.ndarray:
+    status = np.asarray(point_status)
+    if status.ndim != 1 or not np.issubdtype(status.dtype, np.integer):
+        raise ValueError("Staged point status must be a 1-D integer array")
+    if np.any(status < 0) or np.any(status >= _STAGED_POINT_STATUS_COUNT):
+        raise ValueError("Staged point status contains an unknown value")
+    return status == _STAGED_PARTIAL_STATUS
 
 
 def anchor_graph_component_colors(component_index: np.ndarray) -> np.ndarray:
@@ -1475,6 +1490,8 @@ def load_anchor_residual_diagnostics(
         or np.any(source_class >= len(_RESIDUAL_SOURCE_NAMES))
     ):
         raise ValueError(f"{path} residual_source_class contains invalid values")
+    staged_status = np.asarray(arrays["staged_point_solution_status"])
+    partial_mask = staged_partial_mask(staged_status)
     for graph in graphs:
         if graph.source_checkpoint != source_checkpoint:
             raise ValueError(f"{path} source_checkpoint does not match graph")
@@ -1488,6 +1505,8 @@ def load_anchor_residual_diagnostics(
     ):
         raise ValueError(f"{path} Gaussian centers do not match graph anchors")
     anchor_mask = np.asarray(arrays["anchor_mask"], dtype=bool)
+    if not np.array_equal(anchor_mask, staged_status == _STAGED_ANCHOR_STATUS):
+        raise ValueError(f"{path} staged point status does not match anchor_mask")
     if not np.array_equal(
         np.flatnonzero(anchor_mask),
         matching_graph.anchor_gaussian_indices,
@@ -1536,6 +1555,7 @@ def load_anchor_residual_diagnostics(
             arrays["residual_rejected_mask"], dtype=bool
         ),
         anchor_mask=anchor_mask,
+        partial_mask=partial_mask,
         residual_source_class=source_class.astype(np.int8),
     )
 
@@ -1917,8 +1937,10 @@ class AnchorResidualDiagnosticViewer:
         self.diagnostics = diagnostics
         self.world_center = np.asarray(world_center, dtype=np.float32)
         self._point_handle = None
+        self._partial_handle = None
         self._update_lock = threading.Lock()
         num_points = int(diagnostics.points_world.shape[0])
+        partial_count = int(np.count_nonzero(diagnostics.partial_mask))
         point_step = max(num_points // 200, 1)
         with server.gui.add_folder("Anchor residual diagnostics"):
             self.show_diagnostics = server.gui.add_checkbox(
@@ -1948,6 +1970,10 @@ class AnchorResidualDiagnosticViewer:
                 ),
                 initial_value="within fraction",
             )
+            self.show_partial = server.gui.add_checkbox(
+                f"Show partial Gaussians ({partial_count})",
+                False,
+            )
             self.max_visible_points = server.gui.add_slider(
                 "Max residual points",
                 min=0,
@@ -1966,6 +1992,7 @@ class AnchorResidualDiagnosticViewer:
             self.show_diagnostics,
             self.filter,
             self.metric,
+            self.show_partial,
             self.max_visible_points,
             self.point_size,
         ):
@@ -2024,21 +2051,43 @@ class AnchorResidualDiagnosticViewer:
             if self._point_handle is not None:
                 self._point_handle.remove()
                 self._point_handle = None
-            if not bool(self.show_diagnostics.value):
-                return
-            indices = self._selected_indices()
-            if indices.shape[0] == 0:
-                return
-            self._point_handle = self.server.scene.add_point_cloud(
-                "/anchor_residual_diagnostics/points",
-                points=center_world_points(
-                    self.diagnostics.points_world[indices],
-                    self.world_center,
-                ),
-                colors=self._colors(indices),
-                point_size=float(self.point_size.value),
-                point_shape="circle",
-            )
+            if self._partial_handle is not None:
+                self._partial_handle.remove()
+                self._partial_handle = None
+            if bool(self.show_diagnostics.value):
+                indices = self._selected_indices()
+                if indices.shape[0]:
+                    self._point_handle = self.server.scene.add_point_cloud(
+                        "/anchor_residual_diagnostics/points",
+                        points=center_world_points(
+                            self.diagnostics.points_world[indices],
+                            self.world_center,
+                        ),
+                        colors=self._colors(indices),
+                        point_size=float(self.point_size.value),
+                        point_shape="circle",
+                    )
+            if bool(self.show_partial.value):
+                partial_indices = np.flatnonzero(self.diagnostics.partial_mask)
+                visible = stable_uniform_indices(
+                    partial_indices.shape[0],
+                    int(self.max_visible_points.value),
+                )
+                partial_indices = partial_indices[visible]
+                if partial_indices.shape[0]:
+                    self._partial_handle = self.server.scene.add_point_cloud(
+                        "/anchor_residual_diagnostics/partial_points",
+                        points=center_world_points(
+                            self.diagnostics.points_world[partial_indices],
+                            self.world_center,
+                        ),
+                        colors=np.broadcast_to(
+                            _PARTIAL_POINT_COLOR,
+                            (partial_indices.shape[0], 3),
+                        ).copy(),
+                        point_size=float(self.point_size.value),
+                        point_shape="circle",
+                    )
 
 
 def _configure_initial_camera(
@@ -2257,7 +2306,9 @@ def main() -> None:
         print(
             "Loaded anchor residual decomposition for mode "
             f"{residual_diagnostics.mode_index} at "
-            f"{residual_diagnostics.freq_hz:.6g} Hz."
+            f"{residual_diagnostics.freq_hz:.6g} Hz with "
+            f"{int(np.count_nonzero(residual_diagnostics.partial_mask))} "
+            "staged partial Gaussian(s)."
         )
     print(
         f"Viser {viser_version} listening on {server.get_host()}:{server.get_port()}"
