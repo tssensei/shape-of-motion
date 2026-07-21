@@ -125,6 +125,8 @@ class ModalSurfaceCliTests(unittest.TestCase):
                 "--solve-method",
                 "--rigid-component-graph",
                 "--rigid-component-rcond",
+                "--rigid-seed-min-valid-views",
+                "--rigid-seed-min-singular-ratio",
             }.issubset(option_strings)
         )
         base = [
@@ -155,6 +157,34 @@ class ModalSurfaceCliTests(unittest.TestCase):
             ]
         )
         app._validate_solve_method_arguments(args)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            app._validate_solve_method_arguments(
+                parser.parse_args(
+                    base
+                    + [
+                        "--solve-method",
+                        "rigid-components",
+                        "--rigid-component-graph",
+                        "graph.npz",
+                        "--rigid-seed-min-valid-views",
+                        "0",
+                    ]
+                )
+            )
+        with self.assertRaisesRegex(ValueError, r"lie in \[0,1\]"):
+            app._validate_solve_method_arguments(
+                parser.parse_args(
+                    base
+                    + [
+                        "--solve-method",
+                        "rigid-components",
+                        "--rigid-component-graph",
+                        "graph.npz",
+                        "--rigid-seed-min-singular-ratio",
+                        "1.1",
+                    ]
+                )
+            )
 
     def test_anchor_graph_controls_are_not_registered(self) -> None:
         cli = importlib.import_module("modal_surface.__main__")

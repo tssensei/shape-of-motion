@@ -178,6 +178,8 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
         phi = np.zeros(self.points.shape, dtype=np.complex64)
         phi[:, 0] = np.complex64(0.1 + 0.2j)
         rigid_seed = np.asarray([True, True, True, False], dtype=bool)
+        rigid_phi = phi.copy()
+        rigid_phi[~rigid_seed] = 0
         observed = np.asarray([True, True, True, False], dtype=bool)
         fill_target = ~rigid_seed
         completion = np.asarray([False, False, False, True], dtype=bool)
@@ -211,13 +213,22 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
             rigid_component_connectivity_policy=np.array(
                 "accepted_edge_transitive_components_bridges_merge"
             ),
+            rigid_component_seed_policy=np.array(
+                "postsolve_valid_view_and_singular_ratio_gate"
+            ),
+            rigid_seed_min_valid_views=np.array(2, dtype=np.int32),
+            rigid_seed_min_singular_ratio=np.array(1.0e-3, dtype=np.float64),
             rigid_component_graph_path=np.array(graph_path.name),
             rigid_component_graph_source_path=np.array(str(graph_path)),
             rigid_seed_mask=rigid_seed,
             observed_mask=observed,
             fill_target_mask=fill_target,
+            trusted_rigid_seed_mask=rigid_seed,
+            effective_fill_target_mask=fill_target,
             completion_mask=completion,
             point_component_index=np.asarray([0, 0, 0, -1], dtype=np.int32),
+            rigid_phi_pre_fill=rigid_phi,
+            trusted_rigid_phi_pre_fill=rigid_phi,
             final_phi=phi,
             component_graph_index=np.asarray([0], dtype=np.int32),
             component_node_count=np.asarray([3], dtype=np.int32),
@@ -228,8 +239,16 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
             component_singular_values=np.asarray(
                 [[5.0, 4.0, 3.0, 2.0, 1.0, 0.05]], dtype=np.float32
             ),
+            component_singular_ratio=np.asarray([0.01], dtype=np.float32),
             component_rank=np.asarray([6], dtype=np.int8),
             component_rank_deficient_mask=np.asarray([False], dtype=bool),
+            component_seed_retained_mask=np.asarray([True], dtype=bool),
+            component_valid_view_rejected_mask=np.asarray(
+                [False], dtype=bool
+            ),
+            component_singular_rejected_mask=np.asarray(
+                [False], dtype=bool
+            ),
             component_normalized_weighted_residual=np.asarray(
                 [0.1], dtype=np.float32
             ),
@@ -262,6 +281,11 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
                 "rigid_component_residual_policy": "diagnostic_only",
                 "rigid_component_edge_weight_use": "topology_only",
                 "rigid_component_finite_rigidity": "first_order_only",
+                "rigid_component_seed_policy": (
+                    "postsolve_valid_view_and_singular_ratio_gate"
+                ),
+                "rigid_seed_min_valid_views": 2,
+                "rigid_seed_min_singular_ratio": 1.0e-3,
                 "nonseed_policy": "free_motion_fill",
                 "motion_fill_enabled": True,
             },
@@ -831,6 +855,10 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 mode.rigid_seed_mask,
                 [True, True, True, False],
+            )
+            np.testing.assert_array_equal(
+                mode.quarantined_rigid_mask,
+                [False, False, False, False],
             )
             np.testing.assert_array_equal(
                 mode.completed_fill_mask,

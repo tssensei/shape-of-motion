@@ -11,6 +11,8 @@ from modal_surface.optimization_staged import StagedSolverConfig
 STAGED_ANCHOR_SVD_RATIO_DEFAULT = 1e-2
 STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT = 0.1
 RIGID_COMPONENT_RCOND_DEFAULT = 1e-8
+RIGID_SEED_MIN_VALID_VIEWS_DEFAULT = 2
+RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT = 1e-3
 
 
 def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
@@ -39,6 +41,24 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Relative singular-value cutoff for deterministic minimum-norm "
             "rigid-component solves (default: 1e-8)."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-seed-min-valid-views",
+        type=int,
+        default=RIGID_SEED_MIN_VALID_VIEWS_DEFAULT,
+        help=(
+            "Minimum distinct alpha-identifiable views required to retain a "
+            "solved rigid component as a trusted seed (default: 2)."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-seed-min-singular-ratio",
+        type=float,
+        default=RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT,
+        help=(
+            "Minimum full-system sigma_min/sigma_max ratio required to retain "
+            "a solved rigid component as a trusted seed (default: 1e-3)."
         ),
     )
 
@@ -140,6 +160,13 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
         ),
         "rigid_component_finite_phase_samples": 64,
         "rigid_component_finite_rigidity": "first_order_only",
+        "rigid_component_seed_policy": (
+            "postsolve_valid_view_and_singular_ratio_gate"
+        ),
+        "rigid_seed_min_valid_views": int(args.rigid_seed_min_valid_views),
+        "rigid_seed_min_singular_ratio": float(
+            args.rigid_seed_min_singular_ratio
+        ),
         "nonseed_policy": (
             "free_motion_fill"
             if bool(getattr(args, "motion_fill", False))

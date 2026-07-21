@@ -62,12 +62,17 @@ from modal_surface.optimization_staged import (
 from modal_surface.optimization_visualization import write_solve_visualizations
 from modal_surface.optimization_visualization import write_prepared_solve_visualizations
 from modal_surface.rigid_component_solver import (
+    RigidComponentSeedSelectionConfig,
+    RigidComponentSeedSelectionResult,
     RigidComponentSolveResult,
     RigidComponentSolverConfig,
+    select_trusted_rigid_component_seeds,
     solve_rigid_components,
 )
 from modal_surface.solver_cli import (
     RIGID_COMPONENT_RCOND_DEFAULT,
+    RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT,
+    RIGID_SEED_MIN_VALID_VIEWS_DEFAULT,
     STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT,
     STAGED_ANCHOR_SVD_RATIO_DEFAULT,
     add_solve_method_arguments,
@@ -291,8 +296,18 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     graph_paths = list(args.rigid_component_graph)
     rcond = float(args.rigid_component_rcond)
+    min_valid_views = int(args.rigid_seed_min_valid_views)
+    min_singular_ratio = float(args.rigid_seed_min_singular_ratio)
     if not np.isfinite(rcond) or not (0.0 < rcond < 1.0):
         raise ValueError("--rigid-component-rcond must be finite and lie in (0,1).")
+    if min_valid_views <= 0:
+        raise ValueError("--rigid-seed-min-valid-views must be positive.")
+    if not np.isfinite(min_singular_ratio) or not (
+        0.0 <= min_singular_ratio <= 1.0
+    ):
+        raise ValueError(
+            "--rigid-seed-min-singular-ratio must be finite and lie in [0,1]."
+        )
     if args.solve_method == "staged":
         if graph_paths:
             raise ValueError(
@@ -301,6 +316,16 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         if rcond != RIGID_COMPONENT_RCOND_DEFAULT:
             raise ValueError(
                 "A custom --rigid-component-rcond requires "
+                "--solve-method=rigid-components."
+            )
+        if min_valid_views != RIGID_SEED_MIN_VALID_VIEWS_DEFAULT:
+            raise ValueError(
+                "A custom --rigid-seed-min-valid-views requires "
+                "--solve-method=rigid-components."
+            )
+        if min_singular_ratio != RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT:
+            raise ValueError(
+                "A custom --rigid-seed-min-singular-ratio requires "
                 "--solve-method=rigid-components."
             )
         return
@@ -707,13 +732,14 @@ def _rigid_gaussian_latent_stats(
     prepared: PreparedObservations,
     alpha: AlphaSyncResult,
     rigid: RigidComponentSolveResult,
+    seed_selection: RigidComponentSeedSelectionResult,
     motion_fill: RigidSeedMotionFillResult | None,
     observations: Mapping[str, np.ndarray],
     num_fg: int,
 ) -> dict[str, Any]:
     if motion_fill is None:
         _, obs_residual, obs_valid, point_residual, point_valid = (
-            compute_prediction_and_residuals(prepared, alpha, rigid.phi)
+            compute_prediction_and_residuals(prepared, alpha, seed_selection.phi)
         )
     else:
         obs_residual = motion_fill.obs_residual
@@ -763,16 +789,39 @@ def _rigid_gaussian_latent_stats(
         "alpha_optimizer_success": bool(alpha.optimizer_success),
         "observed_point_count": int(np.count_nonzero(rigid.observed_mask)),
         "rigid_seed_count": int(np.count_nonzero(rigid.rigid_seed_mask)),
+        "trusted_rigid_seed_count": int(
+            np.count_nonzero(seed_selection.trusted_rigid_seed_mask)
+        ),
+        "quarantined_rigid_seed_count": int(
+            np.count_nonzero(
+                rigid.rigid_seed_mask
+                & ~seed_selection.trusted_rigid_seed_mask
+            )
+        ),
         "isolated_observed_count": int(
             np.count_nonzero(rigid.observed_mask & ~rigid.rigid_seed_mask)
         ),
         "fill_target_count": int(np.count_nonzero(rigid.fill_target_mask)),
+        "effective_fill_target_count": int(
+            np.count_nonzero(seed_selection.effective_fill_target_mask)
+        ),
         "unobserved_point_count": int(
             np.count_nonzero(prepared.obs_count_per_point == 0)
         ),
         "rigid_component_count": int(rigid.num_components),
         "rank_deficient_component_count": int(
             np.count_nonzero(rigid.component_rank < 6)
+        ),
+        "trusted_rigid_component_count": int(
+            np.count_nonzero(seed_selection.component_seed_retained_mask)
+        ),
+        "valid_view_rejected_component_count": int(
+            np.count_nonzero(
+                seed_selection.component_valid_view_rejected_mask
+            )
+        ),
+        "singular_rejected_component_count": int(
+            np.count_nonzero(seed_selection.component_singular_rejected_mask)
         ),
         "largest_rigid_component_node_count": int(
             np.max(rigid.component_node_count, initial=0)
@@ -1169,6 +1218,7 @@ def _write_rigid_solver_diagnostics(
     alpha: AlphaSyncResult,
     alpha_view_freqs_hz: np.ndarray,
     rigid: RigidComponentSolveResult,
+    seed_selection: RigidComponentSeedSelectionResult,
     *,
     rigid_graph_path: str,
     rigid_graph_source_path: str,
@@ -1177,7 +1227,7 @@ def _write_rigid_solver_diagnostics(
     motion_fill_graph_path: str | None = None,
 ) -> Path:
     if motion_fill is None:
-        final_phi = rigid.phi
+        final_phi = seed_selection.phi
         _, _, _, point_residual, point_residual_valid = (
             compute_prediction_and_residuals(prepared, alpha, final_phi)
         )
@@ -1211,12 +1261,28 @@ def _write_rigid_solver_diagnostics(
         "rigid_component_phase_samples": np.array(
             rigid.config.phase_samples, dtype=np.int32
         ),
+        "rigid_component_seed_policy": np.array(
+            "postsolve_valid_view_and_singular_ratio_gate"
+        ),
+        "rigid_seed_min_valid_views": np.array(
+            seed_selection.config.min_valid_views, dtype=np.int32
+        ),
+        "rigid_seed_min_singular_ratio": np.array(
+            seed_selection.config.min_singular_ratio, dtype=np.float64
+        ),
         "rigid_seed_mask": rigid.rigid_seed_mask.astype(bool),
         "observed_mask": rigid.observed_mask.astype(bool),
         "fill_target_mask": rigid.fill_target_mask.astype(bool),
+        "trusted_rigid_seed_mask": (
+            seed_selection.trusted_rigid_seed_mask.astype(bool)
+        ),
+        "effective_fill_target_mask": (
+            seed_selection.effective_fill_target_mask.astype(bool)
+        ),
         "completion_mask": np.asarray(completion_mask, dtype=bool),
         "point_component_index": rigid.point_component_index.astype(np.int32),
         "rigid_phi_pre_fill": rigid.phi.astype(np.complex64),
+        "trusted_rigid_phi_pre_fill": seed_selection.phi.astype(np.complex64),
         "final_phi": np.asarray(final_phi, dtype=np.complex64),
         "point_residual": np.asarray(point_residual, dtype=np.float32),
         "point_residual_valid_mask": np.asarray(point_residual_valid, dtype=bool),
@@ -1238,8 +1304,20 @@ def _write_rigid_solver_diagnostics(
         "component_singular_values": rigid.component_singular_values.astype(
             np.float32
         ),
+        "component_singular_ratio": (
+            seed_selection.component_singular_ratio.astype(np.float32)
+        ),
         "component_rank": rigid.component_rank.astype(np.int8),
         "component_rank_deficient_mask": (rigid.component_rank < 6),
+        "component_seed_retained_mask": (
+            seed_selection.component_seed_retained_mask.astype(bool)
+        ),
+        "component_valid_view_rejected_mask": (
+            seed_selection.component_valid_view_rejected_mask.astype(bool)
+        ),
+        "component_singular_rejected_mask": (
+            seed_selection.component_singular_rejected_mask.astype(bool)
+        ),
         "component_condition": rigid.component_condition.astype(np.float32),
         "component_weighted_residual_norm": rigid.component_weighted_residual_norm.astype(
             np.float32
@@ -1563,6 +1641,16 @@ def run(args: argparse.Namespace) -> None:
                 )
                 raise
 
+            seed_selection = select_trusted_rigid_component_seeds(
+                rigid,
+                RigidComponentSeedSelectionConfig(
+                    min_valid_views=int(args.rigid_seed_min_valid_views),
+                    min_singular_ratio=float(
+                        args.rigid_seed_min_singular_ratio
+                    ),
+                ),
+            )
+
             rigid_motion_fill = None
             motion_fill_relative_path = (
                 relative_path(motion_fill_graph_path, out_dir)
@@ -1572,11 +1660,17 @@ def run(args: argparse.Namespace) -> None:
             if motion_fill_graph is not None:
                 assert motion_fill_relative_path is not None
                 try:
+                    if not np.any(seed_selection.trusted_rigid_seed_mask):
+                        raise ValueError(
+                            "Rigid seed filtering retained no component for "
+                            "motion fill. Relax --rigid-seed-min-valid-views "
+                            "or --rigid-seed-min-singular-ratio."
+                        )
                     rigid_motion_fill = apply_rigid_seed_motion_fill(
                         prepared,
                         alpha,
-                        rigid.phi,
-                        rigid.rigid_seed_mask,
+                        seed_selection.phi,
+                        seed_selection.trusted_rigid_seed_mask,
                         motion_fill_graph,
                         motion_fill_relative_path,
                     )
@@ -1587,6 +1681,7 @@ def run(args: argparse.Namespace) -> None:
                         alpha,
                         alpha_view_freqs_hz,
                         rigid,
+                        seed_selection,
                         rigid_graph_path=relative_path(
                             rigid_graph_local_path, out_dir
                         ),
@@ -1598,7 +1693,7 @@ def run(args: argparse.Namespace) -> None:
                 )
 
             if rigid_motion_fill is None:
-                final_phi = rigid.phi
+                final_phi = seed_selection.phi
                 final_prediction, _, final_residual_valid, _, _ = (
                     compute_prediction_and_residuals(prepared, alpha, final_phi)
                 )
@@ -1623,6 +1718,7 @@ def run(args: argparse.Namespace) -> None:
                 alpha,
                 alpha_view_freqs_hz,
                 rigid,
+                seed_selection,
                 rigid_graph_path=relative_path(rigid_graph_local_path, out_dir),
                 rigid_graph_source_path=str(loaded_graph.graph_path),
                 motion_fill=rigid_motion_fill,
@@ -1640,6 +1736,7 @@ def run(args: argparse.Namespace) -> None:
                 prepared,
                 alpha,
                 rigid,
+                seed_selection,
                 rigid_motion_fill,
                 observations,
                 fg_means.shape[0],

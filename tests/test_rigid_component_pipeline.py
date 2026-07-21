@@ -212,6 +212,8 @@ class _ToyRigidArtifacts:
         solve_method: str = "rigid-components",
         graph_paths: list[Path] | None = None,
         motion_fill: bool = False,
+        rigid_seed_min_valid_views: int = 1,
+        rigid_seed_min_singular_ratio: float = 0.0,
     ) -> argparse.Namespace:
         parser = argparse.ArgumentParser()
         gaussian_solver_app.add_arguments(parser)
@@ -228,7 +230,16 @@ class _ToyRigidArtifacts:
             "0",
         ]
         if solve_method == "rigid-components":
-            argv.extend(["--solve-method", "rigid-components"])
+            argv.extend(
+                [
+                    "--solve-method",
+                    "rigid-components",
+                    "--rigid-seed-min-valid-views",
+                    str(rigid_seed_min_valid_views),
+                    "--rigid-seed-min-singular-ratio",
+                    str(rigid_seed_min_singular_ratio),
+                ]
+            )
             for graph_path in graph_paths or [self.graph_path]:
                 argv.extend(["--rigid-component-graph", str(graph_path)])
         if motion_fill:
@@ -424,6 +435,16 @@ class RigidComponentPipelineTests(unittest.TestCase):
                 "reuse_graph_source_observation_no_rebuild",
             )
             self.assertTrue(manifest["parameters"]["motion_fill_enabled"])
+            self.assertEqual(
+                manifest["parameters"]["rigid_component_seed_policy"],
+                "postsolve_valid_view_and_singular_ratio_gate",
+            )
+            self.assertEqual(
+                manifest["parameters"]["rigid_seed_min_valid_views"], 1
+            )
+            self.assertEqual(
+                manifest["parameters"]["rigid_seed_min_singular_ratio"], 0.0
+            )
             self.assertEqual(len(manifest["modes"]), 1)
             mode = manifest["modes"][0]
             self.assertEqual(mode["source_observation_path"], str(toy.observation_path))
@@ -465,6 +486,22 @@ class RigidComponentPipelineTests(unittest.TestCase):
                 roles == MOTION_FILL_ROLE_FREE_VARIABLE, ~expected_seed
             )
             self.assertFalse(np.any(latent["completion_mask"][expected_seed]))
+            diagnostics = _load_npz(out_dir / mode["diagnostics_path"])
+            np.testing.assert_array_equal(
+                diagnostics["trusted_rigid_seed_mask"], expected_seed
+            )
+            np.testing.assert_array_equal(
+                diagnostics["effective_fill_target_mask"], ~expected_seed
+            )
+            self.assertTrue(
+                np.all(diagnostics["component_seed_retained_mask"])
+            )
+            self.assertFalse(
+                np.any(diagnostics["component_valid_view_rejected_mask"])
+            )
+            self.assertFalse(
+                np.any(diagnostics["component_singular_rejected_mask"])
+            )
 
             runtime = load_gaussian_modal_fields(
                 str(manifest_path), torch.from_numpy(toy.points.copy())
@@ -473,6 +510,72 @@ class RigidComponentPipelineTests(unittest.TestCase):
             self.assertEqual(tuple(runtime.phi_real.shape), (1, 5, 3))
             self.assertEqual(tuple(runtime.phi_imag.shape), (1, 5, 3))
             self.assertIsNotNone(viewer_modes[0].motion_fill_display_class)
+
+    def test_default_seed_gate_quarantines_single_view_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            toy = _ToyRigidArtifacts(root)
+            out_dir = root / "filtered_output"
+            args = toy.args(
+                out_dir,
+                rigid_seed_min_valid_views=2,
+                rigid_seed_min_singular_ratio=1.0e-3,
+            )
+            with (
+                patch.object(
+                    gaussian_solver_app,
+                    "load_fg_means_from_checkpoint",
+                    return_value=toy.points.copy(),
+                ),
+                patch.object(
+                    gaussian_solver_app,
+                    "load_modal_freqs",
+                    return_value=[
+                        np.asarray([toy.frequency], dtype=np.float32)
+                    ],
+                ),
+                patch.object(
+                    gaussian_solver_app,
+                    "load_view_config",
+                    return_value=SimpleNamespace(view_id="view0"),
+                ),
+                patch.object(
+                    gaussian_solver_app,
+                    "build_gaussian_observation_graph",
+                    side_effect=AssertionError(
+                        "Rigid solve must reuse the graph source observation."
+                    ),
+                ),
+                patch.object(gaussian_solver_app, "_print_observation_sanity"),
+                patch.object(
+                    gaussian_solver_app, "write_prepared_solve_visualizations"
+                ),
+            ):
+                gaussian_solver_app.run(args)
+
+            manifest = json.loads(
+                (out_dir / "modal_modes_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            mode = manifest["modes"][0]
+            latent = _load_npz(out_dir / mode["latent_path"])
+            diagnostics = _load_npz(out_dir / mode["diagnostics_path"])
+            self.assertFalse(np.any(latent["phi"]))
+            self.assertFalse(np.any(diagnostics["trusted_rigid_seed_mask"]))
+            self.assertTrue(
+                np.all(diagnostics["component_valid_view_rejected_mask"])
+            )
+            self.assertTrue(
+                np.all(diagnostics["component_singular_rejected_mask"])
+            )
+            self.assertFalse(
+                np.any(diagnostics["component_seed_retained_mask"])
+            )
+            self.assertTrue(np.any(diagnostics["rigid_phi_pre_fill"]))
+            self.assertFalse(
+                np.any(diagnostics["trusted_rigid_phi_pre_fill"])
+            )
 
     def test_default_staged_run_still_builds_observations_and_uses_staged_solver(
         self,

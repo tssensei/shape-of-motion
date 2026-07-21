@@ -12,7 +12,11 @@ from modal_surface.optimization_staged import (
     PreparedObservations,
     prepare_observations,
 )
-from modal_surface.rigid_component_solver import solve_rigid_components
+from modal_surface.rigid_component_solver import (
+    RigidComponentSeedSelectionConfig,
+    select_trusted_rigid_component_seeds,
+    solve_rigid_components,
+)
 
 
 J_BY_VIEW = (
@@ -243,6 +247,16 @@ class RigidComponentSolverTests(unittest.TestCase):
             float(result.edge_first_order_relative_imag.max()), 1.0e-6
         )
         self.assertEqual(result.phase_angles.shape, (64,))
+        selection = select_trusted_rigid_component_seeds(result)
+        np.testing.assert_array_equal(
+            selection.component_seed_retained_mask,
+            [True],
+        )
+        np.testing.assert_array_equal(
+            selection.trusted_rigid_seed_mask,
+            result.rigid_seed_mask,
+        )
+        np.testing.assert_array_equal(selection.phi, result.phi)
 
     def test_single_view_node_is_solved_through_its_component(self) -> None:
         prepared = _prepare(
@@ -281,6 +295,27 @@ class RigidComponentSolverTests(unittest.TestCase):
         np.testing.assert_array_equal(
             first.component_rotation, second.component_rotation
         )
+        rejected = select_trusted_rigid_component_seeds(first)
+        np.testing.assert_array_equal(
+            rejected.component_valid_view_rejected_mask,
+            [True],
+        )
+        np.testing.assert_array_equal(
+            rejected.component_singular_rejected_mask,
+            [True],
+        )
+        self.assertFalse(np.any(rejected.trusted_rigid_seed_mask))
+        self.assertFalse(np.any(rejected.phi))
+
+        retained = select_trusted_rigid_component_seeds(
+            first,
+            RigidComponentSeedSelectionConfig(
+                min_valid_views=1,
+                min_singular_ratio=0.0,
+            ),
+        )
+        self.assertTrue(np.all(retained.trusted_rigid_seed_mask))
+        np.testing.assert_array_equal(retained.phi, first.phi)
 
     def test_inconsistent_observation_is_diagnostic_only_not_seed_rejection(self) -> None:
         prepared = _prepare(

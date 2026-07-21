@@ -192,19 +192,30 @@ _RIGID_DIAGNOSTIC_REQUIRED_FIELDS = {
     "rigid_component_connectivity_policy",
     "rigid_component_graph_path",
     "rigid_component_graph_source_path",
+    "rigid_component_seed_policy",
+    "rigid_seed_min_valid_views",
+    "rigid_seed_min_singular_ratio",
     "rigid_seed_mask",
     "observed_mask",
     "fill_target_mask",
+    "trusted_rigid_seed_mask",
+    "effective_fill_target_mask",
     "completion_mask",
     "point_component_index",
+    "rigid_phi_pre_fill",
+    "trusted_rigid_phi_pre_fill",
     "final_phi",
     "component_graph_index",
     "component_node_count",
     "component_edge_count",
     "component_distinct_valid_view_count",
     "component_singular_values",
+    "component_singular_ratio",
     "component_rank",
     "component_rank_deficient_mask",
+    "component_seed_retained_mask",
+    "component_valid_view_rejected_mask",
+    "component_singular_rejected_mask",
     "component_normalized_weighted_residual",
     "edge_component_index",
     "edge_finite_drift_max",
@@ -224,6 +235,7 @@ _RIGID_DIAGNOSTIC_NORMAL_COLOR = np.asarray(
 _RIGID_DIAGNOSTIC_ANOMALY_COLOR = np.asarray(
     (1.0, 0.0, 0.0), dtype=np.float32
 )
+_QUARANTINED_RIGID_COLOR = np.asarray((1.0, 0.55, 0.0), dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -286,6 +298,7 @@ class RigidModeViewData:
     points_world: np.ndarray
     phi: np.ndarray
     rigid_seed_mask: np.ndarray
+    quarantined_rigid_mask: np.ndarray
     completed_fill_mask: np.ndarray
     unresolved_fill_mask: np.ndarray
     point_component_index: np.ndarray
@@ -303,6 +316,8 @@ class RigidManifestViewData:
     manifest_path: Path
     source_checkpoint: str
     motion_fill_enabled: bool
+    rigid_seed_min_valid_views: int
+    rigid_seed_min_singular_ratio: float
     modes: tuple[RigidModeViewData, ...]
 
 
@@ -860,6 +875,24 @@ def load_rigid_manifest(
         raise ValueError(
             f"{manifest_path} motion_fill_enabled must be a boolean"
         )
+    rigid_seed_min_valid_views = _manifest_integer(
+        parameters.get("rigid_seed_min_valid_views"),
+        "rigid_seed_min_valid_views",
+        manifest_path,
+    )
+    rigid_seed_min_singular_ratio = _manifest_number(
+        parameters.get("rigid_seed_min_singular_ratio"),
+        "rigid_seed_min_singular_ratio",
+        manifest_path,
+    )
+    if rigid_seed_min_valid_views <= 0:
+        raise ValueError(
+            f"{manifest_path} rigid_seed_min_valid_views must be positive"
+        )
+    if not 0.0 <= rigid_seed_min_singular_ratio <= 1.0:
+        raise ValueError(
+            f"{manifest_path} rigid_seed_min_singular_ratio must lie in [0,1]"
+        )
     expected_parameters = {
         "solver": "rigid_components",
         "rigidity_model": "complex_infinitesimal_se3",
@@ -871,6 +904,9 @@ def load_rigid_manifest(
         "rigid_component_residual_policy": "diagnostic_only",
         "rigid_component_edge_weight_use": "topology_only",
         "rigid_component_finite_rigidity": "first_order_only",
+        "rigid_component_seed_policy": (
+            "postsolve_valid_view_and_singular_ratio_gate"
+        ),
         "nonseed_policy": (
             "free_motion_fill"
             if motion_fill_enabled
@@ -1090,12 +1126,46 @@ def load_rigid_manifest(
                 "rigid_component_connectivity_policy",
                 "accepted_edge_transitive_components_bridges_merge",
             ),
+            (
+                "rigid_component_seed_policy",
+                "postsolve_valid_view_and_singular_ratio_gate",
+            ),
         ):
             if (
                 _scalar_string(diagnostics[name], name, diagnostics_path)
                 != expected_value
             ):
                 raise ValueError(f"{diagnostics_path} {name} is incompatible")
+        diagnostic_min_valid_views = _scalar(
+            diagnostics["rigid_seed_min_valid_views"],
+            "rigid_seed_min_valid_views",
+            diagnostics_path,
+        )
+        diagnostic_min_singular_ratio = _scalar(
+            diagnostics["rigid_seed_min_singular_ratio"],
+            "rigid_seed_min_singular_ratio",
+            diagnostics_path,
+        )
+        if (
+            not np.issubdtype(diagnostic_min_valid_views.dtype, np.integer)
+            or int(diagnostic_min_valid_views.item())
+            != rigid_seed_min_valid_views
+        ):
+            raise ValueError(
+                f"{diagnostics_path} rigid seed minimum views differs from manifest"
+            )
+        diagnostic_ratio_value = float(
+            diagnostic_min_singular_ratio.item()
+        )
+        if not np.isfinite(diagnostic_ratio_value) or not np.isclose(
+            diagnostic_ratio_value,
+            rigid_seed_min_singular_ratio,
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError(
+                f"{diagnostics_path} rigid seed singular ratio differs from manifest"
+            )
         if _scalar_string(
             diagnostics["rigid_component_graph_path"],
             "rigid_component_graph_path",
@@ -1115,6 +1185,8 @@ def load_rigid_manifest(
             "rigid_seed_mask",
             "observed_mask",
             "fill_target_mask",
+            "trusted_rigid_seed_mask",
+            "effective_fill_target_mask",
             "completion_mask",
         )
         for name in mask_names:
@@ -1128,6 +1200,8 @@ def load_rigid_manifest(
         rigid_seed_mask = diagnostics["rigid_seed_mask"]
         observed_mask = diagnostics["observed_mask"]
         fill_target_mask = diagnostics["fill_target_mask"]
+        trusted_seed_mask = diagnostics["trusted_rigid_seed_mask"]
+        effective_fill_target_mask = diagnostics["effective_fill_target_mask"]
         completion_mask = diagnostics["completion_mask"]
         expected_observed = np.zeros((num_points,), dtype=bool)
         expected_observed[graph.node_gaussian_indices] = True
@@ -1140,8 +1214,14 @@ def load_rigid_manifest(
             raise ValueError(f"{diagnostics_path} rigid_seed_mask does not match graph")
         if not np.array_equal(fill_target_mask, ~expected_seed):
             raise ValueError(f"{diagnostics_path} fill_target_mask is inconsistent")
-        if np.any(completion_mask & ~fill_target_mask):
-            raise ValueError(f"{diagnostics_path} completes a rigid seed")
+        if np.any(trusted_seed_mask & ~rigid_seed_mask):
+            raise ValueError(f"{diagnostics_path} trusts a non-candidate rigid seed")
+        if not np.array_equal(effective_fill_target_mask, ~trusted_seed_mask):
+            raise ValueError(
+                f"{diagnostics_path} effective_fill_target_mask is inconsistent"
+            )
+        if np.any(completion_mask & ~effective_fill_target_mask):
+            raise ValueError(f"{diagnostics_path} completes a trusted rigid seed")
         if not np.array_equal(diagnostics["final_phi"], phi):
             raise ValueError(f"{diagnostics_path} final_phi does not match latent")
 
@@ -1228,6 +1308,88 @@ def load_rigid_manifest(
             )
         except ValueError as exc:
             raise ValueError(f"{diagnostics_path} {exc}") from exc
+        stored_singular_ratio = np.asarray(
+            diagnostics["component_singular_ratio"], dtype=np.float32
+        )
+        if not np.array_equal(stored_singular_ratio, component_singular_ratio):
+            raise ValueError(
+                f"{diagnostics_path} component_singular_ratio is inconsistent"
+            )
+        component_selection_masks = {
+            name: np.asarray(diagnostics[name])
+            for name in (
+                "component_seed_retained_mask",
+                "component_valid_view_rejected_mask",
+                "component_singular_rejected_mask",
+            )
+        }
+        for name, values in component_selection_masks.items():
+            if values.shape != (num_components,) or values.dtype != np.bool_:
+                raise ValueError(
+                    f"{diagnostics_path} {name} must be boolean "
+                    f"({num_components},)"
+                )
+        expected_valid_view_rejected = (
+            component_valid_view_count < rigid_seed_min_valid_views
+        )
+        expected_singular_rejected = (
+            component_singular_ratio < rigid_seed_min_singular_ratio
+        )
+        expected_component_retained = ~(
+            expected_valid_view_rejected | expected_singular_rejected
+        )
+        for name, expected_values in (
+            (
+                "component_valid_view_rejected_mask",
+                expected_valid_view_rejected,
+            ),
+            ("component_singular_rejected_mask", expected_singular_rejected),
+            ("component_seed_retained_mask", expected_component_retained),
+        ):
+            if not np.array_equal(
+                component_selection_masks[name], expected_values
+            ):
+                raise ValueError(f"{diagnostics_path} {name} is inconsistent")
+        expected_trusted_seed = np.zeros((num_points,), dtype=bool)
+        candidate_indices = np.flatnonzero(expected_seed)
+        expected_trusted_seed[candidate_indices] = expected_component_retained[
+            point_component[candidate_indices]
+        ]
+        if not np.array_equal(trusted_seed_mask, expected_trusted_seed):
+            raise ValueError(
+                f"{diagnostics_path} trusted_rigid_seed_mask is inconsistent"
+            )
+        raw_rigid_phi = np.asarray(diagnostics["rigid_phi_pre_fill"])
+        trusted_rigid_phi = np.asarray(
+            diagnostics["trusted_rigid_phi_pre_fill"]
+        )
+        for name, values in (
+            ("rigid_phi_pre_fill", raw_rigid_phi),
+            ("trusted_rigid_phi_pre_fill", trusted_rigid_phi),
+        ):
+            if (
+                values.shape != (num_points, 3)
+                or not np.issubdtype(values.dtype, np.complexfloating)
+                or not np.isfinite(values).all()
+            ):
+                raise ValueError(
+                    f"{diagnostics_path} {name} must be finite complex "
+                    f"({num_points},3)"
+                )
+        expected_trusted_phi = np.zeros((num_points, 3), dtype=np.complex64)
+        expected_trusted_phi[trusted_seed_mask] = raw_rigid_phi[
+            trusted_seed_mask
+        ].astype(np.complex64)
+        if not np.array_equal(trusted_rigid_phi, expected_trusted_phi):
+            raise ValueError(
+                f"{diagnostics_path} trusted_rigid_phi_pre_fill is inconsistent"
+            )
+        if not np.array_equal(
+            phi[trusted_seed_mask], trusted_rigid_phi[trusted_seed_mask]
+        ):
+            raise ValueError(
+                f"{latent_path} final phi changed a trusted rigid seed"
+            )
         rank_deficient = np.asarray(diagnostics["component_rank_deficient_mask"])
         if rank_deficient.dtype != np.bool_ or not np.array_equal(
             rank_deficient, component_rank < 6
@@ -1269,7 +1431,7 @@ def load_rigid_manifest(
             role = np.asarray(latent["motion_fill_role"])
             latent_completion = np.asarray(latent["completion_mask"])
             expected_role = np.full((num_points,), 2, dtype=np.int8)
-            expected_role[expected_seed] = 0
+            expected_role[trusted_seed_mask] = 0
             if (
                 not np.issubdtype(role.dtype, np.integer)
                 or not np.array_equal(role, expected_role)
@@ -1302,15 +1464,24 @@ def load_rigid_manifest(
             if (
                 connected.shape != (num_points,)
                 or connected.dtype != np.bool_
-                or not np.array_equal(completion_mask, connected & ~expected_seed)
+                or not np.array_equal(
+                    completion_mask, connected & ~trusted_seed_mask
+                )
             ):
                 raise ValueError(
                     f"{diagnostics_path} completion connectivity is inconsistent"
                 )
-        elif np.any(completion_mask):
-            raise ValueError(
-                f"{diagnostics_path} completion_mask is nonzero without motion fill"
-            )
+        else:
+            if np.any(completion_mask):
+                raise ValueError(
+                    f"{diagnostics_path} completion_mask is nonzero without "
+                    "motion fill"
+                )
+            if not np.array_equal(phi, trusted_rigid_phi):
+                raise ValueError(
+                    f"{latent_path} phi differs from trusted rigid field "
+                    "without motion fill"
+                )
 
         loaded_modes.append(
             RigidModeViewData(
@@ -1323,9 +1494,12 @@ def load_rigid_manifest(
                 graph_source_path=graph_source_path,
                 points_world=points,
                 phi=phi.astype(np.complex64),
-                rigid_seed_mask=rigid_seed_mask,
+                rigid_seed_mask=trusted_seed_mask,
+                quarantined_rigid_mask=rigid_seed_mask & ~trusted_seed_mask,
                 completed_fill_mask=completion_mask,
-                unresolved_fill_mask=fill_target_mask & ~completion_mask,
+                unresolved_fill_mask=(
+                    effective_fill_target_mask & ~completion_mask
+                ),
                 point_component_index=point_component.astype(np.int32),
                 component_normalized_weighted_residual=component_residual,
                 component_rank=component_rank.astype(np.int8),
@@ -1343,6 +1517,8 @@ def load_rigid_manifest(
         manifest_path=manifest_path,
         source_checkpoint=source_checkpoint,
         motion_fill_enabled=motion_fill_enabled,
+        rigid_seed_min_valid_views=rigid_seed_min_valid_views,
+        rigid_seed_min_singular_ratio=rigid_seed_min_singular_ratio,
         modes=tuple(loaded_modes),
     )
 
@@ -2037,6 +2213,7 @@ class ObservedGraphViewer:
         self._node_handle = None
         self._isolated_handle = None
         self._rigid_seed_handle = None
+        self._quarantined_rigid_handle = None
         self._completed_fill_handle = None
         self._unresolved_fill_handle = None
         self._update_lock = threading.Lock()
@@ -2122,6 +2299,7 @@ class ObservedGraphViewer:
                 self.minimum_log10_singular_ratio = None
                 self.motion_rms_percentile = None
                 self.show_rigid_seeds = None
+                self.show_quarantined_rigid = None
                 self.show_completed_fill = None
                 self.show_unresolved_fill = None
             else:
@@ -2162,16 +2340,30 @@ class ObservedGraphViewer:
                 self.minimum_valid_views = server.gui.add_slider(
                     "Minimum valid views",
                     min=1,
-                    max=max(2, max(len(graph.view_ids) for graph in graphs)),
+                    max=max(
+                        2,
+                        rigid_manifest.rigid_seed_min_valid_views,
+                        max(len(graph.view_ids) for graph in graphs),
+                    ),
                     step=1,
-                    initial_value=2,
+                    initial_value=rigid_manifest.rigid_seed_min_valid_views,
                 )
                 self.minimum_log10_singular_ratio = server.gui.add_slider(
                     "Minimum log10 singular ratio",
                     min=-12.0,
                     max=0.0,
                     step=0.25,
-                    initial_value=-3.0,
+                    initial_value=max(
+                        -12.0,
+                        float(
+                            np.log10(
+                                max(
+                                    rigid_manifest.rigid_seed_min_singular_ratio,
+                                    1.0e-12,
+                                )
+                            )
+                        ),
+                    ),
                 )
                 self.motion_rms_percentile = server.gui.add_slider(
                     "Motion RMS percentile",
@@ -2182,6 +2374,10 @@ class ObservedGraphViewer:
                 )
                 self.show_rigid_seeds = server.gui.add_checkbox(
                     "Show rigid seeds",
+                    False,
+                )
+                self.show_quarantined_rigid = server.gui.add_checkbox(
+                    "Show quarantined rigid candidates",
                     False,
                 )
                 if rigid_manifest.motion_fill_enabled:
@@ -2223,6 +2419,7 @@ class ObservedGraphViewer:
             assert self.minimum_log10_singular_ratio is not None
             assert self.motion_rms_percentile is not None
             assert self.show_rigid_seeds is not None
+            assert self.show_quarantined_rigid is not None
             geometry_handles = [
                 self.graph_geometry,
                 self.phase,
@@ -2236,7 +2433,10 @@ class ObservedGraphViewer:
                 self.motion_rms_percentile,
             ):
                 handle.on_update(self._update)
-            rigid_visibility_handles = [self.show_rigid_seeds]
+            rigid_visibility_handles = [
+                self.show_rigid_seeds,
+                self.show_quarantined_rigid,
+            ]
             if self.show_completed_fill is not None:
                 rigid_visibility_handles.append(self.show_completed_fill)
             if self.show_unresolved_fill is not None:
@@ -2354,6 +2554,7 @@ class ObservedGraphViewer:
             "_node_handle",
             "_isolated_handle",
             "_rigid_seed_handle",
+            "_quarantined_rigid_handle",
             "_completed_fill_handle",
             "_unresolved_fill_handle",
         ):
@@ -2384,6 +2585,10 @@ class ObservedGraphViewer:
             assert centered_all_points is not None
             for attribute, mask in (
                 ("_rigid_seed_handle", rigid_mode.rigid_seed_mask),
+                (
+                    "_quarantined_rigid_handle",
+                    rigid_mode.quarantined_rigid_mask,
+                ),
                 ("_completed_fill_handle", rigid_mode.completed_fill_mask),
                 ("_unresolved_fill_handle", rigid_mode.unresolved_fill_mask),
             ):
@@ -2398,6 +2603,7 @@ class ObservedGraphViewer:
             for attribute in (
                 "_node_handle",
                 "_rigid_seed_handle",
+                "_quarantined_rigid_handle",
                 "_completed_fill_handle",
                 "_unresolved_fill_handle",
             ):
@@ -2553,6 +2759,7 @@ class ObservedGraphViewer:
             if rigid_mode is not None:
                 assert centered_all_points is not None
                 assert self.show_rigid_seeds is not None
+                assert self.show_quarantined_rigid is not None
                 overlays = [
                     (
                         self.show_rigid_seeds,
@@ -2560,7 +2767,14 @@ class ObservedGraphViewer:
                         _RIGID_SEED_COLOR,
                         "rigid_seeds",
                         "_rigid_seed_handle",
-                    )
+                    ),
+                    (
+                        self.show_quarantined_rigid,
+                        rigid_mode.quarantined_rigid_mask,
+                        _QUARANTINED_RIGID_COLOR,
+                        "quarantined_rigid_candidates",
+                        "_quarantined_rigid_handle",
+                    ),
                 ]
                 if self.show_completed_fill is not None:
                     overlays.append((
@@ -3105,7 +3319,10 @@ def main() -> None:
         print(
             "Loaded rigid component result for mode "
             f"{mode.mode_index} at {mode.freq_hz:.6g} Hz with "
-            f"{int(np.count_nonzero(mode.rigid_seed_mask))} rigid seed(s), "
+            f"{int(np.count_nonzero(mode.rigid_seed_mask))} trusted rigid "
+            "seed(s), "
+            f"{int(np.count_nonzero(mode.quarantined_rigid_mask))} quarantined "
+            "rigid candidate(s), "
             f"{int(np.count_nonzero(mode.completed_fill_mask))} completed fill "
             "point(s), and "
             f"{int(np.count_nonzero(mode.unresolved_fill_mask))} unresolved fill "

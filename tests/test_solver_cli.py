@@ -51,14 +51,26 @@ class SolverCliTests(unittest.TestCase):
                 "mode4.npz",
                 "--rigid-component-rcond",
                 "1e-7",
+                "--rigid-seed-min-valid-views",
+                "3",
+                "--rigid-seed-min-singular-ratio",
+                "1e-2",
             ]
         )
         self.assertEqual(args.solve_method, "rigid-components")
         self.assertEqual(args.rigid_component_graph, ["mode4.npz"])
+        self.assertEqual(args.rigid_seed_min_valid_views, 3)
+        self.assertEqual(args.rigid_seed_min_singular_ratio, 1e-2)
         parameters = rigid_component_manifest_parameters(args)
         self.assertEqual(parameters["solver"], "rigid_components")
         self.assertEqual(parameters["rigidity_model"], "complex_infinitesimal_se3")
         self.assertEqual(parameters["rigid_component_rcond"], 1e-7)
+        self.assertEqual(parameters["rigid_seed_min_valid_views"], 3)
+        self.assertEqual(parameters["rigid_seed_min_singular_ratio"], 1e-2)
+        self.assertEqual(
+            parameters["rigid_component_seed_policy"],
+            "postsolve_valid_view_and_singular_ratio_gate",
+        )
         self.assertEqual(parameters["nonseed_policy"], "zero_without_motion_fill")
 
     def test_legacy_solver_options_are_not_registered(self) -> None:

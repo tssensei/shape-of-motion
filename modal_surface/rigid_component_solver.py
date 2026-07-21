@@ -46,6 +46,27 @@ class RigidComponentSolverConfig:
 
 
 @dataclass(frozen=True)
+class RigidComponentSeedSelectionConfig:
+    min_valid_views: int = 2
+    min_singular_ratio: float = 1.0e-3
+
+    def validate(self) -> None:
+        if (
+            isinstance(self.min_valid_views, (bool, np.bool_))
+            or not isinstance(self.min_valid_views, (int, np.integer))
+            or self.min_valid_views <= 0
+        ):
+            raise ValueError("rigid seed min_valid_views must be a positive integer")
+        if (
+            not np.isfinite(self.min_singular_ratio)
+            or not 0.0 <= self.min_singular_ratio <= 1.0
+        ):
+            raise ValueError(
+                "rigid seed min_singular_ratio must be finite and lie in [0,1]"
+            )
+
+
+@dataclass(frozen=True)
 class RigidComponentSolveResult:
     config: RigidComponentSolverConfig
     phi: np.ndarray
@@ -96,6 +117,91 @@ class RigidComponentSolveResult:
     @property
     def num_rigid_seeds(self) -> int:
         return int(np.count_nonzero(self.rigid_seed_mask))
+
+
+@dataclass(frozen=True)
+class RigidComponentSeedSelectionResult:
+    config: RigidComponentSeedSelectionConfig
+    phi: np.ndarray
+    trusted_rigid_seed_mask: np.ndarray
+    effective_fill_target_mask: np.ndarray
+    component_seed_retained_mask: np.ndarray
+    component_valid_view_rejected_mask: np.ndarray
+    component_singular_rejected_mask: np.ndarray
+    component_singular_ratio: np.ndarray
+
+
+def select_trusted_rigid_component_seeds(
+    rigid: RigidComponentSolveResult,
+    config: RigidComponentSeedSelectionConfig | None = None,
+) -> RigidComponentSeedSelectionResult:
+    """Keep only sufficiently multi-view, well-conditioned rigid components."""
+
+    config = config or RigidComponentSeedSelectionConfig()
+    config.validate()
+    num_components = rigid.num_components
+    singular = np.asarray(rigid.component_singular_values, dtype=np.float64)
+    rank = np.asarray(rigid.component_rank)
+    if (
+        singular.shape != (num_components, 6)
+        or not np.isfinite(singular).all()
+        or np.any(singular < 0.0)
+        or np.any(singular[:, 1:] > singular[:, :-1])
+    ):
+        raise ValueError("rigid component singular values are invalid")
+    if (
+        rank.shape != (num_components,)
+        or not np.issubdtype(rank.dtype, np.integer)
+        or np.any(rank < 0)
+        or np.any(rank > 6)
+    ):
+        raise ValueError("rigid component rank is invalid")
+    valid_view_count = np.asarray(rigid.component_distinct_valid_view_count)
+    if (
+        valid_view_count.shape != (num_components,)
+        or not np.issubdtype(valid_view_count.dtype, np.integer)
+        or np.any(valid_view_count < 1)
+    ):
+        raise ValueError("rigid component valid-view count is invalid")
+
+    singular_ratio = np.zeros((num_components,), dtype=np.float64)
+    full_rank = (rank == 6) & (singular[:, 0] > 0.0)
+    singular_ratio[full_rank] = singular[full_rank, 5] / singular[full_rank, 0]
+    valid_view_rejected = valid_view_count < int(config.min_valid_views)
+    singular_rejected = singular_ratio < float(config.min_singular_ratio)
+    retained = ~(valid_view_rejected | singular_rejected)
+
+    candidate_mask = np.asarray(rigid.rigid_seed_mask)
+    point_component = np.asarray(rigid.point_component_index)
+    if (
+        candidate_mask.ndim != 1
+        or candidate_mask.dtype != np.bool_
+        or point_component.shape != candidate_mask.shape
+        or not np.issubdtype(point_component.dtype, np.integer)
+    ):
+        raise ValueError("rigid seed candidate mapping is invalid")
+    candidate_indices = np.flatnonzero(candidate_mask)
+    candidate_components = point_component[candidate_indices]
+    if np.any(candidate_components < 0) or np.any(
+        candidate_components >= num_components
+    ):
+        raise ValueError("rigid seed candidate has an invalid component index")
+    trusted_seed_mask = np.zeros(candidate_mask.shape, dtype=bool)
+    trusted_seed_mask[candidate_indices] = retained[candidate_components]
+    trusted_phi = np.zeros(np.asarray(rigid.phi).shape, dtype=np.complex64)
+    trusted_phi[trusted_seed_mask] = np.asarray(
+        rigid.phi[trusted_seed_mask], dtype=np.complex64
+    )
+    return RigidComponentSeedSelectionResult(
+        config=config,
+        phi=trusted_phi,
+        trusted_rigid_seed_mask=trusted_seed_mask,
+        effective_fill_target_mask=~trusted_seed_mask,
+        component_seed_retained_mask=retained,
+        component_valid_view_rejected_mask=valid_view_rejected,
+        component_singular_rejected_mask=singular_rejected,
+        component_singular_ratio=singular_ratio.astype(np.float32),
+    )
 
 
 def _validate_inputs(
