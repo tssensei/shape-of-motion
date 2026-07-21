@@ -102,3 +102,21 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   available multi-view candidates with substantially diminishing gains beyond
   it; the larger remaining bottleneck lies before top-K selection, especially
   insufficient multi-view preselection coverage.
+
+### Selected-multiview to anchor waterfall
+
+- All 23,106 K=4 selected-multiview Gaussians retained at least two
+  alpha-identifiable views.
+- Weighted projection-Jacobian rank rejected 1,340 Gaussians, leaving 21,766;
+  the condition-limit and finite-residual checks rejected none of these.
+- The saved normalized residual threshold was the configured cap `0.1`. It
+  rejected 17,798 of the remaining Gaussians, leaving only 3,968 final anchors.
+- The anchor graph retained all 3,968 nodes in its artifact: 3,059 received at
+  least one accepted structure edge, 909 remained isolated, and 6,703 edges
+  were accepted.
+- Revised anchor-specific conclusion: raw K=4 multi-view coverage is already
+  spatially rich, and observation rank is rarely the limiting condition. The
+  dominant reduction from selected-multiview points to anchors is inconsistent
+  multi-pixel/multi-view modal observations failing the single-3D-phi residual
+  test, not graph construction. Increasing candidate K may add coverage but
+  does not by itself address this consistency bottleneck.
