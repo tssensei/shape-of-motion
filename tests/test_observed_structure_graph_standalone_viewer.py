@@ -33,6 +33,9 @@ from preproc.vis_observed_structure_graph import (
     load_rigid_manifest,
     observation_coverage_colors,
     observed_world_center,
+    rigid_component_anomaly_colors,
+    rigid_component_motion_rms,
+    rigid_component_singular_ratio,
     scale_gaussian_opacities,
     stable_uniform_edge_indices,
     stable_uniform_indices,
@@ -219,6 +222,12 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
             component_graph_index=np.asarray([0], dtype=np.int32),
             component_node_count=np.asarray([3], dtype=np.int32),
             component_edge_count=np.asarray([2], dtype=np.int32),
+            component_distinct_valid_view_count=np.asarray(
+                [2], dtype=np.int32
+            ),
+            component_singular_values=np.asarray(
+                [[5.0, 4.0, 3.0, 2.0, 1.0, 0.05]], dtype=np.float32
+            ),
             component_rank=np.asarray([6], dtype=np.int8),
             component_rank_deficient_mask=np.asarray([False], dtype=bool),
             component_normalized_weighted_residual=np.asarray(
@@ -548,6 +557,41 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
             np.array([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]], dtype=np.float32),
         )
 
+    def test_rigid_component_diagnostic_helpers(self) -> None:
+        ratios = rigid_component_singular_ratio(
+            np.asarray(
+                [
+                    [8.0, 4.0, 2.0, 1.0, 0.5, 0.25],
+                    [8.0, 4.0, 2.0, 1.0, 0.5, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            np.asarray([6, 5], dtype=np.int8),
+        )
+        np.testing.assert_allclose(ratios, [0.03125, 0.0])
+
+        phi = np.zeros((4, 3), dtype=np.complex64)
+        phi[0, 0] = 1.0
+        phi[1, 1] = 2.0j
+        phi[2, 2] = 3.0 + 4.0j
+        np.testing.assert_allclose(
+            rigid_component_motion_rms(
+                phi,
+                np.asarray([0, 0, 1, -1], dtype=np.int32),
+                2,
+            ),
+            [np.sqrt(2.5), 5.0],
+        )
+        np.testing.assert_array_equal(
+            rigid_component_anomaly_colors(
+                np.asarray([False, True], dtype=bool)
+            ),
+            np.asarray(
+                [[0.35, 0.35, 0.35], [1.0, 0.0, 0.0]],
+                dtype=np.float32,
+            ),
+        )
+
     def test_malformed_indices_fail_fast(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             graph_path = self._write_graph(Path(tmp) / "observed_graph.npz")
@@ -796,6 +840,15 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
                 mode.unresolved_fill_mask,
                 [False, False, False, False],
             )
+            np.testing.assert_array_equal(
+                mode.component_distinct_valid_view_count,
+                [2],
+            )
+            np.testing.assert_allclose(mode.component_singular_ratio, [0.01])
+            np.testing.assert_allclose(
+                mode.component_motion_rms,
+                [np.sqrt(0.05)],
+            )
             np.testing.assert_allclose(
                 deform_modal_points(self.points, phi, 0.0, 2.0),
                 self.points + 2.0 * phi.real,
@@ -902,6 +955,80 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
             self.assertEqual(node_handle.remove_count, 1)
             self.assertIsNot(viewer._line_handle, line_handle)
             self.assertIsNot(viewer._node_handle, node_handle)
+
+    def test_rigid_anomaly_edge_colors_follow_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            graph_path = self._write_graph(root / "observed_graph.npz")
+            graph = _load_observed_graph_archive(graph_path)
+            manifest_path, _, _, _ = self._write_rigid_result(root, graph_path)
+            rigid = load_rigid_manifest(manifest_path, (graph,))
+            server = _FakeServer()
+            with patch(
+                "preproc.vis_observed_structure_graph.threading.Thread"
+            ):
+                viewer = ObservedGraphViewer(
+                    server,
+                    (graph,),
+                    max_visible_edges=graph.edge_index.shape[0],
+                    line_width=1.0,
+                    observed_point_size=0.0009,
+                    isolated_point_size=0.0008,
+                    world_center=observed_world_center((graph,)),
+                    rigid_manifest=rigid,
+                )
+
+            assert viewer.minimum_valid_views is not None
+            viewer.edge_color.value = "single-view anomaly"
+            viewer.minimum_valid_views.value = 2
+            viewer._update()
+            assert viewer._line_handle is not None
+            np.testing.assert_array_equal(
+                viewer._line_handle.colors[:, 0],
+                np.repeat(
+                    np.asarray([[0.35, 0.35, 0.35]], dtype=np.float32),
+                    graph.edge_index.shape[0],
+                    axis=0,
+                ),
+            )
+
+            viewer.minimum_valid_views.value = 3
+            viewer._update()
+            assert viewer._line_handle is not None
+            np.testing.assert_array_equal(
+                viewer._line_handle.colors[:, 0],
+                np.repeat(
+                    np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+                    graph.edge_index.shape[0],
+                    axis=0,
+                ),
+            )
+
+            assert viewer.minimum_log10_singular_ratio is not None
+            viewer.edge_color.value = "singular-ratio anomaly"
+            viewer.minimum_log10_singular_ratio.value = -1.0
+            viewer._update()
+            assert viewer._line_handle is not None
+            np.testing.assert_array_equal(
+                viewer._line_handle.colors[:, 0],
+                np.repeat(
+                    np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+                    graph.edge_index.shape[0],
+                    axis=0,
+                ),
+            )
+
+            viewer.edge_color.value = "motion-RMS anomaly"
+            viewer._update()
+            assert viewer._line_handle is not None
+            np.testing.assert_array_equal(
+                viewer._line_handle.colors[:, 0],
+                np.repeat(
+                    np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+                    graph.edge_index.shape[0],
+                    axis=0,
+                ),
+            )
 
     def test_cli_requires_observed_graph_and_validates_display_ranges(self) -> None:
         parser = build_parser()

@@ -201,6 +201,8 @@ _RIGID_DIAGNOSTIC_REQUIRED_FIELDS = {
     "component_graph_index",
     "component_node_count",
     "component_edge_count",
+    "component_distinct_valid_view_count",
+    "component_singular_values",
     "component_rank",
     "component_rank_deficient_mask",
     "component_normalized_weighted_residual",
@@ -216,6 +218,12 @@ _MOTION_FILL_ROLE_NAMES = (
 _RIGID_SEED_COLOR = np.asarray((0.0, 1.0, 1.0), dtype=np.float32)
 _COMPLETED_FILL_COLOR = np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
 _UNRESOLVED_FILL_COLOR = np.asarray((1.0, 0.0, 1.0), dtype=np.float32)
+_RIGID_DIAGNOSTIC_NORMAL_COLOR = np.asarray(
+    (0.35, 0.35, 0.35), dtype=np.float32
+)
+_RIGID_DIAGNOSTIC_ANOMALY_COLOR = np.asarray(
+    (1.0, 0.0, 0.0), dtype=np.float32
+)
 
 
 @dataclass(frozen=True)
@@ -283,6 +291,9 @@ class RigidModeViewData:
     point_component_index: np.ndarray
     component_normalized_weighted_residual: np.ndarray
     component_rank: np.ndarray
+    component_distinct_valid_view_count: np.ndarray
+    component_singular_ratio: np.ndarray
+    component_motion_rms: np.ndarray
     edge_component_index: np.ndarray
     edge_finite_drift_max: np.ndarray
 
@@ -448,6 +459,94 @@ def graph_scalar_colors(values: np.ndarray) -> np.ndarray:
     return np.column_stack(
         [1.0 - normalized, 0.25 + 0.75 * normalized, normalized]
     ).astype(np.float32)
+
+
+def rigid_component_singular_ratio(
+    singular_values: np.ndarray,
+    component_rank: np.ndarray,
+) -> np.ndarray:
+    singular = np.asarray(singular_values, dtype=np.float64)
+    rank = np.asarray(component_rank)
+    if singular.ndim != 2 or singular.shape[1] != 6:
+        raise ValueError("Rigid component singular values must have shape (C,6)")
+    if not np.isfinite(singular).all() or np.any(singular < 0.0):
+        raise ValueError(
+            "Rigid component singular values must be finite and non-negative"
+        )
+    if np.any(singular[:, 1:] > singular[:, :-1]):
+        raise ValueError("Rigid component singular values must be non-increasing")
+    if (
+        rank.shape != (singular.shape[0],)
+        or not np.issubdtype(rank.dtype, np.integer)
+        or np.any(rank < 0)
+        or np.any(rank > 6)
+    ):
+        raise ValueError("Rigid component rank is invalid")
+    ratio = np.zeros((singular.shape[0],), dtype=np.float64)
+    full_rank = (rank == 6) & (singular[:, 0] > 0.0)
+    ratio[full_rank] = singular[full_rank, 5] / singular[full_rank, 0]
+    if not np.isfinite(ratio).all() or np.any((ratio < 0.0) | (ratio > 1.0)):
+        raise ValueError("Rigid component singular ratio is invalid")
+    return ratio.astype(np.float32)
+
+
+def rigid_component_motion_rms(
+    phi: np.ndarray,
+    point_component_index: np.ndarray,
+    num_components: int,
+) -> np.ndarray:
+    field = np.asarray(phi)
+    component_index = np.asarray(point_component_index)
+    if (
+        field.ndim != 2
+        or field.shape[1] != 3
+        or not np.issubdtype(field.dtype, np.complexfloating)
+        or not np.isfinite(field).all()
+    ):
+        raise ValueError("Rigid component phi must be finite complex (N,3)")
+    if (
+        isinstance(num_components, bool)
+        or not isinstance(num_components, (int, np.integer))
+        or num_components <= 0
+    ):
+        raise ValueError("num_components must be a positive integer")
+    if (
+        component_index.shape != (field.shape[0],)
+        or not np.issubdtype(component_index.dtype, np.integer)
+        or np.any(component_index < -1)
+        or np.any(component_index >= int(num_components))
+    ):
+        raise ValueError("Rigid point component indices are invalid")
+    selected = component_index >= 0
+    counts = np.bincount(
+        component_index[selected], minlength=int(num_components)
+    ).astype(np.int64)
+    if np.any(counts == 0):
+        raise ValueError("Every rigid component must contain at least one point")
+    selected_field = field[selected].astype(np.complex128)
+    squared_norm = np.sum(
+        np.square(selected_field.real) + np.square(selected_field.imag), axis=1
+    )
+    summed_squared_norm = np.bincount(
+        component_index[selected],
+        weights=squared_norm,
+        minlength=int(num_components),
+    )
+    rms = np.sqrt(summed_squared_norm / counts)
+    if not np.isfinite(rms).all():
+        raise ValueError("Rigid component motion RMS is non-finite")
+    return rms.astype(np.float32)
+
+
+def rigid_component_anomaly_colors(anomalous: np.ndarray) -> np.ndarray:
+    mask = np.asarray(anomalous)
+    if mask.ndim != 1 or mask.dtype != np.bool_:
+        raise ValueError("Rigid component anomaly mask must be a 1-D boolean array")
+    colors = np.repeat(
+        _RIGID_DIAGNOSTIC_NORMAL_COLOR[None], mask.shape[0], axis=0
+    )
+    colors[mask] = _RIGID_DIAGNOSTIC_ANOMALY_COLOR
+    return colors
 
 
 def gaussian_covariances(
@@ -1105,6 +1204,30 @@ def load_rigid_manifest(
             or np.any(component_rank > 6)
         ):
             raise ValueError(f"{diagnostics_path} component_rank is invalid")
+        component_valid_view_count = np.asarray(
+            diagnostics["component_distinct_valid_view_count"]
+        )
+        if (
+            component_valid_view_count.shape != (num_components,)
+            or not np.issubdtype(component_valid_view_count.dtype, np.integer)
+            or np.any(component_valid_view_count < 1)
+            or np.any(component_valid_view_count > len(graph.view_ids))
+        ):
+            raise ValueError(
+                f"{diagnostics_path} component valid-view count is invalid"
+            )
+        try:
+            component_singular_ratio = rigid_component_singular_ratio(
+                diagnostics["component_singular_values"],
+                component_rank,
+            )
+            component_motion_rms = rigid_component_motion_rms(
+                phi,
+                point_component,
+                num_components,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{diagnostics_path} {exc}") from exc
         rank_deficient = np.asarray(diagnostics["component_rank_deficient_mask"])
         if rank_deficient.dtype != np.bool_ or not np.array_equal(
             rank_deficient, component_rank < 6
@@ -1206,6 +1329,11 @@ def load_rigid_manifest(
                 point_component_index=point_component.astype(np.int32),
                 component_normalized_weighted_residual=component_residual,
                 component_rank=component_rank.astype(np.int8),
+                component_distinct_valid_view_count=(
+                    component_valid_view_count.astype(np.int32)
+                ),
+                component_singular_ratio=component_singular_ratio,
+                component_motion_rms=component_motion_rms,
                 edge_component_index=expected_edge_component.astype(np.int32),
                 edge_finite_drift_max=edge_finite_drift,
             )
@@ -1923,6 +2051,9 @@ class ObservedGraphViewer:
                 "component residual",
                 "component rank",
                 "finite-amplitude drift",
+                "single-view anomaly",
+                "singular-ratio anomaly",
+                "motion-RMS anomaly",
             )
             if rigid_manifest is not None
             else ()
@@ -1987,6 +2118,9 @@ class ObservedGraphViewer:
                 self.play = None
                 self.playback_speed = None
                 self.playback_fps = None
+                self.minimum_valid_views = None
+                self.minimum_log10_singular_ratio = None
+                self.motion_rms_percentile = None
                 self.show_rigid_seeds = None
                 self.show_completed_fill = None
                 self.show_unresolved_fill = None
@@ -2024,6 +2158,27 @@ class ObservedGraphViewer:
                     max=30,
                     step=1,
                     initial_value=10,
+                )
+                self.minimum_valid_views = server.gui.add_slider(
+                    "Minimum valid views",
+                    min=1,
+                    max=max(2, max(len(graph.view_ids) for graph in graphs)),
+                    step=1,
+                    initial_value=2,
+                )
+                self.minimum_log10_singular_ratio = server.gui.add_slider(
+                    "Minimum log10 singular ratio",
+                    min=-12.0,
+                    max=0.0,
+                    step=0.25,
+                    initial_value=-3.0,
+                )
+                self.motion_rms_percentile = server.gui.add_slider(
+                    "Motion RMS percentile",
+                    min=50.0,
+                    max=100.0,
+                    step=0.5,
+                    initial_value=99.0,
                 )
                 self.show_rigid_seeds = server.gui.add_checkbox(
                     "Show rigid seeds",
@@ -2064,6 +2219,9 @@ class ObservedGraphViewer:
             assert self.play is not None
             assert self.playback_speed is not None
             assert self.playback_fps is not None
+            assert self.minimum_valid_views is not None
+            assert self.minimum_log10_singular_ratio is not None
+            assert self.motion_rms_percentile is not None
             assert self.show_rigid_seeds is not None
             geometry_handles = [
                 self.graph_geometry,
@@ -2072,6 +2230,12 @@ class ObservedGraphViewer:
             ]
             for handle in geometry_handles:
                 handle.on_update(self._update_geometry)
+            for handle in (
+                self.minimum_valid_views,
+                self.minimum_log10_singular_ratio,
+                self.motion_rms_percentile,
+            ):
+                handle.on_update(self._update)
             rigid_visibility_handles = [self.show_rigid_seeds]
             if self.show_completed_fill is not None:
                 rigid_visibility_handles.append(self.show_completed_fill)
@@ -2301,6 +2465,58 @@ class ObservedGraphViewer:
                             )
                         edge_colors = graph_scalar_colors(
                             rigid_mode.edge_finite_drift_max[selected_edges]
+                        )
+                    elif color_mode == "single-view anomaly":
+                        if rigid_mode is None or self.minimum_valid_views is None:
+                            raise ValueError(
+                                "Valid-view anomaly color requires a rigid manifest"
+                            )
+                        component_anomaly = (
+                            rigid_mode.component_distinct_valid_view_count
+                            < int(self.minimum_valid_views.value)
+                        )
+                        edge_colors = rigid_component_anomaly_colors(
+                            component_anomaly[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ]
+                        )
+                    elif color_mode == "singular-ratio anomaly":
+                        if (
+                            rigid_mode is None
+                            or self.minimum_log10_singular_ratio is None
+                        ):
+                            raise ValueError(
+                                "Singular-ratio anomaly color requires a rigid manifest"
+                            )
+                        minimum_ratio = 10.0 ** float(
+                            self.minimum_log10_singular_ratio.value
+                        )
+                        component_anomaly = (
+                            rigid_mode.component_singular_ratio < minimum_ratio
+                        )
+                        edge_colors = rigid_component_anomaly_colors(
+                            component_anomaly[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ]
+                        )
+                    elif color_mode == "motion-RMS anomaly":
+                        if rigid_mode is None or self.motion_rms_percentile is None:
+                            raise ValueError(
+                                "Motion-RMS anomaly color requires a rigid manifest"
+                            )
+                        motion_threshold = float(
+                            np.percentile(
+                                rigid_mode.component_motion_rms,
+                                float(self.motion_rms_percentile.value),
+                            )
+                        )
+                        component_anomaly = (
+                            rigid_mode.component_motion_rms >= motion_threshold
+                        )
+                        edge_colors = rigid_component_anomaly_colors(
+                            component_anomaly[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ]
                         )
                     else:
                         raise ValueError(
