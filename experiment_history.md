@@ -200,3 +200,10 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   1.0 and 277/12,942/30,573 at 0.5. The next solver revision therefore uses 2.0
   as the default finite-drift trusted-seed cap to remove extreme deformation
   while affecting about 0.45% of the 236,537 foreground Gaussians.
+- The earlier pointwise motion-fill path was reported to finish in roughly
+  10--15 minutes, while the grouped single-view-component run associated with
+  `/home/zs292/outputs_modal/bush4/mode4_rigid_components_trusted_v2_k8_d0p008`
+  remained unfinished after more than 30 minutes. Since the no-fill baseline
+  finishes in 25.177 s, the next revision targets grouped-only repeated point
+  scans first and adds live connectivity/assembly/LSMR/reconstruction timings
+  so the next run can distinguish Python preparation overhead from LSMR cost.

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -25,6 +25,14 @@ def _record_timing(
 ) -> None:
     if timings is not None:
         timings[name] = float(perf_counter() - started)
+
+
+def _emit_progress(
+    progress: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    if progress is not None:
+        progress(message)
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,17 @@ class AnchorConnectivity:
     component_has_anchor: np.ndarray
     component_anchor_count: np.ndarray
     hop_distance: np.ndarray
+
+
+@dataclass(frozen=True)
+class SharedGroupMembership:
+    """One-time ordered membership and star edges for shared affine groups."""
+
+    ordered_points: np.ndarray
+    counts: np.ndarray
+    offsets: np.ndarray
+    leaders: np.ndarray
+    star_edges: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -457,17 +476,15 @@ def compute_anchor_connectivity(
     )
 
 
-def _compute_grouped_anchor_connectivity(
-    graph: KnnGraph,
-    anchor_mask: np.ndarray,
+def build_shared_group_membership(
     shared_group_index: np.ndarray,
-) -> AnchorConnectivity:
-    """Connect every shared affine group before testing anchor reachability."""
+    num_points: int,
+) -> SharedGroupMembership:
+    """Build ordered group membership once without repeated full point scans."""
 
-    anchor = _validate_boolean_mask(anchor_mask, "anchor_mask", graph.num_points)
     groups = np.asarray(shared_group_index)
     if (
-        groups.shape != (graph.num_points,)
+        groups.shape != (num_points,)
         or not np.issubdtype(groups.dtype, np.integer)
         or np.any(groups < -1)
     ):
@@ -481,27 +498,51 @@ def _compute_grouped_anchor_connectivity(
         np.arange(group_count, dtype=present_groups.dtype),
     ):
         raise ValueError("shared_group_index must use contiguous group indices")
-    if np.any(anchor & (groups >= 0)):
-        raise ValueError("anchor points cannot belong to a shared affine group")
-
-    extra_edges: list[np.ndarray] = []
-    for group_index in range(group_count):
-        members = np.flatnonzero(groups == group_index)
-        if members.size < 2:
-            raise ValueError(
-                f"shared affine group {group_index} must contain at least two points"
-            )
-        extra_edges.append(
-            np.column_stack(
-                [
-                    np.full((members.size - 1,), members[0], dtype=np.int64),
-                    members[1:].astype(np.int64),
-                ]
-            )
+    member_points = np.flatnonzero(groups >= 0)
+    order = np.argsort(groups[member_points], kind="stable")
+    ordered_points = member_points[order].astype(np.int64, copy=False)
+    counts = np.bincount(
+        groups[ordered_points],
+        minlength=group_count,
+    ).astype(np.int64, copy=False)
+    if np.any(counts < 2):
+        invalid_group = int(np.flatnonzero(counts < 2)[0])
+        raise ValueError(
+            f"shared affine group {invalid_group} must contain at least two points"
         )
+    offsets = np.zeros((group_count + 1,), dtype=np.int64)
+    offsets[1:] = np.cumsum(counts, dtype=np.int64)
+    leaders = ordered_points[offsets[:-1]]
+    nonleader_mask = np.ones((ordered_points.size,), dtype=bool)
+    nonleader_mask[offsets[:-1]] = False
+    star_edges = np.column_stack(
+        [
+            np.repeat(leaders, counts - 1),
+            ordered_points[nonleader_mask],
+        ]
+    ).astype(np.int64, copy=False)
+    return SharedGroupMembership(
+        ordered_points=ordered_points,
+        counts=counts,
+        offsets=offsets,
+        leaders=leaders,
+        star_edges=star_edges,
+    )
+
+
+def _compute_grouped_anchor_connectivity(
+    graph: KnnGraph,
+    anchor_mask: np.ndarray,
+    membership: SharedGroupMembership,
+) -> AnchorConnectivity:
+    """Connect every shared affine group before testing anchor reachability."""
+
+    anchor = _validate_boolean_mask(anchor_mask, "anchor_mask", graph.num_points)
+    if np.any(anchor[membership.ordered_points]):
+        raise ValueError("anchor points cannot belong to a shared affine group")
     augmented_edges = (
-        np.concatenate([graph.edge_index, *extra_edges], axis=0)
-        if extra_edges
+        np.concatenate([graph.edge_index, membership.star_edges], axis=0)
+        if membership.star_edges.size
         else graph.edge_index
     )
     component_index, component_sizes = _stable_component_labels(
@@ -798,6 +839,8 @@ def fill_grouped_affine_motion(
     lsmr_conlim: float = 1e8,
     lsmr_maxiter: int | None = None,
     timings: dict[str, float] | None = None,
+    shared_group_membership: SharedGroupMembership | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> MotionFillResult:
     """Fill pointwise motion and shared affine groups in one KNN LSMR system."""
 
@@ -844,15 +887,62 @@ def fill_grouped_affine_motion(
         raise ValueError(
             "shared_group_point_blocks must be finite with shape (num_points,3,6)"
         )
+    membership = (
+        build_shared_group_membership(shared_groups, graph.num_points)
+        if shared_group_membership is None
+        else shared_group_membership
+    )
+    expected_counts = np.bincount(
+        shared_groups[shared_groups >= 0],
+        minlength=shared_group_count,
+    ).astype(np.int64, copy=False)
+    expected_offsets = np.zeros((shared_group_count + 1,), dtype=np.int64)
+    expected_offsets[1:] = np.cumsum(expected_counts, dtype=np.int64)
+    if (
+        membership.counts.shape != (shared_group_count,)
+        or membership.offsets.shape != (shared_group_count + 1,)
+        or membership.leaders.shape != (shared_group_count,)
+        or membership.ordered_points.shape != (int(expected_offsets[-1]),)
+        or membership.star_edges.shape
+        != (int(expected_offsets[-1]) - shared_group_count, 2)
+        or not np.array_equal(membership.counts, expected_counts)
+        or not np.array_equal(membership.offsets, expected_offsets)
+        or not np.array_equal(
+            np.bincount(
+                membership.ordered_points,
+                minlength=graph.num_points,
+            ),
+            (shared_groups >= 0).astype(np.int64),
+        )
+        or not np.array_equal(
+            shared_groups[membership.ordered_points],
+            np.repeat(
+                np.arange(shared_group_count, dtype=shared_groups.dtype),
+                expected_counts,
+            ),
+        )
+        or not np.array_equal(
+            membership.leaders,
+            membership.ordered_points[membership.offsets[:-1]],
+        )
+    ):
+        raise ValueError(
+            "shared_group_membership does not match shared_group_index"
+        )
     _record_timing(timings, "input_validation_seconds", stage_started)
 
     stage_started = perf_counter()
+    _emit_progress(progress, "grouped connectivity started")
     connectivity = _compute_grouped_anchor_connectivity(
         graph,
         anchor,
-        shared_groups,
+        membership,
     )
     _record_timing(timings, "connectivity_seconds", stage_started)
+    _emit_progress(
+        progress,
+        f"grouped connectivity finished in {perf_counter() - stage_started:.3f} s",
+    )
 
     stage_started = perf_counter()
     ordinary_points = np.flatnonzero((shared_groups < 0) & ~anchor)
@@ -894,6 +984,7 @@ def fill_grouped_affine_motion(
     _record_timing(timings, "variable_layout_seconds", stage_started)
 
     stage_started = perf_counter()
+    _emit_progress(progress, "grouped sparse assembly started")
     active_edge_mask = (
         connectivity.connected_to_anchor[graph.edge_index[:, 0]]
         & connectivity.connected_to_anchor[graph.edge_index[:, 1]]
@@ -960,6 +1051,12 @@ def fill_grouped_affine_motion(
             (row_count, column_count), dtype=np.float64
         ).tocsr()
     _record_timing(timings, "system_assembly_seconds", stage_started)
+    _emit_progress(
+        progress,
+        "grouped sparse assembly finished in "
+        f"{perf_counter() - stage_started:.3f} s: rows={row_count}, "
+        f"cols={column_count}, nnz={int(matrix.nnz)}",
+    )
 
     for tolerance, name in ((lsmr_atol, "lsmr_atol"), (lsmr_btol, "lsmr_btol")):
         if not np.isfinite(tolerance) or tolerance < 0.0:
@@ -970,6 +1067,7 @@ def fill_grouped_affine_motion(
         lsmr_maxiter = _require_positive_integer(lsmr_maxiter, "lsmr_maxiter")
     if column_count:
         stage_started = perf_counter()
+        _emit_progress(progress, "grouped LSMR real started")
         real_coefficients, real_solver = _run_lsmr(
             matrix,
             right_hand_side.real,
@@ -979,7 +1077,14 @@ def fill_grouped_affine_motion(
             maxiter=lsmr_maxiter,
         )
         _record_timing(timings, "lsmr_real_seconds", stage_started)
+        _emit_progress(
+            progress,
+            "grouped LSMR real finished in "
+            f"{perf_counter() - stage_started:.3f} s: "
+            f"iterations={real_solver.iterations}, stop_code={real_solver.stop_code}",
+        )
         stage_started = perf_counter()
+        _emit_progress(progress, "grouped LSMR imaginary started")
         imaginary_coefficients, imag_solver = _run_lsmr(
             matrix,
             right_hand_side.imag,
@@ -989,6 +1094,12 @@ def fill_grouped_affine_motion(
             maxiter=lsmr_maxiter,
         )
         _record_timing(timings, "lsmr_imaginary_seconds", stage_started)
+        _emit_progress(
+            progress,
+            "grouped LSMR imaginary finished in "
+            f"{perf_counter() - stage_started:.3f} s: "
+            f"iterations={imag_solver.iterations}, stop_code={imag_solver.stop_code}",
+        )
         if not real_solver.converged or not imag_solver.converged:
             raise RuntimeError(
                 "Grouped motion-fill LSMR did not converge: "
@@ -1005,20 +1116,32 @@ def fill_grouped_affine_motion(
             timings["lsmr_imaginary_seconds"] = 0.0
 
     stage_started = perf_counter()
+    _emit_progress(progress, "grouped reconstruction started")
     output_dtype = np.dtype(phi_source.dtype)
     phi_filled = phi_source.astype(output_dtype, copy=True)
     correction = np.zeros((graph.num_points, 3), dtype=output_dtype)
-    for point in np.flatnonzero(connected_variable).tolist():
-        group_index = int(point_group_index[point])
-        dimension = int(group_dimensions[group_index])
-        start = int(coefficient_offsets[group_index])
-        end = start + dimension
-        point_correction = (
-            point_blocks[point, :, :dimension]
-            @ coefficient_values[start:end]
+    for dimension in np.unique(point_dimensions[connected_variable]):
+        dimension = int(dimension)
+        if dimension == 0:
+            continue
+        selected_points = np.flatnonzero(
+            connected_variable & (point_dimensions == dimension)
         )
-        correction[point] = point_correction.astype(output_dtype, copy=False)
-        phi_filled[point] = point_correction.astype(output_dtype, copy=False)
+        selected_groups = point_group_index[selected_points]
+        coefficient_indices = (
+            coefficient_offsets[selected_groups, None]
+            + np.arange(dimension, dtype=np.int64)[None]
+        )
+        point_correction = np.einsum(
+            "nij,nj->ni",
+            point_blocks[selected_points, :, :dimension],
+            coefficient_values[coefficient_indices],
+        )
+        correction[selected_points] = point_correction.astype(
+            output_dtype,
+            copy=False,
+        )
+        phi_filled[selected_points] = correction[selected_points]
     phi_filled[anchor] = phi_source[anchor]
     completion_mask = connected_variable
     result = MotionFillResult(
@@ -1041,6 +1164,10 @@ def fill_grouped_affine_motion(
         coefficient_group_dimensions=group_dimensions,
     )
     _record_timing(timings, "reconstruction_seconds", stage_started)
+    _emit_progress(
+        progress,
+        f"grouped reconstruction finished in {perf_counter() - stage_started:.3f} s",
+    )
     _record_timing(timings, "linear_fill_total_seconds", total_started)
     return result
 

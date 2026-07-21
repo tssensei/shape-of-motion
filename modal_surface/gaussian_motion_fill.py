@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -15,6 +15,7 @@ from modal_surface.motion_fill import (
     KnnCandidateSet,
     KnnGraph,
     MotionFillResult,
+    build_shared_group_membership,
     fill_grouped_affine_motion,
     fill_nullspace_motion,
 )
@@ -700,11 +701,14 @@ def apply_rigid_seed_motion_fill(
     graph_path: str,
     *,
     timings: dict[str, float] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> RigidSeedMotionFillResult:
     """Jointly fill single-view rigid groups and ordinary non-seed points."""
 
     total_started = perf_counter()
     preparation_started = perf_counter()
+    if progress is not None:
+        progress("grouped preparation started")
     if not graph_path:
         raise ValueError("graph_path must be non-empty.")
     points = np.asarray(prepared.points)
@@ -789,6 +793,10 @@ def apply_rigid_seed_motion_fill(
     shared_group_index[single_view_rigid_fill_point_mask] = component_to_group[
         point_component[single_view_rigid_fill_point_mask]
     ]
+    shared_group_membership = build_shared_group_membership(
+        shared_group_index,
+        num_points,
+    )
     group_dimensions = np.full(
         (selected_components.size,),
         6,
@@ -809,22 +817,31 @@ def apply_rigid_seed_motion_fill(
     shared_point_blocks[single_view_rigid_fill_point_mask, :, :3] = np.eye(
         3, dtype=np.float64
     )[None]
-    for component_idx in selected_components.tolist():
-        radius = float(component_radius[component_idx])
-        if radius <= MOTION_FILL_EPSILON:
-            continue
-        members = np.flatnonzero(point_component == component_idx)
-        centered = points[members].astype(np.float64) - component_centroid[
-            component_idx
-        ]
-        skew = np.zeros((members.size, 3, 3), dtype=np.float64)
+    member_points = shared_group_membership.ordered_points
+    member_groups = shared_group_index[member_points]
+    member_components = selected_components[member_groups]
+    rotating_members = (
+        component_radius[member_components] > MOTION_FILL_EPSILON
+    )
+    if np.any(rotating_members):
+        rotating_points = member_points[rotating_members]
+        rotating_components = member_components[rotating_members]
+        centered = (
+            points[rotating_points].astype(np.float64)
+            - component_centroid[rotating_components]
+        )
+        skew = np.zeros((rotating_points.size, 3, 3), dtype=np.float64)
         skew[:, 0, 1] = -centered[:, 2]
         skew[:, 0, 2] = centered[:, 1]
         skew[:, 1, 0] = centered[:, 2]
         skew[:, 1, 2] = -centered[:, 0]
         skew[:, 2, 0] = -centered[:, 1]
         skew[:, 2, 1] = centered[:, 0]
-        shared_point_blocks[members, :, 3:] = -skew / radius
+        shared_point_blocks[rotating_points, :, 3:] = -skew / component_radius[
+            rotating_components,
+            None,
+            None,
+        ]
 
     numerical_nullity = np.full((num_points,), 3, dtype=np.int8)
     numerical_nullity[roles.fixed_anchor_mask] = 0
@@ -832,6 +849,12 @@ def apply_rigid_seed_motion_fill(
     if timings is not None:
         timings["preparation_seconds"] = float(
             perf_counter() - preparation_started
+        )
+    if progress is not None:
+        progress(
+            "grouped preparation finished in "
+            f"{perf_counter() - preparation_started:.3f} s: "
+            f"groups={selected_components.size}, points={member_points.size}"
         )
     motion = fill_grouped_affine_motion(
         graph,
@@ -844,8 +867,12 @@ def apply_rigid_seed_motion_fill(
         lsmr_btol=MOTION_FILL_LSMR_BTOL,
         lsmr_conlim=MOTION_FILL_LSMR_CONLIM,
         timings=timings,
+        shared_group_membership=shared_group_membership,
+        progress=progress,
     )
     validation_started = perf_counter()
+    if progress is not None:
+        progress("grouped validation and residuals started")
     if not np.array_equal(
         motion.phi[roles.fixed_anchor_mask],
         phi_source[roles.fixed_anchor_mask],
@@ -865,26 +892,60 @@ def apply_rigid_seed_motion_fill(
     if motion.point_coefficient_group_index is None:
         raise RuntimeError("Grouped motion fill did not return coefficient groups")
     model_phi = np.zeros((num_points, 3), dtype=np.complex128)
-    for group_idx, component_idx in enumerate(selected_components.tolist()):
-        members = np.flatnonzero(point_component == component_idx)
-        completed = motion.completion_mask[members]
-        if np.any(completed) and not np.all(completed):
+    if selected_components.size:
+        member_completion = motion.completion_mask[member_points]
+        group_completion_any = np.logical_or.reduceat(
+            member_completion,
+            shared_group_membership.offsets[:-1],
+        )
+        group_completion_all = np.logical_and.reduceat(
+            member_completion,
+            shared_group_membership.offsets[:-1],
+        )
+        if np.any(group_completion_any != group_completion_all):
             raise RuntimeError(
                 "A shared rigid component was only partially completed"
             )
-        component_completion[component_idx] = bool(np.all(completed))
-        if not component_completion[component_idx]:
-            continue
-        start = int(motion.coefficient_offsets[group_idx])
-        dimension = int(group_dimensions[group_idx])
-        coefficients = motion.coefficient_values[start : start + dimension]
-        component_translation[component_idx] = coefficients[:3]
-        radius = float(component_radius[component_idx])
-        if dimension == 6:
-            component_rotation[component_idx] = coefficients[3:] / radius
-        model_phi[members] = (
-            shared_point_blocks[members, :, :dimension] @ coefficients
+        component_completion[selected_components] = group_completion_all
+        completed_groups = np.flatnonzero(group_completion_all)
+        completed_components = selected_components[completed_groups]
+        completed_starts = motion.coefficient_offsets[completed_groups]
+        component_translation[completed_components] = motion.coefficient_values[
+            completed_starts[:, None] + np.arange(3, dtype=np.int64)[None]
+        ]
+        completed_rotating_groups = completed_groups[
+            group_dimensions[completed_groups] == 6
+        ]
+        completed_rotating_components = selected_components[
+            completed_rotating_groups
+        ]
+        completed_rotating_starts = motion.coefficient_offsets[
+            completed_rotating_groups
+        ]
+        component_rotation[completed_rotating_components] = (
+            motion.coefficient_values[
+                completed_rotating_starts[:, None]
+                + np.arange(3, 6, dtype=np.int64)[None]
+            ]
+            / component_radius[completed_rotating_components, None]
         )
+        completed_member_mask = group_completion_all[member_groups]
+        for dimension in np.unique(group_dimensions[group_completion_all]):
+            dimension = int(dimension)
+            selected_member_mask = completed_member_mask & (
+                group_dimensions[member_groups] == dimension
+            )
+            selected_member_points = member_points[selected_member_mask]
+            selected_member_groups = member_groups[selected_member_mask]
+            coefficient_indices = (
+                motion.coefficient_offsets[selected_member_groups, None]
+                + np.arange(dimension, dtype=np.int64)[None]
+            )
+            model_phi[selected_member_points] = np.einsum(
+                "nij,nj->ni",
+                shared_point_blocks[selected_member_points, :, :dimension],
+                motion.coefficient_values[coefficient_indices],
+            )
     if not np.allclose(
         motion.phi[single_view_rigid_fill_point_mask],
         model_phi[single_view_rigid_fill_point_mask].astype(motion.phi.dtype),
@@ -1080,6 +1141,11 @@ def apply_rigid_seed_motion_fill(
             perf_counter() - validation_started
         )
         timings["total_seconds"] = float(perf_counter() - total_started)
+    if progress is not None:
+        progress(
+            "grouped validation and residuals finished in "
+            f"{perf_counter() - validation_started:.3f} s"
+        )
     return result
 
 

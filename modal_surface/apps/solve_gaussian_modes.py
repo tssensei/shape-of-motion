@@ -1958,6 +1958,10 @@ def run(args: argparse.Namespace) -> None:
                         motion_fill_graph,
                         motion_fill_relative_path,
                         timings=motion_fill_timings,
+                        progress=lambda message: print(
+                            f"Motion fill: {message}",
+                            flush=True,
+                        ),
                     )
                 except Exception:
                     _write_rigid_solver_diagnostics(
