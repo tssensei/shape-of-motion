@@ -11,11 +11,14 @@ from preproc.vis_anchor_structure_graph import (
     _validate_args,
     anchor_graph_component_colors,
     anchor_graph_scalar_colors,
+    anchor_world_center,
     build_parser,
+    center_world_points,
     gaussian_covariances,
     load_anchor_graph_source,
     load_anchor_graphs_from_manifest,
     load_gaussian_visualization_sidecar,
+    scale_gaussian_opacities,
     stable_uniform_edge_indices,
 )
 
@@ -239,6 +242,27 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
                 graphs,
             )
         self.assertIsNone(gaussians.background)
+        world_center = anchor_world_center(graphs)
+        np.testing.assert_allclose(world_center, [0.01, 0.0, 0.0])
+        centered_anchors = center_world_points(
+            graphs[0].anchor_points_world,
+            world_center,
+        )
+        centered_gaussians = center_world_points(
+            gaussians.foreground.centers,
+            world_center,
+        )
+        np.testing.assert_allclose(
+            centered_gaussians[graphs[0].anchor_gaussian_indices],
+            centered_anchors,
+        )
+        np.testing.assert_allclose(
+            center_world_points(
+                graphs[0].anchor_points_world[graphs[0].edge_index],
+                world_center,
+            ),
+            centered_anchors[graphs[0].edge_index],
+        )
         np.testing.assert_allclose(
             gaussians.foreground.covariances[0],
             np.diag([1.0, 4.0, 9.0]),
@@ -276,6 +300,16 @@ class StandaloneAnchorGraphViewerTests(unittest.TestCase):
             self._write_gaussian_sidecar(sidecar_path, center_offset=1.0e-3)
             with self.assertRaisesRegex(ValueError, "centers do not match"):
                 load_gaussian_visualization_sidecar(sidecar_path, graphs)
+
+    def test_gaussian_opacity_multiplier_uses_immutable_source_values(self) -> None:
+        source = np.array([[0.2], [0.8]], dtype=np.float32)
+        scaled = scale_gaussian_opacities(source, 0.25)
+        np.testing.assert_allclose(scaled, [[0.05], [0.2]])
+        np.testing.assert_allclose(source, [[0.2], [0.8]])
+        with self.assertRaisesRegex(ValueError, "multiplier"):
+            scale_gaussian_opacities(source, 1.01)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            scale_gaussian_opacities(source[:, 0], 0.5)
 
     def test_cli_requires_one_source_and_validates_display_ranges(self) -> None:
         parser = build_parser()

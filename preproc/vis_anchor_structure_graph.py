@@ -306,6 +306,23 @@ def gaussian_covariances(
     return covariances.astype(np.float32)
 
 
+def scale_gaussian_opacities(
+    opacities: np.ndarray,
+    multiplier: float,
+) -> np.ndarray:
+    opacities = np.asarray(opacities, dtype=np.float32)
+    multiplier = float(multiplier)
+    if opacities.ndim != 2 or opacities.shape[1] != 1:
+        raise ValueError("Gaussian opacities must have shape (N,1)")
+    if not np.isfinite(opacities).all() or np.any(
+        (opacities < 0.0) | (opacities > 1.0)
+    ):
+        raise ValueError("Gaussian opacities must be finite and lie in [0,1]")
+    if not np.isfinite(multiplier) or not 0.0 <= multiplier <= 1.0:
+        raise ValueError("Gaussian opacity multiplier must lie in [0,1]")
+    return opacities * multiplier
+
+
 def _scalar(array: np.ndarray, name: str, path: Path) -> np.ndarray:
     value = np.asarray(array)
     if value.shape != ():
@@ -773,6 +790,36 @@ def load_anchor_graph_source(
     return (_load_graph_archive(graph_path),)
 
 
+def anchor_world_center(
+    graphs: tuple[AnchorGraphViewData, ...],
+) -> np.ndarray:
+    points = [
+        graph.anchor_points_world
+        for graph in graphs
+        if graph.anchor_points_world.shape[0]
+    ]
+    if not points:
+        raise ValueError("Cannot center the viewer without anchor points")
+    all_points = np.concatenate(points, axis=0).astype(np.float64)
+    center = 0.5 * (all_points.min(axis=0) + all_points.max(axis=0))
+    if center.shape != (3,) or not np.isfinite(center).all():
+        raise ValueError("Anchor world center must be finite (3,)")
+    return center.astype(np.float32)
+
+
+def center_world_points(
+    points: np.ndarray,
+    world_center: np.ndarray,
+) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32)
+    center = np.asarray(world_center, dtype=np.float32)
+    if points.ndim < 1 or points.shape[-1] != 3 or not np.isfinite(points).all():
+        raise ValueError("World points must be finite with final dimension 3")
+    if center.shape != (3,) or not np.isfinite(center).all():
+        raise ValueError("world_center must be finite (3,)")
+    return points - center
+
+
 def _load_gaussian_splat_group(
     arrays: dict[str, np.ndarray],
     sidecar_path: Path,
@@ -939,10 +986,20 @@ class StaticGaussianViewer:
         gaussians: GaussianVisualizationData,
         *,
         splat_scale: float,
+        world_center: np.ndarray,
     ) -> None:
+        self.foreground_opacities = gaussians.foreground.opacities.copy()
+        self.background_opacities = (
+            None
+            if gaussians.background is None
+            else gaussians.background.opacities.copy()
+        )
         self.foreground_handle = server.scene.add_gaussian_splats(
             "/static_gaussians/foreground",
-            centers=gaussians.foreground.centers,
+            centers=center_world_points(
+                gaussians.foreground.centers,
+                world_center,
+            ),
             covariances=gaussians.foreground.covariances,
             rgbs=gaussians.foreground.rgbs,
             opacities=gaussians.foreground.opacities,
@@ -953,7 +1010,10 @@ class StaticGaussianViewer:
         if gaussians.background is not None:
             self.background_handle = server.scene.add_gaussian_splats(
                 "/static_gaussians/background",
-                centers=gaussians.background.centers,
+                centers=center_world_points(
+                    gaussians.background.centers,
+                    world_center,
+                ),
                 covariances=gaussians.background.covariances,
                 rgbs=gaussians.background.rgbs,
                 opacities=gaussians.background.opacities,
@@ -978,10 +1038,18 @@ class StaticGaussianViewer:
                 step=0.05,
                 initial_value=splat_scale,
             )
+            self.gaussian_opacity = server.gui.add_slider(
+                "Gaussian opacity",
+                min=0.0,
+                max=1.0,
+                step=0.01,
+                initial_value=1.0,
+            )
         self.show_foreground.on_update(self._update)
         if self.show_background is not None:
             self.show_background.on_update(self._update)
         self.splat_scale.on_update(self._update)
+        self.gaussian_opacity.on_update(self._update_opacity)
         self._update()
 
     def _update(self, _event: Any = None) -> None:
@@ -992,6 +1060,19 @@ class StaticGaussianViewer:
             assert self.show_background is not None
             self.background_handle.visible = bool(self.show_background.value)
             self.background_handle.scale = scale
+
+    def _update_opacity(self, _event: Any = None) -> None:
+        multiplier = float(self.gaussian_opacity.value)
+        self.foreground_handle.opacities = scale_gaussian_opacities(
+            self.foreground_opacities,
+            multiplier,
+        )
+        if self.background_handle is not None:
+            assert self.background_opacities is not None
+            self.background_handle.opacities = scale_gaussian_opacities(
+                self.background_opacities,
+                multiplier,
+            )
 
 
 class AnchorGraphViewer:
@@ -1004,12 +1085,18 @@ class AnchorGraphViewer:
         line_width: float,
         anchor_point_size: float,
         isolated_point_size: float,
+        world_center: np.ndarray,
     ) -> None:
         if not graphs:
             raise ValueError("Anchor graph viewer requires at least one graph")
         self.server = server
         self.graphs = graphs
         self.labels = tuple(graph.label for graph in graphs)
+        self.world_center = np.asarray(world_center, dtype=np.float32)
+        if self.world_center.shape != (3,) or not np.isfinite(
+            self.world_center
+        ).all():
+            raise ValueError("world_center must be finite (3,)")
         self._line_handle = None
         self._anchor_handle = None
         self._isolated_handle = None
@@ -1094,6 +1181,10 @@ class AnchorGraphViewer:
         with self._update_lock:
             self._remove_scene_nodes()
             graph = self._selected_graph()
+            centered_points = center_world_points(
+                graph.anchor_points_world,
+                self.world_center,
+            )
             if bool(self.show_graph.value):
                 selected_edges = stable_uniform_edge_indices(
                     graph.edge_index.shape[0],
@@ -1120,20 +1211,20 @@ class AnchorGraphViewer:
                         )
                     self._line_handle = self.server.scene.add_line_segments(
                         "/anchor_structure_graph/edges",
-                        points=graph.anchor_points_world[edges],
+                        points=centered_points[edges],
                         colors=np.repeat(edge_colors[:, None, :], 2, axis=1),
                         line_width=float(self.line_width.value),
                     )
             if bool(self.show_anchors.value) and graph.anchor_points_world.shape[0]:
                 self._anchor_handle = self.server.scene.add_point_cloud(
                     "/anchor_structure_graph/anchors",
-                    points=graph.anchor_points_world,
+                    points=centered_points,
                     colors=graph.anchor_colors_rgb,
                     point_size=float(self.anchor_point_size.value),
                     point_shape="circle",
                 )
             if bool(self.show_isolated.value):
-                isolated_points = graph.anchor_points_world[graph.isolated_mask]
+                isolated_points = centered_points[graph.isolated_mask]
                 if isolated_points.shape[0]:
                     self._isolated_handle = self.server.scene.add_point_cloud(
                         "/anchor_structure_graph/isolated",
@@ -1151,6 +1242,7 @@ class AnchorGraphViewer:
 def _configure_initial_camera(
     server: Any,
     graphs: tuple[AnchorGraphViewData, ...],
+    world_center: np.ndarray,
 ) -> None:
     nonempty = [
         graph.anchor_points_world
@@ -1159,15 +1251,14 @@ def _configure_initial_camera(
     ]
     if not nonempty:
         return
-    points = np.concatenate(nonempty, axis=0)
+    points = center_world_points(np.concatenate(nonempty, axis=0), world_center)
     minimum = points.min(axis=0)
     maximum = points.max(axis=0)
-    center = 0.5 * (minimum + maximum)
     extent = max(float(np.max(maximum - minimum)), 1.0e-3)
-    server.initial_camera.look_at = tuple(float(value) for value in center)
+    server.initial_camera.look_at = (0.0, 0.0, 0.0)
     server.initial_camera.position = tuple(
         float(value)
-        for value in center + extent * np.asarray([1.2, -1.2, 0.8])
+        for value in extent * np.asarray([1.2, -1.2, 0.8])
     )
 
 
@@ -1227,6 +1318,7 @@ def main() -> None:
         manifest_path=args.manifest,
         graph_path=args.graph_npz,
     )
+    world_center = anchor_world_center(graphs)
     gaussians = (
         load_gaussian_visualization_sidecar(args.gaussian_npz, graphs)
         if args.gaussian_npz is not None
@@ -1263,12 +1355,13 @@ def main() -> None:
         label="Anchor structure graph",
     )
     server.scene.set_up_direction("+z")
-    _configure_initial_camera(server, graphs)
+    _configure_initial_camera(server, graphs, world_center)
     if gaussians is not None:
         StaticGaussianViewer(
             server,
             gaussians,
             splat_scale=args.gaussian_scale,
+            world_center=world_center,
         )
     AnchorGraphViewer(
         server,
@@ -1277,12 +1370,17 @@ def main() -> None:
         line_width=args.line_width,
         anchor_point_size=args.anchor_point_size,
         isolated_point_size=args.isolated_point_size,
+        world_center=world_center,
     )
     print(
         "Loaded "
         f"{len(graphs)} mode(s), "
         f"{sum(graph.edge_index.shape[0] for graph in graphs)} edge(s), "
         f"{sum(graph.anchor_points_world.shape[0] for graph in graphs)} anchor(s)."
+    )
+    print(
+        "Viewer world origin is the anchor AABB center: "
+        f"{world_center.tolist()}"
     )
     if gaussians is not None:
         background_count = (
