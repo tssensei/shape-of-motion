@@ -15,6 +15,7 @@ from modal_surface.observed_structure_graph import (
 from preproc.vis_observed_structure_graph import (
     _load_observed_graph_archive,
     _validate_args,
+    advance_playback_phase,
     anchor_residual_fraction_colors,
     anchor_residual_source_colors,
     anchor_residual_view_colors,
@@ -748,6 +749,24 @@ class StandaloneObservedGraphViewerTests(unittest.TestCase):
                 0.0,
                 1.0,
             )
+
+    def test_playback_phase_uses_mode_frequency_speed_and_wraps(self) -> None:
+        self.assertAlmostEqual(
+            advance_playback_phase(0.25, 0.5, 0.5, 2.0),
+            0.25 + np.pi,
+        )
+        self.assertAlmostEqual(
+            advance_playback_phase(2.0 * np.pi - 0.1, 0.1, 1.0, 1.0),
+            0.1 * 2.0 * np.pi - 0.1,
+        )
+        for values, message in (
+            ((np.nan, 0.1, 1.0, 1.0), "finite"),
+            ((0.0, -0.1, 1.0, 1.0), "non-negative"),
+            ((0.0, 0.1, 0.0, 1.0), "positive"),
+            ((0.0, 0.1, 1.0, 0.0), "positive"),
+        ):
+            with self.assertRaisesRegex(ValueError, message):
+                advance_playback_phase(*values)
 
     def test_cli_requires_observed_graph_and_validates_display_ranges(self) -> None:
         parser = build_parser()

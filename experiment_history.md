@@ -161,3 +161,16 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   defining graph nodes only after the strict first-pass residual filter. This
   motivates the next diagnostic graph over every positive-weight observed
   Gaussian before changing the solver.
+
+## `mode4_rigid_components_full_k8_d0p008`
+
+- Output directory: `/home/zs292/outputs_modal/bush4/mode4_rigid_components_full_k8_d0p008`
+- The mode-4 observed-graph rigid-component pipeline completed successfully and
+  wrote `modal_modes_manifest.json` with solver exit code 0.
+- The reused source observation contained 236,537 foreground Gaussians and
+  291,962 rows: 128,722 from view1, 88,409 from view2, and 74,831 from view3;
+  169,298 Gaussians had no observation row.
+- This is the first completed rigid-component solve after separating the strict
+  complex128 first-order rigidity check from the quantization-accounted
+  complex64 persistence check. Visual motion and component/fill diagnostics
+  remain to be inspected in the standalone Viewer.

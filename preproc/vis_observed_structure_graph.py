@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+import time
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -596,6 +597,39 @@ def deform_modal_points(
         points.astype(np.float64)
         + float(motion_scale) * np.real(coefficient * field.astype(np.complex128))
     ).astype(np.float32)
+
+
+def advance_playback_phase(
+    phase: float,
+    elapsed_seconds: float,
+    frequency_hz: float,
+    speed_multiplier: float,
+) -> float:
+    """Advance a modal phase using wall-clock time and the selected frequency."""
+
+    values = np.asarray(
+        [phase, elapsed_seconds, frequency_hz, speed_multiplier],
+        dtype=np.float64,
+    )
+    if not np.isfinite(values).all():
+        raise ValueError("Playback phase inputs must be finite")
+    if elapsed_seconds < 0.0:
+        raise ValueError("Playback elapsed_seconds must be non-negative")
+    if frequency_hz <= 0.0:
+        raise ValueError("Playback frequency_hz must be positive")
+    if speed_multiplier <= 0.0:
+        raise ValueError("Playback speed_multiplier must be positive")
+    return float(
+        np.mod(
+            phase
+            + 2.0
+            * np.pi
+            * frequency_hz
+            * speed_multiplier
+            * elapsed_seconds,
+            2.0 * np.pi,
+        )
+    )
 
 
 def _manifest_string(value: Any, name: str, path: Path) -> str:
@@ -1878,6 +1912,7 @@ class ObservedGraphViewer:
         self._completed_fill_handle = None
         self._unresolved_fill_handle = None
         self._update_lock = threading.Lock()
+        self._playback_thread = None
 
         max_edges = max(int(graph.edge_index.shape[0]) for graph in graphs)
         edge_step = max(max_edges // 200, 1)
@@ -1947,6 +1982,9 @@ class ObservedGraphViewer:
                 self.graph_geometry = None
                 self.phase = None
                 self.motion_scale = None
+                self.play = None
+                self.playback_speed = None
+                self.playback_fps = None
                 self.show_rigid_seeds = None
                 self.show_completed_fill = None
                 self.show_unresolved_fill = None
@@ -1969,6 +2007,21 @@ class ObservedGraphViewer:
                     max=3.0,
                     step=0.05,
                     initial_value=1.0,
+                )
+                self.play = server.gui.add_checkbox("Play", False)
+                self.playback_speed = server.gui.add_slider(
+                    "Playback speed (x)",
+                    min=0.1,
+                    max=3.0,
+                    step=0.05,
+                    initial_value=1.0,
+                )
+                self.playback_fps = server.gui.add_slider(
+                    "Playback FPS",
+                    min=1,
+                    max=30,
+                    step=1,
+                    initial_value=10,
                 )
                 self.show_rigid_seeds = server.gui.add_checkbox(
                     "Show rigid seeds",
@@ -2003,6 +2056,9 @@ class ObservedGraphViewer:
             assert self.graph_geometry is not None
             assert self.phase is not None
             assert self.motion_scale is not None
+            assert self.play is not None
+            assert self.playback_speed is not None
+            assert self.playback_fps is not None
             assert self.show_rigid_seeds is not None
             rigid_handles = [
                 self.graph_geometry,
@@ -2016,7 +2072,14 @@ class ObservedGraphViewer:
                 rigid_handles.append(self.show_unresolved_fill)
             for handle in rigid_handles:
                 handle.on_update(self._update)
+            self.play.on_update(self._on_playback_toggle)
         self._update()
+        if rigid_manifest is not None:
+            self._playback_thread = threading.Thread(
+                target=self._playback_loop,
+                daemon=True,
+            )
+            self._playback_thread.start()
 
     def _selected_graph(self) -> ObservedGraphViewData:
         selected = str(self.mode.value)
@@ -2029,6 +2092,49 @@ class ObservedGraphViewer:
         graph: ObservedGraphViewData,
     ) -> RigidModeViewData | None:
         return self.rigid_modes.get(graph.mode_index)
+
+    def _on_playback_toggle(self, _event: Any = None) -> None:
+        assert self.play is not None
+        assert self.graph_geometry is not None
+        if bool(self.play.value) and str(self.graph_geometry.value) != "deformed":
+            self.graph_geometry.value = "deformed"
+
+    def _playback_loop(self) -> None:
+        assert self.play is not None
+        assert self.graph_geometry is not None
+        assert self.phase is not None
+        assert self.playback_speed is not None
+        assert self.playback_fps is not None
+        last_time = time.perf_counter()
+        while True:
+            try:
+                now = time.perf_counter()
+                elapsed_seconds = max(now - last_time, 0.0)
+                last_time = now
+                if bool(self.play.value):
+                    if str(self.graph_geometry.value) != "deformed":
+                        self.graph_geometry.value = "deformed"
+                    graph = self._selected_graph()
+                    rigid_mode = self._selected_rigid_mode(graph)
+                    if rigid_mode is None:
+                        raise RuntimeError(
+                            "Playback requires a rigid result for the selected mode"
+                        )
+                    self.phase.value = advance_playback_phase(
+                        float(self.phase.value),
+                        elapsed_seconds,
+                        float(rigid_mode.freq_hz),
+                        float(self.playback_speed.value),
+                    )
+                fps = max(float(self.playback_fps.value), 1.0)
+                time.sleep(1.0 / fps)
+            except Exception as exc:
+                print(
+                    "Observed graph playback thread failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                raise
 
     def _remove_scene_nodes(self) -> None:
         for attribute in (
