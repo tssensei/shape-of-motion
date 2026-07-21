@@ -79,3 +79,26 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   it because its pinned `viser==0.2.1` lacks `SceneApi.add_line_segments`; graph
   inspection is therefore being moved to an isolated modern-Viser viewer, with
   no need to rerun this solve.
+
+### Observation-coverage replay
+
+- Diagnostic artifact: `/home/zs292/outputs_modal/bush4/mode4_anchor_graph_exp/observation_coverage_mode4.npz`
+- The static replay exactly reproduced the saved K=4 per-Gaussian view counts,
+  sample counts, and per-view observation totals before emitting diagnostics.
+- Multi-view selected Gaussian counts for K=4, 8, 12, 16, and 32 were 23,106,
+  34,710, 40,305, 42,719, and 43,931, respectively.
+- Unobserved counts over the same sweep were 169,298, 149,998, 141,542,
+  137,661, and 135,446.
+- The 43,931 Gaussians with positive-contribution candidates in at least two
+  views are independent of selected K. K=4 retained 23,106 (52.6%) of them and
+  lost 20,825 (47.4%) specifically through top-K competition; K=8, 12, and 16
+  retained 79.0%, 91.7%, and 97.2%, respectively.
+- Separately, 160,032 Gaussians were preselected in fewer than two views, and
+  32,574 were preselected in at least two views but retained positive
+  contribution/camera depth in fewer than two views. These counts do not change
+  with selected K.
+- Conclusion: top-4 competition is a major confirmed source of anchor sparsity,
+  but increasing K alone cannot yield dense coverage. K=12 captures most of the
+  available multi-view candidates with substantially diminishing gains beyond
+  it; the larger remaining bottleneck lies before top-K selection, especially
+  insufficient multi-view preselection coverage.
