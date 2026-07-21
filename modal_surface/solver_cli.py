@@ -13,6 +13,8 @@ STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT = 0.1
 RIGID_COMPONENT_RCOND_DEFAULT = 1e-8
 RIGID_SEED_MIN_VALID_VIEWS_DEFAULT = 2
 RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT = 1e-3
+RIGID_SEED_MIN_COMPONENT_NODES_DEFAULT = 4
+RIGID_SEED_MIN_COMPONENT_EDGES_DEFAULT = 3
 
 
 def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
@@ -59,6 +61,24 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Minimum full-system sigma_min/sigma_max ratio required to retain "
             "a solved rigid component as a trusted seed (default: 1e-3)."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-seed-min-component-nodes",
+        type=int,
+        default=RIGID_SEED_MIN_COMPONENT_NODES_DEFAULT,
+        help=(
+            "Minimum component node count required to retain a solved rigid "
+            "component as a trusted seed (default: 4)."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-seed-min-component-edges",
+        type=int,
+        default=RIGID_SEED_MIN_COMPONENT_EDGES_DEFAULT,
+        help=(
+            "Minimum component edge count required to retain a solved rigid "
+            "component as a trusted seed (default: 3)."
         ),
     )
 
@@ -161,11 +181,17 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
         "rigid_component_finite_phase_samples": 64,
         "rigid_component_finite_rigidity": "first_order_only",
         "rigid_component_seed_policy": (
-            "postsolve_valid_view_and_singular_ratio_gate"
+            "postsolve_valid_view_singular_ratio_and_size_gate"
         ),
         "rigid_seed_min_valid_views": int(args.rigid_seed_min_valid_views),
         "rigid_seed_min_singular_ratio": float(
             args.rigid_seed_min_singular_ratio
+        ),
+        "rigid_seed_min_component_nodes": int(
+            args.rigid_seed_min_component_nodes
+        ),
+        "rigid_seed_min_component_edges": int(
+            args.rigid_seed_min_component_edges
         ),
         "nonseed_policy": (
             "free_motion_fill"
