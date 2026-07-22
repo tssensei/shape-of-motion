@@ -29,13 +29,13 @@ from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_METHOD,
     MOTION_FILL_ROLE_NAMES,
     MOTION_FILL_VERSION,
-    RIGID_SEED_MOTION_FILL_METHOD,
+    RIGID_SEQUENTIAL_MOTION_FILL_METHOD,
     RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD,
     RIGID_SINGLE_VIEW_PARTIAL_FILL_POLICY,
     GaussianMotionFillResult,
     RigidSeedMotionFillResult,
     apply_gaussian_motion_fill,
-    apply_rigid_seed_motion_fill,
+    apply_sequential_rigid_motion_fill,
     apply_single_view_component_partial_fill,
     write_motion_fill_diagnostics,
     write_motion_fill_graph,
@@ -412,20 +412,6 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         raise ValueError(
             "--solve-method=rigid-components requires --rigid-component-graph."
         )
-    if motion_fill_stage != "single-view-components":
-        if observable_ratio != RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT:
-            raise ValueError(
-                "A custom --rigid-single-view-observable-ratio requires "
-                "--rigid-motion-fill-stage=single-view-components."
-            )
-        if (
-            ray_direction_fraction
-            != RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT
-        ):
-            raise ValueError(
-                "A custom --rigid-single-view-ray-direction-min-fraction requires "
-                "--rigid-motion-fill-stage=single-view-components."
-            )
     if float(args.anchor_svd_ratio_min) != STAGED_ANCHOR_SVD_RATIO_DEFAULT:
         raise ValueError(
             "--anchor-svd-ratio-min is unavailable for rigid component solves; "
@@ -1002,8 +988,11 @@ def _rigid_gaussian_latent_stats(
                 "motion_fill_method": motion_fill_method,
                 "effective_field_method": (
                     "rigid_component_twist+single_view_partial_component_knn_lsmr"
-                    if motion_fill.single_view_partial_diagnostics is not None
-                    else "rigid_component_twist+single_view_grouped_rigid_knn_lsmr"
+                    if motion_fill_method == RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD
+                    else (
+                        "rigid_component_twist+single_view_partial_component_"
+                        "knn_lsmr+independent_gaussian_knn_lsmr"
+                    )
                 ),
                 "motion_fill": motion_fill.diagnostics,
             }
@@ -1537,11 +1526,11 @@ def _write_rigid_solver_diagnostics(
             raise ValueError("Rigid motion-fill diagnostics require graph metadata.")
         motion = motion_fill.motion
         motion_fill_method = str(motion_fill.diagnostics["method"])
-        component_fill_policy = (
-            RIGID_SINGLE_VIEW_PARTIAL_FILL_POLICY
-            if motion_fill.single_view_partial_diagnostics is not None
-            else "shared_unknown_normalized_infinitesimal_se3_twist"
-        )
+        if motion_fill.single_view_partial_diagnostics is None:
+            raise ValueError(
+                "Rigid motion fill requires single-view partial diagnostics."
+            )
+        component_fill_policy = RIGID_SINGLE_VIEW_PARTIAL_FILL_POLICY
         arrays.update(
             {
                 "motion_fill_method": np.array(motion_fill_method),
@@ -1843,25 +1832,44 @@ def _write_time_profile(
         )
         if bool(motion["enabled"]):
             motion_fill_stage = str(motion["stage"])
-            print(
-                "    fill prep/connect/assemble "
-                f"{float(motion['preparation_seconds']):.3f} / "
-                f"{float(motion['connectivity_seconds']):.3f} / "
-                f"{float(motion['system_assembly_seconds']):.3f} s"
-            )
-            print(
-                "    fill LSMR real/imag        "
-                f"{float(motion['lsmr_real_seconds']):.3f} / "
-                f"{float(motion['lsmr_imaginary_seconds']):.3f} s"
-            )
             if motion_fill_stage == RIGID_MOTION_FILL_STAGE_DEFAULT:
                 print(
-                    "    fill layout/recon/validate "
-                    f"{float(motion['variable_layout_seconds']):.3f} / "
-                    f"{float(motion['reconstruction_seconds']):.3f} / "
+                    "    component fill total       "
+                    f"{float(motion['component_total_seconds']):.3f} s"
+                )
+                print(
+                    "    component LSMR real/imag  "
+                    f"{float(motion['component_lsmr_real_seconds']):.3f} / "
+                    f"{float(motion['component_lsmr_imaginary_seconds']):.3f} s"
+                )
+                print(
+                    "    point prep/connect/assemble "
+                    f"{float(motion['pointwise_preparation_seconds']):.3f} / "
+                    f"{float(motion['pointwise_connectivity_seconds']):.3f} / "
+                    f"{float(motion['pointwise_system_assembly_seconds']):.3f} s"
+                )
+                print(
+                    "    point LSMR real/imag      "
+                    f"{float(motion['pointwise_lsmr_real_seconds']):.3f} / "
+                    f"{float(motion['pointwise_lsmr_imaginary_seconds']):.3f} s"
+                )
+                print(
+                    "    point recon / validation  "
+                    f"{float(motion['pointwise_reconstruction_seconds']):.3f} / "
                     f"{float(motion['validation_and_residual_seconds']):.3f} s"
                 )
             elif motion_fill_stage == "single-view-components":
+                print(
+                    "    fill prep/connect/assemble "
+                    f"{float(motion['preparation_seconds']):.3f} / "
+                    f"{float(motion['connectivity_seconds']):.3f} / "
+                    f"{float(motion['system_assembly_seconds']):.3f} s"
+                )
+                print(
+                    "    fill LSMR real/imag        "
+                    f"{float(motion['lsmr_real_seconds']):.3f} / "
+                    f"{float(motion['lsmr_imaginary_seconds']):.3f} s"
+                )
                 print(
                     "    fill validation/residual  "
                     f"{float(motion['validation_and_residual_seconds']):.3f} s"
@@ -2169,7 +2177,7 @@ def run(args: argparse.Namespace) -> None:
                             progress=progress,
                         )
                     else:
-                        rigid_motion_fill = apply_rigid_seed_motion_fill(
+                        rigid_motion_fill = apply_sequential_rigid_motion_fill(
                             prepared,
                             alpha,
                             rigid,
@@ -2177,6 +2185,15 @@ def run(args: argparse.Namespace) -> None:
                             loaded_graph.graph,
                             motion_fill_graph,
                             motion_fill_relative_path,
+                            observable_singular_ratio_min=float(
+                                args.rigid_single_view_observable_ratio
+                            ),
+                            ray_direction_min_fraction=float(
+                                args.rigid_single_view_ray_direction_min_fraction
+                            ),
+                            max_finite_drift=float(
+                                args.rigid_seed_max_finite_drift
+                            ),
                             timings=motion_fill_timings,
                             progress=progress,
                         )
@@ -2433,7 +2450,7 @@ def run(args: argparse.Namespace) -> None:
             RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD
             if args.solve_method == "rigid-components"
             and args.rigid_motion_fill_stage == "single-view-components"
-            else RIGID_SEED_MOTION_FILL_METHOD
+            else RIGID_SEQUENTIAL_MOTION_FILL_METHOD
             if args.solve_method == "rigid-components"
             else MOTION_FILL_METHOD
         )
@@ -2448,7 +2465,7 @@ def run(args: argparse.Namespace) -> None:
                     "ordinary_gaussians_zero_component_only"
                     if args.solve_method == "rigid-components"
                     and args.rigid_motion_fill_stage == "single-view-components"
-                    else "none_all_nonseed_free"
+                    else "completed_components_fixed_all_other_gaussians_free"
                     if args.solve_method == "rigid-components"
                     else "retain_observable_exclude_from_graph"
                 ),

@@ -272,3 +272,11 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   `/home/zs292/outputs_modal/bush4/mode4_single_view_partial_view_support_0p15_no_radius_gate`
   found the 0.15 version visually reasonable, so subsequent component-only
   experiments retain 0.15 while increasing KNN influence separately.
+- The next full-fill comparison uses
+  `/home/zs292/outputs_modal/bush4/mode4_sequential_partial_then_pointwise_independent_profile`.
+  It removes the earlier simultaneous grouped-component/point solve: trusted
+  components and finite-safe trusted-connected single-view completions are
+  frozen after the fast component stage, while every remaining Gaussian is
+  reset and solved as an independent 3D point variable. The run profile now
+  separates component-stage time from pointwise connectivity, assembly,
+  real/imaginary LSMR, and reconstruction time.

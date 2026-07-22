@@ -15,7 +15,7 @@ RIGID_SEED_MIN_VALID_VIEWS_DEFAULT = 2
 RIGID_SEED_MIN_SECONDARY_VIEW_NODE_RATIO_DEFAULT = 1.0 / 3.0
 RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT = 1e-3
 RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT = 2.0
-RIGID_MOTION_FILL_STAGE_DEFAULT = "joint"
+RIGID_MOTION_FILL_STAGE_DEFAULT = "sequential"
 RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT = 1.0e-2
 RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT = 0.8
 
@@ -86,11 +86,12 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--rigid-motion-fill-stage",
-        choices=["joint", "single-view-components"],
+        choices=["sequential", "single-view-components"],
         default=RIGID_MOTION_FILL_STAGE_DEFAULT,
         help=(
-            "Run the existing joint component/point fill, or only complete "
-            "single-view component weak directions before any pointwise fill "
+            "Complete single-view component weak directions and then fill every "
+            "remaining Gaussian as an independent 3D variable, or stop after "
+            "the component stage "
             f"(default: {RIGID_MOTION_FILL_STAGE_DEFAULT})."
         ),
     )
@@ -202,8 +203,14 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
             "observable_twist_plus_knn_filled_weak_and_ray_directions"
         )
     elif motion_fill_enabled:
-        nonseed_policy = "single_view_component_rigid_else_free_motion_fill"
-        component_fill_policy = "shared_unknown_normalized_infinitesimal_se3_twist"
+        nonseed_policy = (
+            "trusted_and_completed_single_view_components_fixed_"
+            "all_other_gaussians_independent_3d_motion_fill"
+        )
+        component_fill_policy = (
+            "observable_twist_plus_knn_filled_weak_and_ray_directions_"
+            "then_fixed_for_pointwise_fill"
+        )
     else:
         nonseed_policy = "zero_without_motion_fill"
         component_fill_policy = "disabled"

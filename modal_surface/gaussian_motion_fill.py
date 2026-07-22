@@ -18,7 +18,6 @@ from modal_surface.motion_fill import (
     MotionFillResult,
     SparseSolveMetadata,
     build_shared_group_membership,
-    fill_grouped_affine_motion,
     fill_nullspace_motion,
 )
 from modal_surface.observed_structure_graph import ObservedStructureGraph
@@ -70,8 +69,8 @@ MOTION_FILL_LSMR_BTOL = 1e-10
 MOTION_FILL_LSMR_CONLIM = 1e8
 MOTION_FILL_NULLSPACE_RTOL = 1e-4
 MOTION_FILL_OBSERVATION_DRIFT_RTOL = 1e-4
-RIGID_SEED_MOTION_FILL_METHOD = (
-    "rigid_seed_single_view_component_grouped_knn_lsmr"
+RIGID_SEQUENTIAL_MOTION_FILL_METHOD = (
+    "rigid_seed_partial_component_then_independent_gaussian_knn_lsmr"
 )
 RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD = (
     "rigid_seed_single_view_partial_component_knn_lsmr"
@@ -130,7 +129,7 @@ class GaussianMotionFillResult:
 
 @dataclass(frozen=True)
 class RigidSeedMotionFillResult:
-    """Grouped rigid and pointwise completion from fixed seed motions."""
+    """Rigid-component and independent-Gaussian completion from fixed seeds."""
 
     motion: MotionFillResult
     roles: GaussianMotionFillRoles
@@ -278,7 +277,7 @@ def derive_rigid_seed_motion_fill_roles(
     rigid_seed_mask: np.ndarray,
     constrained_component_mask: np.ndarray,
 ) -> GaussianMotionFillRoles:
-    """Assign fixed seeds, grouped component variables, and free points."""
+    """Assign fixed seeds, optional component variables, and free points."""
 
     mask_source = np.asarray(rigid_seed_mask)
     if mask_source.ndim != 1:
@@ -1642,7 +1641,7 @@ def apply_single_view_component_partial_fill(
     return result
 
 
-def apply_rigid_seed_motion_fill(
+def apply_sequential_rigid_motion_fill(
     prepared: PreparedObservations,
     alpha: AlphaSyncResult,
     rigid: RigidComponentSolveResult,
@@ -1651,408 +1650,142 @@ def apply_rigid_seed_motion_fill(
     graph: KnnGraph,
     graph_path: str,
     *,
+    observable_singular_ratio_min: float,
+    ray_direction_min_fraction: float,
+    max_finite_drift: float,
     timings: dict[str, float] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> RigidSeedMotionFillResult:
-    """Jointly fill single-view rigid groups and ordinary non-seed points."""
+    """Fill trusted single-view components, then independent Gaussian vectors."""
 
     total_started = perf_counter()
-    preparation_started = perf_counter()
-    if progress is not None:
-        progress("grouped preparation started")
-    if not graph_path:
-        raise ValueError("graph_path must be non-empty.")
-    points = np.asarray(prepared.points)
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError(f"points_world must have shape (N,3), got {points.shape}.")
-    num_points = int(points.shape[0])
-    if graph.num_points != num_points:
-        raise ValueError(
-            f"Motion-fill graph has {graph.num_points} points, expected {num_points}."
-        )
-    if rigid.phi.shape != (num_points, 3):
-        raise ValueError("rigid solve point count does not match prepared observations")
-    if seed_selection.phi.shape != (num_points, 3):
-        raise ValueError("rigid seed selection point count is inconsistent")
-    num_components = rigid.num_components
-    component_retained = np.asarray(
-        seed_selection.component_seed_retained_mask,
-        dtype=bool,
+    component_timings: dict[str, float] = {}
+    component_result = apply_single_view_component_partial_fill(
+        prepared,
+        alpha,
+        rigid,
+        seed_selection,
+        observed_graph,
+        graph,
+        graph_path,
+        observable_singular_ratio_min=observable_singular_ratio_min,
+        ray_direction_min_fraction=ray_direction_min_fraction,
+        max_finite_drift=max_finite_drift,
+        timings=component_timings,
+        progress=progress,
     )
-    component_view_count = np.asarray(
-        seed_selection.component_supported_valid_view_count
-    )
-    if (
-        component_retained.shape != (num_components,)
-        or component_view_count.shape != (num_components,)
-        or not np.issubdtype(component_view_count.dtype, np.integer)
-    ):
-        raise ValueError("rigid component selection metadata is inconsistent")
-    single_view_component_fill_mask = (
-        (component_view_count == 1) & ~component_retained
-    )
-    point_component = np.asarray(rigid.point_component_index)
-    if (
-        point_component.shape != (num_points,)
-        or not np.issubdtype(point_component.dtype, np.integer)
-        or np.any(point_component < -1)
-        or np.any(point_component >= num_components)
-    ):
-        raise ValueError("rigid point_component_index is invalid")
-    single_view_rigid_fill_point_mask = np.zeros((num_points,), dtype=bool)
-    component_points = point_component >= 0
-    single_view_rigid_fill_point_mask[component_points] = (
-        single_view_component_fill_mask[point_component[component_points]]
-    )
+
+    num_points = int(prepared.points.shape[0])
     trusted_seed_mask = np.asarray(
         seed_selection.trusted_rigid_seed_mask,
         dtype=bool,
     )
-    roles = derive_rigid_seed_motion_fill_roles(
-        trusted_seed_mask,
-        single_view_rigid_fill_point_mask,
+    component_anchor_mask = np.asarray(
+        component_result.motion.completion_mask,
+        dtype=bool,
     )
-    if roles.role.shape != (num_points,):
-        raise ValueError(
-            f"rigid seed roles must have shape ({num_points},), got "
-            f"{roles.role.shape}."
-        )
-    phi_source = np.asarray(seed_selection.phi)
-    if phi_source.shape != (num_points, 3):
-        raise ValueError(
-            f"trusted rigid phi must have shape ({num_points},3), got "
-            f"{phi_source.shape}."
-        )
-    if not np.issubdtype(phi_source.dtype, np.complexfloating):
-        raise ValueError(
-            f"rigid_seed_phi must have complex dtype, got {phi_source.dtype}."
-        )
-    if not np.all(np.isfinite(phi_source)):
-        raise ValueError("rigid_seed_phi must contain only finite values.")
-    if np.any(phi_source[roles.free_variable_mask] != 0):
-        raise ValueError("trusted rigid phi must be zero at every free point")
-    if np.any(phi_source[roles.constrained_variable_mask] != 0):
-        raise ValueError("trusted rigid phi must be zero at grouped component points")
-
-    selected_components = np.flatnonzero(single_view_component_fill_mask)
-    component_to_group = np.full((num_components,), -1, dtype=np.int32)
-    component_to_group[selected_components] = np.arange(
-        selected_components.size,
-        dtype=np.int32,
-    )
-    shared_group_index = np.full((num_points,), -1, dtype=np.int32)
-    shared_group_index[single_view_rigid_fill_point_mask] = component_to_group[
-        point_component[single_view_rigid_fill_point_mask]
-    ]
-    shared_group_membership = build_shared_group_membership(
-        shared_group_index,
-        num_points,
-    )
-    group_dimensions = np.full(
-        (selected_components.size,),
-        6,
-        dtype=np.int32,
-    )
-    component_radius = np.asarray(rigid.component_radius, dtype=np.float64)
-    component_centroid = np.asarray(rigid.component_centroid, dtype=np.float64)
     if (
-        component_radius.shape != (num_components,)
-        or component_centroid.shape != (num_components, 3)
-        or not np.isfinite(component_radius).all()
-        or np.any(component_radius < 0.0)
-        or not np.isfinite(component_centroid).all()
+        trusted_seed_mask.shape != (num_points,)
+        or component_anchor_mask.shape != (num_points,)
+        or np.any(trusted_seed_mask & component_anchor_mask)
     ):
-        raise ValueError("rigid component geometry is invalid")
-    group_dimensions[component_radius[selected_components] <= MOTION_FILL_EPSILON] = 3
-    shared_point_blocks = np.zeros((num_points, 3, 6), dtype=np.float64)
-    shared_point_blocks[single_view_rigid_fill_point_mask, :, :3] = np.eye(
-        3, dtype=np.float64
-    )[None]
-    member_points = shared_group_membership.ordered_points
-    member_groups = shared_group_index[member_points]
-    member_components = selected_components[member_groups]
-    rotating_members = (
-        component_radius[member_components] > MOTION_FILL_EPSILON
-    )
-    if np.any(rotating_members):
-        rotating_points = member_points[rotating_members]
-        rotating_components = member_components[rotating_members]
-        centered = (
-            points[rotating_points].astype(np.float64)
-            - component_centroid[rotating_components]
-        )
-        skew = np.zeros((rotating_points.size, 3, 3), dtype=np.float64)
-        skew[:, 0, 1] = -centered[:, 2]
-        skew[:, 0, 2] = centered[:, 1]
-        skew[:, 1, 0] = centered[:, 2]
-        skew[:, 1, 2] = -centered[:, 0]
-        skew[:, 2, 0] = -centered[:, 1]
-        skew[:, 2, 1] = centered[:, 0]
-        shared_point_blocks[rotating_points, :, 3:] = -skew / component_radius[
-            rotating_components,
-            None,
-            None,
-        ]
+        raise RuntimeError("Sequential rigid motion-fill anchor masks are invalid")
+    fixed_anchor_mask = trusted_seed_mask | component_anchor_mask
+    if not np.any(fixed_anchor_mask):
+        raise ValueError("Sequential rigid motion fill requires at least one anchor")
 
-    numerical_nullity = np.full((num_points,), 3, dtype=np.int8)
-    numerical_nullity[roles.fixed_anchor_mask] = 0
-    operator = _build_observation_operator(prepared, alpha)
-    if timings is not None:
-        timings["preparation_seconds"] = float(
-            perf_counter() - preparation_started
-        )
-    if progress is not None:
-        progress(
-            "grouped preparation finished in "
-            f"{perf_counter() - preparation_started:.3f} s: "
-            f"groups={selected_components.size}, points={member_points.size}"
-        )
-    motion = fill_grouped_affine_motion(
+    phi_fixed = np.zeros((num_points, 3), dtype=np.complex64)
+    phi_fixed[fixed_anchor_mask] = component_result.motion.phi[fixed_anchor_mask]
+    point_nullspace_basis = np.broadcast_to(
+        np.eye(3, dtype=np.float64),
+        (num_points, 3, 3),
+    )
+    point_nullity = np.full((num_points,), 3, dtype=np.int8)
+    point_nullity[fixed_anchor_mask] = 0
+    point_target_mask = ~fixed_anchor_mask
+    empty_mask = np.zeros((num_points,), dtype=bool)
+    roles = derive_rigid_seed_motion_fill_roles(
+        fixed_anchor_mask,
+        empty_mask,
+    )
+
+    pointwise_timings: dict[str, float] = {}
+    point_motion = fill_nullspace_motion(
         graph,
-        phi_source,
-        roles.fixed_anchor_mask,
-        shared_group_index,
-        shared_point_blocks,
-        group_dimensions,
+        phi_fixed,
+        point_nullspace_basis,
+        point_nullity,
+        fixed_anchor_mask,
+        empty_mask,
+        point_target_mask,
+        excluded_mask=empty_mask,
         lsmr_atol=MOTION_FILL_LSMR_ATOL,
         lsmr_btol=MOTION_FILL_LSMR_BTOL,
         lsmr_conlim=MOTION_FILL_LSMR_CONLIM,
-        timings=timings,
-        shared_group_membership=shared_group_membership,
+        timings=pointwise_timings,
         progress=progress,
     )
+    if not np.array_equal(
+        point_motion.phi[fixed_anchor_mask],
+        phi_fixed[fixed_anchor_mask],
+    ):
+        raise RuntimeError("Pointwise motion fill changed a rigid-component anchor")
+
+    overall_completion = (
+        point_motion.completion_mask | component_anchor_mask
+    )
+    motion = MotionFillResult(
+        phi=point_motion.phi,
+        phi_observable=point_motion.phi_observable,
+        phi_nullspace_correction=point_motion.phi_nullspace_correction,
+        completion_mask=overall_completion,
+        completion_connected_to_anchor=(
+            point_motion.completion_connected_to_anchor
+        ),
+        coefficient_values=point_motion.coefficient_values,
+        coefficient_offsets=point_motion.coefficient_offsets,
+        connectivity=point_motion.connectivity,
+        real_solver=point_motion.real_solver,
+        imag_solver=point_motion.imag_solver,
+        system_row_count=point_motion.system_row_count,
+        system_column_count=point_motion.system_column_count,
+        active_edge_count=point_motion.active_edge_count,
+        point_coefficient_group_index=None,
+        coefficient_group_dimensions=None,
+    )
+
     validation_started = perf_counter()
     if progress is not None:
-        progress("grouped validation and residuals started")
-    if not np.array_equal(
-        motion.phi[roles.fixed_anchor_mask],
-        phi_source[roles.fixed_anchor_mask],
-    ):
-        raise RuntimeError("Motion fill changed a rigid seed.")
-    if np.any(motion.phi_nullspace_correction[roles.fixed_anchor_mask] != 0):
-        raise RuntimeError("Motion fill assigned a correction to a rigid seed.")
-
-    component_completion = np.zeros((num_components,), dtype=bool)
-    component_translation = np.zeros(
-        (num_components, 3), dtype=np.complex128
-    )
-    component_rotation = np.zeros((num_components, 3), dtype=np.complex128)
-    component_first_order_relative_max = np.zeros(
-        (num_components,), dtype=np.float64
-    )
-    if motion.point_coefficient_group_index is None:
-        raise RuntimeError("Grouped motion fill did not return coefficient groups")
-    model_phi = np.zeros((num_points, 3), dtype=np.complex128)
-    if selected_components.size:
-        member_completion = motion.completion_mask[member_points]
-        group_completion_any = np.logical_or.reduceat(
-            member_completion,
-            shared_group_membership.offsets[:-1],
-        )
-        group_completion_all = np.logical_and.reduceat(
-            member_completion,
-            shared_group_membership.offsets[:-1],
-        )
-        if np.any(group_completion_any != group_completion_all):
-            raise RuntimeError(
-                "A shared rigid component was only partially completed"
-            )
-        component_completion[selected_components] = group_completion_all
-        completed_groups = np.flatnonzero(group_completion_all)
-        completed_components = selected_components[completed_groups]
-        completed_starts = motion.coefficient_offsets[completed_groups]
-        component_translation[completed_components] = motion.coefficient_values[
-            completed_starts[:, None] + np.arange(3, dtype=np.int64)[None]
-        ]
-        completed_rotating_groups = completed_groups[
-            group_dimensions[completed_groups] == 6
-        ]
-        completed_rotating_components = selected_components[
-            completed_rotating_groups
-        ]
-        completed_rotating_starts = motion.coefficient_offsets[
-            completed_rotating_groups
-        ]
-        component_rotation[completed_rotating_components] = (
-            motion.coefficient_values[
-                completed_rotating_starts[:, None]
-                + np.arange(3, 6, dtype=np.int64)[None]
-            ]
-            / component_radius[completed_rotating_components, None]
-        )
-        completed_member_mask = group_completion_all[member_groups]
-        for dimension in np.unique(group_dimensions[group_completion_all]):
-            dimension = int(dimension)
-            selected_member_mask = completed_member_mask & (
-                group_dimensions[member_groups] == dimension
-            )
-            selected_member_points = member_points[selected_member_mask]
-            selected_member_groups = member_groups[selected_member_mask]
-            coefficient_indices = (
-                motion.coefficient_offsets[selected_member_groups, None]
-                + np.arange(dimension, dtype=np.int64)[None]
-            )
-            model_phi[selected_member_points] = np.einsum(
-                "nij,nj->ni",
-                shared_point_blocks[selected_member_points, :, :dimension],
-                motion.coefficient_values[coefficient_indices],
-            )
-    if not np.allclose(
-        motion.phi[single_view_rigid_fill_point_mask],
-        model_phi[single_view_rigid_fill_point_mask].astype(motion.phi.dtype),
-        rtol=1.0e-6,
-        atol=1.0e-7,
-    ):
-        raise RuntimeError(
-            "Grouped motion fill did not preserve its shared rigid parameterization"
-        )
-
-    local_edges = np.asarray(observed_graph.topology.edge_index, dtype=np.int64)
-    node_indices = np.asarray(observed_graph.node_gaussian_indices, dtype=np.int64)
-    global_edges = node_indices[local_edges]
-    edge_components = np.asarray(rigid.edge_component_index)
-    if (
-        edge_components.shape != (global_edges.shape[0],)
-        or not np.issubdtype(edge_components.dtype, np.integer)
-        or np.any(edge_components < 0)
-        or np.any(edge_components >= num_components)
-    ):
-        raise ValueError("rigid edge components do not match observed graph edges")
-    selected_edge = single_view_component_fill_mask[edge_components]
-    if np.any(selected_edge):
-        selected_global_edges = global_edges[selected_edge]
-        selected_edge_components = edge_components[selected_edge]
-        edge_vectors = (
-            points[selected_global_edges[:, 1]].astype(np.float64)
-            - points[selected_global_edges[:, 0]].astype(np.float64)
-        )
-        edge_delta_phi = (
-            model_phi[selected_global_edges[:, 1]]
-            - model_phi[selected_global_edges[:, 0]]
-        )
-        edge_axial = np.einsum("ij,ij->i", edge_vectors, edge_delta_phi)
-        edge_squared_length = np.einsum(
-            "ij,ij->i", edge_vectors, edge_vectors
-        )
-        edge_relative = np.maximum(
-            np.abs(edge_axial.real),
-            np.abs(edge_axial.imag),
-        ) / np.maximum(edge_squared_length, MOTION_FILL_EPSILON)
-        np.maximum.at(
-            component_first_order_relative_max,
-            selected_edge_components,
-            edge_relative,
-        )
-    maximum_first_order_error = float(
-        np.max(
-            component_first_order_relative_max[
-                single_view_component_fill_mask
-            ],
-            initial=0.0,
-        )
-    )
-    if maximum_first_order_error > rigid.config.first_order_rtol:
-        raise RuntimeError(
-            "Single-view component fill violated first-order rigidity: "
-            f"max_relative={maximum_first_order_error:.9g}, "
-            f"rtol={rigid.config.first_order_rtol:.9g}"
-        )
-
+        progress("sequential validation and residuals started")
     pred, obs_residual, obs_residual_valid, point_residual, point_residual_valid = (
         compute_prediction_and_residuals(prepared, alpha, motion.phi)
     )
-    observed_mask = np.zeros((num_points,), dtype=bool)
-    positive_rows = operator.weight > 0.0
-    observed_mask[np.unique(operator.point_index[positive_rows])] = True
-    usable_observed_mask = np.zeros((num_points,), dtype=bool)
-    usable_observed_mask[np.unique(operator.point_index[operator.valid_rows])] = True
-    fill_target_mask = (
-        roles.constrained_variable_mask | roles.free_variable_mask
-    )
-    completed_observed = (
-        motion.completion_mask & fill_target_mask & observed_mask
-    )
-    completed_unobserved = (
-        motion.completion_mask & fill_target_mask & ~observed_mask
-    )
-    unresolved_observed = fill_target_mask & observed_mask & ~motion.completion_mask
-    unresolved_unobserved = fill_target_mask & ~observed_mask & ~motion.completion_mask
-
-    role_counts = {
-        name: int(np.count_nonzero(roles.role == index))
-        for index, name in enumerate(MOTION_FILL_ROLE_NAMES)
-    }
+    observed_mask = component_result.observed_mask
+    completed_observed = motion.completion_mask & ~trusted_seed_mask & observed_mask
+    completed_unobserved = motion.completion_mask & ~trusted_seed_mask & ~observed_mask
+    unresolved_target = ~trusted_seed_mask & ~motion.completion_mask
     diagnostics = {
-        "method": RIGID_SEED_MOTION_FILL_METHOD,
+        "method": RIGID_SEQUENTIAL_MOTION_FILL_METHOD,
         "version": MOTION_FILL_VERSION,
         "graph_path": graph_path,
-        "role_counts": role_counts,
-        "numerical_subspace": {
-            "policy": (
-                "rigid_seed_fixed_single_view_shared_twist_other_nonseed_fullspace"
-            ),
-            "nullity_counts": {
-                str(dimension): int(
-                    np.count_nonzero(numerical_nullity == dimension)
-                )
-                for dimension in range(4)
-            },
-        },
-        "single_view_component_fill": {
-            "component_count": int(selected_components.size),
-            "point_count": int(
-                np.count_nonzero(single_view_rigid_fill_point_mask)
-            ),
-            "completed_component_count": int(
-                np.count_nonzero(
-                    component_completion & single_view_component_fill_mask
-                )
-            ),
-            "unresolved_component_count": int(
-                np.count_nonzero(
-                    ~component_completion & single_view_component_fill_mask
-                )
-            ),
-            "model_first_order_relative_max": maximum_first_order_error,
-        },
-        "observability": {
-            "observed_point_count": int(np.count_nonzero(observed_mask)),
-            "usable_observed_point_count": int(
-                np.count_nonzero(usable_observed_mask)
-            ),
-            "observed_fill_target_count": int(
-                np.count_nonzero(fill_target_mask & observed_mask)
-            ),
-            "unobserved_fill_target_count": int(
-                np.count_nonzero(fill_target_mask & ~observed_mask)
-            ),
+        "pipeline": (
+            "single_view_partial_components_then_independent_3d_gaussians"
+        ),
+        "component_stage": component_result.diagnostics,
+        "role_counts": {
+            name: int(np.count_nonzero(roles.role == index))
+            for index, name in enumerate(MOTION_FILL_ROLE_NAMES)
         },
         "completion": {
-            "count": int(np.count_nonzero(motion.completion_mask)),
-            "completed_observed_fill_target_count": int(
-                np.count_nonzero(completed_observed)
+            "component_anchor_point_count": int(
+                np.count_nonzero(component_anchor_mask)
             ),
-            "completed_unobserved_fill_target_count": int(
+            "pointwise_target_count": int(np.count_nonzero(point_target_mask)),
+            "completed_observed_count": int(np.count_nonzero(completed_observed)),
+            "completed_unobserved_count": int(
                 np.count_nonzero(completed_unobserved)
             ),
-            "unresolved_observed_fill_target_count": int(
-                np.count_nonzero(unresolved_observed)
-            ),
-            "unresolved_unobserved_fill_target_count": int(
-                np.count_nonzero(unresolved_unobserved)
-            ),
-            "anchor_connected_point_count": int(
-                np.count_nonzero(motion.completion_connected_to_anchor)
-            ),
-        },
-        "connectivity": {
-            "component_count": int(motion.connectivity.component_sizes.shape[0]),
-            "anchor_connected_component_count": int(
-                np.count_nonzero(motion.connectivity.component_has_anchor)
-            ),
-            "seed_free_component_count": int(
-                np.count_nonzero(~motion.connectivity.component_has_anchor)
-            ),
+            "unresolved_target_count": int(np.count_nonzero(unresolved_target)),
         },
         "system": {
             "row_count": int(motion.system_row_count),
@@ -2066,19 +1799,27 @@ def apply_rigid_seed_motion_fill(
     result = RigidSeedMotionFillResult(
         motion=motion,
         roles=roles,
-        numerical_nullity=numerical_nullity,
+        numerical_nullity=point_nullity,
         observed_mask=observed_mask,
-        usable_observed_mask=usable_observed_mask,
-        fill_target_mask=fill_target_mask,
-        single_view_component_fill_mask=single_view_component_fill_mask,
-        single_view_rigid_fill_point_mask=single_view_rigid_fill_point_mask,
-        single_view_component_completion_mask=component_completion,
-        single_view_component_translation=component_translation.astype(
-            np.complex64
+        usable_observed_mask=component_result.usable_observed_mask,
+        fill_target_mask=~trusted_seed_mask,
+        single_view_component_fill_mask=(
+            component_result.single_view_component_fill_mask
         ),
-        single_view_component_rotation=component_rotation.astype(np.complex64),
+        single_view_rigid_fill_point_mask=(
+            component_result.single_view_rigid_fill_point_mask
+        ),
+        single_view_component_completion_mask=(
+            component_result.single_view_component_completion_mask
+        ),
+        single_view_component_translation=(
+            component_result.single_view_component_translation
+        ),
+        single_view_component_rotation=(
+            component_result.single_view_component_rotation
+        ),
         single_view_component_first_order_relative_max=(
-            component_first_order_relative_max.astype(np.float32)
+            component_result.single_view_component_first_order_relative_max
         ),
         obs_pred_y=pred,
         obs_residual=obs_residual,
@@ -2086,16 +1827,22 @@ def apply_rigid_seed_motion_fill(
         point_residual=point_residual,
         point_residual_valid_mask=point_residual_valid,
         diagnostics=diagnostics,
+        single_view_partial_diagnostics=(
+            component_result.single_view_partial_diagnostics
+        ),
     )
+    validation_seconds = float(perf_counter() - validation_started)
     if timings is not None:
-        timings["validation_and_residual_seconds"] = float(
-            perf_counter() - validation_started
-        )
+        for name, seconds in component_timings.items():
+            timings[f"component_{name}"] = float(seconds)
+        for name, seconds in pointwise_timings.items():
+            timings[f"pointwise_{name}"] = float(seconds)
+        timings["validation_and_residual_seconds"] = validation_seconds
         timings["total_seconds"] = float(perf_counter() - total_started)
     if progress is not None:
         progress(
-            "grouped validation and residuals finished in "
-            f"{perf_counter() - validation_started:.3f} s"
+            "sequential validation and residuals finished in "
+            f"{validation_seconds:.3f} s"
         )
     return result
 

@@ -1031,16 +1031,24 @@ def load_rigid_manifest(
             f"{manifest_path} motion_fill_enabled must be a boolean"
         )
     rigid_motion_fill_stage = parameters.get("rigid_motion_fill_stage", "joint")
-    if rigid_motion_fill_stage not in {"joint", "single-view-components"}:
+    if rigid_motion_fill_stage not in {
+        "joint",
+        "sequential",
+        "single-view-components",
+    }:
         raise ValueError(
             f"{manifest_path} rigid_motion_fill_stage is incompatible"
         )
     component_fill_only = motion_fill_enabled and (
         rigid_motion_fill_stage == "single-view-components"
     )
+    partial_fill_enabled = motion_fill_enabled and rigid_motion_fill_stage in {
+        "sequential",
+        "single-view-components",
+    }
     manifest_partial_observable_ratio = None
     manifest_partial_ray_fraction = None
-    if component_fill_only:
+    if partial_fill_enabled:
         manifest_partial_observable_ratio = _manifest_number(
             parameters.get("rigid_single_view_observable_ratio"),
             "rigid_single_view_observable_ratio",
@@ -1105,6 +1113,11 @@ def load_rigid_manifest(
         "nonseed_policy": (
             "single_view_partial_rigid_other_gaussians_zero"
             if component_fill_only
+            else (
+                "trusted_and_completed_single_view_components_fixed_"
+                "all_other_gaussians_independent_3d_motion_fill"
+            )
+            if motion_fill_enabled and rigid_motion_fill_stage == "sequential"
             else "single_view_component_rigid_else_free_motion_fill"
             if motion_fill_enabled
             else "zero_without_motion_fill"
@@ -1112,6 +1125,11 @@ def load_rigid_manifest(
         "single_view_component_fill_policy": (
             "observable_twist_plus_knn_filled_weak_and_ray_directions"
             if component_fill_only
+            else (
+                "observable_twist_plus_knn_filled_weak_and_ray_directions_"
+                "then_fixed_for_pointwise_fill"
+            )
+            if motion_fill_enabled and rigid_motion_fill_stage == "sequential"
             else "shared_unknown_normalized_infinitesimal_se3_twist"
             if motion_fill_enabled
             else "disabled"
@@ -1783,7 +1801,7 @@ def load_rigid_manifest(
                 )
             role = np.asarray(latent["motion_fill_role"])
             latent_completion = np.asarray(latent["completion_mask"])
-            grouped_required = {
+            rigid_fill_required = {
                 "component_centroid",
                 "single_view_component_fill_policy",
                 "single_view_component_fill_mask",
@@ -1793,15 +1811,15 @@ def load_rigid_manifest(
                 "single_view_component_rotation",
                 "single_view_component_first_order_relative_max",
             }
-            grouped_missing = sorted(grouped_required - set(diagnostics))
-            if grouped_missing:
+            rigid_fill_missing = sorted(rigid_fill_required - set(diagnostics))
+            if rigid_fill_missing:
                 raise ValueError(
-                    f"{diagnostics_path} is missing grouped rigid-fill fields: "
-                    f"{grouped_missing}"
+                    f"{diagnostics_path} is missing rigid-fill fields: "
+                    f"{rigid_fill_missing}"
                 )
             expected_component_fill_policy = (
                 "observable_twist_plus_knn_filled_weak_and_ray_directions"
-                if component_fill_only
+                if partial_fill_enabled
                 else "shared_unknown_normalized_infinitesimal_se3_twist"
             )
             if _scalar_string(
@@ -1865,22 +1883,23 @@ def load_rigid_manifest(
                 raise ValueError(
                     f"{diagnostics_path} single-view component completion is invalid"
                 )
-            for component_idx in np.flatnonzero(
-                single_view_component_fill
-            ).tolist():
-                member_completion = completion_mask[
-                    point_component == component_idx
-                ]
-                if (
-                    member_completion.size == 0
-                    or np.any(member_completion) != np.all(member_completion)
-                    or bool(np.all(member_completion))
-                    != bool(single_view_component_completion[component_idx])
-                ):
-                    raise ValueError(
-                        f"{diagnostics_path} component {component_idx} has partial "
-                        "or inconsistent grouped completion"
-                    )
+            if rigid_motion_fill_stage != "sequential":
+                for component_idx in np.flatnonzero(
+                    single_view_component_fill
+                ).tolist():
+                    member_completion = completion_mask[
+                        point_component == component_idx
+                    ]
+                    if (
+                        member_completion.size == 0
+                        or np.any(member_completion) != np.all(member_completion)
+                        or bool(np.all(member_completion))
+                        != bool(single_view_component_completion[component_idx])
+                    ):
+                        raise ValueError(
+                            f"{diagnostics_path} component {component_idx} has "
+                            "partial or inconsistent component completion"
+                        )
             component_centroid = np.asarray(
                 diagnostics["component_centroid"], dtype=np.float64
             )
@@ -1933,8 +1952,13 @@ def load_rigid_manifest(
                     f"{diagnostics_path} single-view rigidity error is nonzero "
                     "outside selected components"
                 )
+            rigid_component_validation_mask = (
+                single_view_component_completion
+                if rigid_motion_fill_stage == "sequential"
+                else single_view_component_fill
+            )
             for component_idx in np.flatnonzero(
-                single_view_component_fill
+                rigid_component_validation_mask
             ).tolist():
                 members = np.flatnonzero(point_component == component_idx)
                 centered = points[members].astype(np.float64) - component_centroid[
@@ -1965,7 +1989,16 @@ def load_rigid_manifest(
                     )
             expected_role = np.full((num_points,), 2, dtype=np.int8)
             expected_role[trusted_seed_mask] = 0
-            expected_role[single_view_fill_points] = 1
+            if rigid_motion_fill_stage == "sequential":
+                component_anchor_points = np.zeros((num_points,), dtype=bool)
+                component_anchor_points[component_points] = (
+                    single_view_component_completion[
+                        point_component[component_points]
+                    ]
+                )
+                expected_role[component_anchor_points] = 0
+            else:
+                expected_role[single_view_fill_points] = 1
             if (
                 not np.issubdtype(role.dtype, np.integer)
                 or not np.array_equal(role, expected_role)
@@ -1985,6 +2018,11 @@ def load_rigid_manifest(
             expected_motion_fill_method = (
                 "rigid_seed_single_view_partial_component_knn_lsmr"
                 if component_fill_only
+                else (
+                    "rigid_seed_partial_component_then_independent_gaussian_"
+                    "knn_lsmr"
+                )
+                if rigid_motion_fill_stage == "sequential"
                 else "rigid_seed_single_view_component_grouped_knn_lsmr"
             )
             if _scalar_string(
@@ -2010,7 +2048,7 @@ def load_rigid_manifest(
                 raise ValueError(
                     f"{diagnostics_path} completion connectivity is inconsistent"
                 )
-            if component_fill_only:
+            if partial_fill_enabled:
                 partial_required = {
                     "single_view_observable_singular_ratio_min",
                     "single_view_ray_direction_min_fraction",
@@ -2208,7 +2246,7 @@ def load_rigid_manifest(
                 rejected_points[component_points] = rejected_components[
                     point_component[component_points]
                 ]
-                if np.any(phi[rejected_points] != 0):
+                if component_fill_only and np.any(phi[rejected_points] != 0):
                     raise ValueError(
                         f"{latent_path} rejected partial components retain motion"
                     )
@@ -2231,6 +2269,14 @@ def load_rigid_manifest(
                     "without motion fill"
                 )
 
+        single_view_completed_points = np.zeros((num_points,), dtype=bool)
+        if motion_fill_enabled:
+            component_points = point_component >= 0
+            single_view_completed_points[component_points] = (
+                single_view_component_completion[
+                    point_component[component_points]
+                ]
+            )
         loaded_modes.append(
             RigidModeViewData(
                 manifest_path=manifest_path,
@@ -2245,11 +2291,7 @@ def load_rigid_manifest(
                 raw_rigid_phi=raw_rigid_phi.astype(np.complex64),
                 rigid_seed_mask=trusted_seed_mask,
                 quarantined_rigid_mask=rigid_seed_mask & ~trusted_seed_mask,
-                single_view_rigid_fill_mask=(
-                    single_view_fill_points & completion_mask
-                    if motion_fill_enabled
-                    else np.zeros((num_points,), dtype=bool)
-                ),
+                single_view_rigid_fill_mask=single_view_completed_points,
                 completed_fill_mask=completion_mask,
                 unresolved_fill_mask=(
                     effective_fill_target_mask & ~completion_mask
@@ -3034,7 +3076,8 @@ class ObservedGraphViewer:
                 "partial post-fill rejection",
             )
             if rigid_manifest is not None
-            and rigid_manifest.rigid_motion_fill_stage == "single-view-components"
+            and rigid_manifest.rigid_motion_fill_stage
+            in {"sequential", "single-view-components"}
             else ()
         )
         rigid_color_options = (
