@@ -12,7 +12,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 if TYPE_CHECKING:
-    from modal_surface.optimization_staged import StagedSolveResult
+    from modal_surface.optimization_staged import (
+        PreparedObservations,
+        StagedSolveResult,
+    )
 
 
 def _scatter_mode_image(
@@ -87,7 +90,24 @@ def write_solve_visualizations(
 ) -> None:
     """Write final per-view observation images and solved-field point clouds."""
 
-    prepared = staged.prepared
+    write_prepared_solve_visualizations(
+        staged.prepared,
+        phi,
+        obs_pred_y,
+        obs_residual_valid_mask,
+        vis_dir,
+    )
+
+
+def write_prepared_solve_visualizations(
+    prepared: PreparedObservations,
+    phi: np.ndarray,
+    obs_pred_y: np.ndarray,
+    obs_residual_valid_mask: np.ndarray,
+    vis_dir: str | Path,
+) -> None:
+    """Write solve visualizations from a prepared observation contract."""
+
     if (
         "view_image_width" not in prepared.arrays
         or "view_image_height" not in prepared.arrays

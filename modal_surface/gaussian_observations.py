@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -57,7 +58,7 @@ def _load_view_inputs(
     return configs, modals, np.asarray(freqs, dtype=np.float32), reference_freq_hz
 
 
-def _require_scipy_kdtree():
+def require_scipy_kdtree():
     try:
         from scipy.spatial import cKDTree # pyright: ignore[reportAttributeAccessIssue]
     except ImportError as exc:
@@ -65,7 +66,7 @@ def _require_scipy_kdtree():
     return cKDTree
 
 
-def _quat_wxyz_to_rotmat(quats: np.ndarray) -> np.ndarray:
+def quaternion_wxyz_to_rotation_matrices(quats: np.ndarray) -> np.ndarray:
     quats = np.asarray(quats, dtype=np.float64)
     if quats.ndim != 2 or quats.shape[1] != 4:
         raise ValueError(f"gaussian_quats must have shape (N,4), got {quats.shape}.")
@@ -87,7 +88,7 @@ def _quat_wxyz_to_rotmat(quats: np.ndarray) -> np.ndarray:
     return mats
 
 
-def _validate_pixel_candidate_inputs(
+def validate_pixel_candidate_inputs(
     points_world: np.ndarray,
     gaussian_scales: np.ndarray | None,
     gaussian_quats: np.ndarray | None,
@@ -136,6 +137,71 @@ def _validate_pixel_candidate_inputs(
         depth_arrays.append(depth_arr)
         acc_arrays.append(acc_arr)
     return scales, quats, opacities, depth_arrays, acc_arrays
+
+
+@dataclass(frozen=True)
+class ScoredPixelGaussianCandidates:
+    gaussian_indices: np.ndarray
+    contribution_scores: np.ndarray
+    positive_camera_z_mask: np.ndarray
+
+
+def score_pixel_gaussian_candidates(
+    *,
+    surface_point_world: np.ndarray,
+    candidate_indices: np.ndarray,
+    points_world: np.ndarray,
+    gaussian_scales: np.ndarray,
+    gaussian_rotmats: np.ndarray,
+    gaussian_opacities: np.ndarray,
+    point_camera_z: np.ndarray,
+    min_contribution: float,
+) -> ScoredPixelGaussianCandidates:
+    indices = np.asarray(candidate_indices, dtype=np.int64).reshape(-1)
+    indices = indices[(indices >= 0) & (indices < points_world.shape[0])]
+    if indices.size == 0:
+        return ScoredPixelGaussianCandidates(
+            gaussian_indices=np.empty((0,), dtype=np.int64),
+            contribution_scores=np.empty((0,), dtype=np.float64),
+            positive_camera_z_mask=np.empty((0,), dtype=bool),
+        )
+    delta = (
+        np.asarray(surface_point_world, dtype=np.float64)[None]
+        - points_world[indices].astype(np.float64)
+    )
+    local = np.einsum(
+        "nij,nj->ni",
+        np.swapaxes(gaussian_rotmats[indices], 1, 2),
+        delta,
+    )
+    scaled = local / np.maximum(
+        gaussian_scales[indices].astype(np.float64),
+        float(np.float32(1.0e-8)),
+    )
+    mahalanobis2 = np.sum(scaled * scaled, axis=1)
+    scores = gaussian_opacities[indices].astype(np.float64) * np.exp(
+        -0.5 * mahalanobis2
+    )
+    valid = np.isfinite(scores) & (scores >= float(min_contribution))
+    indices = indices[valid]
+    scores = scores[valid]
+    if indices.size == 0:
+        return ScoredPixelGaussianCandidates(
+            gaussian_indices=np.empty((0,), dtype=np.int64),
+            contribution_scores=np.empty((0,), dtype=np.float64),
+            positive_camera_z_mask=np.empty((0,), dtype=bool),
+        )
+    order = np.argsort(scores)[::-1]
+    indices = indices[order]
+    scores = scores[order]
+    positive_z = np.isfinite(point_camera_z[indices]) & (
+        point_camera_z[indices] > 0
+    )
+    return ScoredPixelGaussianCandidates(
+        gaussian_indices=indices,
+        contribution_scores=scores,
+        positive_camera_z_mask=positive_z,
+    )
 
 
 def _append_view_pixel_candidate_observations(
@@ -216,33 +282,26 @@ def _append_view_pixel_candidate_observations(
     _, point_camera_z = project_points(points_world, cfg.K, cfg.world_to_camera)
     added = 0
     min_contribution = float(pixel_min_contribution)
-    scale_eps = np.float32(1e-8)
 
     # for a pixel
     for row, (x, y, depth, surface_point, candidates) in enumerate(
         zip(flat_x.tolist(), flat_y.tolist(), depths.tolist(), surface_points, candidate_rows)
     ):
-        candidate_indices = np.asarray(candidates, dtype=np.int64)
-        candidate_indices = candidate_indices[(candidate_indices >= 0) & (candidate_indices < points_world.shape[0])]
-        if candidate_indices.size == 0:
+        scored = score_pixel_gaussian_candidates(
+            surface_point_world=surface_point,
+            candidate_indices=np.asarray(candidates, dtype=np.int64),
+            points_world=points_world,
+            gaussian_scales=gaussian_scales,
+            gaussian_rotmats=gaussian_rotmats,
+            gaussian_opacities=gaussian_opacities,
+            point_camera_z=point_camera_z,
+            min_contribution=min_contribution,
+        )
+        if scored.gaussian_indices.size == 0:
             continue
-
-        delta = surface_point[None, :].astype(np.float64) - points_world[candidate_indices].astype(np.float64)
-        local = np.einsum("nij,nj->ni", np.swapaxes(gaussian_rotmats[candidate_indices], 1, 2), delta)
-        scaled = local / np.maximum(gaussian_scales[candidate_indices].astype(np.float64), float(scale_eps))
-        mahalanobis2 = np.sum(scaled * scaled, axis=1) # eulerian distance + scale
-        scores = gaussian_opacities[candidate_indices].astype(np.float64) * np.exp(-0.5 * mahalanobis2)
-        valid = np.isfinite(scores) & (scores >= min_contribution)
-        if not np.any(valid):
-            continue
-        candidate_indices = candidate_indices[valid]
-        scores = scores[valid]
-
-        order = np.argsort(scores)[::-1][: int(pixel_candidate_k)]
-        candidate_indices = candidate_indices[order]
-        scores = scores[order]
-
-        positive_z = np.isfinite(point_camera_z[candidate_indices]) & (point_camera_z[candidate_indices] > 0)
+        candidate_indices = scored.gaussian_indices[: int(pixel_candidate_k)]
+        scores = scored.contribution_scores[: int(pixel_candidate_k)]
+        positive_z = scored.positive_camera_z_mask[: int(pixel_candidate_k)]
         if not np.any(positive_z):
             continue
         candidate_indices = candidate_indices[positive_z]
@@ -297,7 +356,7 @@ def build_gaussian_observation_graph(
 ) -> Path:
     """Build an N-view observation graph, optionally reusing a Gaussian KD-tree."""
     # data validation & format unification
-    _validate_pixel_candidate_args(
+    validate_pixel_candidate_args(
         pixel_sample_stride,
         pixel_candidate_k,
         pixel_preselect_k,
@@ -319,7 +378,7 @@ def build_gaussian_observation_graph(
         gaussian_opacities,
         rendered_depths,
         rendered_accs,
-    ) = _validate_pixel_candidate_inputs(
+    ) = validate_pixel_candidate_inputs(
         points_world_all,
         gaussian_scales,
         gaussian_quats,
@@ -329,9 +388,9 @@ def build_gaussian_observation_graph(
         configs,
     )
     if gaussian_tree is None:
-        cKDTree = _require_scipy_kdtree()
+        cKDTree = require_scipy_kdtree()
         gaussian_tree = cKDTree(points_world_all.astype(np.float64))
-    gaussian_rotmats = _quat_wxyz_to_rotmat(gaussian_quats)
+    gaussian_rotmats = quaternion_wxyz_to_rotation_matrices(gaussian_quats)
 
     obs_point_indices: list[int] = []
     obs_view_indices: list[int] = []
@@ -470,7 +529,7 @@ def build_gaussian_observation_graph(
     return out
 
 
-def _validate_pixel_candidate_args(
+def validate_pixel_candidate_args(
     pixel_sample_stride: int,
     pixel_candidate_k: int,
     pixel_preselect_k: int,

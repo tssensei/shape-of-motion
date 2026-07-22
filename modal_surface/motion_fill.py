@@ -9,12 +9,30 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from time import perf_counter
+from typing import Any, Callable
 
 import numpy as np
 
 
 _CONVERGED_LSMR_STOP_CODES = frozenset({0, 1, 2, 4, 5})
+
+
+def _record_timing(
+    timings: dict[str, float] | None,
+    name: str,
+    started: float,
+) -> None:
+    if timings is not None:
+        timings[name] = float(perf_counter() - started)
+
+
+def _emit_progress(
+    progress: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    if progress is not None:
+        progress(message)
 
 
 @dataclass(frozen=True)
@@ -65,6 +83,15 @@ class AnchorConnectivity:
 
 
 @dataclass(frozen=True)
+class SharedGroupMembership:
+    """One-time ordered membership for partial rigid-component groups."""
+
+    ordered_points: np.ndarray
+    counts: np.ndarray
+    offsets: np.ndarray
+
+
+@dataclass(frozen=True)
 class SparseSolveMetadata:
     """Convergence information returned by one real-valued LSMR solve."""
 
@@ -110,6 +137,8 @@ class MotionFillResult:
     system_row_count: int
     system_column_count: int
     active_edge_count: int
+    point_coefficient_group_index: np.ndarray | None = None
+    coefficient_group_dimensions: np.ndarray | None = None
 
 
 def _require_scipy_kdtree():
@@ -445,6 +474,49 @@ def compute_anchor_connectivity(
     )
 
 
+def build_shared_group_membership(
+    shared_group_index: np.ndarray,
+    num_points: int,
+) -> SharedGroupMembership:
+    """Build ordered group membership once without repeated full point scans."""
+
+    groups = np.asarray(shared_group_index)
+    if (
+        groups.shape != (num_points,)
+        or not np.issubdtype(groups.dtype, np.integer)
+        or np.any(groups < -1)
+    ):
+        raise ValueError(
+            "shared_group_index must be an integer point array with values >= -1"
+        )
+    group_count = int(groups.max(initial=-1)) + 1
+    present_groups = np.unique(groups[groups >= 0])
+    if not np.array_equal(
+        present_groups,
+        np.arange(group_count, dtype=present_groups.dtype),
+    ):
+        raise ValueError("shared_group_index must use contiguous group indices")
+    member_points = np.flatnonzero(groups >= 0)
+    order = np.argsort(groups[member_points], kind="stable")
+    ordered_points = member_points[order].astype(np.int64, copy=False)
+    counts = np.bincount(
+        groups[ordered_points],
+        minlength=group_count,
+    ).astype(np.int64, copy=False)
+    if np.any(counts < 2):
+        invalid_group = int(np.flatnonzero(counts < 2)[0])
+        raise ValueError(
+            f"shared affine group {invalid_group} must contain at least two points"
+        )
+    offsets = np.zeros((group_count + 1,), dtype=np.int64)
+    offsets[1:] = np.cumsum(counts, dtype=np.int64)
+    return SharedGroupMembership(
+        ordered_points=ordered_points,
+        counts=counts,
+        offsets=offsets,
+    )
+
+
 def validate_motion_fill_inputs(
     phi_observable: np.ndarray,
     point_nullspace_basis: np.ndarray,
@@ -569,17 +641,29 @@ def _assemble_sparse_system(
     graph: KnnGraph,
     inputs: ValidatedMotionFillInputs,
     connectivity: AnchorConnectivity,
+    solve_connected_mask: np.ndarray,
 ) -> tuple[object, np.ndarray, np.ndarray, np.ndarray, int]:
     coo_matrix, _ = _require_scipy_sparse()
-    variable_mask = connectivity.connected_to_anchor & ~inputs.anchor_mask
+    solve_connected = _validate_boolean_mask(
+        solve_connected_mask,
+        "solve_connected_mask",
+        graph.num_points,
+    )
+    if np.any(solve_connected & ~connectivity.connected_to_anchor):
+        raise ValueError(
+            "solve_connected_mask must be a subset of anchor connectivity."
+        )
+    if np.any(inputs.anchor_mask & ~solve_connected):
+        raise ValueError("Every anchor must be included in solve_connected_mask.")
+    variable_mask = solve_connected & ~inputs.anchor_mask
     variable_dimensions = np.where(variable_mask, inputs.point_nullity, 0).astype(np.int64)
     coefficient_offsets = np.zeros((graph.num_points + 1,), dtype=np.int64)
     coefficient_offsets[1:] = np.cumsum(variable_dimensions, dtype=np.int64)
     column_count = int(coefficient_offsets[-1])
 
     active_edge_mask = (
-        connectivity.connected_to_anchor[graph.edge_index[:, 0]]
-        & connectivity.connected_to_anchor[graph.edge_index[:, 1]]
+        solve_connected[graph.edge_index[:, 0]]
+        & solve_connected[graph.edge_index[:, 1]]
     )
     active_edge_indices = np.where(active_edge_mask)[0]
     edges = graph.edge_index[active_edge_indices]
@@ -692,13 +776,19 @@ def fill_nullspace_motion(
     unobserved_mask: np.ndarray,
     *,
     excluded_mask: np.ndarray | None = None,
-    lsmr_atol: float = 1e-10,
-    lsmr_btol: float = 1e-10,
+    lsmr_atol: float = 1e-6,
+    lsmr_btol: float = 1e-6,
     lsmr_conlim: float = 1e8,
     lsmr_maxiter: int | None = None,
+    max_anchor_hops: int | None = None,
+    timings: dict[str, float] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> MotionFillResult:
     """Complete nullspace coefficients on anchor-connected graph components."""
 
+    total_started = perf_counter()
+    preparation_started = perf_counter()
+    _emit_progress(progress, "pointwise preparation started")
     _validate_graph(graph)
     inputs = validate_motion_fill_inputs(
         phi_observable,
@@ -721,17 +811,66 @@ def fill_nullspace_motion(
         raise ValueError("lsmr_conlim must be finite and positive.")
     if lsmr_maxiter is not None:
         lsmr_maxiter = _require_positive_integer(lsmr_maxiter, "lsmr_maxiter")
+    if max_anchor_hops is not None:
+        max_anchor_hops = _require_positive_integer(
+            max_anchor_hops,
+            "max_anchor_hops",
+        )
+    _record_timing(timings, "preparation_seconds", preparation_started)
+    _emit_progress(
+        progress,
+        "pointwise preparation finished in "
+        f"{perf_counter() - preparation_started:.3f} s",
+    )
 
+    connectivity_started = perf_counter()
+    _emit_progress(progress, "pointwise KNN connectivity started")
     connectivity = compute_anchor_connectivity(
         graph,
         inputs.anchor_mask,
         inputs.excluded_mask,
     )
+    solve_connected_mask = connectivity.connected_to_anchor.copy()
+    if max_anchor_hops is not None:
+        solve_connected_mask &= (
+            connectivity.hop_distance <= int(max_anchor_hops)
+        )
+    hop_limited_count = int(
+        np.count_nonzero(
+            connectivity.connected_to_anchor
+            & ~solve_connected_mask
+            & ~inputs.anchor_mask
+        )
+    )
+    _record_timing(timings, "connectivity_seconds", connectivity_started)
+    _emit_progress(
+        progress,
+        "pointwise KNN connectivity finished in "
+        f"{perf_counter() - connectivity_started:.3f} s: "
+        f"connected_points={int(np.count_nonzero(connectivity.connected_to_anchor))}, "
+        f"solve_points={int(np.count_nonzero(solve_connected_mask))}, "
+        f"hop_limited_targets={hop_limited_count}",
+    )
+    assembly_started = perf_counter()
+    _emit_progress(progress, "pointwise sparse assembly started")
     matrix, rhs, coefficient_offsets, variable_mask, active_edge_count = _assemble_sparse_system(
-        graph, inputs, connectivity
+        graph,
+        inputs,
+        connectivity,
+        solve_connected_mask,
     )
     column_count = int(matrix.shape[1])
+    _record_timing(timings, "system_assembly_seconds", assembly_started)
+    _emit_progress(
+        progress,
+        "pointwise sparse assembly finished in "
+        f"{perf_counter() - assembly_started:.3f} s: "
+        f"rows={int(matrix.shape[0])}, cols={column_count}, "
+        f"nnz={int(matrix.nnz)}",
+    )
     if column_count:
+        real_started = perf_counter()
+        _emit_progress(progress, "pointwise LSMR real started")
         real_coefficients, real_solver = _run_lsmr(
             matrix,
             rhs.real,
@@ -740,6 +879,15 @@ def fill_nullspace_motion(
             conlim=float(lsmr_conlim),
             maxiter=lsmr_maxiter,
         )
+        _record_timing(timings, "lsmr_real_seconds", real_started)
+        _emit_progress(
+            progress,
+            "pointwise LSMR real finished in "
+            f"{perf_counter() - real_started:.3f} s: "
+            f"iterations={real_solver.iterations}, stop_code={real_solver.stop_code}",
+        )
+        imaginary_started = perf_counter()
+        _emit_progress(progress, "pointwise LSMR imaginary started")
         imaginary_coefficients, imag_solver = _run_lsmr(
             matrix,
             rhs.imag,
@@ -747,6 +895,13 @@ def fill_nullspace_motion(
             btol=float(lsmr_btol),
             conlim=float(lsmr_conlim),
             maxiter=lsmr_maxiter,
+        )
+        _record_timing(timings, "lsmr_imaginary_seconds", imaginary_started)
+        _emit_progress(
+            progress,
+            "pointwise LSMR imaginary finished in "
+            f"{perf_counter() - imaginary_started:.3f} s: "
+            f"iterations={imag_solver.iterations}, stop_code={imag_solver.stop_code}",
         )
         if not real_solver.converged or not imag_solver.converged:
             raise RuntimeError(
@@ -759,7 +914,12 @@ def fill_nullspace_motion(
         coefficient_values = np.empty((0,), dtype=np.complex128)
         real_solver = _empty_solve_metadata(rhs.real)
         imag_solver = _empty_solve_metadata(rhs.imag)
+        if timings is not None:
+            timings["lsmr_real_seconds"] = 0.0
+            timings["lsmr_imaginary_seconds"] = 0.0
 
+    reconstruction_started = perf_counter()
+    _emit_progress(progress, "pointwise reconstruction started")
     phi_source = np.asarray(phi_observable)
     phi_filled = phi_source.astype(inputs.output_dtype, copy=True)
     correction = np.zeros((graph.num_points, 3), dtype=inputs.output_dtype)
@@ -776,8 +936,8 @@ def fill_nullspace_motion(
     phi_filled[inputs.anchor_mask] = phi_source[inputs.anchor_mask]
     phi_filled[inputs.excluded_mask] = phi_source[inputs.excluded_mask]
 
-    completion_mask = connectivity.connected_to_anchor & ~inputs.anchor_mask
-    return MotionFillResult(
+    completion_mask = solve_connected_mask & ~inputs.anchor_mask
+    result = MotionFillResult(
         phi=phi_filled,
         phi_observable=phi_source.astype(inputs.output_dtype, copy=True),
         phi_nullspace_correction=correction,
@@ -792,3 +952,11 @@ def fill_nullspace_motion(
         system_column_count=column_count,
         active_edge_count=active_edge_count,
     )
+    _record_timing(timings, "reconstruction_seconds", reconstruction_started)
+    _record_timing(timings, "total_seconds", total_started)
+    _emit_progress(
+        progress,
+        "pointwise reconstruction finished in "
+        f"{perf_counter() - reconstruction_started:.3f} s",
+    )
+    return result

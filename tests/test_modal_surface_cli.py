@@ -52,6 +52,10 @@ class ModalSurfaceCliTests(unittest.TestCase):
         self.assertFalse(args.motion_fill)
         self.assertEqual(args.motion_fill_k, 8)
         self.assertIsNone(args.motion_fill_max_distance)
+        self.assertIsNone(args.base_manifest)
+        self.assertEqual(args.solve_method, "staged")
+        self.assertEqual(args.rigid_component_graph, [])
+        self.assertEqual(args.rigid_component_rcond, 1e-8)
 
     def test_observation_filter_controls_are_not_registered(self) -> None:
         cli = importlib.import_module("modal_surface.__main__")
@@ -111,6 +115,110 @@ class ModalSurfaceCliTests(unittest.TestCase):
                     motion_fill_max_distance=None,
                 )
             )
+
+    def test_rigid_component_controls_and_cross_method_validation(self) -> None:
+        cli = importlib.import_module("modal_surface.__main__")
+        app = importlib.import_module("modal_surface.apps.solve_gaussian_modes")
+        parser = cli.build_arg_parser()
+        option_strings = _option_strings(parser)
+        self.assertTrue(
+            {
+                "--solve-method",
+                "--base-manifest",
+                "--rigid-component-graph",
+                "--rigid-component-rcond",
+                "--rigid-seed-min-valid-views",
+                "--rigid-seed-min-singular-ratio",
+            }.issubset(option_strings)
+        )
+        base = [
+            "--input-ckpt",
+            "checkpoint.ckpt",
+            "--view-config",
+            "view.json",
+            "--modal-npz",
+            "modal.npz",
+            "--out-dir",
+            "modes",
+        ]
+        with self.assertRaisesRegex(ValueError, "requires --solve-method"):
+            app._validate_solve_method_arguments(
+                parser.parse_args(base + ["--rigid-component-graph", "graph.npz"])
+            )
+        with self.assertRaisesRegex(ValueError, "requires --rigid-component-graph"):
+            app._validate_solve_method_arguments(
+                parser.parse_args(base + ["--solve-method", "rigid-components"])
+            )
+        args = parser.parse_args(
+            base
+            + [
+                "--solve-method",
+                "rigid-components",
+                "--rigid-component-graph",
+                "graph.npz",
+            ]
+        )
+        app._validate_solve_method_arguments(args)
+        app._validate_solve_method_arguments(
+            parser.parse_args(base + ["--base-manifest", "base_manifest.json"])
+        )
+        with self.assertRaisesRegex(ValueError, "supported only"):
+            app._validate_solve_method_arguments(
+                parser.parse_args(
+                    base
+                    + [
+                        "--solve-method",
+                        "rigid-components",
+                        "--rigid-component-graph",
+                        "graph.npz",
+                        "--base-manifest",
+                        "base_manifest.json",
+                    ]
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            app._validate_solve_method_arguments(
+                parser.parse_args(
+                    base
+                    + [
+                        "--solve-method",
+                        "rigid-components",
+                        "--rigid-component-graph",
+                        "graph.npz",
+                        "--rigid-seed-min-valid-views",
+                        "0",
+                    ]
+                )
+            )
+        with self.assertRaisesRegex(ValueError, r"lie in \[0,1\]"):
+            app._validate_solve_method_arguments(
+                parser.parse_args(
+                    base
+                    + [
+                        "--solve-method",
+                        "rigid-components",
+                        "--rigid-component-graph",
+                        "graph.npz",
+                        "--rigid-seed-min-singular-ratio",
+                        "1.1",
+                    ]
+                )
+            )
+
+    def test_anchor_graph_controls_are_not_registered(self) -> None:
+        cli = importlib.import_module("modal_surface.__main__")
+        parser = cli.build_arg_parser()
+        removed_options = {
+            "--anchor-graph",
+            "--anchor-graph-max-distance",
+            "--anchor-graph-max-neighbors",
+            "--anchor-graph-color-mad-multiplier",
+            "--anchor-graph-depth-mad-multiplier",
+            "--anchor-graph-depth-samples",
+            "--anchor-graph-min-shared-views",
+        }
+
+        self.assertTrue(removed_options.isdisjoint(_option_strings(parser)))
 
     def test_snr_weighting_controls_are_not_registered(self) -> None:
         cli = importlib.import_module("modal_surface.__main__")

@@ -214,6 +214,7 @@ def _checkpoint_inputs(points: np.ndarray) -> tuple[
     np.ndarray,
     np.ndarray,
     np.ndarray,
+    np.ndarray,
     list[np.ndarray],
     list[np.ndarray],
 ]:
@@ -225,6 +226,7 @@ def _checkpoint_inputs(points: np.ndarray) -> tuple[
         np.ones((num_points, 3), dtype=np.float32),
         quaternions,
         np.ones((num_points,), dtype=np.float32),
+        np.full((num_points, 3), 0.5, dtype=np.float32),
         [],
         [],
     )
@@ -345,7 +347,7 @@ class CompactGaussianArtifactTests(unittest.TestCase):
             with (
                 patch.object(
                     gaussian_solver_app,
-                    "_load_fg_pixel_candidate_inputs_from_checkpoint",
+                    "load_fg_pixel_candidate_inputs_from_checkpoint",
                     return_value=_checkpoint_inputs(observations["points_world"]),
                 ),
                 patch.object(
@@ -408,7 +410,7 @@ class CompactGaussianArtifactTests(unittest.TestCase):
             with (
                 patch.object(
                     gaussian_solver_app,
-                    "_load_fg_pixel_candidate_inputs_from_checkpoint",
+                    "load_fg_pixel_candidate_inputs_from_checkpoint",
                     return_value=_checkpoint_inputs(observations["points_world"]),
                 ),
                 patch.object(
