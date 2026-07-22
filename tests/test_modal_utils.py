@@ -299,14 +299,15 @@ class MotionFillRoleDisplayTests(unittest.TestCase):
         return manifest_path
 
     def test_classifies_all_display_roles_and_colors(self) -> None:
-        roles = np.asarray([0, 1, 1, 2, 2, 3], dtype=np.int8)
-        completion = np.asarray([False, False, True, False, True, False])
+        roles = np.asarray([0, 0, 1, 1, 2, 2, 3], dtype=np.int8)
+        completion = np.asarray([False, True, False, True, False, True, False])
 
         classes = classify_motion_fill_display_points(roles, completion)
 
         np.testing.assert_array_equal(
             classes,
             [
+                MOTION_FILL_DISPLAY_ANCHOR,
                 MOTION_FILL_DISPLAY_ANCHOR,
                 MOTION_FILL_DISPLAY_PARTIAL,
                 MOTION_FILL_DISPLAY_FILLED,
@@ -318,6 +319,7 @@ class MotionFillRoleDisplayTests(unittest.TestCase):
         np.testing.assert_allclose(
             motion_fill_display_colors(classes),
             [
+                [0.05, 0.55, 1.0],
                 [0.05, 0.55, 1.0],
                 [1.0, 0.55, 0.1],
                 [0.1, 0.85, 0.3],
@@ -345,13 +347,11 @@ class MotionFillRoleDisplayTests(unittest.TestCase):
                 np.asarray([4], dtype=np.int8), np.asarray([False])
             )
 
-    def test_rejects_completion_for_noncompletable_roles(self) -> None:
-        for role in (0, 3):
-            with self.subTest(role=role):
-                with self.assertRaisesRegex(ValueError, "non-completable"):
-                    classify_motion_fill_display_points(
-                        np.asarray([role], dtype=np.int8), np.asarray([True])
-                    )
+    def test_rejects_completion_for_excluded_role(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-completable"):
+            classify_motion_fill_display_points(
+                np.asarray([3], dtype=np.int8), np.asarray([True])
+            )
 
     def test_loads_role_metadata_and_preserves_legacy_manifests(self) -> None:
         role_fields = {

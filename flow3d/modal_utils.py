@@ -92,11 +92,12 @@ def classify_motion_fill_display_points(
         raise ValueError(
             f"motion_fill_role values must lie in [0,{len(MOTION_FILL_ROLE_NAMES) - 1}]"
         )
-    completable = (role == MOTION_FILL_ROLE_CONSTRAINED_VARIABLE) | (
+    filled_variable = (role == MOTION_FILL_ROLE_CONSTRAINED_VARIABLE) | (
         role == MOTION_FILL_ROLE_FREE_VARIABLE
     )
-    if np.any(completion & ~completable):
-        point = int(np.where(completion & ~completable)[0][0])
+    completion_incompatible = completion & (role == MOTION_FILL_ROLE_EXCLUDED)
+    if np.any(completion_incompatible):
+        point = int(np.where(completion_incompatible)[0][0])
         raise ValueError(
             "completion_mask is true for non-completable motion_fill_role "
             f"at point {point}"
@@ -107,7 +108,7 @@ def classify_motion_fill_display_points(
     display_class[
         (role == MOTION_FILL_ROLE_CONSTRAINED_VARIABLE) & ~completion
     ] = MOTION_FILL_DISPLAY_PARTIAL
-    display_class[completion] = MOTION_FILL_DISPLAY_FILLED
+    display_class[completion & filled_variable] = MOTION_FILL_DISPLAY_FILLED
     display_class[
         (role == MOTION_FILL_ROLE_FREE_VARIABLE) & ~completion
     ] = MOTION_FILL_DISPLAY_UNOBSERVED
