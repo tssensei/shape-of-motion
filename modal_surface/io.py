@@ -28,7 +28,6 @@ from pathlib import Path
 import tempfile
 from typing import Any, Mapping
 
-import cv2
 import numpy as np
 
 
@@ -130,6 +129,8 @@ def load_depth(path: str | Path, expected_shape: tuple[int, int], depth_scale: f
     if path.suffix.lower() == ".npy":
         depth = np.load(str(path))
     else:
+        import cv2
+
         depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
         if depth is None:
             raise FileNotFoundError(f"Cannot read depth file: {path}")
@@ -149,6 +150,8 @@ def load_mask(path: str | Path | None, expected_shape: tuple[int, int]) -> np.nd
     if path.suffix.lower() == ".npy":
         mask = np.load(str(path))
     else:
+        import cv2
+
         mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             raise FileNotFoundError(f"Cannot read mask file: {path}")
