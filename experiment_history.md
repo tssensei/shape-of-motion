@@ -225,3 +225,10 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   reached SciPy's default 70-iteration limit in milliseconds with stop code 7,
   so no artifact was published; this identifies the default column-count
   iteration cap, rather than runtime or matrix size, as the immediate failure.
+- After raising the component-only LSMR budget, the same partial-fill experiment
+  completed its solve and wrote the modal manifest and artifacts in 28.784 s of
+  pipeline time. Per-mode fill took 0.253 s, including 0.005 s real and 0.004 s
+  imaginary LSMR, versus 2,342.102 s for the joint grouped baseline. The process
+  then exited while printing the already-written timing profile because the
+  summary formatter still required joint-only layout and reconstruction keys;
+  this is a profiling-output defect rather than a solve or artifact failure.

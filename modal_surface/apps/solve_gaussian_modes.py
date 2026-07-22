@@ -1791,6 +1791,7 @@ def _write_time_profile(
             f"{float(motion['total_seconds']):.3f} s"
         )
         if bool(motion["enabled"]):
+            motion_fill_stage = str(motion["stage"])
             print(
                 "    fill prep/connect/assemble "
                 f"{float(motion['preparation_seconds']):.3f} / "
@@ -1802,12 +1803,22 @@ def _write_time_profile(
                 f"{float(motion['lsmr_real_seconds']):.3f} / "
                 f"{float(motion['lsmr_imaginary_seconds']):.3f} s"
             )
-            print(
-                "    fill layout/recon/validate "
-                f"{float(motion['variable_layout_seconds']):.3f} / "
-                f"{float(motion['reconstruction_seconds']):.3f} / "
-                f"{float(motion['validation_and_residual_seconds']):.3f} s"
-            )
+            if motion_fill_stage == RIGID_MOTION_FILL_STAGE_DEFAULT:
+                print(
+                    "    fill layout/recon/validate "
+                    f"{float(motion['variable_layout_seconds']):.3f} / "
+                    f"{float(motion['reconstruction_seconds']):.3f} / "
+                    f"{float(motion['validation_and_residual_seconds']):.3f} s"
+                )
+            elif motion_fill_stage == "single-view-components":
+                print(
+                    "    fill validation/residual  "
+                    f"{float(motion['validation_and_residual_seconds']):.3f} s"
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported rigid motion-fill profile stage: {motion_fill_stage}"
+                )
     print(f"Saved time profile -> {path}")
     return path
 
@@ -2118,6 +2129,7 @@ def run(args: argparse.Namespace) -> None:
                 )
             mode_profile["motion_fill"] = {
                 "enabled": motion_fill_graph is not None,
+                "stage": str(args.rigid_motion_fill_stage),
                 "total_seconds": 0.0,
                 **motion_fill_timings,
             }
