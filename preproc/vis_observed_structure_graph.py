@@ -857,6 +857,74 @@ def _assert_observed_graph_identity(
             )
 
 
+def _rigid_reconstruction_quantization_metrics(
+    persisted_phi: np.ndarray,
+    persisted_translation: np.ndarray,
+    persisted_rotation: np.ndarray,
+    centered_points: np.ndarray,
+) -> tuple[float, float, float, float, float, float]:
+    actual = np.asarray(persisted_phi, dtype=np.complex128)
+    translation = np.asarray(persisted_translation, dtype=np.complex128)
+    rotation = np.asarray(persisted_rotation, dtype=np.complex128)
+    centered = np.asarray(centered_points, dtype=np.float64)
+    expected = translation + np.cross(rotation[None], centered)
+
+    absolute_centered = np.abs(centered)
+
+    def component_metrics(
+        actual_part: np.ndarray,
+        expected_part: np.ndarray,
+        translation_part: np.ndarray,
+        rotation_part: np.ndarray,
+    ) -> tuple[float, float, float]:
+        absolute_rotation = np.abs(rotation_part)
+        cross_operand_scale = np.column_stack(
+            (
+                absolute_rotation[1] * absolute_centered[:, 2]
+                + absolute_rotation[2] * absolute_centered[:, 1],
+                absolute_rotation[2] * absolute_centered[:, 0]
+                + absolute_rotation[0] * absolute_centered[:, 2],
+                absolute_rotation[0] * absolute_centered[:, 1]
+                + absolute_rotation[1] * absolute_centered[:, 0],
+            )
+        )
+        operand_scale = (
+            np.abs(actual_part)
+            + np.abs(translation_part)[None]
+            + cross_operand_scale
+        )
+        float32_epsilon = np.finfo(np.float32).eps
+        float64_epsilon = np.finfo(np.float64).eps
+        quantization_bound = (
+            8.0
+            * float32_epsilon
+            * np.maximum(operand_scale, np.finfo(np.float32).tiny)
+            + 64.0
+            * float64_epsilon
+            * np.maximum(operand_scale, np.finfo(np.float64).tiny)
+        )
+        error = np.abs(actual_part - expected_part)
+        return (
+            float(np.max(error)),
+            float(np.max(quantization_bound)),
+            float(np.max(error - quantization_bound)),
+        )
+
+    real_metrics = component_metrics(
+        actual.real,
+        expected.real,
+        translation.real,
+        rotation.real,
+    )
+    imaginary_metrics = component_metrics(
+        actual.imag,
+        expected.imag,
+        translation.imag,
+        rotation.imag,
+    )
+    return (*real_metrics, *imaginary_metrics)
+
+
 def load_rigid_manifest(
     path: str | Path,
     graphs: tuple[ObservedGraphViewData, ...],
@@ -1684,18 +1752,28 @@ def load_rigid_manifest(
                 centered = points[members].astype(np.float64) - component_centroid[
                     component_idx
                 ]
-                expected_phi = (
-                    component_translation[component_idx]
-                    + np.cross(
-                        component_rotation[component_idx][None], centered
-                    )
+                (
+                    real_error,
+                    real_bound,
+                    real_excess,
+                    imaginary_error,
+                    imaginary_bound,
+                    imaginary_excess,
+                ) = _rigid_reconstruction_quantization_metrics(
+                    phi[members],
+                    component_translation[component_idx],
+                    component_rotation[component_idx],
+                    centered,
                 )
-                if not np.allclose(
-                    phi[members], expected_phi, rtol=1.0e-5, atol=1.0e-6
-                ):
+                if real_excess > 0.0 or imaginary_excess > 0.0:
                     raise ValueError(
                         f"{latent_path} component {component_idx} is not represented "
-                        "by its filled rigid twist"
+                        "by its filled rigid twist within complex64 quantization: "
+                        f"real_error={real_error:.9g}, real_bound={real_bound:.9g}, "
+                        f"real_excess={real_excess:.9g}, "
+                        f"imaginary_error={imaginary_error:.9g}, "
+                        f"imaginary_bound={imaginary_bound:.9g}, "
+                        f"imaginary_excess={imaginary_excess:.9g}"
                     )
             expected_role = np.full((num_points,), 2, dtype=np.int8)
             expected_role[trusted_seed_mask] = 0

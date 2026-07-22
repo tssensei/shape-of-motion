@@ -232,3 +232,10 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   then exited while printing the already-written timing profile because the
   summary formatter still required joint-only layout and reconstruction keys;
   this is a profiling-output defect rather than a solve or artifact failure.
+- The standalone Viewer initially rejected the completed partial artifact at
+  component 515 because it compared the independently persisted complex64 point
+  field and complex64 rigid twist with a fixed allclose tolerance. The partial
+  solver constructs the field exactly from the twist in complex128 before those
+  arrays are rounded separately, so large cancelling translation/rotation terms
+  require an operand-scaled real/imaginary quantization bound during artifact
+  validation rather than a tolerance based only on the final motion amplitude.
