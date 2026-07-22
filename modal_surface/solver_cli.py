@@ -205,7 +205,7 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
     elif motion_fill_enabled:
         nonseed_policy = (
             "trusted_and_completed_single_view_components_fixed_"
-            "all_other_gaussians_independent_3d_motion_fill"
+            "anchor_hop_limited_independent_3d_gaussian_motion_fill"
         )
         component_fill_policy = (
             "observable_twist_plus_knn_filled_weak_and_ray_directions_"
@@ -214,7 +214,7 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
     else:
         nonseed_policy = "zero_without_motion_fill"
         component_fill_policy = "disabled"
-    return {
+    parameters = {
         "solver": "rigid_components",
         "rigidity_model": "complex_infinitesimal_se3",
         "rigid_component_rcond": float(args.rigid_component_rcond),
@@ -264,3 +264,8 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
         "alpha_info_ratio_min": float(args.alpha_info_ratio_min),
         "alpha_failure": str(args.alpha_failure),
     }
+    if motion_fill_enabled and motion_fill_stage == "sequential":
+        parameters["motion_fill_max_anchor_hops"] = int(
+            args.motion_fill_max_anchor_hops
+        )
+    return parameters

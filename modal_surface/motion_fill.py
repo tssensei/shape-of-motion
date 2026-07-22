@@ -641,17 +641,29 @@ def _assemble_sparse_system(
     graph: KnnGraph,
     inputs: ValidatedMotionFillInputs,
     connectivity: AnchorConnectivity,
+    solve_connected_mask: np.ndarray,
 ) -> tuple[object, np.ndarray, np.ndarray, np.ndarray, int]:
     coo_matrix, _ = _require_scipy_sparse()
-    variable_mask = connectivity.connected_to_anchor & ~inputs.anchor_mask
+    solve_connected = _validate_boolean_mask(
+        solve_connected_mask,
+        "solve_connected_mask",
+        graph.num_points,
+    )
+    if np.any(solve_connected & ~connectivity.connected_to_anchor):
+        raise ValueError(
+            "solve_connected_mask must be a subset of anchor connectivity."
+        )
+    if np.any(inputs.anchor_mask & ~solve_connected):
+        raise ValueError("Every anchor must be included in solve_connected_mask.")
+    variable_mask = solve_connected & ~inputs.anchor_mask
     variable_dimensions = np.where(variable_mask, inputs.point_nullity, 0).astype(np.int64)
     coefficient_offsets = np.zeros((graph.num_points + 1,), dtype=np.int64)
     coefficient_offsets[1:] = np.cumsum(variable_dimensions, dtype=np.int64)
     column_count = int(coefficient_offsets[-1])
 
     active_edge_mask = (
-        connectivity.connected_to_anchor[graph.edge_index[:, 0]]
-        & connectivity.connected_to_anchor[graph.edge_index[:, 1]]
+        solve_connected[graph.edge_index[:, 0]]
+        & solve_connected[graph.edge_index[:, 1]]
     )
     active_edge_indices = np.where(active_edge_mask)[0]
     edges = graph.edge_index[active_edge_indices]
@@ -768,6 +780,7 @@ def fill_nullspace_motion(
     lsmr_btol: float = 1e-10,
     lsmr_conlim: float = 1e8,
     lsmr_maxiter: int | None = None,
+    max_anchor_hops: int | None = None,
     timings: dict[str, float] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> MotionFillResult:
@@ -798,6 +811,11 @@ def fill_nullspace_motion(
         raise ValueError("lsmr_conlim must be finite and positive.")
     if lsmr_maxiter is not None:
         lsmr_maxiter = _require_positive_integer(lsmr_maxiter, "lsmr_maxiter")
+    if max_anchor_hops is not None:
+        max_anchor_hops = _require_positive_integer(
+            max_anchor_hops,
+            "max_anchor_hops",
+        )
     _record_timing(timings, "preparation_seconds", preparation_started)
     _emit_progress(
         progress,
@@ -812,17 +830,34 @@ def fill_nullspace_motion(
         inputs.anchor_mask,
         inputs.excluded_mask,
     )
+    solve_connected_mask = connectivity.connected_to_anchor.copy()
+    if max_anchor_hops is not None:
+        solve_connected_mask &= (
+            connectivity.hop_distance <= int(max_anchor_hops)
+        )
+    hop_limited_count = int(
+        np.count_nonzero(
+            connectivity.connected_to_anchor
+            & ~solve_connected_mask
+            & ~inputs.anchor_mask
+        )
+    )
     _record_timing(timings, "connectivity_seconds", connectivity_started)
     _emit_progress(
         progress,
         "pointwise KNN connectivity finished in "
         f"{perf_counter() - connectivity_started:.3f} s: "
-        f"connected_points={int(np.count_nonzero(connectivity.connected_to_anchor))}",
+        f"connected_points={int(np.count_nonzero(connectivity.connected_to_anchor))}, "
+        f"solve_points={int(np.count_nonzero(solve_connected_mask))}, "
+        f"hop_limited_targets={hop_limited_count}",
     )
     assembly_started = perf_counter()
     _emit_progress(progress, "pointwise sparse assembly started")
     matrix, rhs, coefficient_offsets, variable_mask, active_edge_count = _assemble_sparse_system(
-        graph, inputs, connectivity
+        graph,
+        inputs,
+        connectivity,
+        solve_connected_mask,
     )
     column_count = int(matrix.shape[1])
     _record_timing(timings, "system_assembly_seconds", assembly_started)
@@ -901,7 +936,7 @@ def fill_nullspace_motion(
     phi_filled[inputs.anchor_mask] = phi_source[inputs.anchor_mask]
     phi_filled[inputs.excluded_mask] = phi_source[inputs.excluded_mask]
 
-    completion_mask = connectivity.connected_to_anchor & ~inputs.anchor_mask
+    completion_mask = solve_connected_mask & ~inputs.anchor_mask
     result = MotionFillResult(
         phi=phi_filled,
         phi_observable=phi_source.astype(inputs.output_dtype, copy=True),

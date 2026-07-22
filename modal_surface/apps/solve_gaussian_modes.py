@@ -93,6 +93,7 @@ from modal_surface.solver_cli import (
 
 
 _DEFAULT_MOTION_FILL_K = 8
+_DEFAULT_MOTION_FILL_MAX_ANCHOR_HOPS = 8
 
 
 def parse_mode_indices(raw: str, num_modes: int) -> list[int]:
@@ -297,6 +298,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=None,
         help="Required maximum KNN edge distance in scene units when --motion-fill is enabled.",
+    )
+    parser.add_argument(
+        "--motion-fill-max-anchor-hops",
+        type=int,
+        default=_DEFAULT_MOTION_FILL_MAX_ANCHOR_HOPS,
+        help=(
+            "Maximum KNN hop distance from a fixed anchor included in sequential "
+            "pointwise motion fill (default: 8)."
+        ),
     )
     add_solve_method_arguments(parser)
     add_staged_solver_arguments(parser)
@@ -746,6 +756,13 @@ def _validate_motion_fill_arguments(
             raise ValueError("--motion-fill-max-distance requires --motion-fill.")
         if args.motion_fill_k != _DEFAULT_MOTION_FILL_K:
             raise ValueError("A custom --motion-fill-k requires --motion-fill.")
+        if (
+            args.motion_fill_max_anchor_hops
+            != _DEFAULT_MOTION_FILL_MAX_ANCHOR_HOPS
+        ):
+            raise ValueError(
+                "A custom --motion-fill-max-anchor-hops requires --motion-fill."
+            )
         return
     if args.motion_fill_max_distance is None:
         raise ValueError("--motion-fill requires --motion-fill-max-distance in scene units.")
@@ -758,6 +775,12 @@ def _validate_motion_fill_arguments(
     max_distance = float(args.motion_fill_max_distance)
     if not np.isfinite(max_distance) or max_distance <= 0.0:
         raise ValueError("--motion-fill-max-distance must be finite and positive.")
+    if (
+        isinstance(args.motion_fill_max_anchor_hops, (bool, np.bool_))
+        or not isinstance(args.motion_fill_max_anchor_hops, (int, np.integer))
+        or int(args.motion_fill_max_anchor_hops) <= 0
+    ):
+        raise ValueError("--motion-fill-max-anchor-hops must be a positive integer.")
     if num_points is not None and int(args.motion_fill_k) >= int(num_points):
         raise ValueError(
             f"--motion-fill-k must be smaller than the foreground Gaussian count ({num_points})."
@@ -1628,6 +1651,11 @@ def _write_rigid_solver_diagnostics(
                 ),
             }
         )
+        if motion_fill_method == RIGID_SEQUENTIAL_MOTION_FILL_METHOD:
+            arrays["motion_fill_max_anchor_hops"] = np.array(
+                int(motion_fill.diagnostics["max_anchor_hops"]),
+                dtype=np.int32,
+            )
         partial = motion_fill.single_view_partial_diagnostics
         if partial is not None:
             arrays.update(
@@ -1847,6 +1875,11 @@ def _write_time_profile(
                     f"{float(motion['pointwise_preparation_seconds']):.3f} / "
                     f"{float(motion['pointwise_connectivity_seconds']):.3f} / "
                     f"{float(motion['pointwise_system_assembly_seconds']):.3f} s"
+                )
+                print(
+                    "    point max hops / limited   "
+                    f"{int(motion['max_anchor_hops'])} / "
+                    f"{int(motion['hop_limited_target_count'])}"
                 )
                 print(
                     "    point LSMR real/imag      "
@@ -2194,6 +2227,9 @@ def run(args: argparse.Namespace) -> None:
                             max_finite_drift=float(
                                 args.rigid_seed_max_finite_drift
                             ),
+                            max_anchor_hops=int(
+                                args.motion_fill_max_anchor_hops
+                            ),
                             timings=motion_fill_timings,
                             progress=progress,
                         )
@@ -2220,6 +2256,22 @@ def run(args: argparse.Namespace) -> None:
                 "total_seconds": 0.0,
                 **motion_fill_timings,
             }
+            if (
+                rigid_motion_fill is not None
+                and args.rigid_motion_fill_stage == "sequential"
+            ):
+                mode_profile["motion_fill"].update(
+                    {
+                        "max_anchor_hops": int(
+                            rigid_motion_fill.diagnostics["max_anchor_hops"]
+                        ),
+                        "hop_limited_target_count": int(
+                            rigid_motion_fill.diagnostics["completion"][
+                                "hop_limited_target_count"
+                            ]
+                        ),
+                    }
+                )
 
             stage_started = perf_counter()
             if rigid_motion_fill is None:
@@ -2465,7 +2517,10 @@ def run(args: argparse.Namespace) -> None:
                     "ordinary_gaussians_zero_component_only"
                     if args.solve_method == "rigid-components"
                     and args.rigid_motion_fill_stage == "single-view-components"
-                    else "completed_components_fixed_all_other_gaussians_free"
+                    else (
+                        "completed_components_fixed_anchor_hop_limited_"
+                        "gaussians_free"
+                    )
                     if args.solve_method == "rigid-components"
                     else "retain_observable_exclude_from_graph"
                 ),
@@ -2495,6 +2550,16 @@ def run(args: argparse.Namespace) -> None:
                     "component_count": int(motion_fill_graph.component_sizes.shape[0]),
                     "isolated_point_count": int(
                         np.count_nonzero(motion_fill_graph.isolated_mask)
+                    ),
+                    **(
+                        {
+                            "max_anchor_hops": int(
+                                args.motion_fill_max_anchor_hops
+                            )
+                        }
+                        if args.solve_method == "rigid-components"
+                        and args.rigid_motion_fill_stage == "sequential"
+                        else {}
                     ),
                 },
                 "modes": motion_fill_mode_diagnostics,

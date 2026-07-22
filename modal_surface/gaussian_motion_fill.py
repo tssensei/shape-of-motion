@@ -1653,11 +1653,18 @@ def apply_sequential_rigid_motion_fill(
     observable_singular_ratio_min: float,
     ray_direction_min_fraction: float,
     max_finite_drift: float,
+    max_anchor_hops: int,
     timings: dict[str, float] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> RigidSeedMotionFillResult:
     """Fill trusted single-view components, then independent Gaussian vectors."""
 
+    if (
+        isinstance(max_anchor_hops, (bool, np.bool_))
+        or not isinstance(max_anchor_hops, (int, np.integer))
+        or int(max_anchor_hops) <= 0
+    ):
+        raise ValueError("max_anchor_hops must be a positive integer")
     total_started = perf_counter()
     component_timings: dict[str, float] = {}
     component_result = apply_single_view_component_partial_fill(
@@ -1722,6 +1729,7 @@ def apply_sequential_rigid_motion_fill(
         lsmr_atol=MOTION_FILL_LSMR_ATOL,
         lsmr_btol=MOTION_FILL_LSMR_BTOL,
         lsmr_conlim=MOTION_FILL_LSMR_CONLIM,
+        max_anchor_hops=max_anchor_hops,
         timings=pointwise_timings,
         progress=progress,
     )
@@ -1764,10 +1772,16 @@ def apply_sequential_rigid_motion_fill(
     completed_observed = motion.completion_mask & ~trusted_seed_mask & observed_mask
     completed_unobserved = motion.completion_mask & ~trusted_seed_mask & ~observed_mask
     unresolved_target = ~trusted_seed_mask & ~motion.completion_mask
+    hop_limited_target = (
+        point_motion.completion_connected_to_anchor
+        & ~point_motion.completion_mask
+        & point_target_mask
+    )
     diagnostics = {
         "method": RIGID_SEQUENTIAL_MOTION_FILL_METHOD,
         "version": MOTION_FILL_VERSION,
         "graph_path": graph_path,
+        "max_anchor_hops": int(max_anchor_hops),
         "pipeline": (
             "single_view_partial_components_then_independent_3d_gaussians"
         ),
@@ -1781,6 +1795,9 @@ def apply_sequential_rigid_motion_fill(
                 np.count_nonzero(component_anchor_mask)
             ),
             "pointwise_target_count": int(np.count_nonzero(point_target_mask)),
+            "hop_limited_target_count": int(
+                np.count_nonzero(hop_limited_target)
+            ),
             "completed_observed_count": int(np.count_nonzero(completed_observed)),
             "completed_unobserved_count": int(
                 np.count_nonzero(completed_unobserved)

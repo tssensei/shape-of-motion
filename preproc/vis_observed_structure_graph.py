@@ -348,6 +348,7 @@ class RigidManifestViewData:
     source_checkpoint: str
     motion_fill_enabled: bool
     rigid_motion_fill_stage: str
+    motion_fill_max_anchor_hops: int | None
     rigid_seed_min_valid_views: int
     rigid_seed_min_secondary_view_node_ratio: float
     rigid_seed_min_singular_ratio: float
@@ -1046,6 +1047,19 @@ def load_rigid_manifest(
         "sequential",
         "single-view-components",
     }
+    motion_fill_max_anchor_hops = None
+    if motion_fill_enabled and rigid_motion_fill_stage == "sequential":
+        raw_max_anchor_hops = parameters.get("motion_fill_max_anchor_hops")
+        if raw_max_anchor_hops is not None:
+            motion_fill_max_anchor_hops = _manifest_integer(
+                raw_max_anchor_hops,
+                "motion_fill_max_anchor_hops",
+                manifest_path,
+            )
+            if motion_fill_max_anchor_hops <= 0:
+                raise ValueError(
+                    f"{manifest_path} motion_fill_max_anchor_hops must be positive"
+                )
     manifest_partial_observable_ratio = None
     manifest_partial_ray_fraction = None
     if partial_fill_enabled:
@@ -1115,7 +1129,11 @@ def load_rigid_manifest(
             if component_fill_only
             else (
                 "trusted_and_completed_single_view_components_fixed_"
-                "all_other_gaussians_independent_3d_motion_fill"
+                + (
+                    "anchor_hop_limited_independent_3d_gaussian_motion_fill"
+                    if motion_fill_max_anchor_hops is not None
+                    else "all_other_gaussians_independent_3d_motion_fill"
+                )
             )
             if motion_fill_enabled and rigid_motion_fill_stage == "sequential"
             else "single_view_component_rigid_else_free_motion_fill"
@@ -2038,13 +2056,53 @@ def load_rigid_manifest(
                     f"{diagnostics_path} motion_fill_role differs from latent"
                 )
             connected = np.asarray(diagnostics["completion_connected_to_anchor"])
-            if (
-                connected.shape != (num_points,)
-                or connected.dtype != np.bool_
-                or not np.array_equal(
-                    completion_mask, connected & ~trusted_seed_mask
+            if connected.shape != (num_points,) or connected.dtype != np.bool_:
+                raise ValueError(
+                    f"{diagnostics_path} completion connectivity is inconsistent"
                 )
+            expected_completion = connected & ~trusted_seed_mask
+            if (
+                rigid_motion_fill_stage == "sequential"
+                and motion_fill_max_anchor_hops is not None
             ):
+                for name in (
+                    "motion_fill_max_anchor_hops",
+                    "point_anchor_hop_distance",
+                ):
+                    if name not in diagnostics:
+                        raise ValueError(f"{diagnostics_path} is missing {name}")
+                persisted_max_hops = np.asarray(
+                    diagnostics["motion_fill_max_anchor_hops"]
+                )
+                if (
+                    persisted_max_hops.shape != ()
+                    or not np.issubdtype(
+                        persisted_max_hops.dtype,
+                        np.integer,
+                    )
+                    or int(persisted_max_hops.item())
+                    != motion_fill_max_anchor_hops
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} motion_fill_max_anchor_hops "
+                        "is inconsistent"
+                    )
+                anchor_hops = np.asarray(
+                    diagnostics["point_anchor_hop_distance"]
+                )
+                if (
+                    anchor_hops.shape != (num_points,)
+                    or not np.issubdtype(anchor_hops.dtype, np.integer)
+                    or not np.array_equal(anchor_hops >= 0, connected)
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} point_anchor_hop_distance "
+                        "is inconsistent"
+                    )
+                expected_completion &= (
+                    anchor_hops <= motion_fill_max_anchor_hops
+                )
+            if not np.array_equal(completion_mask, expected_completion):
                 raise ValueError(
                     f"{diagnostics_path} completion connectivity is inconsistent"
                 )
@@ -2354,6 +2412,7 @@ def load_rigid_manifest(
         source_checkpoint=source_checkpoint,
         motion_fill_enabled=motion_fill_enabled,
         rigid_motion_fill_stage=rigid_motion_fill_stage,
+        motion_fill_max_anchor_hops=motion_fill_max_anchor_hops,
         rigid_seed_min_valid_views=rigid_seed_min_valid_views,
         rigid_seed_min_secondary_view_node_ratio=(
             rigid_seed_min_secondary_view_node_ratio

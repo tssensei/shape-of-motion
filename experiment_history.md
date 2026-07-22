@@ -280,3 +280,9 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   reset and solved as an independent 3D point variable. The run profile now
   separates component-stage time from pointwise connectivity, assembly,
   real/imaginary LSMR, and reconstruction time.
+- The next bounded-propagation comparison uses
+  `/home/zs292/outputs_modal/bush4/mode4_sequential_partial_then_pointwise_hop8_profile`.
+  It retains the sequential partial-component anchors but restricts the
+  independent-Gaussian LSMR to points within eight full-graph KNN hops of a
+  fixed anchor. Farther connected targets remain zero and incomplete, while
+  their original hop distances and the total truncated count remain diagnostic.
