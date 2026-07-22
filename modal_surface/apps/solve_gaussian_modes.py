@@ -1584,6 +1584,9 @@ def _write_rigid_solver_diagnostics(
                 "single_view_component_completion_mask": (
                     motion_fill.single_view_component_completion_mask.astype(bool)
                 ),
+                "single_view_component_anchor_mask": (
+                    motion_fill.single_view_component_anchor_mask.astype(bool)
+                ),
                 "single_view_component_translation": (
                     motion_fill.single_view_component_translation.astype(
                         np.complex64
@@ -2518,7 +2521,7 @@ def run(args: argparse.Namespace) -> None:
                     if args.solve_method == "rigid-components"
                     and args.rigid_motion_fill_stage == "single-view-components"
                     else (
-                        "completed_components_fixed_anchor_hop_limited_"
+                        "finite_safe_components_fixed_anchor_hop_limited_"
                         "gaussians_free"
                     )
                     if args.solve_method == "rigid-components"

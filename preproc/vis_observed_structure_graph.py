@@ -323,6 +323,7 @@ class RigidModeViewData:
     component_motion_rms: np.ndarray
     component_finite_drift_max: np.ndarray
     single_view_component_completion_mask: np.ndarray
+    single_view_component_anchor_mask: np.ndarray
     single_view_component_observable_rank: np.ndarray | None
     single_view_component_fill_nullity: np.ndarray | None
     single_view_component_trusted_knn_edge_count: np.ndarray | None
@@ -1048,6 +1049,7 @@ def load_rigid_manifest(
         "single-view-components",
     }
     motion_fill_max_anchor_hops = None
+    single_view_component_anchor_policy = None
     if motion_fill_enabled and rigid_motion_fill_stage == "sequential":
         raw_max_anchor_hops = parameters.get("motion_fill_max_anchor_hops")
         if raw_max_anchor_hops is not None:
@@ -1060,6 +1062,16 @@ def load_rigid_manifest(
                 raise ValueError(
                     f"{manifest_path} motion_fill_max_anchor_hops must be positive"
                 )
+        single_view_component_anchor_policy = parameters.get(
+            "single_view_component_anchor_policy"
+        )
+        if single_view_component_anchor_policy not in {
+            None,
+            "all_postfill_finite_safe_components",
+        }:
+            raise ValueError(
+                f"{manifest_path} single_view_component_anchor_policy is incompatible"
+            )
     manifest_partial_observable_ratio = None
     manifest_partial_ray_fraction = None
     if partial_fill_enabled:
@@ -1128,7 +1140,11 @@ def load_rigid_manifest(
             "single_view_partial_rigid_other_gaussians_zero"
             if component_fill_only
             else (
-                "trusted_and_completed_single_view_components_fixed_"
+                (
+                    "trusted_and_finite_safe_single_view_components_fixed_"
+                    if single_view_component_anchor_policy is not None
+                    else "trusted_and_completed_single_view_components_fixed_"
+                )
                 + (
                     "anchor_hop_limited_independent_3d_gaussian_motion_fill"
                     if motion_fill_max_anchor_hops is not None
@@ -1145,7 +1161,11 @@ def load_rigid_manifest(
             if component_fill_only
             else (
                 "observable_twist_plus_knn_filled_weak_and_ray_directions_"
-                "then_fixed_for_pointwise_fill"
+                + (
+                    "all_finite_safe_then_fixed_for_pointwise_fill"
+                    if single_view_component_anchor_policy is not None
+                    else "then_fixed_for_pointwise_fill"
+                )
             )
             if motion_fill_enabled and rigid_motion_fill_stage == "sequential"
             else "shared_unknown_normalized_infinitesimal_se3_twist"
@@ -1801,6 +1821,9 @@ def load_rigid_manifest(
         single_view_component_completion = np.zeros(
             (num_components,), dtype=bool
         )
+        single_view_component_anchor = np.zeros(
+            (num_components,), dtype=bool
+        )
         partial_observable_rank = None
         partial_fill_nullity = None
         partial_trusted_knn_count = None
@@ -1901,6 +1924,34 @@ def load_rigid_manifest(
                 raise ValueError(
                     f"{diagnostics_path} single-view component completion is invalid"
                 )
+            if (
+                rigid_motion_fill_stage == "sequential"
+                and single_view_component_anchor_policy is not None
+            ):
+                if "single_view_component_anchor_mask" not in diagnostics:
+                    raise ValueError(
+                        f"{diagnostics_path} is missing "
+                        "single_view_component_anchor_mask"
+                    )
+                single_view_component_anchor = np.asarray(
+                    diagnostics["single_view_component_anchor_mask"]
+                )
+                if (
+                    single_view_component_anchor.dtype != np.bool_
+                    or single_view_component_anchor.shape != (num_components,)
+                    or np.any(
+                        single_view_component_anchor
+                        & ~single_view_component_fill
+                    )
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} single-view component anchor "
+                        "mask is invalid"
+                    )
+            else:
+                single_view_component_anchor = (
+                    single_view_component_completion.copy()
+                )
             if rigid_motion_fill_stage != "sequential":
                 for component_idx in np.flatnonzero(
                     single_view_component_fill
@@ -1971,7 +2022,7 @@ def load_rigid_manifest(
                     "outside selected components"
                 )
             rigid_component_validation_mask = (
-                single_view_component_completion
+                single_view_component_anchor
                 if rigid_motion_fill_stage == "sequential"
                 else single_view_component_fill
             )
@@ -2010,7 +2061,7 @@ def load_rigid_manifest(
             if rigid_motion_fill_stage == "sequential":
                 component_anchor_points = np.zeros((num_points,), dtype=bool)
                 component_anchor_points[component_points] = (
-                    single_view_component_completion[
+                    single_view_component_anchor[
                         point_component[component_points]
                     ]
                 )
@@ -2281,6 +2332,18 @@ def load_rigid_manifest(
                     raise ValueError(
                         f"{diagnostics_path} partial post-fill retention is inconsistent"
                     )
+                if (
+                    rigid_motion_fill_stage == "sequential"
+                    and single_view_component_anchor_policy is not None
+                    and not np.array_equal(
+                        single_view_component_anchor,
+                        partial_postfill_retained,
+                    )
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} single-view component anchors "
+                        "differ from finite-safe retention"
+                    )
                 partial_connected = np.asarray(
                     diagnostics[
                         "single_view_component_connected_to_trusted_mask"
@@ -2327,11 +2390,11 @@ def load_rigid_manifest(
                     "without motion fill"
                 )
 
-        single_view_completed_points = np.zeros((num_points,), dtype=bool)
+        single_view_anchor_points = np.zeros((num_points,), dtype=bool)
         if motion_fill_enabled:
             component_points = point_component >= 0
-            single_view_completed_points[component_points] = (
-                single_view_component_completion[
+            single_view_anchor_points[component_points] = (
+                single_view_component_anchor[
                     point_component[component_points]
                 ]
             )
@@ -2349,7 +2412,7 @@ def load_rigid_manifest(
                 raw_rigid_phi=raw_rigid_phi.astype(np.complex64),
                 rigid_seed_mask=trusted_seed_mask,
                 quarantined_rigid_mask=rigid_seed_mask & ~trusted_seed_mask,
-                single_view_rigid_fill_mask=single_view_completed_points,
+                single_view_rigid_fill_mask=single_view_anchor_points,
                 completed_fill_mask=completion_mask,
                 unresolved_fill_mask=(
                     effective_fill_target_mask & ~completion_mask
@@ -2371,6 +2434,9 @@ def load_rigid_manifest(
                 component_finite_drift_max=component_finite_drift,
                 single_view_component_completion_mask=(
                     single_view_component_completion.astype(bool)
+                ),
+                single_view_component_anchor_mask=(
+                    single_view_component_anchor.astype(bool)
                 ),
                 single_view_component_observable_rank=(
                     None
@@ -3763,10 +3829,10 @@ class ObservedGraphViewer:
                             == 1
                         )
                         edge_colors[single_view] = _RIGID_DIAGNOSTIC_ANOMALY_COLOR
-                        completed = rigid_mode.single_view_component_completion_mask[
+                        anchored = rigid_mode.single_view_component_anchor_mask[
                             edge_components
                         ]
-                        edge_colors[completed] = _SINGLE_VIEW_RIGID_FILL_COLOR
+                        edge_colors[anchored] = _SINGLE_VIEW_RIGID_FILL_COLOR
                     elif color_mode == "partial observable rank":
                         if (
                             rigid_mode is None

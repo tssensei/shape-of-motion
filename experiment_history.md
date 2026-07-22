@@ -291,3 +291,9 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   It keeps the eight-hop sequential graph and changes both real and imaginary
   component/pointwise LSMR stopping tolerances from `1e-10` to `1e-6`; the run
   should be compared by iteration count, LSMR wall time, and final Viewer motion.
+- The corrected component-anchor comparison uses
+  `/home/zs292/outputs_modal/bush4/mode4_finite_safe_single_view_anchors_hop8_tol1e6_profile`.
+  All single-view components that pass finite drift now keep their component
+  motion and seed downstream Gaussian interpolation; trusted-KNN connectivity
+  only supplies weak/ray coefficients. The eight-hop cutoff is measured from
+  this expanded anchor set and applies only to remaining independent Gaussians.

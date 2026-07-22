@@ -140,6 +140,7 @@ class RigidSeedMotionFillResult:
     single_view_component_fill_mask: np.ndarray
     single_view_rigid_fill_point_mask: np.ndarray
     single_view_component_completion_mask: np.ndarray
+    single_view_component_anchor_mask: np.ndarray
     single_view_component_translation: np.ndarray
     single_view_component_rotation: np.ndarray
     single_view_component_first_order_relative_max: np.ndarray
@@ -1615,6 +1616,7 @@ def apply_single_view_component_partial_fill(
         single_view_component_fill_mask=single_view_component_fill_mask,
         single_view_rigid_fill_point_mask=selected_point_mask,
         single_view_component_completion_mask=component_completion,
+        single_view_component_anchor_mask=component_postfill_retained,
         single_view_component_translation=component_translation.astype(np.complex64),
         single_view_component_rotation=component_rotation.astype(np.complex64),
         single_view_component_first_order_relative_max=(
@@ -1657,7 +1659,7 @@ def apply_sequential_rigid_motion_fill(
     timings: dict[str, float] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> RigidSeedMotionFillResult:
-    """Fill trusted single-view components, then independent Gaussian vectors."""
+    """Fix finite-safe single-view components, then fill independent Gaussians."""
 
     if (
         isinstance(max_anchor_hops, (bool, np.bool_))
@@ -1687,13 +1689,24 @@ def apply_sequential_rigid_motion_fill(
         seed_selection.trusted_rigid_seed_mask,
         dtype=bool,
     )
-    component_anchor_mask = np.asarray(
-        component_result.motion.completion_mask,
+    point_component = np.asarray(rigid.point_component_index, dtype=np.int64)
+    component_anchor_components = np.asarray(
+        component_result.single_view_component_anchor_mask,
         dtype=bool,
     )
     if (
         trusted_seed_mask.shape != (num_points,)
-        or component_anchor_mask.shape != (num_points,)
+        or point_component.shape != (num_points,)
+        or component_anchor_components.shape != (rigid.num_components,)
+    ):
+        raise RuntimeError("Sequential rigid motion-fill anchor metadata is invalid")
+    component_anchor_mask = np.zeros((num_points,), dtype=bool)
+    component_points = point_component >= 0
+    component_anchor_mask[component_points] = component_anchor_components[
+        point_component[component_points]
+    ]
+    if (
+        component_anchor_mask.shape != (num_points,)
         or np.any(trusted_seed_mask & component_anchor_mask)
     ):
         raise RuntimeError("Sequential rigid motion-fill anchor masks are invalid")
@@ -1791,6 +1804,14 @@ def apply_sequential_rigid_motion_fill(
             for index, name in enumerate(MOTION_FILL_ROLE_NAMES)
         },
         "completion": {
+            "component_anchor_component_count": int(
+                np.count_nonzero(component_anchor_components)
+            ),
+            "trusted_connected_component_count": int(
+                np.count_nonzero(
+                    component_result.single_view_component_completion_mask
+                )
+            ),
             "component_anchor_point_count": int(
                 np.count_nonzero(component_anchor_mask)
             ),
@@ -1828,6 +1849,9 @@ def apply_sequential_rigid_motion_fill(
         ),
         single_view_component_completion_mask=(
             component_result.single_view_component_completion_mask
+        ),
+        single_view_component_anchor_mask=(
+            component_result.single_view_component_anchor_mask
         ),
         single_view_component_translation=(
             component_result.single_view_component_translation
