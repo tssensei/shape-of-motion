@@ -265,3 +265,10 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   distinct component nodes as the dominant view, keeps the normalized-motion
   gate disabled for isolation, and sends downgraded effective-single-view
   components through the existing partial KNN fill.
+- A secondary/dominant distinct-node coverage sweep over 438 raw multiview
+  components found ratios p10/p25/p50 of 0.1595/0.2893/0.5921. Thresholds
+  0.05, 0.10, 0.15, 0.20, 0.25, and 1/3 downgraded 8, 19, 43, 59, 76, and
+  117 components respectively. Viewer inspection of
+  `/home/zs292/outputs_modal/bush4/mode4_single_view_partial_view_support_0p15_no_radius_gate`
+  found the 0.15 version visually reasonable, so subsequent component-only
+  experiments retain 0.15 while increasing KNN influence separately.

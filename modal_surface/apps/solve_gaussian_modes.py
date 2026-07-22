@@ -82,7 +82,6 @@ from modal_surface.solver_cli import (
     RIGID_SEED_MIN_VALID_VIEWS_DEFAULT,
     RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT,
     RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT,
-    RIGID_SINGLE_VIEW_MAX_NORMALIZED_MOTION_RMS_DEFAULT,
     STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT,
     STAGED_ANCHOR_SVD_RATIO_DEFAULT,
     add_solve_method_arguments,
@@ -317,9 +316,6 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     ray_direction_fraction = float(
         args.rigid_single_view_ray_direction_min_fraction
     )
-    max_normalized_motion_rms = float(
-        args.rigid_single_view_max_normalized_motion_rms
-    )
     if not np.isfinite(rcond) or not (0.0 < rcond < 1.0):
         raise ValueError("--rigid-component-rcond must be finite and lie in (0,1).")
     if min_valid_views <= 0:
@@ -353,14 +349,6 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         raise ValueError(
             "--rigid-single-view-ray-direction-min-fraction must be finite and "
             "lie in [0,1]."
-        )
-    if (
-        not np.isfinite(max_normalized_motion_rms)
-        or max_normalized_motion_rms < 0.0
-    ):
-        raise ValueError(
-            "--rigid-single-view-max-normalized-motion-rms must be finite and "
-            "non-negative."
         )
     if motion_fill_stage != RIGID_MOTION_FILL_STAGE_DEFAULT and not bool(
         args.motion_fill
@@ -419,14 +407,6 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
                 "A custom --rigid-single-view-ray-direction-min-fraction requires "
                 "--solve-method=rigid-components."
             )
-        if (
-            max_normalized_motion_rms
-            != RIGID_SINGLE_VIEW_MAX_NORMALIZED_MOTION_RMS_DEFAULT
-        ):
-            raise ValueError(
-                "A custom --rigid-single-view-max-normalized-motion-rms requires "
-                "--solve-method=rigid-components."
-            )
         return
     if not graph_paths:
         raise ValueError(
@@ -444,14 +424,6 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         ):
             raise ValueError(
                 "A custom --rigid-single-view-ray-direction-min-fraction requires "
-                "--rigid-motion-fill-stage=single-view-components."
-            )
-        if (
-            max_normalized_motion_rms
-            != RIGID_SINGLE_VIEW_MAX_NORMALIZED_MOTION_RMS_DEFAULT
-        ):
-            raise ValueError(
-                "A custom --rigid-single-view-max-normalized-motion-rms requires "
                 "--rigid-motion-fill-stage=single-view-components."
             )
     if float(args.anchor_svd_ratio_min) != STAGED_ANCHOR_SVD_RATIO_DEFAULT:
@@ -1680,9 +1652,6 @@ def _write_rigid_solver_diagnostics(
                     "single_view_max_finite_drift": np.array(
                         partial.max_finite_drift, dtype=np.float64
                     ),
-                    "single_view_max_normalized_motion_rms": np.array(
-                        partial.max_normalized_motion_rms, dtype=np.float64
-                    ),
                     "single_view_component_observable_rank": (
                         partial.component_observable_rank.astype(np.int8)
                     ),
@@ -1718,14 +1687,8 @@ def _write_rigid_solver_diagnostics(
                     "single_view_component_partial_finite_drift_max": (
                         partial.component_finite_drift_max.astype(np.float32)
                     ),
-                    "single_view_component_normalized_motion_rms": (
-                        partial.component_normalized_motion_rms.astype(np.float32)
-                    ),
                     "single_view_component_finite_drift_rejected_mask": (
                         partial.component_finite_drift_rejected_mask.astype(bool)
-                    ),
-                    "single_view_component_motion_rms_rejected_mask": (
-                        partial.component_motion_rms_rejected_mask.astype(bool)
                     ),
                     "single_view_component_postfill_retained_mask": (
                         partial.component_postfill_retained_mask.astype(bool)
@@ -2201,9 +2164,6 @@ def run(args: argparse.Namespace) -> None:
                             ),
                             max_finite_drift=float(
                                 args.rigid_seed_max_finite_drift
-                            ),
-                            max_normalized_motion_rms=float(
-                                args.rigid_single_view_max_normalized_motion_rms
                             ),
                             timings=motion_fill_timings,
                             progress=progress,

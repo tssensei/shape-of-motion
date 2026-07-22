@@ -158,7 +158,6 @@ class RigidSingleViewPartialDiagnostics:
     observable_singular_ratio_min: float
     ray_direction_min_fraction: float
     max_finite_drift: float
-    max_normalized_motion_rms: float
     component_observable_rank: np.ndarray
     component_fill_nullity: np.ndarray
     component_ray_dominated_basis_count: np.ndarray
@@ -170,9 +169,7 @@ class RigidSingleViewPartialDiagnostics:
     component_tangent_motion_rms: np.ndarray
     component_ray_motion_ratio: np.ndarray
     component_finite_drift_max: np.ndarray
-    component_normalized_motion_rms: np.ndarray
     component_finite_drift_rejected_mask: np.ndarray
-    component_motion_rms_rejected_mask: np.ndarray
     component_postfill_retained_mask: np.ndarray
 
 
@@ -839,7 +836,6 @@ def apply_single_view_component_partial_fill(
     observable_singular_ratio_min: float,
     ray_direction_min_fraction: float,
     max_finite_drift: float,
-    max_normalized_motion_rms: float,
     timings: dict[str, float] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> RigidSeedMotionFillResult:
@@ -867,14 +863,6 @@ def apply_single_view_component_partial_fill(
         )
     if not np.isfinite(max_finite_drift) or max_finite_drift < 0.0:
         raise ValueError("max_finite_drift must be finite and non-negative")
-    if (
-        not np.isfinite(max_normalized_motion_rms)
-        or max_normalized_motion_rms < 0.0
-    ):
-        raise ValueError(
-            "max_normalized_motion_rms must be finite and non-negative"
-        )
-
     points = np.asarray(prepared.points, dtype=np.float64)
     num_points = int(points.shape[0])
     if points.shape != (num_points, 3) or graph.num_points != num_points:
@@ -1453,35 +1441,14 @@ def apply_single_view_component_partial_fill(
         num_components,
     )
 
-    component_motion_energy = np.zeros((num_components,), dtype=np.float64)
     selected_members = membership.ordered_points
-    np.add.at(
-        component_motion_energy,
-        point_component[selected_members],
-        np.sum(np.abs(final_phi[selected_members]) ** 2, axis=1),
-    )
-    component_node_count = np.bincount(
-        point_component[component_points], minlength=num_components
-    ).astype(np.int64)
-    component_motion_rms = np.sqrt(
-        component_motion_energy
-        / np.maximum(component_node_count, 1).astype(np.float64)
-    )
-    component_normalized_motion_rms = component_motion_rms / np.maximum(
-        component_radius, MOTION_FILL_EPSILON
-    )
     component_finite_drift_rejected = (
         single_view_component_fill_mask
         & (component_finite_drift > max_finite_drift)
     )
-    component_motion_rms_rejected = (
-        single_view_component_fill_mask
-        & (component_normalized_motion_rms > max_normalized_motion_rms)
-    )
     component_postfill_retained = (
         single_view_component_fill_mask
         & ~component_finite_drift_rejected
-        & ~component_motion_rms_rejected
     )
     component_postfill_rejected = (
         single_view_component_fill_mask & ~component_postfill_retained
@@ -1512,7 +1479,6 @@ def apply_single_view_component_partial_fill(
             "single-view component post-fill gate: "
             f"retained={int(np.count_nonzero(component_postfill_retained))}, "
             f"finite_drift_rejected={int(np.count_nonzero(component_finite_drift_rejected))}, "
-            f"motion_rms_rejected={int(np.count_nonzero(component_motion_rms_rejected))}, "
             f"total_rejected={int(np.count_nonzero(component_postfill_rejected))}"
         )
 
@@ -1594,7 +1560,6 @@ def apply_single_view_component_partial_fill(
         observable_singular_ratio_min=float(observable_singular_ratio_min),
         ray_direction_min_fraction=float(ray_direction_min_fraction),
         max_finite_drift=float(max_finite_drift),
-        max_normalized_motion_rms=float(max_normalized_motion_rms),
         component_observable_rank=observable_rank,
         component_fill_nullity=fill_nullity,
         component_ray_dominated_basis_count=ray_dominated_count,
@@ -1606,13 +1571,9 @@ def apply_single_view_component_partial_fill(
         component_tangent_motion_rms=tangent_motion_rms.astype(np.float32),
         component_ray_motion_ratio=ray_motion_ratio.astype(np.float32),
         component_finite_drift_max=component_finite_drift.astype(np.float32),
-        component_normalized_motion_rms=(
-            component_normalized_motion_rms.astype(np.float32)
-        ),
         component_finite_drift_rejected_mask=(
             component_finite_drift_rejected
         ),
-        component_motion_rms_rejected_mask=component_motion_rms_rejected,
         component_postfill_retained_mask=component_postfill_retained,
     )
     diagnostics = {
@@ -1629,12 +1590,8 @@ def apply_single_view_component_partial_fill(
             "observable_singular_ratio_min": float(observable_singular_ratio_min),
             "ray_direction_min_fraction": float(ray_direction_min_fraction),
             "max_finite_drift": float(max_finite_drift),
-            "max_normalized_motion_rms": float(max_normalized_motion_rms),
             "finite_drift_rejected_component_count": int(
                 np.count_nonzero(component_finite_drift_rejected)
-            ),
-            "motion_rms_rejected_component_count": int(
-                np.count_nonzero(component_motion_rms_rejected)
             ),
             "postfill_rejected_component_count": int(
                 np.count_nonzero(component_postfill_rejected)
