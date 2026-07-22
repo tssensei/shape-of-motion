@@ -157,6 +157,8 @@ class RigidSeedMotionFillResult:
 class RigidSingleViewPartialDiagnostics:
     observable_singular_ratio_min: float
     ray_direction_min_fraction: float
+    max_finite_drift: float
+    max_normalized_motion_rms: float
     component_observable_rank: np.ndarray
     component_fill_nullity: np.ndarray
     component_ray_dominated_basis_count: np.ndarray
@@ -168,6 +170,10 @@ class RigidSingleViewPartialDiagnostics:
     component_tangent_motion_rms: np.ndarray
     component_ray_motion_ratio: np.ndarray
     component_finite_drift_max: np.ndarray
+    component_normalized_motion_rms: np.ndarray
+    component_finite_drift_rejected_mask: np.ndarray
+    component_motion_rms_rejected_mask: np.ndarray
+    component_postfill_retained_mask: np.ndarray
 
 
 def _require_boolean_mask(
@@ -832,6 +838,8 @@ def apply_single_view_component_partial_fill(
     *,
     observable_singular_ratio_min: float,
     ray_direction_min_fraction: float,
+    max_finite_drift: float,
+    max_normalized_motion_rms: float,
     timings: dict[str, float] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> RigidSeedMotionFillResult:
@@ -856,6 +864,15 @@ def apply_single_view_component_partial_fill(
     ):
         raise ValueError(
             "ray_direction_min_fraction must be finite and lie in [0,1]"
+        )
+    if not np.isfinite(max_finite_drift) or max_finite_drift < 0.0:
+        raise ValueError("max_finite_drift must be finite and non-negative")
+    if (
+        not np.isfinite(max_normalized_motion_rms)
+        or max_normalized_motion_rms < 0.0
+    ):
+        raise ValueError(
+            "max_normalized_motion_rms must be finite and non-negative"
         )
 
     points = np.asarray(prepared.points, dtype=np.float64)
@@ -1121,12 +1138,6 @@ def apply_single_view_component_partial_fill(
     connected_groups = group_hop >= 0
     component_connected = np.zeros((num_components,), dtype=bool)
     component_connected[selected_components] = connected_groups
-    connected_point_mask = np.zeros((num_points,), dtype=bool)
-    if membership.ordered_points.size:
-        member_groups = shared_group_index[membership.ordered_points]
-        connected_point_mask[membership.ordered_points] = connected_groups[
-            member_groups
-        ]
     active_edge_mask = eligible_edge_mask.copy()
     for side in (0, 1):
         side_single = endpoint_single[:, side]
@@ -1310,7 +1321,6 @@ def apply_single_view_component_partial_fill(
         progress("single-view component reconstruction and validation started")
     final_phi = phi_observable.copy()
     correction = np.zeros((num_points, 3), dtype=np.complex128)
-    component_completion = component_connected.copy()
     component_translation = np.zeros((num_components, 3), dtype=np.complex128)
     component_rotation = np.zeros((num_components, 3), dtype=np.complex128)
     component_final_twist = observable_twist.copy()
@@ -1343,7 +1353,6 @@ def apply_single_view_component_partial_fill(
             component_rotation[component_idx] = component_final_twist[
                 component_idx, 3:
             ] / radius
-    completion_mask = connected_point_mask
     final_phi[trusted_seed_mask] = np.asarray(
         seed_selection.phi[trusted_seed_mask], dtype=np.complex128
     )
@@ -1442,6 +1451,69 @@ def apply_single_view_component_partial_fill(
         num_components,
     )
 
+    component_motion_energy = np.zeros((num_components,), dtype=np.float64)
+    selected_members = membership.ordered_points
+    np.add.at(
+        component_motion_energy,
+        point_component[selected_members],
+        np.sum(np.abs(final_phi[selected_members]) ** 2, axis=1),
+    )
+    component_node_count = np.bincount(
+        point_component[component_points], minlength=num_components
+    ).astype(np.int64)
+    component_motion_rms = np.sqrt(
+        component_motion_energy
+        / np.maximum(component_node_count, 1).astype(np.float64)
+    )
+    component_normalized_motion_rms = component_motion_rms / np.maximum(
+        component_radius, MOTION_FILL_EPSILON
+    )
+    component_finite_drift_rejected = (
+        single_view_component_fill_mask
+        & (component_finite_drift > max_finite_drift)
+    )
+    component_motion_rms_rejected = (
+        single_view_component_fill_mask
+        & (component_normalized_motion_rms > max_normalized_motion_rms)
+    )
+    component_postfill_retained = (
+        single_view_component_fill_mask
+        & ~component_finite_drift_rejected
+        & ~component_motion_rms_rejected
+    )
+    component_postfill_rejected = (
+        single_view_component_fill_mask & ~component_postfill_retained
+    )
+    rejected_point_mask = np.zeros((num_points,), dtype=bool)
+    rejected_point_mask[selected_point_mask] = component_postfill_rejected[
+        point_component[selected_point_mask]
+    ]
+    final_phi[rejected_point_mask] = 0.0
+    phi_observable[rejected_point_mask] = 0.0
+    correction[rejected_point_mask] = 0.0
+    component_final_twist[component_postfill_rejected] = 0.0
+    component_translation[component_postfill_rejected] = 0.0
+    component_rotation[component_postfill_rejected] = 0.0
+
+    effective_connected_groups = (
+        connected_groups & component_postfill_retained[selected_components]
+    )
+    component_completion = np.zeros((num_components,), dtype=bool)
+    component_completion[selected_components] = effective_connected_groups
+    completion_mask = np.zeros((num_points,), dtype=bool)
+    if selected_members.size:
+        completion_mask[selected_members] = effective_connected_groups[
+            shared_group_index[selected_members]
+        ]
+    if progress is not None:
+        progress(
+            "single-view component post-fill gate: "
+            f"retained={int(np.count_nonzero(component_postfill_retained))}, "
+            f"finite_drift_rejected={int(np.count_nonzero(component_finite_drift_rejected))}, "
+            f"motion_rms_rejected={int(np.count_nonzero(component_motion_rms_rejected))}, "
+            f"total_rejected={int(np.count_nonzero(component_postfill_rejected))}"
+        )
+
     pred, obs_residual, obs_residual_valid, point_residual, point_residual_valid = (
         compute_prediction_and_residuals(prepared, alpha, final_phi)
     )
@@ -1454,8 +1526,8 @@ def apply_single_view_component_partial_fill(
     fill_target_mask = selected_point_mask
 
     active_mask = trusted_seed_mask | selected_point_mask
-    connected_to_anchor = trusted_seed_mask | connected_point_mask
-    unconnected_groups = np.flatnonzero(~connected_groups)
+    connected_to_anchor = trusted_seed_mask | completion_mask
+    unconnected_groups = np.flatnonzero(~effective_connected_groups)
     active_component_count = 1 + int(unconnected_groups.size)
     active_component_index = np.full((num_points,), -1, dtype=np.int32)
     active_component_index[connected_to_anchor] = 0
@@ -1479,7 +1551,7 @@ def apply_single_view_component_partial_fill(
     hop_distance[trusted_seed_mask] = 0
     if membership.ordered_points.size:
         member_groups = shared_group_index[membership.ordered_points]
-        connected_members = connected_groups[member_groups]
+        connected_members = effective_connected_groups[member_groups]
         hop_distance[membership.ordered_points[connected_members]] = group_hop[
             member_groups[connected_members]
         ]
@@ -1519,6 +1591,8 @@ def apply_single_view_component_partial_fill(
     partial_diagnostics = RigidSingleViewPartialDiagnostics(
         observable_singular_ratio_min=float(observable_singular_ratio_min),
         ray_direction_min_fraction=float(ray_direction_min_fraction),
+        max_finite_drift=float(max_finite_drift),
+        max_normalized_motion_rms=float(max_normalized_motion_rms),
         component_observable_rank=observable_rank,
         component_fill_nullity=fill_nullity,
         component_ray_dominated_basis_count=ray_dominated_count,
@@ -1530,6 +1604,14 @@ def apply_single_view_component_partial_fill(
         component_tangent_motion_rms=tangent_motion_rms.astype(np.float32),
         component_ray_motion_ratio=ray_motion_ratio.astype(np.float32),
         component_finite_drift_max=component_finite_drift.astype(np.float32),
+        component_normalized_motion_rms=(
+            component_normalized_motion_rms.astype(np.float32)
+        ),
+        component_finite_drift_rejected_mask=(
+            component_finite_drift_rejected
+        ),
+        component_motion_rms_rejected_mask=component_motion_rms_rejected,
+        component_postfill_retained_mask=component_postfill_retained,
     )
     diagnostics = {
         "method": RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD,
@@ -1544,6 +1626,17 @@ def apply_single_view_component_partial_fill(
             ),
             "observable_singular_ratio_min": float(observable_singular_ratio_min),
             "ray_direction_min_fraction": float(ray_direction_min_fraction),
+            "max_finite_drift": float(max_finite_drift),
+            "max_normalized_motion_rms": float(max_normalized_motion_rms),
+            "finite_drift_rejected_component_count": int(
+                np.count_nonzero(component_finite_drift_rejected)
+            ),
+            "motion_rms_rejected_component_count": int(
+                np.count_nonzero(component_motion_rms_rejected)
+            ),
+            "postfill_rejected_component_count": int(
+                np.count_nonzero(component_postfill_rejected)
+            ),
         },
         "system": {
             "row_count": row_count,

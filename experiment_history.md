@@ -246,3 +246,11 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   This contradicted the intended partial model: unconnected selected components
   should retain their stable non-ray observable twist with zero weak-direction
   correction, while remaining marked incomplete for KNN completion.
+- Following inspection of
+  `/home/zs292/outputs_modal/bush4/mode4_single_view_partial_component_fill_r1e2_ray0p8`,
+  the next component-only revision rejects excessive candidate motion after
+  reconstruction but before publication. It zeros a whole single-view component
+  when finite-amplitude edge drift exceeds `2.0` or point-motion RMS divided by
+  component radius exceeds `2.0`, removes rejected groups from completion and
+  future anchor connectivity, and retains the pre-zero metrics and separate
+  rejection masks for Viewer diagnosis.

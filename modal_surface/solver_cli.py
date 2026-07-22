@@ -17,6 +17,7 @@ RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT = 2.0
 RIGID_MOTION_FILL_STAGE_DEFAULT = "joint"
 RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT = 1.0e-2
 RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT = 0.8
+RIGID_SINGLE_VIEW_MAX_NORMALIZED_MOTION_RMS_DEFAULT = 2.0
 
 
 def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
@@ -100,6 +101,15 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Minimum induced radial-motion fraction that moves a single-view "
             "twist basis direction into KNN completion (default: 0.8)."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-single-view-max-normalized-motion-rms",
+        type=float,
+        default=RIGID_SINGLE_VIEW_MAX_NORMALIZED_MOTION_RMS_DEFAULT,
+        help=(
+            "Maximum post-fill point-motion RMS divided by component radius; "
+            "larger single-view components are zeroed as a whole (default: 2.0)."
         ),
     )
 
@@ -235,6 +245,9 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
         ),
         "rigid_single_view_ray_direction_min_fraction": float(
             args.rigid_single_view_ray_direction_min_fraction
+        ),
+        "rigid_single_view_max_normalized_motion_rms": float(
+            args.rigid_single_view_max_normalized_motion_rms
         ),
         "alpha_solver_model": str(args.alpha_model),
         "alpha_gain_min": float(args.alpha_gain_min),

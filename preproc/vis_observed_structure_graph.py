@@ -241,6 +241,10 @@ _RIGID_DIAGNOSTIC_ANOMALY_COLOR = np.asarray(
 )
 _QUARANTINED_RIGID_COLOR = np.asarray((1.0, 0.55, 0.0), dtype=np.float32)
 _SINGLE_VIEW_RIGID_FILL_COLOR = np.asarray((0.15, 0.45, 1.0), dtype=np.float32)
+_PARTIAL_MOTION_REJECTION_COLOR = np.asarray(
+    (1.0, 0.55, 0.0), dtype=np.float32
+)
+_PARTIAL_BOTH_REJECTION_COLOR = np.asarray((1.0, 0.0, 1.0), dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -320,6 +324,10 @@ class RigidModeViewData:
     single_view_component_fill_nullity: np.ndarray | None
     single_view_component_trusted_knn_edge_count: np.ndarray | None
     single_view_component_ray_motion_ratio: np.ndarray | None
+    single_view_component_normalized_motion_rms: np.ndarray | None
+    single_view_component_finite_drift_rejected_mask: np.ndarray | None
+    single_view_component_motion_rms_rejected_mask: np.ndarray | None
+    single_view_component_postfill_retained_mask: np.ndarray | None
     edge_component_index: np.ndarray
     edge_finite_drift_max: np.ndarray
 
@@ -342,6 +350,7 @@ class RigidManifestViewData:
     rigid_seed_min_valid_views: int
     rigid_seed_min_singular_ratio: float
     rigid_seed_max_finite_drift: float
+    rigid_single_view_max_normalized_motion_rms: float | None
     source_cameras: tuple[SourceCameraViewData, ...]
     modes: tuple[RigidModeViewData, ...]
 
@@ -1030,6 +1039,7 @@ def load_rigid_manifest(
     )
     manifest_partial_observable_ratio = None
     manifest_partial_ray_fraction = None
+    manifest_partial_max_normalized_motion_rms = None
     if component_fill_only:
         manifest_partial_observable_ratio = _manifest_number(
             parameters.get("rigid_single_view_observable_ratio"),
@@ -1041,6 +1051,16 @@ def load_rigid_manifest(
             "rigid_single_view_ray_direction_min_fraction",
             manifest_path,
         )
+        manifest_partial_max_normalized_motion_rms = _manifest_number(
+            parameters.get("rigid_single_view_max_normalized_motion_rms"),
+            "rigid_single_view_max_normalized_motion_rms",
+            manifest_path,
+        )
+        if manifest_partial_max_normalized_motion_rms < 0.0:
+            raise ValueError(
+                f"{manifest_path} rigid_single_view_max_normalized_motion_rms "
+                "must be non-negative"
+            )
     rigid_seed_min_valid_views = _manifest_integer(
         parameters.get("rigid_seed_min_valid_views"),
         "rigid_seed_min_valid_views",
@@ -1645,6 +1665,10 @@ def load_rigid_manifest(
         partial_fill_nullity = None
         partial_trusted_knn_count = None
         partial_ray_motion_ratio = None
+        partial_normalized_motion_rms = None
+        partial_finite_drift_rejected = None
+        partial_motion_rms_rejected = None
+        partial_postfill_retained = None
         if motion_fill_enabled:
             role_names = _string_vector(
                 latent["motion_fill_role_names"],
@@ -1888,6 +1912,8 @@ def load_rigid_manifest(
                 partial_required = {
                     "single_view_observable_singular_ratio_min",
                     "single_view_ray_direction_min_fraction",
+                    "single_view_max_finite_drift",
+                    "single_view_max_normalized_motion_rms",
                     "single_view_component_observable_rank",
                     "single_view_component_fill_nullity",
                     "single_view_component_ray_dominated_basis_count",
@@ -1899,6 +1925,10 @@ def load_rigid_manifest(
                     "single_view_component_tangent_motion_rms",
                     "single_view_component_ray_motion_ratio",
                     "single_view_component_partial_finite_drift_max",
+                    "single_view_component_normalized_motion_rms",
+                    "single_view_component_finite_drift_rejected_mask",
+                    "single_view_component_motion_rms_rejected_mask",
+                    "single_view_component_postfill_retained_mask",
                 }
                 partial_missing = sorted(partial_required - set(diagnostics))
                 if partial_missing:
@@ -1924,11 +1954,29 @@ def load_rigid_manifest(
                         diagnostics_path,
                     ).item()
                 )
+                partial_max_finite_drift = float(
+                    _scalar(
+                        diagnostics["single_view_max_finite_drift"],
+                        "single_view_max_finite_drift",
+                        diagnostics_path,
+                    ).item()
+                )
+                partial_max_normalized_motion_rms = float(
+                    _scalar(
+                        diagnostics["single_view_max_normalized_motion_rms"],
+                        "single_view_max_normalized_motion_rms",
+                        diagnostics_path,
+                    ).item()
+                )
                 if (
                     not np.isfinite(partial_observable_ratio_min)
                     or not 0.0 < partial_observable_ratio_min <= 1.0
                     or not np.isfinite(partial_ray_direction_min_fraction)
                     or not 0.0 <= partial_ray_direction_min_fraction <= 1.0
+                    or not np.isfinite(partial_max_finite_drift)
+                    or partial_max_finite_drift < 0.0
+                    or not np.isfinite(partial_max_normalized_motion_rms)
+                    or partial_max_normalized_motion_rms < 0.0
                 ):
                     raise ValueError(
                         f"{diagnostics_path} partial component thresholds are invalid"
@@ -1941,6 +1989,16 @@ def load_rigid_manifest(
                 ) or not np.isclose(
                     partial_ray_direction_min_fraction,
                     float(manifest_partial_ray_fraction),
+                    rtol=0.0,
+                    atol=1.0e-12,
+                ) or not np.isclose(
+                    partial_max_finite_drift,
+                    rigid_seed_max_finite_drift,
+                    rtol=0.0,
+                    atol=1.0e-12,
+                ) or not np.isclose(
+                    partial_max_normalized_motion_rms,
+                    float(manifest_partial_max_normalized_motion_rms),
                     rtol=0.0,
                     atol=1.0e-12,
                 ):
@@ -1959,6 +2017,23 @@ def load_rigid_manifest(
                 partial_ray_motion_ratio = np.asarray(
                     diagnostics["single_view_component_ray_motion_ratio"],
                     dtype=np.float32,
+                )
+                partial_normalized_motion_rms = np.asarray(
+                    diagnostics["single_view_component_normalized_motion_rms"],
+                    dtype=np.float32,
+                )
+                partial_finite_drift_rejected = np.asarray(
+                    diagnostics[
+                        "single_view_component_finite_drift_rejected_mask"
+                    ]
+                )
+                partial_motion_rms_rejected = np.asarray(
+                    diagnostics[
+                        "single_view_component_motion_rms_rejected_mask"
+                    ]
+                )
+                partial_postfill_retained = np.asarray(
+                    diagnostics["single_view_component_postfill_retained_mask"]
                 )
                 for name, values in (
                     (
@@ -1996,6 +2071,51 @@ def load_rigid_manifest(
                     raise ValueError(
                         f"{diagnostics_path} partial ray-motion ratio is invalid"
                     )
+                if (
+                    partial_normalized_motion_rms.shape != (num_components,)
+                    or not np.isfinite(partial_normalized_motion_rms).all()
+                    or np.any(partial_normalized_motion_rms < 0.0)
+                    or np.any(
+                        partial_normalized_motion_rms[
+                            ~single_view_component_fill
+                        ]
+                        != 0.0
+                    )
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} partial normalized motion RMS is invalid"
+                    )
+                for name, values in (
+                    (
+                        "single_view_component_finite_drift_rejected_mask",
+                        partial_finite_drift_rejected,
+                    ),
+                    (
+                        "single_view_component_motion_rms_rejected_mask",
+                        partial_motion_rms_rejected,
+                    ),
+                    (
+                        "single_view_component_postfill_retained_mask",
+                        partial_postfill_retained,
+                    ),
+                ):
+                    if (
+                        values.dtype != np.bool_
+                        or values.shape != (num_components,)
+                        or np.any(values & ~single_view_component_fill)
+                    ):
+                        raise ValueError(f"{diagnostics_path} {name} is invalid")
+                expected_postfill_retained = (
+                    single_view_component_fill
+                    & ~partial_finite_drift_rejected
+                    & ~partial_motion_rms_rejected
+                )
+                if not np.array_equal(
+                    partial_postfill_retained, expected_postfill_retained
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} partial post-fill retention is inconsistent"
+                    )
                 partial_connected = np.asarray(
                     diagnostics[
                         "single_view_component_connected_to_trusted_mask"
@@ -2003,12 +2123,32 @@ def load_rigid_manifest(
                 )
                 if (
                     partial_connected.dtype != np.bool_
+                    or partial_connected.shape != (num_components,)
                     or not np.array_equal(
-                        partial_connected, single_view_component_completion
+                        partial_connected & partial_postfill_retained,
+                        single_view_component_completion,
                     )
                 ):
                     raise ValueError(
                         f"{diagnostics_path} partial trusted connectivity is inconsistent"
+                    )
+                rejected_components = (
+                    single_view_component_fill & ~partial_postfill_retained
+                )
+                rejected_points = np.zeros((num_points,), dtype=bool)
+                rejected_points[component_points] = rejected_components[
+                    point_component[component_points]
+                ]
+                if np.any(phi[rejected_points] != 0):
+                    raise ValueError(
+                        f"{latent_path} rejected partial components retain motion"
+                    )
+                if (
+                    np.any(component_translation[rejected_components] != 0)
+                    or np.any(component_rotation[rejected_components] != 0)
+                ):
+                    raise ValueError(
+                        f"{diagnostics_path} rejected partial rigid twists are nonzero"
                     )
         else:
             if np.any(completion_mask):
@@ -2077,6 +2217,26 @@ def load_rigid_manifest(
                     if partial_ray_motion_ratio is None
                     else partial_ray_motion_ratio.astype(np.float32)
                 ),
+                single_view_component_normalized_motion_rms=(
+                    None
+                    if partial_normalized_motion_rms is None
+                    else partial_normalized_motion_rms.astype(np.float32)
+                ),
+                single_view_component_finite_drift_rejected_mask=(
+                    None
+                    if partial_finite_drift_rejected is None
+                    else partial_finite_drift_rejected.astype(bool)
+                ),
+                single_view_component_motion_rms_rejected_mask=(
+                    None
+                    if partial_motion_rms_rejected is None
+                    else partial_motion_rms_rejected.astype(bool)
+                ),
+                single_view_component_postfill_retained_mask=(
+                    None
+                    if partial_postfill_retained is None
+                    else partial_postfill_retained.astype(bool)
+                ),
                 edge_component_index=expected_edge_component.astype(np.int32),
                 edge_finite_drift_max=edge_finite_drift,
             )
@@ -2090,6 +2250,9 @@ def load_rigid_manifest(
         rigid_seed_min_valid_views=rigid_seed_min_valid_views,
         rigid_seed_min_singular_ratio=rigid_seed_min_singular_ratio,
         rigid_seed_max_finite_drift=rigid_seed_max_finite_drift,
+        rigid_single_view_max_normalized_motion_rms=(
+            manifest_partial_max_normalized_motion_rms
+        ),
         source_cameras=tuple(source_cameras),
         modes=tuple(loaded_modes),
     )
@@ -2803,6 +2966,7 @@ class ObservedGraphViewer:
                 "partial fill nullity",
                 "trusted-KNN support",
                 "partial ray-motion ratio",
+                "partial post-fill rejection",
             )
             if rigid_manifest is not None
             and rigid_manifest.rigid_motion_fill_stage == "single-view-components"
@@ -3445,6 +3609,52 @@ class ObservedGraphViewer:
                                     rigid_mode.edge_component_index[selected_edges]
                                 ]
                             )
+                        )
+                    elif color_mode == "partial post-fill rejection":
+                        if (
+                            rigid_mode is None
+                            or rigid_mode.single_view_component_finite_drift_rejected_mask
+                            is None
+                            or rigid_mode.single_view_component_motion_rms_rejected_mask
+                            is None
+                            or rigid_mode.single_view_component_postfill_retained_mask
+                            is None
+                        ):
+                            raise ValueError(
+                                "Partial post-fill rejection requires component-only fill"
+                            )
+                        edge_components = rigid_mode.edge_component_index[
+                            selected_edges
+                        ]
+                        edge_colors = np.full(
+                            (selected_edges.size, 3),
+                            _RIGID_DIAGNOSTIC_NORMAL_COLOR,
+                            dtype=np.float32,
+                        )
+                        retained = (
+                            rigid_mode.single_view_component_postfill_retained_mask[
+                                edge_components
+                            ]
+                        )
+                        finite_rejected = (
+                            rigid_mode.single_view_component_finite_drift_rejected_mask[
+                                edge_components
+                            ]
+                        )
+                        motion_rejected = (
+                            rigid_mode.single_view_component_motion_rms_rejected_mask[
+                                edge_components
+                            ]
+                        )
+                        edge_colors[retained] = _SINGLE_VIEW_RIGID_FILL_COLOR
+                        edge_colors[finite_rejected] = (
+                            _RIGID_DIAGNOSTIC_ANOMALY_COLOR
+                        )
+                        edge_colors[motion_rejected] = (
+                            _PARTIAL_MOTION_REJECTION_COLOR
+                        )
+                        edge_colors[finite_rejected & motion_rejected] = (
+                            _PARTIAL_BOTH_REJECTION_COLOR
                         )
                     else:
                         raise ValueError(
