@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from modal_surface.io import load_view_config
 from modal_surface.observed_structure_graph import (
     LoadedObservedStructureGraph as ObservedGraphViewData,
     load_observed_structure_graph,
@@ -324,6 +325,15 @@ class RigidModeViewData:
 
 
 @dataclass(frozen=True)
+class SourceCameraViewData:
+    label: str
+    image_width: int
+    image_height: int
+    K: np.ndarray
+    world_to_camera: np.ndarray
+
+
+@dataclass(frozen=True)
 class RigidManifestViewData:
     manifest_path: Path
     source_checkpoint: str
@@ -332,6 +342,7 @@ class RigidManifestViewData:
     rigid_seed_min_valid_views: int
     rigid_seed_min_singular_ratio: float
     rigid_seed_max_finite_drift: float
+    source_cameras: tuple[SourceCameraViewData, ...]
     modes: tuple[RigidModeViewData, ...]
 
 
@@ -950,6 +961,57 @@ def load_rigid_manifest(
         "source_checkpoint",
         manifest_path,
     )
+    raw_source_view_configs = manifest.get("source_view_configs")
+    if not isinstance(raw_source_view_configs, list) or not raw_source_view_configs:
+        raise ValueError(
+            f"{manifest_path} source_view_configs must be a non-empty list"
+        )
+    source_view_config_paths = tuple(
+        Path(
+            _manifest_string(
+                value,
+                f"source_view_configs[{index}]",
+                manifest_path,
+            )
+        )
+        for index, value in enumerate(raw_source_view_configs)
+    )
+    source_view_configs = tuple(
+        load_view_config(path) for path in source_view_config_paths
+    )
+    expected_view_ids = graphs[0].view_ids
+    if any(graph.view_ids != expected_view_ids for graph in graphs[1:]):
+        raise ValueError("Observed graph inputs do not share one view order")
+    source_view_ids = tuple(config.view_id for config in source_view_configs)
+    if source_view_ids != expected_view_ids:
+        raise ValueError(
+            f"{manifest_path} source view-config order does not match observed graphs"
+        )
+    source_cameras: list[SourceCameraViewData] = []
+    for config, config_path in zip(source_view_configs, source_view_config_paths):
+        if (
+            config.image_width <= 0
+            or config.image_height <= 0
+            or not np.isfinite(config.K).all()
+            or config.K[1, 1] <= 0.0
+            or not np.isfinite(config.world_to_camera).all()
+        ):
+            raise ValueError(f"{config_path} contains invalid camera geometry")
+        try:
+            np.linalg.inv(config.world_to_camera)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(
+                f"{config_path} world_to_camera is singular"
+            ) from exc
+        source_cameras.append(
+            SourceCameraViewData(
+                label=config.view_id,
+                image_width=config.image_width,
+                image_height=config.image_height,
+                K=config.K.astype(np.float64),
+                world_to_camera=config.world_to_camera.astype(np.float64),
+            )
+        )
     parameters = manifest.get("parameters")
     if not isinstance(parameters, dict):
         raise ValueError(f"{manifest_path} parameters must be an object")
@@ -2028,6 +2090,7 @@ def load_rigid_manifest(
         rigid_seed_min_valid_views=rigid_seed_min_valid_views,
         rigid_seed_min_singular_ratio=rigid_seed_min_singular_ratio,
         rigid_seed_max_finite_drift=rigid_seed_max_finite_drift,
+        source_cameras=tuple(source_cameras),
         modes=tuple(loaded_modes),
     )
 
@@ -3748,6 +3811,103 @@ class AnchorResidualDiagnosticViewer:
                     )
 
 
+def _observed_display_extent(
+    graphs: tuple[ObservedGraphViewData, ...],
+    world_center: np.ndarray,
+) -> float:
+    nonempty = [
+        graph.node_points_world
+        for graph in graphs
+        if graph.node_points_world.shape[0]
+    ]
+    if not nonempty:
+        return 1.0e-3
+    points = center_world_points(np.concatenate(nonempty, axis=0), world_center)
+    return max(float(np.max(points.max(axis=0) - points.min(axis=0))), 1.0e-3)
+
+
+class SourceCameraViewer:
+    def __init__(
+        self,
+        server: Any,
+        cameras: tuple[SourceCameraViewData, ...],
+        *,
+        world_center: np.ndarray,
+        scene_extent: float,
+    ) -> None:
+        import viser.transforms as vtf
+
+        self.server = server
+        self.camera_handles: dict[str, Any] = {}
+        self.button_handles: list[Any] = []
+        camera_colors = (
+            (80, 150, 255),
+            (255, 130, 70),
+            (95, 200, 120),
+            (210, 120, 255),
+            (255, 210, 80),
+            (80, 220, 220),
+        )
+        frustum_scale = 0.08 * float(scene_extent)
+        with server.gui.add_folder("Source cameras"):
+            show_cameras = server.gui.add_checkbox("Show cameras", True)
+            reset_orbit = server.gui.add_button("Reset orbit center")
+            for index, camera in enumerate(cameras):
+                camera_to_world = np.linalg.inv(camera.world_to_camera)
+                wxyz = vtf.SO3.from_matrix(camera_to_world[:3, :3]).wxyz
+                position = (
+                    camera_to_world[:3, 3]
+                    - np.asarray(world_center, dtype=np.float64)
+                )
+                fov = float(
+                    2.0
+                    * np.arctan(
+                        0.5 * camera.image_height / float(camera.K[1, 1])
+                    )
+                )
+                aspect = float(camera.image_width) / float(camera.image_height)
+                self.camera_handles[camera.label] = (
+                    server.scene.add_camera_frustum(
+                        f"/source_cameras/{camera.label}",
+                        fov=fov,
+                        aspect=aspect,
+                        scale=frustum_scale,
+                        color=camera_colors[index % len(camera_colors)],
+                        wxyz=wxyz,
+                        position=position,
+                    )
+                )
+                button = server.gui.add_button(f"Go to {camera.label}")
+
+                def _go_to_camera(
+                    event: Any,
+                    camera_wxyz: np.ndarray = wxyz.copy(),
+                    camera_position: np.ndarray = position.copy(),
+                    camera_fov: float = fov,
+                ) -> None:
+                    if event.client is None:
+                        return
+                    with event.client.atomic():
+                        event.client.camera.position = camera_position
+                        event.client.camera.look_at = (0.0, 0.0, 0.0)
+                        event.client.camera.wxyz = camera_wxyz
+                        event.client.camera.fov = camera_fov
+
+                button.on_click(_go_to_camera)
+                self.button_handles.append(button)
+
+            def _toggle_cameras(event: Any) -> None:
+                for handle in self.camera_handles.values():
+                    handle.visible = bool(event.target.value)
+
+            def _reset_orbit_center(event: Any) -> None:
+                if event.client is not None:
+                    event.client.camera.look_at = (0.0, 0.0, 0.0)
+
+            show_cameras.on_update(_toggle_cameras)
+            reset_orbit.on_click(_reset_orbit_center)
+
+
 def _configure_initial_camera(
     server: Any,
     graphs: tuple[ObservedGraphViewData, ...],
@@ -3760,10 +3920,7 @@ def _configure_initial_camera(
     ]
     if not nonempty:
         return
-    points = center_world_points(np.concatenate(nonempty, axis=0), world_center)
-    minimum = points.min(axis=0)
-    maximum = points.max(axis=0)
-    extent = max(float(np.max(maximum - minimum)), 1.0e-3)
+    extent = _observed_display_extent(graphs, world_center)
     server.initial_camera.look_at = (0.0, 0.0, 0.0)
     server.initial_camera.position = tuple(
         float(value)
@@ -3907,6 +4064,13 @@ def main() -> None:
             "Installed Viser lacks SceneApi.add_gaussian_splats "
             f"(detected version {viser_version})"
         )
+    if rigid_manifest is not None and not hasattr(
+        SceneApi, "add_camera_frustum"
+    ):
+        raise RuntimeError(
+            "Installed Viser lacks SceneApi.add_camera_frustum "
+            f"(detected version {viser_version})"
+        )
 
     server = viser.ViserServer(
         host=args.host,
@@ -3915,6 +4079,16 @@ def main() -> None:
     )
     server.scene.set_up_direction("+z")
     _configure_initial_camera(server, graphs, world_center)
+    source_camera_viewer = (
+        SourceCameraViewer(
+            server,
+            rigid_manifest.source_cameras,
+            world_center=world_center,
+            scene_extent=_observed_display_extent(graphs, world_center),
+        )
+        if rigid_manifest is not None
+        else None
+    )
     if gaussians is not None:
         StaticGaussianViewer(
             server,
@@ -3971,6 +4145,11 @@ def main() -> None:
             "Loaded static Gaussian sidecar with "
             f"{gaussians.foreground.centers.shape[0]} foreground and "
             f"{background_count} background splat(s)."
+        )
+    if source_camera_viewer is not None:
+        print(
+            f"Loaded {len(source_camera_viewer.camera_handles)} source camera(s) "
+            "from the rigid manifest view configs."
         )
     if coverage is not None:
         print(
