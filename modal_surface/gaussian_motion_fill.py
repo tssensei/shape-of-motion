@@ -1173,7 +1173,7 @@ def apply_single_view_component_partial_fill(
         )
     phi_observable = np.zeros((num_points, 3), dtype=np.complex128)
     phi_observable[trusted_seed_mask] = observable_phi[trusted_seed_mask]
-    phi_observable[connected_point_mask] = observable_phi[connected_point_mask]
+    phi_observable[selected_point_mask] = observable_phi[selected_point_mask]
     sqrt_weight = np.sqrt(graph.edge_weight[active_edge_indices])
     right_hand_side = (
         sqrt_weight[:, None]
@@ -1315,11 +1315,12 @@ def apply_single_view_component_partial_fill(
     component_rotation = np.zeros((num_components, 3), dtype=np.complex128)
     component_final_twist = observable_twist.copy()
     for group_idx, component_idx in enumerate(selected_components.tolist()):
-        if not connected_groups[group_idx]:
-            component_final_twist[component_idx] = 0.0
-            continue
-        dimension = int(group_dimensions[group_idx])
-        if dimension:
+        dimension = (
+            int(group_dimensions[group_idx])
+            if connected_groups[group_idx]
+            else 0
+        )
+        if dimension > 0:
             start = int(coefficient_offsets[group_idx])
             coefficients = coefficient_values[start : start + dimension]
             component_final_twist[component_idx] += (
@@ -1367,16 +1368,16 @@ def apply_single_view_component_partial_fill(
         edge_components[selected_component_edges],
         edge_relative[selected_component_edges],
     )
-    completed_first_order_max = float(
+    selected_first_order_max = float(
         np.max(
-            component_first_order_relative_max[component_completion],
+            component_first_order_relative_max[single_view_component_fill_mask],
             initial=0.0,
         )
     )
-    if completed_first_order_max > rigid.config.first_order_rtol:
+    if selected_first_order_max > rigid.config.first_order_rtol:
         raise RuntimeError(
             "Single-view partial component fill violated first-order rigidity: "
-            f"max_relative={completed_first_order_max:.9g}"
+            f"max_relative={selected_first_order_max:.9g}"
         )
 
     postfill_residual = np.zeros((num_components,), dtype=np.float64)
@@ -1384,8 +1385,6 @@ def apply_single_view_component_partial_fill(
     tangent_motion_rms = np.zeros((num_components,), dtype=np.float64)
     ray_motion_ratio = np.zeros((num_components,), dtype=np.float64)
     for group_idx, component_idx in enumerate(selected_components.tolist()):
-        if not connected_groups[group_idx]:
-            continue
         rows = usable_rows[
             row_offsets[component_idx] : row_offsets[component_idx + 1]
         ]
@@ -1438,7 +1437,7 @@ def apply_single_view_component_partial_fill(
         final_phi,
         global_edges,
         edge_components,
-        component_completion,
+        single_view_component_fill_mask,
         np.asarray(rigid.phase_angles, dtype=np.float64),
         num_components,
     )

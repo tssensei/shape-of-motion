@@ -239,3 +239,10 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   arrays are rounded separately, so large cancelling translation/rotation terms
   require an operand-scaled real/imaginary quantization bound during artifact
   validation rather than a tolerance based only on the final motion amplitude.
+- Viewer inspection then showed that most red single-view anomaly components
+  remained static. The component-only run had selected 249 groups but connected
+  only 49 to trusted anchors; the implementation copied observable motion only
+  for those connected groups and explicitly zeroed every other final twist.
+  This contradicted the intended partial model: unconnected selected components
+  should retain their stable non-ray observable twist with zero weak-direction
+  correction, while remaining marked incomplete for KNN completion.

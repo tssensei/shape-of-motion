@@ -1727,9 +1727,9 @@ def load_rigid_manifest(
                         f"{diagnostics_path} {name} must be finite complex "
                         f"({num_components},3)"
                     )
-                if np.any(values[~single_view_component_completion] != 0):
+                if np.any(values[~single_view_component_fill] != 0):
                     raise ValueError(
-                        f"{diagnostics_path} {name} is nonzero outside completed "
+                        f"{diagnostics_path} {name} is nonzero outside selected "
                         "single-view components"
                     )
             if (
@@ -1746,7 +1746,7 @@ def load_rigid_manifest(
                     "outside selected components"
                 )
             for component_idx in np.flatnonzero(
-                single_view_component_completion
+                single_view_component_fill
             ).tolist():
                 members = np.flatnonzero(point_component == component_idx)
                 centered = points[members].astype(np.float64) - component_centroid[
