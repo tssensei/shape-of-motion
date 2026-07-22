@@ -286,3 +286,8 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   independent-Gaussian LSMR to points within eight full-graph KNN hops of a
   fixed anchor. Farther connected targets remain zero and incomplete, while
   their original hop distances and the total truncated count remain diagnostic.
+- The tolerance comparison uses
+  `/home/zs292/outputs_modal/bush4/mode4_sequential_partial_then_pointwise_hop8_tol1e6_profile`.
+  It keeps the eight-hop sequential graph and changes both real and imaginary
+  component/pointwise LSMR stopping tolerances from `1e-10` to `1e-6`; the run
+  should be compared by iteration count, LSMR wall time, and final Viewer motion.
