@@ -742,19 +742,21 @@ def _rigid_point_blocks(
 def _component_lsmr(
     matrix: Any,
     right_hand_side: np.ndarray,
-) -> tuple[np.ndarray, SparseSolveMetadata]:
+) -> tuple[np.ndarray, SparseSolveMetadata, int]:
     try:
         from scipy.sparse.linalg import lsmr
     except ImportError as exc:
         raise ImportError(
             "Single-view component fill requires scipy.sparse.linalg.lsmr"
         ) from exc
+    maxiter = max(1000, 4 * int(matrix.shape[1]))
     solved = lsmr(
         matrix,
         np.asarray(right_hand_side, dtype=np.float64),
         atol=MOTION_FILL_LSMR_ATOL,
         btol=MOTION_FILL_LSMR_BTOL,
         conlim=MOTION_FILL_LSMR_CONLIM,
+        maxiter=maxiter,
     )
     stop_code = int(solved[1])
     metadata = SparseSolveMetadata(
@@ -768,7 +770,7 @@ def _component_lsmr(
         condition_estimate=float(solved[6]),
         solution_norm=float(solved[7]),
     )
-    return np.asarray(solved[0], dtype=np.float64), metadata
+    return np.asarray(solved[0], dtype=np.float64), metadata, maxiter
 
 
 def _empty_component_lsmr(right_hand_side: np.ndarray) -> SparseSolveMetadata:
@@ -1251,7 +1253,7 @@ def apply_single_view_component_partial_fill(
         solve_started = perf_counter()
         if progress is not None:
             progress("single-view component LSMR real started")
-        real_coefficients, real_solver = _component_lsmr(
+        real_coefficients, real_solver, lsmr_maxiter = _component_lsmr(
             matrix, right_hand_side.real
         )
         if timings is not None:
@@ -1262,14 +1264,19 @@ def apply_single_view_component_partial_fill(
             progress(
                 "single-view component LSMR real finished in "
                 f"{perf_counter() - solve_started:.3f} s: "
-                f"iterations={real_solver.iterations}, stop_code={real_solver.stop_code}"
+                f"iterations={real_solver.iterations}, stop_code={real_solver.stop_code}, "
+                f"maxiter={lsmr_maxiter}"
             )
         solve_started = perf_counter()
         if progress is not None:
             progress("single-view component LSMR imaginary started")
-        imaginary_coefficients, imag_solver = _component_lsmr(
-            matrix, right_hand_side.imag
-        )
+        (
+            imaginary_coefficients,
+            imag_solver,
+            imaginary_lsmr_maxiter,
+        ) = _component_lsmr(matrix, right_hand_side.imag)
+        if imaginary_lsmr_maxiter != lsmr_maxiter:
+            raise RuntimeError("real and imaginary component LSMR budgets differ")
         if timings is not None:
             timings["lsmr_imaginary_seconds"] = float(
                 perf_counter() - solve_started
@@ -1278,7 +1285,8 @@ def apply_single_view_component_partial_fill(
             progress(
                 "single-view component LSMR imaginary finished in "
                 f"{perf_counter() - solve_started:.3f} s: "
-                f"iterations={imag_solver.iterations}, stop_code={imag_solver.stop_code}"
+                f"iterations={imag_solver.iterations}, stop_code={imag_solver.stop_code}, "
+                f"maxiter={lsmr_maxiter}"
             )
         if not real_solver.converged or not imag_solver.converged:
             raise RuntimeError(

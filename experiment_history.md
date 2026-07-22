@@ -207,3 +207,21 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   finishes in 25.177 s, the next revision targets grouped-only repeated point
   scans first and adds live connectivity/assembly/LSMR/reconstruction timings
   so the next run can distinguish Python preparation overhead from LSMR cost.
+- The optimized joint grouped run in
+  `/home/zs292/outputs_modal/bush4/mode4_grouped_motion_fill_optimized_profile_retry`
+  completed in 2,374.810 s. Motion fill consumed 2,351.347 s (99.7% of the
+  solve/fill time), with real and imaginary LSMR taking 1,169.362 s and
+  1,168.312 s respectively; preparation, connectivity, assembly, layout,
+  reconstruction, and validation together took under five seconds. Viewer
+  inspection found coherent, non-splitting component motion and generally good
+  visual quality, while confirming that the joint route obtains rejected
+  single-view component twists from KNN smoothness rather than retaining their
+  observable single-view motion.
+- The first component-only partial-fill run in
+  `/home/zs292/outputs_modal/bush4/mode4_single_view_partial_component_fill_r1e2_ray0p8`
+  prepared 249 groups containing 6,482 points. Its reduced graph had 441
+  eligible edges, 262 active edges, 49 trusted-connected groups, and a
+  786-by-70 sparse system with 1,356 nonzeros. Both real and imaginary LSMR
+  reached SciPy's default 70-iteration limit in milliseconds with stop code 7,
+  so no artifact was published; this identifies the default column-count
+  iteration cap, rather than runtime or matrix size, as the immediate failure.
