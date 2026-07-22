@@ -254,3 +254,14 @@ fifth solved bush4 mode, without motion fill, refinement, or Gaussian training.
   component radius exceeds `2.0`, removes rejected groups from completion and
   future anchor connectivity, and retains the pre-zero metrics and separate
   rejection masks for Viewer diagnosis.
+- Viewer comparison of the radius-gated and ungated single-view partial runs
+  showed that some components with plausible motion in their source view became
+  inconsistent with adjacent trusted structures from side views. Inspection
+  identified raw component-level view presence as too permissive: one sparsely
+  observed secondary region could promote an otherwise single-view component.
+  The next run directory is
+  `/home/zs292/outputs_modal/bush4/mode4_single_view_partial_view_support_1over3_no_radius_gate`;
+  it requires every supporting view to observe at least one third as many
+  distinct component nodes as the dominant view, keeps the normalized-motion
+  gate disabled for isolation, and sends downgraded effective-single-view
+  components through the existing partial KNN fill.

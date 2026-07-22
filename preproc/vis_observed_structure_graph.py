@@ -195,6 +195,7 @@ _RIGID_DIAGNOSTIC_REQUIRED_FIELDS = {
     "rigid_component_graph_source_path",
     "rigid_component_seed_policy",
     "rigid_seed_min_valid_views",
+    "rigid_seed_min_secondary_view_node_ratio",
     "rigid_seed_min_singular_ratio",
     "rigid_seed_max_finite_drift",
     "rigid_seed_mask",
@@ -210,7 +211,11 @@ _RIGID_DIAGNOSTIC_REQUIRED_FIELDS = {
     "component_graph_index",
     "component_node_count",
     "component_edge_count",
+    "component_valid_view_node_count",
     "component_distinct_valid_view_count",
+    "component_supported_valid_view_count",
+    "component_dominant_valid_view_index",
+    "component_secondary_view_node_ratio",
     "component_singular_values",
     "component_singular_ratio",
     "component_rank",
@@ -316,6 +321,8 @@ class RigidModeViewData:
     component_normalized_weighted_residual: np.ndarray
     component_rank: np.ndarray
     component_distinct_valid_view_count: np.ndarray
+    component_supported_valid_view_count: np.ndarray
+    component_secondary_view_node_ratio: np.ndarray
     component_singular_ratio: np.ndarray
     component_motion_rms: np.ndarray
     component_finite_drift_max: np.ndarray
@@ -348,6 +355,7 @@ class RigidManifestViewData:
     motion_fill_enabled: bool
     rigid_motion_fill_stage: str
     rigid_seed_min_valid_views: int
+    rigid_seed_min_secondary_view_node_ratio: float
     rigid_seed_min_singular_ratio: float
     rigid_seed_max_finite_drift: float
     rigid_single_view_max_normalized_motion_rms: float | None
@@ -1066,6 +1074,11 @@ def load_rigid_manifest(
         "rigid_seed_min_valid_views",
         manifest_path,
     )
+    rigid_seed_min_secondary_view_node_ratio = _manifest_number(
+        parameters.get("rigid_seed_min_secondary_view_node_ratio"),
+        "rigid_seed_min_secondary_view_node_ratio",
+        manifest_path,
+    )
     rigid_seed_min_singular_ratio = _manifest_number(
         parameters.get("rigid_seed_min_singular_ratio"),
         "rigid_seed_min_singular_ratio",
@@ -1079,6 +1092,11 @@ def load_rigid_manifest(
     if rigid_seed_min_valid_views <= 0:
         raise ValueError(
             f"{manifest_path} rigid_seed_min_valid_views must be positive"
+        )
+    if not 0.0 <= rigid_seed_min_secondary_view_node_ratio <= 1.0:
+        raise ValueError(
+            f"{manifest_path} rigid_seed_min_secondary_view_node_ratio must "
+            "lie in [0,1]"
         )
     if not 0.0 <= rigid_seed_min_singular_ratio <= 1.0:
         raise ValueError(
@@ -1345,6 +1363,11 @@ def load_rigid_manifest(
             "rigid_seed_min_valid_views",
             diagnostics_path,
         )
+        diagnostic_min_secondary_view_node_ratio = _scalar(
+            diagnostics["rigid_seed_min_secondary_view_node_ratio"],
+            "rigid_seed_min_secondary_view_node_ratio",
+            diagnostics_path,
+        )
         diagnostic_min_singular_ratio = _scalar(
             diagnostics["rigid_seed_min_singular_ratio"],
             "rigid_seed_min_singular_ratio",
@@ -1362,6 +1385,19 @@ def load_rigid_manifest(
         ):
             raise ValueError(
                 f"{diagnostics_path} rigid seed minimum views differs from manifest"
+            )
+        diagnostic_secondary_ratio_value = float(
+            diagnostic_min_secondary_view_node_ratio.item()
+        )
+        if not np.isfinite(diagnostic_secondary_ratio_value) or not np.isclose(
+            diagnostic_secondary_ratio_value,
+            rigid_seed_min_secondary_view_node_ratio,
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError(
+                f"{diagnostics_path} rigid seed secondary-view ratio differs "
+                "from manifest"
             )
         diagnostic_ratio_value = float(
             diagnostic_min_singular_ratio.item()
@@ -1506,6 +1542,19 @@ def load_rigid_manifest(
         component_valid_view_count = np.asarray(
             diagnostics["component_distinct_valid_view_count"]
         )
+        component_valid_view_node_count = np.asarray(
+            diagnostics["component_valid_view_node_count"]
+        )
+        component_supported_view_count = np.asarray(
+            diagnostics["component_supported_valid_view_count"]
+        )
+        component_dominant_view_index = np.asarray(
+            diagnostics["component_dominant_valid_view_index"]
+        )
+        component_secondary_view_node_ratio = np.asarray(
+            diagnostics["component_secondary_view_node_ratio"],
+            dtype=np.float32,
+        )
         if (
             component_valid_view_count.shape != (num_components,)
             or not np.issubdtype(component_valid_view_count.dtype, np.integer)
@@ -1514,6 +1563,79 @@ def load_rigid_manifest(
         ):
             raise ValueError(
                 f"{diagnostics_path} component valid-view count is invalid"
+            )
+        if (
+            component_valid_view_node_count.shape
+            != (num_components, len(graph.view_ids))
+            or not np.issubdtype(
+                component_valid_view_node_count.dtype, np.integer
+            )
+            or np.any(component_valid_view_node_count < 0)
+            or np.any(
+                component_valid_view_node_count
+                > expected_node_count[:, None]
+            )
+            or not np.array_equal(
+                component_valid_view_count,
+                np.count_nonzero(component_valid_view_node_count, axis=1),
+            )
+        ):
+            raise ValueError(
+                f"{diagnostics_path} component valid-view node counts are invalid"
+            )
+        dominant_view_node_count = np.max(
+            component_valid_view_node_count, axis=1
+        )
+        expected_dominant_view_index = np.argmax(
+            component_valid_view_node_count, axis=1
+        )
+        expected_supported_view_count = np.count_nonzero(
+            (component_valid_view_node_count > 0)
+            & (
+                component_valid_view_node_count
+                >= dominant_view_node_count[:, None]
+                * rigid_seed_min_secondary_view_node_ratio
+            ),
+            axis=1,
+        )
+        sorted_view_node_count = np.sort(
+            component_valid_view_node_count, axis=1
+        )
+        secondary_view_node_count = (
+            sorted_view_node_count[:, -2]
+            if len(graph.view_ids) > 1
+            else np.zeros((num_components,), dtype=np.int32)
+        )
+        expected_secondary_view_node_ratio = (
+            secondary_view_node_count.astype(np.float64)
+            / dominant_view_node_count.astype(np.float64)
+        ).astype(np.float32)
+        if (
+            component_supported_view_count.shape != (num_components,)
+            or not np.issubdtype(
+                component_supported_view_count.dtype, np.integer
+            )
+            or not np.array_equal(
+                component_supported_view_count,
+                expected_supported_view_count,
+            )
+            or component_dominant_view_index.shape != (num_components,)
+            or not np.issubdtype(
+                component_dominant_view_index.dtype, np.integer
+            )
+            or not np.array_equal(
+                component_dominant_view_index,
+                expected_dominant_view_index,
+            )
+            or component_secondary_view_node_ratio.shape != (num_components,)
+            or not np.isfinite(component_secondary_view_node_ratio).all()
+            or not np.array_equal(
+                component_secondary_view_node_ratio,
+                expected_secondary_view_node_ratio,
+            )
+        ):
+            raise ValueError(
+                f"{diagnostics_path} component supported-view metadata is invalid"
             )
         try:
             component_singular_ratio = rigid_component_singular_ratio(
@@ -1561,7 +1683,7 @@ def load_rigid_manifest(
                     f"({num_components},)"
                 )
         expected_valid_view_rejected = (
-            component_valid_view_count < rigid_seed_min_valid_views
+            component_supported_view_count < rigid_seed_min_valid_views
         )
         expected_singular_rejected = (
             component_singular_ratio < rigid_seed_min_singular_ratio
@@ -1714,7 +1836,7 @@ def load_rigid_manifest(
                 diagnostics["single_view_component_fill_mask"]
             )
             expected_single_view_component_fill = (
-                (component_valid_view_count == 1)
+                (component_supported_view_count == 1)
                 & ~component_selection_masks["component_seed_retained_mask"]
             )
             if (
@@ -2191,6 +2313,12 @@ def load_rigid_manifest(
                 component_distinct_valid_view_count=(
                     component_valid_view_count.astype(np.int32)
                 ),
+                component_supported_valid_view_count=(
+                    component_supported_view_count.astype(np.int32)
+                ),
+                component_secondary_view_node_ratio=(
+                    component_secondary_view_node_ratio.astype(np.float32)
+                ),
                 component_singular_ratio=component_singular_ratio,
                 component_motion_rms=component_motion_rms,
                 component_finite_drift_max=component_finite_drift,
@@ -2248,6 +2376,9 @@ def load_rigid_manifest(
         motion_fill_enabled=motion_fill_enabled,
         rigid_motion_fill_stage=rigid_motion_fill_stage,
         rigid_seed_min_valid_views=rigid_seed_min_valid_views,
+        rigid_seed_min_secondary_view_node_ratio=(
+            rigid_seed_min_secondary_view_node_ratio
+        ),
         rigid_seed_min_singular_ratio=rigid_seed_min_singular_ratio,
         rigid_seed_max_finite_drift=rigid_seed_max_finite_drift,
         rigid_single_view_max_normalized_motion_rms=(
@@ -2976,6 +3107,10 @@ class ObservedGraphViewer:
             (
                 "component residual",
                 "component rank",
+                "raw valid-view count",
+                "supported valid-view count",
+                "secondary-view node ratio",
+                "view-support downgrade",
                 "finite-amplitude drift",
                 "finite-drift anomaly",
                 "single-view anomaly",
@@ -3451,6 +3586,50 @@ class ObservedGraphViewer:
                                 rigid_mode.edge_component_index[selected_edges]
                             ].astype(np.float32)
                         )
+                    elif color_mode == "raw valid-view count":
+                        if rigid_mode is None:
+                            raise ValueError(
+                                "Raw valid-view count requires a rigid manifest"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            rigid_mode.component_distinct_valid_view_count[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ].astype(np.float32)
+                        )
+                    elif color_mode == "supported valid-view count":
+                        if rigid_mode is None:
+                            raise ValueError(
+                                "Supported valid-view count requires a rigid manifest"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            rigid_mode.component_supported_valid_view_count[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ].astype(np.float32)
+                        )
+                    elif color_mode == "secondary-view node ratio":
+                        if rigid_mode is None:
+                            raise ValueError(
+                                "Secondary-view node ratio requires a rigid manifest"
+                            )
+                        edge_colors = graph_scalar_colors(
+                            rigid_mode.component_secondary_view_node_ratio[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ]
+                        )
+                    elif color_mode == "view-support downgrade":
+                        if rigid_mode is None:
+                            raise ValueError(
+                                "View-support downgrade requires a rigid manifest"
+                            )
+                        component_anomaly = (
+                            rigid_mode.component_distinct_valid_view_count
+                            > rigid_mode.component_supported_valid_view_count
+                        )
+                        edge_colors = rigid_component_anomaly_colors(
+                            component_anomaly[
+                                rigid_mode.edge_component_index[selected_edges]
+                            ]
+                        )
                     elif color_mode == "finite-amplitude drift":
                         if rigid_mode is None:
                             raise ValueError(
@@ -3482,7 +3661,7 @@ class ObservedGraphViewer:
                                 "Valid-view anomaly color requires a rigid manifest"
                             )
                         component_anomaly = (
-                            rigid_mode.component_distinct_valid_view_count
+                            rigid_mode.component_supported_valid_view_count
                             < int(self.minimum_valid_views.value)
                         )
                         edge_colors = rigid_component_anomaly_colors(
@@ -3542,7 +3721,7 @@ class ObservedGraphViewer:
                             dtype=np.float32,
                         )
                         single_view = (
-                            rigid_mode.component_distinct_valid_view_count[
+                            rigid_mode.component_supported_valid_view_count[
                                 edge_components
                             ]
                             == 1

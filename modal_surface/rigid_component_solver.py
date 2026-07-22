@@ -48,6 +48,7 @@ class RigidComponentSolverConfig:
 @dataclass(frozen=True)
 class RigidComponentSeedSelectionConfig:
     min_valid_views: int = 2
+    min_secondary_view_node_ratio: float = 1.0 / 3.0
     min_singular_ratio: float = 1.0e-3
     max_finite_drift: float = 2.0
 
@@ -58,6 +59,14 @@ class RigidComponentSeedSelectionConfig:
             or self.min_valid_views <= 0
         ):
             raise ValueError("rigid seed min_valid_views must be a positive integer")
+        if (
+            not np.isfinite(self.min_secondary_view_node_ratio)
+            or not 0.0 <= self.min_secondary_view_node_ratio <= 1.0
+        ):
+            raise ValueError(
+                "rigid seed min_secondary_view_node_ratio must be finite and "
+                "lie in [0,1]"
+            )
         if (
             not np.isfinite(self.min_singular_ratio)
             or not 0.0 <= self.min_singular_ratio <= 1.0
@@ -85,6 +94,7 @@ class RigidComponentSolveResult:
     component_centroid: np.ndarray
     component_radius: np.ndarray
     component_usable_observation_row_count: np.ndarray
+    component_valid_view_node_count: np.ndarray
     component_distinct_valid_view_count: np.ndarray
     component_singular_values: np.ndarray
     component_rank: np.ndarray
@@ -135,6 +145,9 @@ class RigidComponentSeedSelectionResult:
     component_singular_rejected_mask: np.ndarray
     component_finite_drift_rejected_mask: np.ndarray
     component_singular_ratio: np.ndarray
+    component_supported_valid_view_count: np.ndarray
+    component_dominant_valid_view_index: np.ndarray
+    component_secondary_view_node_ratio: np.ndarray
 
 
 def select_trusted_rigid_component_seeds(
@@ -162,17 +175,57 @@ def select_trusted_rigid_component_seeds(
         or np.any(rank > 6)
     ):
         raise ValueError("rigid component rank is invalid")
-    valid_view_count = np.asarray(rigid.component_distinct_valid_view_count)
+    valid_view_node_count = np.asarray(rigid.component_valid_view_node_count)
     if (
-        valid_view_count.shape != (num_components,)
-        or not np.issubdtype(valid_view_count.dtype, np.integer)
-        or np.any(valid_view_count < 1)
+        valid_view_node_count.ndim != 2
+        or valid_view_node_count.shape[0] != num_components
+        or valid_view_node_count.shape[1] < 1
+        or not np.issubdtype(valid_view_node_count.dtype, np.integer)
+        or np.any(valid_view_node_count < 0)
     ):
-        raise ValueError("rigid component valid-view count is invalid")
+        raise ValueError("rigid component valid-view node counts are invalid")
+    distinct_valid_view_count = np.asarray(
+        rigid.component_distinct_valid_view_count
+    )
+    if (
+        distinct_valid_view_count.shape != (num_components,)
+        or not np.issubdtype(distinct_valid_view_count.dtype, np.integer)
+        or not np.array_equal(
+            distinct_valid_view_count,
+            np.count_nonzero(valid_view_node_count, axis=1),
+        )
+    ):
+        raise ValueError("rigid component distinct valid-view count is invalid")
+    dominant_view_index = np.argmax(valid_view_node_count, axis=1).astype(
+        np.int32
+    )
+    dominant_view_node_count = np.max(valid_view_node_count, axis=1)
+    if np.any(dominant_view_node_count < 1):
+        raise ValueError("a rigid component has no valid-view node support")
+    supported_view_mask = (
+        (valid_view_node_count > 0)
+        & (
+            valid_view_node_count
+            >= dominant_view_node_count[:, None]
+            * float(config.min_secondary_view_node_ratio)
+        )
+    )
+    supported_view_count = np.count_nonzero(
+        supported_view_mask, axis=1
+    ).astype(np.int32)
+    sorted_view_node_count = np.sort(valid_view_node_count, axis=1)
+    if valid_view_node_count.shape[1] > 1:
+        secondary_view_node_count = sorted_view_node_count[:, -2]
+    else:
+        secondary_view_node_count = np.zeros((num_components,), dtype=np.int64)
+    secondary_view_node_ratio = (
+        secondary_view_node_count.astype(np.float64)
+        / dominant_view_node_count.astype(np.float64)
+    )
     singular_ratio = np.zeros((num_components,), dtype=np.float64)
     full_rank = (rank == 6) & (singular[:, 0] > 0.0)
     singular_ratio[full_rank] = singular[full_rank, 5] / singular[full_rank, 0]
-    valid_view_rejected = valid_view_count < int(config.min_valid_views)
+    valid_view_rejected = supported_view_count < int(config.min_valid_views)
     singular_rejected = singular_ratio < float(config.min_singular_ratio)
     finite_drift = np.asarray(rigid.component_finite_drift_max, dtype=np.float64)
     if (
@@ -217,6 +270,11 @@ def select_trusted_rigid_component_seeds(
         component_singular_rejected_mask=singular_rejected,
         component_finite_drift_rejected_mask=finite_drift_rejected,
         component_singular_ratio=singular_ratio.astype(np.float32),
+        component_supported_valid_view_count=supported_view_count,
+        component_dominant_valid_view_index=dominant_view_index,
+        component_secondary_view_node_ratio=(
+            secondary_view_node_ratio.astype(np.float32)
+        ),
     )
 
 
@@ -512,9 +570,27 @@ def solve_rigid_components(
     row_offsets = np.concatenate(
         [np.zeros((1,), dtype=np.int64), np.cumsum(component_row_count)]
     )
+    usable_row_points = prepared.obs_point_index[usable_rows].astype(np.int64)
+    usable_row_views = prepared.obs_view_index[usable_rows].astype(np.int64)
+    component_view_point_code = (
+        (
+            usable_row_components.astype(np.int64) * int(prepared.num_views)
+            + usable_row_views
+        )
+        * num_points
+        + usable_row_points
+    )
+    unique_component_view_points = np.unique(component_view_point_code)
+    component_view_bins = unique_component_view_points // num_points
+    component_valid_view_node_count = np.bincount(
+        component_view_bins,
+        minlength=num_components * int(prepared.num_views),
+    ).reshape(num_components, int(prepared.num_views)).astype(np.int32)
+    component_view_count = np.count_nonzero(
+        component_valid_view_node_count, axis=1
+    ).astype(np.int32)
 
     phi = np.zeros((num_points, 3), dtype=np.complex128)
-    component_view_count = np.zeros((num_components,), dtype=np.int32)
     component_singular = np.zeros((num_components, 6), dtype=np.float64)
     component_rank = np.zeros((num_components,), dtype=np.int8)
     component_condition = np.full((num_components,), np.inf, dtype=np.float64)
@@ -589,9 +665,6 @@ def solve_rigid_components(
         component_translation[component_idx] = solution[:3]
         if radius > _EPS:
             component_rotation[component_idx] = solution[3:] / radius
-        component_view_count[component_idx] = int(
-            np.unique(prepared.obs_view_index[rows]).size
-        )
         residual = design @ solution - target
         residual_norm = float(np.linalg.norm(residual))
         measurement_norm = float(np.linalg.norm(target))
@@ -773,6 +846,7 @@ def solve_rigid_components(
         component_centroid=component_centroid.astype(np.float32),
         component_radius=component_radius.astype(np.float32),
         component_usable_observation_row_count=component_row_count,
+        component_valid_view_node_count=component_valid_view_node_count,
         component_distinct_valid_view_count=component_view_count,
         component_singular_values=component_singular.astype(np.float32),
         component_rank=component_rank,

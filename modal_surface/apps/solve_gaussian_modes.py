@@ -77,6 +77,7 @@ from modal_surface.solver_cli import (
     RIGID_COMPONENT_RCOND_DEFAULT,
     RIGID_MOTION_FILL_STAGE_DEFAULT,
     RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT,
+    RIGID_SEED_MIN_SECONDARY_VIEW_NODE_RATIO_DEFAULT,
     RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT,
     RIGID_SEED_MIN_VALID_VIEWS_DEFAULT,
     RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT,
@@ -306,6 +307,9 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     graph_paths = list(args.rigid_component_graph)
     rcond = float(args.rigid_component_rcond)
     min_valid_views = int(args.rigid_seed_min_valid_views)
+    min_secondary_view_node_ratio = float(
+        args.rigid_seed_min_secondary_view_node_ratio
+    )
     min_singular_ratio = float(args.rigid_seed_min_singular_ratio)
     max_finite_drift = float(args.rigid_seed_max_finite_drift)
     motion_fill_stage = str(args.rigid_motion_fill_stage)
@@ -320,6 +324,14 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         raise ValueError("--rigid-component-rcond must be finite and lie in (0,1).")
     if min_valid_views <= 0:
         raise ValueError("--rigid-seed-min-valid-views must be positive.")
+    if (
+        not np.isfinite(min_secondary_view_node_ratio)
+        or not 0.0 <= min_secondary_view_node_ratio <= 1.0
+    ):
+        raise ValueError(
+            "--rigid-seed-min-secondary-view-node-ratio must be finite and "
+            "lie in [0,1]."
+        )
     if not np.isfinite(min_singular_ratio) or not (
         0.0 <= min_singular_ratio <= 1.0
     ):
@@ -369,6 +381,14 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         if min_valid_views != RIGID_SEED_MIN_VALID_VIEWS_DEFAULT:
             raise ValueError(
                 "A custom --rigid-seed-min-valid-views requires "
+                "--solve-method=rigid-components."
+            )
+        if (
+            min_secondary_view_node_ratio
+            != RIGID_SEED_MIN_SECONDARY_VIEW_NODE_RATIO_DEFAULT
+        ):
+            raise ValueError(
+                "A custom --rigid-seed-min-secondary-view-node-ratio requires "
                 "--solve-method=rigid-components."
             )
         if min_singular_ratio != RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT:
@@ -943,6 +963,12 @@ def _rigid_gaussian_latent_stats(
                 seed_selection.component_valid_view_rejected_mask
             )
         ),
+        "view_support_downgraded_component_count": int(
+            np.count_nonzero(
+                rigid.component_distinct_valid_view_count
+                > seed_selection.component_supported_valid_view_count
+            )
+        ),
         "singular_rejected_component_count": int(
             np.count_nonzero(seed_selection.component_singular_rejected_mask)
         ),
@@ -1398,6 +1424,10 @@ def _write_rigid_solver_diagnostics(
         "rigid_seed_min_valid_views": np.array(
             seed_selection.config.min_valid_views, dtype=np.int32
         ),
+        "rigid_seed_min_secondary_view_node_ratio": np.array(
+            seed_selection.config.min_secondary_view_node_ratio,
+            dtype=np.float64,
+        ),
         "rigid_seed_min_singular_ratio": np.array(
             seed_selection.config.min_singular_ratio, dtype=np.float64
         ),
@@ -1432,8 +1462,20 @@ def _write_rigid_solver_diagnostics(
         "component_usable_observation_row_count": rigid.component_usable_observation_row_count.astype(
             np.int32
         ),
+        "component_valid_view_node_count": (
+            rigid.component_valid_view_node_count.astype(np.int32)
+        ),
         "component_distinct_valid_view_count": rigid.component_distinct_valid_view_count.astype(
             np.int32
+        ),
+        "component_supported_valid_view_count": (
+            seed_selection.component_supported_valid_view_count.astype(np.int32)
+        ),
+        "component_dominant_valid_view_index": (
+            seed_selection.component_dominant_valid_view_index.astype(np.int32)
+        ),
+        "component_secondary_view_node_ratio": (
+            seed_selection.component_secondary_view_node_ratio.astype(np.float32)
         ),
         "component_singular_values": rigid.component_singular_values.astype(
             np.float32
@@ -2095,6 +2137,9 @@ def run(args: argparse.Namespace) -> None:
                 rigid,
                 RigidComponentSeedSelectionConfig(
                     min_valid_views=int(args.rigid_seed_min_valid_views),
+                    min_secondary_view_node_ratio=float(
+                        args.rigid_seed_min_secondary_view_node_ratio
+                    ),
                     min_singular_ratio=float(
                         args.rigid_seed_min_singular_ratio
                     ),
@@ -2102,6 +2147,19 @@ def run(args: argparse.Namespace) -> None:
                         args.rigid_seed_max_finite_drift
                     ),
                 ),
+            )
+            raw_view_count = rigid.component_distinct_valid_view_count
+            supported_view_count = (
+                seed_selection.component_supported_valid_view_count
+            )
+            print(
+                "Rigid view support: "
+                f"components={rigid.num_components}, "
+                f"raw_multiview={int(np.count_nonzero(raw_view_count >= 2))}, "
+                f"supported_multiview={int(np.count_nonzero(supported_view_count >= 2))}, "
+                f"downgraded={int(np.count_nonzero(raw_view_count > supported_view_count))}, "
+                f"effective_single_view={int(np.count_nonzero(supported_view_count == 1))}",
+                flush=True,
             )
             mode_profile["seed_selection_seconds"] = float(
                 perf_counter() - stage_started

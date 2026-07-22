@@ -881,7 +881,9 @@ def apply_single_view_component_partial_fill(
         raise ValueError("prepared points and motion-fill graph are inconsistent")
     num_components = rigid.num_components
     point_component = np.asarray(rigid.point_component_index)
-    component_view_count = np.asarray(rigid.component_distinct_valid_view_count)
+    component_view_count = np.asarray(
+        seed_selection.component_supported_valid_view_count
+    )
     component_retained = np.asarray(
         seed_selection.component_seed_retained_mask, dtype=bool
     )
@@ -1721,7 +1723,7 @@ def apply_rigid_seed_motion_fill(
         dtype=bool,
     )
     component_view_count = np.asarray(
-        rigid.component_distinct_valid_view_count
+        seed_selection.component_supported_valid_view_count
     )
     if (
         component_retained.shape != (num_components,)

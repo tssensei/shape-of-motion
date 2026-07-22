@@ -12,6 +12,7 @@ STAGED_ANCHOR_SVD_RATIO_DEFAULT = 1e-2
 STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT = 0.1
 RIGID_COMPONENT_RCOND_DEFAULT = 1e-8
 RIGID_SEED_MIN_VALID_VIEWS_DEFAULT = 2
+RIGID_SEED_MIN_SECONDARY_VIEW_NODE_RATIO_DEFAULT = 1.0 / 3.0
 RIGID_SEED_MIN_SINGULAR_RATIO_DEFAULT = 1e-3
 RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT = 2.0
 RIGID_MOTION_FILL_STAGE_DEFAULT = "joint"
@@ -53,8 +54,8 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=RIGID_SEED_MIN_VALID_VIEWS_DEFAULT,
         help=(
-            "Minimum distinct alpha-identifiable views required to retain a "
-            "solved rigid component as a trusted seed (default: 2)."
+            "Minimum node-coverage-supported alpha-identifiable views required "
+            "to retain a solved rigid component as a trusted seed (default: 2)."
         ),
     )
     parser.add_argument(
@@ -64,6 +65,15 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Minimum full-system sigma_min/sigma_max ratio required to retain "
             "a solved rigid component as a trusted seed (default: 1e-3)."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-seed-min-secondary-view-node-ratio",
+        type=float,
+        default=RIGID_SEED_MIN_SECONDARY_VIEW_NODE_RATIO_DEFAULT,
+        help=(
+            "Minimum distinct-node coverage relative to the dominant view for "
+            "another view to support a rigid seed (default: 1/3)."
         ),
     )
     parser.add_argument(
@@ -231,6 +241,9 @@ def rigid_component_manifest_parameters(args: argparse.Namespace) -> dict[str, A
             "postsolve_valid_view_singular_ratio_and_finite_drift_gate"
         ),
         "rigid_seed_min_valid_views": int(args.rigid_seed_min_valid_views),
+        "rigid_seed_min_secondary_view_node_ratio": float(
+            args.rigid_seed_min_secondary_view_node_ratio
+        ),
         "rigid_seed_min_singular_ratio": float(
             args.rigid_seed_min_singular_ratio
         ),
