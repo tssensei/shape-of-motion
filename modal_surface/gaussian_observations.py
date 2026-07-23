@@ -185,7 +185,6 @@ def _append_view_pixel_candidate_topology(
     obs_pixels: list[list[float]],
     obs_j: list[np.ndarray],
     obs_contribution_weight: list[float],
-    obs_contribution_score: list[float],
     obs_contribution_sum: list[float],
     obs_surface_pixels: list[list[float]],
     obs_surface_camera_z: list[float],
@@ -270,15 +269,14 @@ def _append_view_pixel_candidate_topology(
             continue
         weights = (scores / denom).astype(np.float32)
         jacobians = projection_jacobian(points_world[candidate_indices], cfg.K, cfg.world_to_camera)
-        for row_idx, (point_idx, score, contribution_weight) in enumerate(
-            zip(candidate_indices.tolist(), scores.tolist(), weights.tolist())
+        for row_idx, (point_idx, contribution_weight) in enumerate(
+            zip(candidate_indices.tolist(), weights.tolist())
         ):
             obs_point_indices.append(int(point_idx))
             obs_view_indices.append(view_index)
             obs_pixels.append([float(x), float(y)])
             obs_j.append(jacobians[row_idx].astype(np.float32))
             obs_contribution_weight.append(float(contribution_weight))
-            obs_contribution_score.append(float(score))
             obs_contribution_sum.append(denom)
             obs_surface_pixels.append([float(surface_pixels[row, 0]), float(surface_pixels[row, 1])])
             obs_surface_camera_z.append(float(depth))
@@ -397,7 +395,6 @@ def build_gaussian_observation_topology(
     obs_pixels: list[list[float]] = []
     obs_j: list[np.ndarray] = []
     obs_contribution_weight: list[float] = []
-    obs_contribution_score: list[float] = []
     obs_contribution_sum: list[float] = []
     obs_surface_pixels: list[list[float]] = []
     obs_surface_camera_z: list[float] = []
@@ -419,7 +416,6 @@ def build_gaussian_observation_topology(
             obs_pixels,
             obs_j,
             obs_contribution_weight,
-            obs_contribution_score,
             obs_contribution_sum,
             obs_surface_pixels,
             obs_surface_camera_z,
@@ -442,7 +438,6 @@ def build_gaussian_observation_topology(
     counts = gaus_view_obs_mask.sum(axis=1).astype(np.int32)
     for key, values in (
         ("obs_contribution_weight", obs_contribution_weight),
-        ("obs_contribution_score", obs_contribution_score),
         ("obs_contribution_sum", obs_contribution_sum),
         ("obs_surface_pixels_xy", obs_surface_pixels),
         ("obs_surface_camera_z", obs_surface_camera_z),
@@ -492,9 +487,6 @@ def build_gaussian_observation_topology(
         "obs_contribution_weight": np.asarray(
             obs_contribution_weight, dtype=np.float32
         ),
-        "obs_contribution_score": np.asarray(
-            obs_contribution_score, dtype=np.float32
-        ),
         "obs_contribution_sum": np.asarray(
             obs_contribution_sum, dtype=np.float32
         ),
@@ -517,7 +509,6 @@ def _observation_topology_id(topology: Mapping[str, np.ndarray]) -> str:
         "obs_sample_index",
         "obs_J",
         "obs_contribution_weight",
-        "obs_contribution_score",
         "sample_view_index",
         "sample_pixels_xy",
         "sample_contribution_sum",
@@ -598,9 +589,6 @@ def split_gaussian_observation_topology(
         "source_view_configs": np.asarray(observations["source_view_configs"]),
         "obs_contribution_weight": np.asarray(
             observations["obs_contribution_weight"], dtype=np.float32
-        ),
-        "obs_contribution_score": np.asarray(
-            observations["obs_contribution_score"], dtype=np.float32
         ),
         "sample_view_index": obs_view_index[sample_rows],
         "sample_pixels_xy": obs_pixels_xy[sample_rows],

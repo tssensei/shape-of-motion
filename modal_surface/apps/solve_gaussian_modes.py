@@ -625,7 +625,6 @@ def _validate_rigid_source_observations(
         "obs_count_per_point",
         "obs_sample_count_per_point",
         "obs_contribution_weight",
-        "obs_contribution_score",
         "obs_contribution_sum",
         "observations_per_view",
         "pixel_candidate_method",
@@ -701,7 +700,6 @@ def _validate_rigid_source_observations(
     num_observations = int(obs_view_index.shape[0])
     for key in (
         "obs_contribution_weight",
-        "obs_contribution_score",
         "obs_contribution_sum",
     ):
         values = np.asarray(observations[key])
@@ -933,8 +931,8 @@ def _gaussian_latent_stats(
             }
         )
     contribution_weight = observations["obs_contribution_weight"].astype(np.float32)
-    contribution_score = observations["obs_contribution_score"].astype(np.float32)
     contribution_sum = observations["obs_contribution_sum"].astype(np.float32)
+    contribution_score = contribution_weight * contribution_sum
     stats.update(
         {
             "contribution_weight_p50": json_float(np.percentile(contribution_weight, 50)),
@@ -1098,13 +1096,17 @@ def _rigid_gaussian_latent_stats(
             np.asarray(observations["pixel_candidate_method"]).item()
         ),
     }
-    for name in (
-        "obs_contribution_weight",
-        "obs_contribution_score",
-        "obs_contribution_sum",
+    contribution_weight = np.asarray(
+        observations["obs_contribution_weight"], dtype=np.float32
+    )
+    contribution_sum = np.asarray(
+        observations["obs_contribution_sum"], dtype=np.float32
+    )
+    for label, values in (
+        ("contribution_weight", contribution_weight),
+        ("contribution_score", contribution_weight * contribution_sum),
+        ("contribution_sum", contribution_sum),
     ):
-        values = np.asarray(observations[name], dtype=np.float32)
-        label = name.removeprefix("obs_")
         stats[f"{label}_p50"] = _finite_percentile(values, 50)
         stats[f"{label}_p90"] = _finite_percentile(values, 90)
         stats[f"{label}_max"] = _finite_percentile(values, 100)
