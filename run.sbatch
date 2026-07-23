@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=bush4-sweep-3dgs-hq
+#SBATCH --job-name=bush4-723
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:nvidia_rtx_6000_ada_generation:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
 #SBATCH --time=8:00:00
-#SBATCH --output=/home/zs292/slurm_outputs/som/bush4-sweep-3dgs-hq-%j.out
-#SBATCH --error=/home/zs292/slurm_outputs/som/bush4-sweep-3dgs-hq-%j.err
+#SBATCH --output=/home/zs292/slurm_outputs/som/bush4-723-%j.out
+#SBATCH --error=/home/zs292/slurm_outputs/som/bush4-723-%j.err
 
 set -euo pipefail
 
