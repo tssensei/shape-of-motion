@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shutil
 import tempfile
 from time import perf_counter
 from typing import Any, Mapping, SupportsFloat
@@ -318,6 +317,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Required maximum KNN edge distance in scene units when --motion-fill is enabled.",
     )
     parser.add_argument(
+        "--motion-fill-graph",
+        default=None,
+        help=(
+            "Existing shared Gaussian KNN graph NPZ to reuse when --motion-fill "
+            "is enabled."
+        ),
+    )
+    parser.add_argument(
         "--motion-fill-max-anchor-hops",
         type=int,
         default=_DEFAULT_MOTION_FILL_MAX_ANCHOR_HOPS,
@@ -467,27 +474,6 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         )
 
 
-def _copy_file_atomic(source: Path, destination: Path) -> Path:
-    source_resolved = source.resolve(strict=True)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and destination.resolve() == source_resolved:
-        return destination
-    with tempfile.NamedTemporaryFile(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=destination.parent,
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-    try:
-        shutil.copyfile(source_resolved, temporary)
-        os.replace(temporary, destination)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-    return destination
-
-
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
@@ -536,7 +522,7 @@ def _load_rigid_component_observations(
 ) -> dict[int, Path]:
     loaded_by_mode: dict[int, Path] = {}
     for raw_path in observation_paths:
-        path = Path(raw_path)
+        path = Path(raw_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(path)
         with np.load(path, allow_pickle=False) as archive:
@@ -793,6 +779,8 @@ def _validate_motion_fill_arguments(
     num_points: int | None = None,
 ) -> None:
     if not bool(args.motion_fill):
+        if args.motion_fill_graph is not None:
+            raise ValueError("--motion-fill-graph requires --motion-fill.")
         if args.motion_fill_max_distance is not None:
             raise ValueError("--motion-fill-max-distance requires --motion-fill.")
         if args.motion_fill_k != _DEFAULT_MOTION_FILL_K:
@@ -805,6 +793,11 @@ def _validate_motion_fill_arguments(
                 "A custom --motion-fill-max-anchor-hops requires --motion-fill."
             )
         return
+    if args.motion_fill_graph is not None and args.base_manifest is not None:
+        raise ValueError(
+            "--motion-fill-graph and --base-manifest cannot both provide the "
+            "motion-fill graph."
+        )
     if args.motion_fill_max_distance is None:
         raise ValueError("--motion-fill requires --motion-fill-max-distance in scene units.")
     if (
@@ -2034,7 +2027,9 @@ def run(args: argparse.Namespace) -> None:
 
     gaussian_tree = None
     stage_started = perf_counter()
-    if args.solve_method == "staged" or args.motion_fill:
+    if args.solve_method == "staged" or (
+        args.motion_fill and args.motion_fill_graph is None
+    ):
         from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
 
         gaussian_tree = cKDTree(fg_means.astype(np.float64))
@@ -2093,7 +2088,8 @@ def run(args: argparse.Namespace) -> None:
     latent_dir = out_dir / "latents"
     diagnostics_dir = out_dir / "diagnostics"
     vis_dir = out_dir / "vis"
-    obs_dir.mkdir(parents=True, exist_ok=True)
+    if args.solve_method == "staged":
+        obs_dir.mkdir(parents=True, exist_ok=True)
     latent_dir.mkdir(parents=True, exist_ok=True)
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
@@ -2107,6 +2103,7 @@ def run(args: argparse.Namespace) -> None:
     motion_fill_mode_diagnostics: dict[str, Any] = {}
     motion_fill_graph_profile: dict[str, Any] = {
         "enabled": bool(args.motion_fill),
+        "source": "disabled",
         "query_candidates_seconds": 0.0,
         "build_graph_seconds": 0.0,
         "write_graph_seconds": 0.0,
@@ -2114,8 +2111,19 @@ def run(args: argparse.Namespace) -> None:
     }
     if args.motion_fill:
         graph_started = perf_counter()
-        assert gaussian_tree is not None
-        if incremental_base is not None:
+        if args.motion_fill_graph is not None:
+            motion_fill_graph_path = (
+                Path(args.motion_fill_graph).expanduser().resolve()
+            )
+            motion_fill_graph = load_motion_fill_graph(
+                motion_fill_graph_path,
+                fg_means,
+                expected_k=int(args.motion_fill_k),
+                expected_max_distance=float(args.motion_fill_max_distance),
+            )
+            motion_fill_graph_profile["source"] = "external"
+            print(f"Reused external motion-fill graph -> {motion_fill_graph_path}")
+        elif incremental_base is not None:
             if incremental_base.motion_fill_graph_path is None:
                 raise ValueError(
                     "The base manifest does not provide the required motion-fill graph"
@@ -2127,8 +2135,11 @@ def run(args: argparse.Namespace) -> None:
                 expected_k=int(args.motion_fill_k),
                 expected_max_distance=float(args.motion_fill_max_distance),
             )
+            motion_fill_graph_profile["source"] = "base_manifest"
             print(f"Reused motion-fill graph -> {motion_fill_graph_path}")
         else:
+            motion_fill_graph_profile["source"] = "built"
+            assert gaussian_tree is not None
             stage_started = perf_counter()
             candidates = query_knn_candidates(
                 fg_means,
@@ -2162,12 +2173,9 @@ def run(args: argparse.Namespace) -> None:
             perf_counter() - graph_started
         )
 
-    rigid_graph_local_path: Path | None = None
-    if rigid_graph is not None:
-        rigid_graph_local_path = _copy_file_atomic(
-            rigid_graph.graph_path,
-            out_dir / "rigid_components" / "graph.npz",
-        )
+    rigid_graph_artifact_path = (
+        rigid_graph.graph_path if rigid_graph is not None else None
+    )
 
     modes: list[dict[str, Any]] = []
     mode_time_profiles: dict[str, dict[str, Any]] = {}
@@ -2183,7 +2191,7 @@ def run(args: argparse.Namespace) -> None:
         latent_path.unlink(missing_ok=True)
         if args.solve_method == "rigid-components":
             assert rigid_graph is not None
-            assert rigid_graph_local_path is not None
+            assert rigid_graph_artifact_path is not None
             mode_profile: dict[str, Any] = {}
             stage_started = perf_counter()
             source_observation_path = rigid_observations[mode_index]
@@ -2201,7 +2209,6 @@ def run(args: argparse.Namespace) -> None:
                 foreground_points=fg_means,
             )
             _print_observation_sanity(observations, fg_means.shape[0])
-            _copy_file_atomic(source_observation_path, obs_path)
             mode_profile["observation_input_seconds"] = float(
                 perf_counter() - stage_started
             )
@@ -2360,7 +2367,7 @@ def run(args: argparse.Namespace) -> None:
                         rigid,
                         seed_selection,
                         rigid_graph_path=relative_path(
-                            rigid_graph_local_path, out_dir
+                            rigid_graph_artifact_path, out_dir
                         ),
                         rigid_graph_source_path=str(rigid_graph.graph_path),
                     )
@@ -2419,7 +2426,9 @@ def run(args: argparse.Namespace) -> None:
                 alpha_view_freqs_hz,
                 rigid,
                 seed_selection,
-                rigid_graph_path=relative_path(rigid_graph_local_path, out_dir),
+                rigid_graph_path=relative_path(
+                    rigid_graph_artifact_path, out_dir
+                ),
                 rigid_graph_source_path=str(rigid_graph.graph_path),
                 motion_fill=rigid_motion_fill,
                 motion_fill_graph=motion_fill_graph,
@@ -2450,7 +2459,9 @@ def run(args: argparse.Namespace) -> None:
                     "freq_hz": reference_freq,
                     "freqs_hz_by_view": freqs_by_view,
                     "label": f"{mode_index}: {reference_freq:.6f} Hz",
-                    "observation_path": relative_path(obs_path, out_dir),
+                    "observation_path": relative_path(
+                        source_observation_path, out_dir
+                    ),
                     "source_observation_path": str(source_observation_path),
                     "latent_path": relative_path(latent_path, out_dir),
                     "diagnostics_path": relative_path(diagnostics_path, out_dir),
@@ -2458,7 +2469,7 @@ def run(args: argparse.Namespace) -> None:
                         diagnostics_path, out_dir
                     ),
                     "rigid_component_graph_path": relative_path(
-                        rigid_graph_local_path, out_dir
+                        rigid_graph_artifact_path, out_dir
                     ),
                     "rigid_component_graph_source_path": str(
                         rigid_graph.graph_path
