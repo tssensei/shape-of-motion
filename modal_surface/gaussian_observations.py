@@ -186,8 +186,6 @@ def _append_view_pixel_candidate_topology(
     obs_j: list[np.ndarray],
     obs_contribution_weight: list[float],
     obs_contribution_sum: list[float],
-    obs_surface_pixels: list[list[float]],
-    obs_surface_camera_z: list[float],
     pixel_sample_stride: int,
     pixel_candidate_k: int,
     pixel_preselect_k: int,
@@ -241,8 +239,11 @@ def _append_view_pixel_candidate_topology(
     min_contribution = float(pixel_min_contribution)
 
     # for a pixel
-    for row, (x, y, depth, surface_point, candidates) in enumerate(
-        zip(flat_x.tolist(), flat_y.tolist(), depths.tolist(), surface_points, candidate_rows)
+    for x, y, surface_point, candidates in zip(
+        flat_x.tolist(),
+        flat_y.tolist(),
+        surface_points,
+        candidate_rows,
     ):
         scored = score_pixel_gaussian_candidates(
             surface_point_world=surface_point,
@@ -278,8 +279,6 @@ def _append_view_pixel_candidate_topology(
             obs_j.append(jacobians[row_idx].astype(np.float32))
             obs_contribution_weight.append(float(contribution_weight))
             obs_contribution_sum.append(denom)
-            obs_surface_pixels.append([float(surface_pixels[row, 0]), float(surface_pixels[row, 1])])
-            obs_surface_camera_z.append(float(depth))
             added += 1
     return added
 
@@ -396,8 +395,6 @@ def build_gaussian_observation_topology(
     obs_j: list[np.ndarray] = []
     obs_contribution_weight: list[float] = []
     obs_contribution_sum: list[float] = []
-    obs_surface_pixels: list[list[float]] = []
-    obs_surface_camera_z: list[float] = []
     observations_per_view: list[int] = []
     for view_index, cfg in enumerate(configs):
         count = _append_view_pixel_candidate_topology(
@@ -417,8 +414,6 @@ def build_gaussian_observation_topology(
             obs_j,
             obs_contribution_weight,
             obs_contribution_sum,
-            obs_surface_pixels,
-            obs_surface_camera_z,
             pixel_sample_stride,
             pixel_candidate_k,
             pixel_preselect_k,
@@ -439,8 +434,6 @@ def build_gaussian_observation_topology(
     for key, values in (
         ("obs_contribution_weight", obs_contribution_weight),
         ("obs_contribution_sum", obs_contribution_sum),
-        ("obs_surface_pixels_xy", obs_surface_pixels),
-        ("obs_surface_camera_z", obs_surface_camera_z),
     ):
         if len(values) != obs_point_arr.shape[0]:
             raise ValueError(f"Internal error: {key} count does not match observations.")
@@ -490,12 +483,6 @@ def build_gaussian_observation_topology(
         "obs_contribution_sum": np.asarray(
             obs_contribution_sum, dtype=np.float32
         ),
-        "obs_surface_pixels_xy": np.asarray(
-            obs_surface_pixels, dtype=np.float32
-        ),
-        "obs_surface_camera_z": np.asarray(
-            obs_surface_camera_z, dtype=np.float32
-        ),
     }
     return split_gaussian_observation_topology(topology_source)
 
@@ -512,8 +499,6 @@ def _observation_topology_id(topology: Mapping[str, np.ndarray]) -> str:
         "sample_view_index",
         "sample_pixels_xy",
         "sample_contribution_sum",
-        "sample_surface_pixels_xy",
-        "sample_surface_camera_z",
         "view_ids",
         "view_image_width",
         "view_image_height",
@@ -595,17 +580,7 @@ def split_gaussian_observation_topology(
         "sample_contribution_sum": np.asarray(
             observations["obs_contribution_sum"], dtype=np.float32
         )[sample_rows],
-        "sample_surface_pixels_xy": np.asarray(
-            observations["obs_surface_pixels_xy"], dtype=np.float32
-        )[sample_rows],
-        "sample_surface_camera_z": np.asarray(
-            observations["obs_surface_camera_z"], dtype=np.float32
-        )[sample_rows],
     }
-    topology["samples_per_view"] = np.bincount(
-        topology["sample_view_index"],
-        minlength=topology["view_ids"].shape[0],
-    ).astype(np.int32)
     topology["topology_id"] = np.array(_observation_topology_id(topology))
     return topology
 
@@ -770,12 +745,6 @@ def compose_gaussian_observations(
             "obs_y": sample_values[obs_sample_index],
             "obs_contribution_sum": np.asarray(
                 topology["sample_contribution_sum"]
-            )[obs_sample_index],
-            "obs_surface_pixels_xy": np.asarray(
-                topology["sample_surface_pixels_xy"]
-            )[obs_sample_index],
-            "obs_surface_camera_z": np.asarray(
-                topology["sample_surface_camera_z"]
             )[obs_sample_index],
             "view_freqs_hz": np.asarray(measurement["view_freqs_hz"]),
             "freq_hz": np.asarray(measurement["freq_hz"]),
