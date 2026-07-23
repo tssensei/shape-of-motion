@@ -27,9 +27,10 @@ MEASUREMENT_DIR=$BASIS_ROOT/gaussian_observations/measurements
 OBSERVED_GRAPH=$SCENE_ROOT/shared/preprocessing/observed_structure_graphs/rgb_depth_knn8_maxdist0p008_v3/graph.npz
 MOTION_FILL_GRAPH=$SCENE_ROOT/shared/preprocessing/motion_fill_graphs/knn8_maxdist0p008_v1/graph.npz
 
-PHASE_NAME=rigid_rgbdepth_v3_sequential_k60_phase_v1
-BOUNDED_COMPLEX_NAME=rigid_rgbdepth_v3_sequential_k60_bounded_complex_v1
+OUTPUT_NAME=rigid_rgbdepth_v3_sequential_k60_bounded_complex_v1
+OUTPUT_DIR=$FIELD_ROOT/$OUTPUT_NAME
 LOG_DIR=$FIELD_ROOT/logs
+LOG_PATH=$LOG_DIR/$OUTPUT_NAME.log
 
 mkdir -p "$LOG_DIR"
 
@@ -52,13 +53,10 @@ for path in "${REQUIRED_FILES[@]}"; do
   fi
 done
 
-for output_name in "$PHASE_NAME" "$BOUNDED_COMPLEX_NAME"; do
-  output_dir=$FIELD_ROOT/$output_name
-  if [[ -e "$output_dir" && ! -f "$output_dir/modal_modes_manifest.json" ]]; then
-    echo "Refusing to overwrite incomplete existing output: $output_dir" >&2
-    exit 1
-  fi
-done
+if [[ -e "$OUTPUT_DIR" && ! -f "$OUTPUT_DIR/modal_modes_manifest.json" ]]; then
+  echo "Refusing to overwrite incomplete existing output: $OUTPUT_DIR" >&2
+  exit 1
+fi
 
 shopt -s nullglob
 MEASUREMENT_ARGS=()
@@ -117,26 +115,15 @@ COMMON_ARGS=(
   --motion-fill-max-anchor-hops 8
 )
 
-run_variant() {
-  local alpha_model=$1
-  local output_name=$2
-  local output_dir=$FIELD_ROOT/$output_name
-  local log_path=$LOG_DIR/$output_name.log
-
-  if [[ -f "$output_dir/modal_modes_manifest.json" ]]; then
-    echo "[$(date --iso-8601=seconds)] Skipping completed $alpha_model -> $output_dir"
-    return
-  fi
-
-  echo "[$(date --iso-8601=seconds)] Starting $alpha_model -> $output_dir"
+if [[ -f "$OUTPUT_DIR/modal_modes_manifest.json" ]]; then
+  echo "[$(date --iso-8601=seconds)] Skipping completed bounded-complex -> $OUTPUT_DIR"
+else
+  echo "[$(date --iso-8601=seconds)] Starting bounded-complex -> $OUTPUT_DIR"
   PYTHONPATH=. python -u -m modal_surface \
     "${COMMON_ARGS[@]}" \
     "${MEASUREMENT_ARGS[@]}" \
-    --out-dir "$output_dir" \
-    --alpha-model "$alpha_model" \
-    2>&1 | tee "$log_path"
-  echo "[$(date --iso-8601=seconds)] Finished $alpha_model -> $output_dir"
-}
-
-run_variant phase "$PHASE_NAME"
-run_variant bounded-complex "$BOUNDED_COMPLEX_NAME"
+    --out-dir "$OUTPUT_DIR" \
+    --alpha-model bounded-complex \
+    2>&1 | tee "$LOG_PATH"
+  echo "[$(date --iso-8601=seconds)] Finished bounded-complex -> $OUTPUT_DIR"
+fi
