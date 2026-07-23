@@ -16,7 +16,14 @@ from modal_surface.checkpoint_render_inputs import (
     load_fg_means_from_checkpoint,
     load_fg_pixel_candidate_inputs_from_checkpoint,
 )
-from modal_surface.gaussian_observations import build_gaussian_observation_graph
+from modal_surface.gaussian_observations import (
+    OBSERVATION_MEASUREMENT_FORMAT,
+    OBSERVATION_SPLIT_VERSION,
+    build_gaussian_observation_graph,
+    compose_gaussian_observations,
+    load_gaussian_observation_measurement,
+    load_gaussian_observation_topology,
+)
 from modal_surface.gaussian_motion_fill import (
     MOTION_FILL_EPSILON,
     MOTION_FILL_LSMR_ATOL,
@@ -339,7 +346,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     graph_path = args.rigid_component_graph
-    observation_paths = list(args.rigid_component_observation)
+    observation_topology_path = args.rigid_component_observation_topology
+    observation_measurement_paths = list(
+        args.rigid_component_observation_measurement
+    )
     if args.solve_method == "rigid-components" and args.base_manifest is not None:
         raise ValueError(
             "--base-manifest is currently supported only with --solve-method=staged."
@@ -401,9 +411,14 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
             raise ValueError(
                 "--rigid-component-graph requires --solve-method=rigid-components."
             )
-        if observation_paths:
+        if observation_topology_path is not None:
             raise ValueError(
-                "--rigid-component-observation requires "
+                "--rigid-component-observation-topology requires "
+                "--solve-method=rigid-components."
+            )
+        if observation_measurement_paths:
+            raise ValueError(
+                "--rigid-component-observation-measurement requires "
                 "--solve-method=rigid-components."
             )
         if rcond != RIGID_COMPONENT_RCOND_DEFAULT:
@@ -457,10 +472,15 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         raise ValueError(
             "--solve-method=rigid-components requires --rigid-component-graph."
         )
-    if not observation_paths:
+    if observation_topology_path is None:
         raise ValueError(
             "--solve-method=rigid-components requires "
-            "--rigid-component-observation."
+            "--rigid-component-observation-topology."
+        )
+    if not observation_measurement_paths:
+        raise ValueError(
+            "--solve-method=rigid-components requires "
+            "--rigid-component-observation-measurement."
         )
     if float(args.anchor_svd_ratio_min) != STAGED_ANCHOR_SVD_RATIO_DEFAULT:
         raise ValueError(
@@ -516,29 +536,40 @@ def _scalar_value(
     return value.item()
 
 
-def _load_rigid_component_observations(
-    observation_paths: list[str],
+def _load_rigid_component_measurements(
+    measurement_paths: list[str],
     mode_indices: list[int],
 ) -> dict[int, Path]:
     loaded_by_mode: dict[int, Path] = {}
-    for raw_path in observation_paths:
+    for raw_path in measurement_paths:
         path = Path(raw_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(path)
         with np.load(path, allow_pickle=False) as archive:
-            if "mode_index" not in archive.files:
-                raise ValueError(f"{path} is missing required field mode_index.")
-            mode_index = int(
-                _scalar_value(
-                    {"mode_index": np.asarray(archive["mode_index"])},
-                    "mode_index",
-                    path,
-                )
+            metadata = {
+                name: np.asarray(archive[name])
+                for name in ("format", "version", "mode_index")
+                if name in archive.files
+            }
+        if str(_scalar_value(metadata, "format", path)) != (
+            OBSERVATION_MEASUREMENT_FORMAT
+        ):
+            raise ValueError(f"{path} is not an observation measurement artifact.")
+        if int(_scalar_value(metadata, "version", path)) != (
+            OBSERVATION_SPLIT_VERSION
+        ):
+            raise ValueError(f"{path} has an unsupported measurement version.")
+        mode_index = int(
+            _scalar_value(
+                metadata,
+                "mode_index",
+                path,
             )
+        )
         if mode_index in loaded_by_mode:
             previous = loaded_by_mode[mode_index]
             raise ValueError(
-                "Duplicate rigid component observation for mode "
+                "Duplicate rigid component observation measurement for mode "
                 f"{mode_index}: {previous} and {path}."
             )
         loaded_by_mode[mode_index] = path
@@ -548,7 +579,7 @@ def _load_rigid_component_observations(
     extra = sorted(supplied - requested)
     if missing or extra:
         raise ValueError(
-            "Rigid component observations must match requested modes exactly: "
+            "Rigid component observation measurements must match requested modes exactly: "
             f"missing={missing}, extra={extra}."
         )
     return loaded_by_mode
@@ -2055,9 +2086,19 @@ def run(args: argparse.Namespace) -> None:
         if args.solve_method == "rigid-components"
         else None
     )
-    rigid_observations = (
-        _load_rigid_component_observations(
-            list(args.rigid_component_observation),
+    rigid_observation_topology_path = (
+        Path(args.rigid_component_observation_topology).expanduser().resolve()
+        if args.solve_method == "rigid-components"
+        else None
+    )
+    rigid_observation_topology = (
+        load_gaussian_observation_topology(rigid_observation_topology_path)
+        if rigid_observation_topology_path is not None
+        else None
+    )
+    rigid_observation_measurements = (
+        _load_rigid_component_measurements(
+            list(args.rigid_component_observation_measurement),
             mode_indices,
         )
         if args.solve_method == "rigid-components"
@@ -2192,14 +2233,22 @@ def run(args: argparse.Namespace) -> None:
         if args.solve_method == "rigid-components":
             assert rigid_graph is not None
             assert rigid_graph_artifact_path is not None
+            assert rigid_observation_topology is not None
+            assert rigid_observation_topology_path is not None
             mode_profile: dict[str, Any] = {}
             stage_started = perf_counter()
-            source_observation_path = rigid_observations[mode_index]
-            observations = _load_npz_arrays(source_observation_path)
+            source_measurement_path = rigid_observation_measurements[mode_index]
+            measurement = load_gaussian_observation_measurement(
+                source_measurement_path
+            )
+            observations = compose_gaussian_observations(
+                rigid_observation_topology,
+                measurement,
+            )
             prepared = _validate_rigid_source_observations(
                 rigid_graph,
                 observations,
-                source_path=source_observation_path,
+                source_path=source_measurement_path,
                 args=args,
                 view_config_paths=view_configs_paths,
                 modal_npz_paths=modal_npzs_paths,
@@ -2459,10 +2508,12 @@ def run(args: argparse.Namespace) -> None:
                     "freq_hz": reference_freq,
                     "freqs_hz_by_view": freqs_by_view,
                     "label": f"{mode_index}: {reference_freq:.6f} Hz",
-                    "observation_path": relative_path(
-                        source_observation_path, out_dir
+                    "observation_measurement_path": relative_path(
+                        source_measurement_path, out_dir
                     ),
-                    "source_observation_path": str(source_observation_path),
+                    "source_observation_measurement_path": str(
+                        source_measurement_path
+                    ),
                     "latent_path": relative_path(latent_path, out_dir),
                     "diagnostics_path": relative_path(diagnostics_path, out_dir),
                     "component_diagnostics_path": relative_path(
@@ -2628,7 +2679,10 @@ def run(args: argparse.Namespace) -> None:
                 "rigid_component_graph_count": 1,
                 "rigid_component_graph_policy": "shared_observation_topology",
                 "rigid_component_observation_policy": (
-                    "explicit_per_mode_observation_no_rebuild"
+                    "shared_topology_sample_measurements_v1"
+                ),
+                "observation_storage_policy": (
+                    "shared_topology_sample_measurements_v1"
                 ),
             }
         )
@@ -2720,6 +2774,14 @@ def run(args: argparse.Namespace) -> None:
         "parameters": manifest_parameters,
         "modes": combined_modes,
     }
+    if rigid_observation_topology_path is not None:
+        manifest["observation_topology_path"] = relative_path(
+            rigid_observation_topology_path,
+            out_dir,
+        )
+        manifest["source_observation_topology_path"] = str(
+            rigid_observation_topology_path
+        )
     if incremental_base is not None:
         manifest["incremental_extension"] = {
             "base_manifest": str(incremental_base.path),

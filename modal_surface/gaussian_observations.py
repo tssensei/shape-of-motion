@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -17,6 +18,10 @@ from modal_surface.io import (
     load_view_config,
     save_npz_compressed_atomic,
 )
+
+OBSERVATION_TOPOLOGY_FORMAT = "gaussian_observation_topology"
+OBSERVATION_MEASUREMENT_FORMAT = "gaussian_observation_measurement"
+OBSERVATION_SPLIT_VERSION = 1
 
 
 def _load_view_inputs(
@@ -527,6 +532,281 @@ def build_gaussian_observation_graph(
         },
     )
     return out
+
+
+def _observation_topology_id(topology: Mapping[str, np.ndarray]) -> str:
+    digest = hashlib.sha256()
+    for name in (
+        "points_world",
+        "gaussian_indices",
+        "obs_point_index",
+        "obs_sample_index",
+        "obs_J",
+        "obs_camera_z",
+        "obs_contribution_weight",
+        "obs_contribution_score",
+        "sample_view_index",
+        "sample_pixels_xy",
+        "sample_contribution_sum",
+        "sample_surface_pixels_xy",
+        "sample_surface_camera_z",
+        "view_ids",
+        "view_image_width",
+        "view_image_height",
+    ):
+        array = np.ascontiguousarray(topology[name])
+        digest.update(name.encode("utf-8"))
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def split_gaussian_observation_topology(
+    observations: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Extract mode-independent topology from one full observation artifact."""
+    obs_view_index = np.asarray(observations["obs_view_index"], dtype=np.int32)
+    obs_pixels_xy = np.asarray(observations["obs_pixels_xy"], dtype=np.float32)
+    if obs_view_index.ndim != 1 or obs_pixels_xy.shape != (obs_view_index.size, 2):
+        raise ValueError("Observation rows have invalid view/pixel shapes.")
+    if obs_view_index.size == 0:
+        raise ValueError("Observation topology cannot be empty.")
+
+    sample_start = np.ones(obs_view_index.size, dtype=bool)
+    sample_start[1:] = (
+        (obs_view_index[1:] != obs_view_index[:-1])
+        | np.any(obs_pixels_xy[1:] != obs_pixels_xy[:-1], axis=1)
+    )
+    sample_rows = np.flatnonzero(sample_start)
+    obs_sample_index = np.cumsum(sample_start, dtype=np.int64) - 1
+
+    topology = {
+        "format": np.array(OBSERVATION_TOPOLOGY_FORMAT),
+        "version": np.array(OBSERVATION_SPLIT_VERSION, dtype=np.int32),
+        "points_world": np.asarray(observations["points_world"], dtype=np.float32),
+        "gaussian_indices": np.asarray(observations["gaussian_indices"], dtype=np.int32),
+        "point_type": np.asarray(observations["point_type"]),
+        "source_checkpoint": np.asarray(observations["source_checkpoint"]),
+        "obs_point_index": np.asarray(observations["obs_point_index"], dtype=np.int32),
+        "obs_sample_index": obs_sample_index.astype(np.int32),
+        "obs_J": np.asarray(observations["obs_J"], dtype=np.float32),
+        "obs_camera_z": np.asarray(observations["obs_camera_z"], dtype=np.float32),
+        "obs_count_per_point": np.asarray(observations["obs_count_per_point"], dtype=np.int32),
+        "obs_sample_count_per_point": np.asarray(
+            observations["obs_sample_count_per_point"], dtype=np.int32
+        ),
+        "view_ids": np.asarray(observations["view_ids"]),
+        "view_image_width": np.asarray(observations["view_image_width"], dtype=np.int32),
+        "view_image_height": np.asarray(observations["view_image_height"], dtype=np.int32),
+        "mask_erode_iters": np.asarray(observations["mask_erode_iters"], dtype=np.int32),
+        "candidate_point_count": np.asarray(
+            observations["candidate_point_count"], dtype=np.int32
+        ),
+        "preserved_all_points": np.asarray(observations["preserved_all_points"]),
+        "pixel_sample_stride": np.asarray(
+            observations["pixel_sample_stride"], dtype=np.int32
+        ),
+        "pixel_candidate_k": np.asarray(
+            observations["pixel_candidate_k"], dtype=np.int32
+        ),
+        "pixel_preselect_k": np.asarray(
+            observations["pixel_preselect_k"], dtype=np.int32
+        ),
+        "pixel_render_acc_min": np.asarray(
+            observations["pixel_render_acc_min"], dtype=np.float32
+        ),
+        "pixel_min_contribution": np.asarray(
+            observations["pixel_min_contribution"], dtype=np.float32
+        ),
+        "pixel_candidate_method": np.asarray(observations["pixel_candidate_method"]),
+        "observations_per_view": np.asarray(
+            observations["observations_per_view"], dtype=np.int32
+        ),
+        "source_view_configs": np.asarray(observations["source_view_configs"]),
+        "obs_contribution_weight": np.asarray(
+            observations["obs_contribution_weight"], dtype=np.float32
+        ),
+        "obs_contribution_score": np.asarray(
+            observations["obs_contribution_score"], dtype=np.float32
+        ),
+        "sample_view_index": obs_view_index[sample_rows],
+        "sample_pixels_xy": obs_pixels_xy[sample_rows],
+        "sample_contribution_sum": np.asarray(
+            observations["obs_contribution_sum"], dtype=np.float32
+        )[sample_rows],
+        "sample_surface_pixels_xy": np.asarray(
+            observations["obs_surface_pixels_xy"], dtype=np.float32
+        )[sample_rows],
+        "sample_surface_camera_z": np.asarray(
+            observations["obs_surface_camera_z"], dtype=np.float32
+        )[sample_rows],
+    }
+    topology["samples_per_view"] = np.bincount(
+        topology["sample_view_index"],
+        minlength=topology["view_ids"].shape[0],
+    ).astype(np.int32)
+    topology["topology_id"] = np.array(_observation_topology_id(topology))
+    return topology
+
+
+def write_gaussian_observation_topology(
+    path: str | Path,
+    topology: Mapping[str, np.ndarray],
+) -> Path:
+    out = Path(path)
+    save_npz_compressed_atomic(out, dict(topology))
+    return out
+
+
+def load_gaussian_observation_topology(
+    path: str | Path,
+) -> dict[str, np.ndarray]:
+    source = Path(path).expanduser().resolve(strict=True)
+    with np.load(source, allow_pickle=False) as archive:
+        topology = {name: archive[name] for name in archive.files}
+    if str(np.asarray(topology.get("format")).item()) != OBSERVATION_TOPOLOGY_FORMAT:
+        raise ValueError(f"{source} is not a Gaussian observation topology artifact.")
+    if int(np.asarray(topology.get("version")).item()) != OBSERVATION_SPLIT_VERSION:
+        raise ValueError(f"{source} has an unsupported observation topology version.")
+    return topology
+
+
+def build_gaussian_observation_measurements(
+    topology: Mapping[str, np.ndarray],
+    view_config_paths: Sequence[str | Path],
+    modal_npz_paths: Sequence[str | Path],
+    mode_indices: Sequence[int],
+    freq_tolerance_hz: float,
+) -> list[dict[str, np.ndarray]]:
+    if not mode_indices:
+        raise ValueError("At least one mode index is required.")
+    configs, modals, _, _ = _load_view_inputs(
+        view_config_paths,
+        modal_npz_paths,
+        int(mode_indices[0]),
+        freq_tolerance_hz,
+    )
+    topology_view_ids = np.asarray(topology["view_ids"]).astype(str)
+    if topology_view_ids.tolist() != [cfg.view_id for cfg in configs]:
+        raise ValueError("Observation topology views do not match the supplied view configs.")
+
+    sample_view_index = np.asarray(topology["sample_view_index"], dtype=np.int32)
+    sample_pixels_xy = np.asarray(topology["sample_pixels_xy"], dtype=np.float32)
+    sample_x = sample_pixels_xy[:, 0].astype(np.int64)
+    sample_y = sample_pixels_xy[:, 1].astype(np.int64)
+    topology_id = np.asarray(topology["topology_id"])
+    measurements: list[dict[str, np.ndarray]] = []
+    for raw_mode_index in mode_indices:
+        mode_index = int(raw_mode_index)
+        if mode_index < 0 or any(
+            mode_index >= modal["mode_u"].shape[0] for modal in modals
+        ):
+            raise ValueError(f"mode_index={mode_index} is out of range.")
+        view_freqs_hz = np.asarray(
+            [float(modal["selected_freqs_hz"][mode_index]) for modal in modals],
+            dtype=np.float32,
+        )
+        if np.max(np.abs(view_freqs_hz - view_freqs_hz[0])) > freq_tolerance_hz:
+            raise ValueError(f"Mode frequency mismatch at mode_index={mode_index}.")
+        values = np.empty((sample_view_index.size, 2), dtype=np.complex64)
+        for view_index, modal in enumerate(modals):
+            rows = sample_view_index == view_index
+            values[rows, 0] = modal["mode_u"][mode_index, sample_y[rows], sample_x[rows]]
+            values[rows, 1] = modal["mode_v"][mode_index, sample_y[rows], sample_x[rows]]
+        measurements.append(
+            {
+                "format": np.array(OBSERVATION_MEASUREMENT_FORMAT),
+                "version": np.array(OBSERVATION_SPLIT_VERSION, dtype=np.int32),
+                "topology_id": topology_id,
+                "mode_index": np.array(mode_index, dtype=np.int32),
+                "freq_hz": np.array(view_freqs_hz[0], dtype=np.float32),
+                "view_freqs_hz": view_freqs_hz,
+                "sample_y": values,
+                "source_modal_npzs": np.asarray(
+                    [str(path) for path in modal_npz_paths]
+                ),
+            }
+        )
+    return measurements
+
+
+def write_gaussian_observation_measurement(
+    path: str | Path,
+    measurement: Mapping[str, np.ndarray],
+) -> Path:
+    out = Path(path)
+    save_npz_compressed_atomic(out, dict(measurement))
+    return out
+
+
+def load_gaussian_observation_measurement(
+    path: str | Path,
+) -> dict[str, np.ndarray]:
+    source = Path(path).expanduser().resolve(strict=True)
+    with np.load(source, allow_pickle=False) as archive:
+        measurement = {name: archive[name] for name in archive.files}
+    if str(np.asarray(measurement.get("format")).item()) != OBSERVATION_MEASUREMENT_FORMAT:
+        raise ValueError(f"{source} is not a Gaussian observation measurement artifact.")
+    if int(np.asarray(measurement.get("version")).item()) != OBSERVATION_SPLIT_VERSION:
+        raise ValueError(f"{source} has an unsupported observation measurement version.")
+    return measurement
+
+
+def compose_gaussian_observations(
+    topology: Mapping[str, np.ndarray],
+    measurement: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    if str(np.asarray(topology["topology_id"]).item()) != str(
+        np.asarray(measurement["topology_id"]).item()
+    ):
+        raise ValueError("Observation measurement does not belong to this topology.")
+    obs_sample_index = np.asarray(topology["obs_sample_index"], dtype=np.int32)
+    sample_values = np.asarray(measurement["sample_y"], dtype=np.complex64)
+    if sample_values.shape != (
+        np.asarray(topology["sample_view_index"]).shape[0],
+        2,
+    ):
+        raise ValueError("Observation measurement sample_y has an invalid shape.")
+
+    observations = {
+        name: np.asarray(value)
+        for name, value in topology.items()
+        if name
+        not in {
+            "format",
+            "version",
+            "topology_id",
+            "obs_sample_index",
+            "sample_view_index",
+            "sample_pixels_xy",
+            "sample_contribution_sum",
+            "sample_surface_pixels_xy",
+            "sample_surface_camera_z",
+            "samples_per_view",
+        }
+    }
+    observations.update(
+        {
+            "obs_view_index": np.asarray(topology["sample_view_index"])[obs_sample_index],
+            "obs_pixels_xy": np.asarray(topology["sample_pixels_xy"])[obs_sample_index],
+            "obs_y": sample_values[obs_sample_index],
+            "obs_contribution_sum": np.asarray(
+                topology["sample_contribution_sum"]
+            )[obs_sample_index],
+            "obs_surface_pixels_xy": np.asarray(
+                topology["sample_surface_pixels_xy"]
+            )[obs_sample_index],
+            "obs_surface_camera_z": np.asarray(
+                topology["sample_surface_camera_z"]
+            )[obs_sample_index],
+            "view_freqs_hz": np.asarray(measurement["view_freqs_hz"]),
+            "freq_hz": np.asarray(measurement["freq_hz"]),
+            "mode_index": np.asarray(measurement["mode_index"]),
+            "source_modal_npzs": np.asarray(measurement["source_modal_npzs"]),
+        }
+    )
+    return observations
 
 
 def validate_pixel_candidate_args(

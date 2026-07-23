@@ -39,12 +39,20 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--rigid-component-observation",
+        "--rigid-component-observation-topology",
+        type=str,
+        help=(
+            "One shared Gaussian observation topology NPZ for all requested "
+            "modes when --solve-method=rigid-components."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-component-observation-measurement",
         action="append",
         default=[],
         help=(
-            "Gaussian observation NPZ for a requested mode. Repeat once per "
-            "requested mode when --solve-method=rigid-components."
+            "Lightweight Gaussian observation measurement NPZ for a requested "
+            "mode. Repeat once per requested mode."
         ),
     )
     parser.add_argument(

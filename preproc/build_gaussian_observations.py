@@ -1,8 +1,9 @@
-"""Build reusable per-mode Gaussian observation artifacts without solving modes."""
+"""Build shared Gaussian observation topology and per-mode measurements."""
 
 from __future__ import annotations
 
 import argparse
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,13 @@ import numpy as np
 from modal_surface.checkpoint_render_inputs import (
     load_fg_pixel_candidate_inputs_from_checkpoint,
 )
-from modal_surface.gaussian_observations import build_gaussian_observation_graph
+from modal_surface.gaussian_observations import (
+    build_gaussian_observation_graph,
+    build_gaussian_observation_measurements,
+    split_gaussian_observation_topology,
+    write_gaussian_observation_measurement,
+    write_gaussian_observation_topology,
+)
 from modal_surface.io import load_modal_freqs
 
 
@@ -45,8 +52,8 @@ def _freq_slug(freq_hz: float) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Build reusable per-mode foreground-Gaussian observations without "
-            "running staged or rigid modal optimization"
+            "Build one reusable foreground-Gaussian observation topology and "
+            "lightweight per-mode measurements without solving modes"
         )
     )
     parser.add_argument("--input-ckpt", type=Path, required=True)
@@ -100,21 +107,24 @@ def main() -> None:
         int(frequencies_by_view[0].shape[0]),
     )
     out_dir = args.out_dir.expanduser().resolve()
+    topology_path = out_dir / "topology.npz"
+    measurements_dir = out_dir / "measurements"
     output_paths = {
         mode_index: out_dir
+        / "measurements"
         / (
             f"mode_{mode_index:03d}_"
             f"{_freq_slug(float(frequencies_by_view[0][mode_index]))}hz.npz"
         )
         for mode_index in mode_indices
     }
-    existing = [path for path in output_paths.values() if path.exists()]
+    existing = [path for path in [topology_path, *output_paths.values()] if path.exists()]
     if existing:
         raise FileExistsError(
             "Observation output already exists: "
             + ", ".join(str(path) for path in existing)
         )
-    out_dir.mkdir(parents=True, exist_ok=True)
+    measurements_dir.mkdir(parents=True, exist_ok=True)
 
     (
         foreground_means,
@@ -131,15 +141,15 @@ def main() -> None:
     from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
 
     gaussian_tree = cKDTree(foreground_means.astype(np.float64))
-    for mode_index in mode_indices:
-        output_path = output_paths[mode_index]
+    with tempfile.TemporaryDirectory(prefix="gaussian-observation-topology-") as temp_dir:
+        reference_path = Path(temp_dir) / "reference_observations.npz"
         build_gaussian_observation_graph(
             points_world=foreground_means,
             view_config_paths=view_config_paths,
             modal_npz_paths=modal_npz_paths,
-            out_path=output_path,
+            out_path=reference_path,
             source_checkpoint=str(input_checkpoint),
-            mode_index=mode_index,
+            mode_index=mode_indices[0],
             mask_erode_iters=int(args.mask_erode_iters),
             freq_tolerance_hz=float(args.freq_tolerance_hz),
             pixel_sample_stride=int(args.pixel_sample_stride),
@@ -154,7 +164,24 @@ def main() -> None:
             rendered_accs=rendered_accumulations,
             gaussian_tree=gaussian_tree,
         )
-        print(f"Wrote Gaussian observations -> {output_path}")
+        with np.load(reference_path, allow_pickle=False) as archive:
+            reference_observations = {
+                name: archive[name] for name in archive.files
+            }
+    topology = split_gaussian_observation_topology(reference_observations)
+    measurements = build_gaussian_observation_measurements(
+        topology,
+        view_config_paths,
+        modal_npz_paths,
+        mode_indices,
+        float(args.freq_tolerance_hz),
+    )
+    write_gaussian_observation_topology(topology_path, topology)
+    print(f"Wrote Gaussian observation topology -> {topology_path}")
+    for mode_index, measurement in zip(mode_indices, measurements):
+        output_path = output_paths[mode_index]
+        write_gaussian_observation_measurement(output_path, measurement)
+        print(f"Wrote Gaussian observation measurement -> {output_path}")
 
 
 if __name__ == "__main__":

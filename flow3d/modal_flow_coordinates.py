@@ -13,6 +13,7 @@ import numpy as np
 from scipy.linalg import solve_triangular
 
 from modal_peak_pick.core.cache import ModalAnalysisCache, load_analysis_cache
+from modal_surface.gaussian_observations import load_gaussian_observation_topology
 
 
 MODAL_FLOW_COORDINATE_FORMAT = "modal_flow_coordinates"
@@ -466,49 +467,77 @@ def _load_observation_topology(
     path: Path,
     manifest_path: Path,
     source_checkpoint: str,
-    mode_index: int,
-    frequency_hz: float,
+    mode_index: int | None,
+    frequency_hz: float | None,
 ) -> _ObservationTopology:
-    with np.load(path, allow_pickle=False) as archive:
+    split_format = mode_index is None
+    if split_format:
+        arrays = load_gaussian_observation_topology(path)
+    else:
+        with np.load(path, allow_pickle=False) as archive:
+            arrays = {name: np.asarray(archive[name]) for name in archive.files}
+
+    required = {
+        "points_world",
+        "gaussian_indices",
+        "point_type",
+        "source_checkpoint",
+        "obs_point_index",
+        "obs_J",
+        "obs_contribution_weight",
+        "view_ids",
+        "view_image_width",
+        "view_image_height",
+    }
+    missing = sorted(required - set(arrays))
+    if missing:
+        raise ValueError(f"{path} is missing required fields: {missing}")
+    point_type = _scalar_string(arrays["point_type"], "point_type", path)
+    observation_source = _scalar_string(
+        arrays["source_checkpoint"], "source_checkpoint", path
+    )
+    points_world = np.asarray(arrays["points_world"], dtype=np.float32)
+    gaussian_indices = np.asarray(arrays["gaussian_indices"])
+    obs_point_index = np.asarray(arrays["obs_point_index"])
+    if split_format:
+        obs_sample_index = np.asarray(arrays["obs_sample_index"], dtype=np.int64)
+        obs_view_index = np.asarray(arrays["sample_view_index"])[obs_sample_index]
+        obs_pixels_xy = np.asarray(arrays["sample_pixels_xy"])[obs_sample_index]
+    else:
+        obs_view_index = np.asarray(arrays["obs_view_index"])
+        obs_pixels_xy = np.asarray(arrays["obs_pixels_xy"])
+    obs_j = np.asarray(arrays["obs_J"])
+    obs_weight = np.asarray(arrays["obs_contribution_weight"])
+    view_ids = _string_vector(arrays["view_ids"], "view_ids", path)
+    view_width = np.asarray(arrays["view_image_width"])
+    view_height = np.asarray(arrays["view_image_height"])
+
+    if not split_format:
+        assert mode_index is not None
+        assert frequency_hz is not None
         required = {
-            "points_world",
-            "gaussian_indices",
-            "point_type",
-            "source_checkpoint",
-            "obs_point_index",
-            "obs_view_index",
-            "obs_pixels_xy",
-            "obs_J",
-            "obs_contribution_weight",
-            "view_ids",
-            "view_image_width",
-            "view_image_height",
             "freq_hz",
             "mode_index",
         }
-        _require_npz_fields(archive, required, path)
-        point_type = _scalar_string(archive["point_type"], "point_type", path)
-        observation_source = _scalar_string(archive["source_checkpoint"], "source_checkpoint", path)
-        observation_mode_index = _scalar_int(archive["mode_index"], "mode_index", path)
-        observation_frequency = _scalar_float(archive["freq_hz"], "freq_hz", path)
-        points_world = np.asarray(archive["points_world"], dtype=np.float32)
-        gaussian_indices = np.asarray(archive["gaussian_indices"])
-        obs_point_index = np.asarray(archive["obs_point_index"])
-        obs_view_index = np.asarray(archive["obs_view_index"])
-        obs_pixels_xy = np.asarray(archive["obs_pixels_xy"])
-        obs_j = np.asarray(archive["obs_J"])
-        obs_weight = np.asarray(archive["obs_contribution_weight"])
-        view_ids = _string_vector(archive["view_ids"], "view_ids", path)
-        view_width = np.asarray(archive["view_image_width"])
-        view_height = np.asarray(archive["view_image_height"])
+        missing = sorted(required - set(arrays))
+        if missing:
+            raise ValueError(f"{path} is missing required fields: {missing}")
+        observation_mode_index = _scalar_int(
+            arrays["mode_index"], "mode_index", path
+        )
+        observation_frequency = _scalar_float(
+            arrays["freq_hz"], "freq_hz", path
+        )
 
     if point_type != "foreground_gaussian_center":
         raise ValueError(f"{path} point_type must be 'foreground_gaussian_center'")
     if observation_source != source_checkpoint:
         raise ValueError(f"{path} source_checkpoint does not match {manifest_path}")
-    if observation_mode_index != mode_index:
+    if not split_format and observation_mode_index != mode_index:
         raise ValueError(f"{path} mode_index does not match {manifest_path}")
-    if not np.isclose(observation_frequency, frequency_hz, rtol=1e-6, atol=1e-6):
+    if not split_format and not np.isclose(
+        observation_frequency, frequency_hz, rtol=1e-6, atol=1e-6
+    ):
         raise ValueError(f"{path} freq_hz does not match {manifest_path}")
     if (
         points_world.ndim != 2
@@ -630,6 +659,20 @@ def _load_manifest(path_value: str | Path) -> _ManifestData:
     expected_points: np.ndarray | None = None
     expected_indices: np.ndarray | None = None
     expected_topology: _ObservationTopology | None = None
+    shared_topology_path: Path | None = None
+    if "observation_topology_path" in payload:
+        shared_topology_path = _resolve_artifact_path(
+            path,
+            payload.get("observation_topology_path"),
+            "observation_topology_path",
+        )
+        expected_topology = _load_observation_topology(
+            shared_topology_path,
+            path,
+            source_checkpoint,
+            None,
+            None,
+        )
     for slot, raw_mode in enumerate(raw_modes):
         if not isinstance(raw_mode, dict):
             raise ValueError(f"{path} mode entries must be objects")
@@ -671,9 +714,6 @@ def _load_manifest(path_value: str | Path) -> _ManifestData:
             raise ValueError(f"{path} mode {mode_index} alpha_by_view contains duplicate views")
 
         latent_path = _resolve_artifact_path(path, raw_mode.get("latent_path"), "latent_path")
-        observation_path = _resolve_artifact_path(
-            path, raw_mode.get("observation_path"), "observation_path"
-        )
         points, phi, gaussian_indices = _load_latent_mode(
             latent_path,
             path,
@@ -681,13 +721,21 @@ def _load_manifest(path_value: str | Path) -> _ManifestData:
             mode_index,
             frequency_hz,
         )
-        topology = _load_observation_topology(
-            observation_path,
-            path,
-            source_checkpoint,
-            mode_index,
-            frequency_hz,
-        )
+        if shared_topology_path is None:
+            observation_path = _resolve_artifact_path(
+                path, raw_mode.get("observation_path"), "observation_path"
+            )
+            topology = _load_observation_topology(
+                observation_path,
+                path,
+                source_checkpoint,
+                mode_index,
+                frequency_hz,
+            )
+        else:
+            observation_path = shared_topology_path
+            assert expected_topology is not None
+            topology = expected_topology
         if alpha_view_ids != list(topology.view_ids):
             raise ValueError(
                 f"{path} mode {mode_index} alpha_by_view order must match observation view_ids"
@@ -702,7 +750,8 @@ def _load_manifest(path_value: str | Path) -> _ManifestData:
         if expected_points is None:
             expected_points = points
             expected_indices = gaussian_indices
-            expected_topology = topology
+            if expected_topology is None:
+                expected_topology = topology
         else:
             assert expected_indices is not None
             assert expected_topology is not None
@@ -710,7 +759,8 @@ def _load_manifest(path_value: str | Path) -> _ManifestData:
                 raise ValueError(f"{latent_path} points_world differs from the first mode latent")
             if not np.array_equal(gaussian_indices, expected_indices):
                 raise ValueError(f"{latent_path} gaussian_indices differs from the first mode latent")
-            _same_topology(topology, expected_topology, observation_path)
+            if shared_topology_path is None:
+                _same_topology(topology, expected_topology, observation_path)
 
         mode_indices.append(mode_index)
         frequencies.append(frequency_hz)

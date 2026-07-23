@@ -10,6 +10,7 @@ import numpy as np
 from modal_surface.checkpoint_render_inputs import (
     load_fg_pixel_candidate_inputs_from_checkpoint,
 )
+from modal_surface.gaussian_observations import load_gaussian_observation_topology
 from modal_surface.io import load_view_config
 from modal_surface.observation_coverage import (
     OBSERVATION_COVERAGE_CATEGORY_NAMES,
@@ -50,19 +51,17 @@ def _scalar(array: np.ndarray, name: str, path: Path) -> object:
     return value.item()
 
 
-def load_reference_observations(
+def load_observation_topology(
     path: Path,
     *,
     input_checkpoint: Path,
     view_config_paths: list[Path],
 ) -> dict[str, np.ndarray]:
-    if not path.exists():
-        raise FileNotFoundError(path)
-    with np.load(path, allow_pickle=False) as archive:
-        missing = sorted(_REFERENCE_REQUIRED_FIELDS - set(archive.files))
-        if missing:
-            raise ValueError(f"{path} missing required fields: {missing}")
-        reference = {name: archive[name] for name in _REFERENCE_REQUIRED_FIELDS}
+    topology = load_gaussian_observation_topology(path)
+    missing = sorted(_REFERENCE_REQUIRED_FIELDS - set(topology))
+    if missing:
+        raise ValueError(f"{path} missing required fields: {missing}")
+    reference = {name: topology[name] for name in _REFERENCE_REQUIRED_FIELDS}
     point_type = str(_scalar(reference["point_type"], "point_type", path))
     if point_type != "foreground_gaussian_center":
         raise ValueError(f"{path} has unsupported point_type={point_type!r}")
@@ -129,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
     )
-    parser.add_argument("--reference-observations", type=Path, required=True)
+    parser.add_argument("--observation-topology", type=Path, required=True)
     parser.add_argument("--out-npz", type=Path, required=True)
     parser.add_argument("--k-values", default="4,8,12,16,32")
     return parser
@@ -160,8 +159,8 @@ def _print_summary(diagnostics: ObservationCoverageDiagnostics) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
-    reference = load_reference_observations(
-        args.reference_observations,
+    reference = load_observation_topology(
+        args.observation_topology,
         input_checkpoint=args.input_ckpt,
         view_config_paths=args.view_config,
     )
@@ -169,42 +168,42 @@ def main() -> None:
         _scalar(
             reference["mask_erode_iters"],
             "mask_erode_iters",
-            args.reference_observations,
+            args.observation_topology,
         )
     )
     pixel_sample_stride = int(
         _scalar(
             reference["pixel_sample_stride"],
             "pixel_sample_stride",
-            args.reference_observations,
+            args.observation_topology,
         )
     )
     baseline_k = int(
         _scalar(
             reference["pixel_candidate_k"],
             "pixel_candidate_k",
-            args.reference_observations,
+            args.observation_topology,
         )
     )
     pixel_preselect_k = int(
         _scalar(
             reference["pixel_preselect_k"],
             "pixel_preselect_k",
-            args.reference_observations,
+            args.observation_topology,
         )
     )
     pixel_render_acc_min = float(
         _scalar(
             reference["pixel_render_acc_min"],
             "pixel_render_acc_min",
-            args.reference_observations,
+            args.observation_topology,
         )
     )
     pixel_min_contribution = float(
         _scalar(
             reference["pixel_min_contribution"],
             "pixel_min_contribution",
-            args.reference_observations,
+            args.observation_topology,
         )
     )
     k_values = parse_coverage_k_values(args.k_values, pixel_preselect_k)
@@ -253,13 +252,13 @@ def main() -> None:
         diagnostics,
         reference,
         baseline_k,
-        args.reference_observations,
+        args.observation_topology,
     )
     output = write_observation_coverage_diagnostics(
         args.out_npz,
         diagnostics,
         source_checkpoint=str(args.input_ckpt),
-        reference_observation_path=args.reference_observations,
+        reference_observation_path=args.observation_topology,
         baseline_k=baseline_k,
         baseline_k_index=baseline_k_index,
         mask_erode_iters=mask_erode_iters,
@@ -268,7 +267,7 @@ def main() -> None:
         pixel_render_acc_min=pixel_render_acc_min,
         pixel_min_contribution=pixel_min_contribution,
     )
-    print(f"Exact K={baseline_k} replay matches {args.reference_observations}")
+    print(f"Exact K={baseline_k} replay matches {args.observation_topology}")
     _print_summary(diagnostics)
     print(f"Wrote {output}")
 

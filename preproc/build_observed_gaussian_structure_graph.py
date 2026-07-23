@@ -10,6 +10,7 @@ import numpy as np
 from modal_surface.checkpoint_render_inputs import (
     load_fg_pixel_candidate_inputs_from_checkpoint,
 )
+from modal_surface.gaussian_observations import load_gaussian_observation_topology
 from modal_surface.io import load_view_config
 from modal_surface.observed_structure_graph import (
     ObservedStructureGraphConfig,
@@ -24,7 +25,6 @@ _REFERENCE_REQUIRED_FIELDS = {
     "point_type",
     "source_checkpoint",
     "obs_point_index",
-    "obs_view_index",
     "obs_contribution_weight",
     "view_ids",
     "pixel_render_acc_min",
@@ -39,22 +39,23 @@ def _scalar(array: np.ndarray, name: str, path: Path) -> object:
     return value.item()
 
 
-def load_reference_observations(
+def load_observation_topology(
     path: Path,
     *,
     input_checkpoint: Path,
     view_config_paths: list[Path],
 ) -> dict[str, np.ndarray]:
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    with np.load(path, allow_pickle=False) as archive:
-        missing = sorted(_REFERENCE_REQUIRED_FIELDS - set(archive.files))
-        if missing:
-            raise ValueError(f"{path} missing required fields: {missing}")
-        reference = {
-            name: np.asarray(archive[name])
-            for name in _REFERENCE_REQUIRED_FIELDS
-        }
+    topology = load_gaussian_observation_topology(path)
+    missing = sorted(_REFERENCE_REQUIRED_FIELDS - set(topology))
+    if missing:
+        raise ValueError(f"{path} missing required fields: {missing}")
+    reference = {
+        name: np.asarray(topology[name])
+        for name in _REFERENCE_REQUIRED_FIELDS
+    }
+    reference["obs_view_index"] = np.asarray(topology["sample_view_index"])[
+        np.asarray(topology["obs_sample_index"], dtype=np.int32)
+    ]
 
     if str(_scalar(reference["point_type"], "point_type", path)) != (
         "foreground_gaussian_center"
@@ -132,7 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
     )
-    parser.add_argument("--reference-observations", type=Path, required=True)
+    parser.add_argument("--observation-topology", type=Path, required=True)
     parser.add_argument("--out-npz", type=Path, required=True)
     parser.add_argument("--max-distance", type=float, required=True)
     parser.add_argument("--max-neighbors", type=int, default=8)
@@ -147,8 +148,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    reference = load_reference_observations(
-        args.reference_observations,
+    reference = load_observation_topology(
+        args.observation_topology,
         input_checkpoint=args.input_ckpt,
         view_config_paths=args.view_config,
     )
@@ -157,7 +158,7 @@ def main() -> None:
         _scalar(
             reference["pixel_render_acc_min"],
             "pixel_render_acc_min",
-            args.reference_observations,
+            args.observation_topology,
         )
     )
     config = ObservedStructureGraphConfig(
@@ -217,7 +218,7 @@ def main() -> None:
         args.out_npz,
         graph,
         source_checkpoint=str(args.input_ckpt),
-        topology_source_observation_path=str(args.reference_observations),
+        topology_source_observation_path=str(args.observation_topology),
         num_foreground_gaussians=fg_means.shape[0],
     )
     print(

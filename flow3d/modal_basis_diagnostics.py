@@ -25,6 +25,9 @@ from flow3d.modal_flow_coordinates import (
     _view_pixel_groups,
 )
 from modal_peak_pick.core.cache import ModalAnalysisCache
+from modal_surface.gaussian_observations import (
+    load_gaussian_observation_measurement,
+)
 
 
 MODAL_BASIS_DIAGNOSTIC_FORMAT = "modal_basis_capacity_diagnostics"
@@ -418,23 +421,45 @@ def _validate_observation_modal_values(
     if not isinstance(raw_modes, list) or len(raw_modes) != manifest.mode_indices.size:
         raise ValueError(f"{manifest_path} modes do not match the loaded manifest")
     topology = manifest.topology
+    sample_start = np.ones(topology.obs_view_index.size, dtype=bool)
+    sample_start[1:] = (
+        (topology.obs_view_index[1:] != topology.obs_view_index[:-1])
+        | np.any(
+            topology.obs_pixels_xy[1:] != topology.obs_pixels_xy[:-1],
+            axis=1,
+        )
+    )
+    sample_rows = np.flatnonzero(sample_start)
     for mode_slot, raw_mode in enumerate(raw_modes):
         if not isinstance(raw_mode, dict):
             raise ValueError(f"{manifest_path} mode entries must be objects")
-        observation_path = _resolve_manifest_path(
-            manifest_path, raw_mode.get("observation_path"), "observation_path"
-        )
-        with np.load(observation_path, allow_pickle=False) as archive:
-            if "obs_y" not in archive.files:
-                raise ValueError(f"{observation_path} is missing obs_y")
-            obs_y = np.asarray(archive["obs_y"])
-        if obs_y.shape != (topology.obs_point_index.size, 2) or not np.iscomplexobj(obs_y):
-            raise ValueError(f"{observation_path} obs_y must be complex [O,2]")
+        if "observation_measurement_path" in raw_mode:
+            observation_path = _resolve_manifest_path(
+                manifest_path,
+                raw_mode.get("observation_measurement_path"),
+                "observation_measurement_path",
+            )
+            measurement = load_gaussian_observation_measurement(observation_path)
+            obs_y = np.asarray(measurement["sample_y"])
+            value_rows = sample_rows
+        else:
+            observation_path = _resolve_manifest_path(
+                manifest_path, raw_mode.get("observation_path"), "observation_path"
+            )
+            with np.load(observation_path, allow_pickle=False) as archive:
+                if "obs_y" not in archive.files:
+                    raise ValueError(f"{observation_path} is missing obs_y")
+                obs_y = np.asarray(archive["obs_y"])
+            value_rows = np.arange(topology.obs_point_index.size)
+        if obs_y.shape != (value_rows.size, 2) or not np.iscomplexobj(obs_y):
+            raise ValueError(f"{observation_path} modal values must be complex [N,2]")
         if not np.isfinite(obs_y.real).all() or not np.isfinite(obs_y.imag).all():
-            raise ValueError(f"{observation_path} obs_y contains non-finite values")
+            raise ValueError(f"{observation_path} modal values contain non-finite values")
         for view_index, modal in enumerate(modal_views):
-            rows = np.flatnonzero(topology.obs_view_index == view_index)
-            pixels = topology.obs_pixels_xy[rows]
+            rows = np.flatnonzero(
+                topology.obs_view_index[value_rows] == view_index
+            )
+            pixels = topology.obs_pixels_xy[value_rows[rows]]
             expected = np.stack(
                 [
                     modal.mode_u[mode_slot, pixels[:, 1], pixels[:, 0]],
@@ -444,7 +469,7 @@ def _validate_observation_modal_values(
             )
             if not np.array_equal(obs_y[rows], expected):
                 raise ValueError(
-                    f"{observation_path} obs_y does not match {modal.path} for "
+                    f"{observation_path} modal values do not match {modal.path} for "
                     f"view {topology.view_ids[view_index]!r}"
                 )
 

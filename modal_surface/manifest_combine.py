@@ -11,9 +11,10 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from modal_surface.gaussian_observations import load_gaussian_observation_topology
+
 
 _MODE_ARTIFACT_FIELDS = (
-    "observation_path",
     "latent_path",
     "diagnostics_path",
     "component_diagnostics_path",
@@ -147,6 +148,30 @@ def _load_observation_topology(
         }
 
 
+def _load_split_observation_topology(path: Path) -> dict[str, np.ndarray]:
+    topology = load_gaussian_observation_topology(path)
+    obs_sample_index = np.asarray(topology["obs_sample_index"], dtype=np.int32)
+    normalized = {
+        "points_world": np.asarray(topology["points_world"]),
+        "gaussian_indices": np.asarray(topology["gaussian_indices"]),
+        "obs_point_index": np.asarray(topology["obs_point_index"]),
+        "obs_view_index": np.asarray(topology["sample_view_index"])[
+            obs_sample_index
+        ],
+        "obs_pixels_xy": np.asarray(topology["sample_pixels_xy"])[
+            obs_sample_index
+        ],
+        "obs_J": np.asarray(topology["obs_J"]),
+        "obs_contribution_weight": np.asarray(
+            topology["obs_contribution_weight"]
+        ),
+        "view_ids": np.asarray(topology["view_ids"]),
+        "view_image_width": np.asarray(topology["view_image_width"]),
+        "view_image_height": np.asarray(topology["view_image_height"]),
+    }
+    return normalized
+
+
 def _validate_same_topology(
     current: Mapping[str, np.ndarray],
     expected: Mapping[str, np.ndarray],
@@ -165,6 +190,17 @@ def _rebase_mode(
     output_path: Path,
 ) -> dict[str, Any]:
     mode = deepcopy(dict(raw_mode))
+    observation_field = (
+        "observation_measurement_path"
+        if "observation_measurement_path" in mode
+        else "observation_path"
+    )
+    observation_path = _resolve_artifact_path(
+        manifest_path,
+        mode.get(observation_field),
+        observation_field,
+    )
+    mode[observation_field] = _relative_to_output(observation_path, output_path)
     for field in _MODE_ARTIFACT_FIELDS:
         value = mode.get(field)
         if value is None and field in _OPTIONAL_MODE_ARTIFACT_FIELDS:
@@ -339,6 +375,25 @@ def combine_modal_manifests(
     for path, payload in manifests:
         indices = _validated_mode_indices(path, payload)
         parameters = payload["parameters"]
+        split_topology_path: Path | None = None
+        split_topology: dict[str, np.ndarray] | None = None
+        if "observation_topology_path" in payload:
+            split_topology_path = _resolve_artifact_path(
+                path,
+                payload.get("observation_topology_path"),
+                "observation_topology_path",
+            )
+            split_topology = _load_split_observation_topology(
+                split_topology_path
+            )
+            if expected_topology is None:
+                expected_topology = split_topology
+            else:
+                _validate_same_topology(
+                    split_topology,
+                    expected_topology,
+                    split_topology_path,
+                )
         graph_count = parameters.get("rigid_component_graph_count")
         if graph_count is not None:
             if parameters.get("rigid_component_graph_policy") != (
@@ -387,20 +442,21 @@ def combine_modal_manifests(
                         f"manifests: {shared_rigid_graph_source_path} and "
                         f"{mode_graph_source_path}"
                     )
-            topology = _load_observation_topology(path, raw_mode)
-            observation_path = _resolve_artifact_path(
-                path,
-                raw_mode.get("observation_path"),
-                "observation_path",
-            )
-            if expected_topology is None:
-                expected_topology = topology
-            else:
-                _validate_same_topology(
-                    topology,
-                    expected_topology,
-                    observation_path,
+            if split_topology is None:
+                topology = _load_observation_topology(path, raw_mode)
+                observation_path = _resolve_artifact_path(
+                    path,
+                    raw_mode.get("observation_path"),
+                    "observation_path",
                 )
+                if expected_topology is None:
+                    expected_topology = topology
+                else:
+                    _validate_same_topology(
+                        topology,
+                        expected_topology,
+                        observation_path,
+                    )
             combined_mode = _rebase_mode(path, raw_mode, output)
             if shared_rigid_graph_path is not None:
                 combined_mode["rigid_component_graph_path"] = _relative_to_output(
@@ -425,6 +481,16 @@ def combine_modal_manifests(
     combined["mode_indices"] = combined_indices
     combined["parameters"] = shared_parameters
     combined["modes"] = combined_modes
+    if "observation_topology_path" in first:
+        first_topology_path = _resolve_artifact_path(
+            first_path,
+            first.get("observation_topology_path"),
+            "observation_topology_path",
+        )
+        combined["observation_topology_path"] = _relative_to_output(
+            first_topology_path,
+            output,
+        )
     if all(value == source_modal_npzs[0] for value in source_modal_npzs[1:]):
         combined["source_modal_npzs"] = source_modal_npzs[0]
     else:
