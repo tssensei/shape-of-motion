@@ -41,9 +41,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Ordered view-to-cache mappings; order must exactly match the frame map.",
     )
     parser.add_argument(
-        "--modal-manifest",
+        "--observation-topology",
         required=True,
-        help="Current Gaussian modal manifest used to define the candidate ROI.",
+        help=(
+            "Standalone Gaussian observation topology used to define the "
+            "candidate ROI."
+        ),
     )
     parser.add_argument(
         "--modal-frame-map",
@@ -82,7 +85,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=2,
         help=(
-            "Expected interior sampling-grid stride of the manifest's candidate pixels; "
+            "Expected interior sampling-grid stride of the topology's candidate pixels; "
             "this validates the existing ROI and does not resample it."
         ),
     )
@@ -116,7 +119,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         if not cache_path.is_dir():
             raise ValueError(f"Flow cache directory does not exist: {cache_path}")
 
-    for argument_name in ("modal_manifest", "modal_frame_map"):
+    for argument_name in ("observation_topology", "modal_frame_map"):
         path = Path(getattr(args, argument_name)).expanduser()
         if not path.is_file():
             option_name = argument_name.replace("_", "-")
@@ -130,7 +133,7 @@ def run(args: argparse.Namespace) -> None:
 
     result = run_modal_frequency_selection(
         flow_cache_specs=args.flow_caches,
-        modal_manifest_path=args.modal_manifest,
+        observation_topology_path=args.observation_topology,
         modal_frame_map_path=args.modal_frame_map,
         output_dir=args.out_dir,
         min_freq_hz=args.min_freq_hz,

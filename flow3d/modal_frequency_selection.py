@@ -18,14 +18,14 @@ import matplotlib.pyplot as plt
 from flow3d.modal_flow_coordinates import (
     _load_and_validate_caches,
     _load_frame_map,
-    _load_manifest,
     _view_pixel_groups,
+    load_flow_observation_topology,
 )
 from modal_peak_pick.core.cache import ModalAnalysisCache
 
 
 MODAL_FREQUENCY_SELECTION_FORMAT = "modal_frequency_selection"
-MODAL_FREQUENCY_SELECTION_VERSION = 1
+MODAL_FREQUENCY_SELECTION_VERSION = 2
 
 SUMMARY_FILENAME = "frequency_selection_summary.json"
 DIAGNOSTICS_FILENAME = "frequency_selection_diagnostics.npz"
@@ -82,6 +82,64 @@ class _Fit:
 def _json_float(value: SupportsFloat) -> float | None:
     result = float(value)
     return result if np.isfinite(result) else None
+
+
+def _topology_provenance(path: Path) -> dict[str, Any]:
+    scalar_fields = (
+        "topology_id",
+        "source_checkpoint",
+        "mask_erode_iters",
+        "pixel_sample_stride",
+        "pixel_candidate_k",
+        "pixel_preselect_k",
+        "pixel_render_acc_min",
+        "pixel_min_contribution",
+        "pixel_candidate_method",
+    )
+    required_fields = set(scalar_fields) | {"source_view_configs"}
+    with np.load(path, allow_pickle=False) as archive:
+        missing = sorted(required_fields - set(archive.files))
+        if missing:
+            raise ValueError(f"{path} is missing topology provenance fields: {missing}")
+        values: dict[str, Any] = {}
+        for name in scalar_fields:
+            array = np.asarray(archive[name])
+            if array.shape != ():
+                raise ValueError(f"{path} {name} must be scalar")
+            value = array.item()
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            values[name] = value
+        source_view_configs_array = np.asarray(archive["source_view_configs"])
+        if source_view_configs_array.ndim != 1:
+            raise ValueError(f"{path} source_view_configs must be one-dimensional")
+        source_view_configs = [
+            value.decode("utf-8") if isinstance(value, bytes) else str(value)
+            for value in source_view_configs_array.tolist()
+        ]
+
+    for name in ("topology_id", "source_checkpoint", "pixel_candidate_method"):
+        if not isinstance(values[name], str) or not values[name]:
+            raise ValueError(f"{path} {name} must be a non-empty string")
+    integer_names = (
+        "mask_erode_iters",
+        "pixel_sample_stride",
+        "pixel_candidate_k",
+        "pixel_preselect_k",
+    )
+    for name in integer_names:
+        if isinstance(values[name], bool) or not isinstance(
+            values[name], (int, np.integer)
+        ):
+            raise ValueError(f"{path} {name} must be an integer")
+        values[name] = int(values[name])
+    for name in ("pixel_render_acc_min", "pixel_min_contribution"):
+        value = float(values[name])
+        if not np.isfinite(value):
+            raise ValueError(f"{path} {name} must be finite")
+        values[name] = value
+    values["source_view_configs"] = source_view_configs
+    return values
 
 
 def _validate_positive_int(value: int, name: str) -> int:
@@ -798,7 +856,7 @@ def _validate_output(path: Path, mode_counts: np.ndarray, view_count: int) -> No
 def run_modal_frequency_selection(
     *,
     flow_cache_specs: Sequence[str],
-    modal_manifest_path: str | Path,
+    observation_topology_path: str | Path,
     modal_frame_map_path: str | Path,
     output_dir: str | Path,
     min_freq_hz: float,
@@ -821,13 +879,19 @@ def run_modal_frequency_selection(
     requested_counts = _validate_mode_counts(mode_counts, frequencies_hz.size)
 
     frame_map = _load_frame_map(modal_frame_map_path)
-    manifest = _load_manifest(modal_manifest_path)
-    topology = manifest.topology
-    manifest_source = manifest.path
-    baseline_mode_indices = manifest.mode_indices.copy()
-    baseline_frequencies = manifest.frequencies_hz.copy()
+    topology_source = Path(observation_topology_path).expanduser().resolve(strict=True)
+    topology = load_flow_observation_topology(topology_source)
+    topology_provenance = _topology_provenance(topology_source)
+    if len(topology_provenance["source_view_configs"]) != len(topology.view_ids):
+        raise ValueError(
+            f"{topology_source} source_view_configs count does not match its views"
+        )
+    if stride != topology_provenance["pixel_sample_stride"]:
+        raise ValueError(
+            f"--pixel-stride={stride} does not match observation topology "
+            f"pixel_sample_stride={topology_provenance['pixel_sample_stride']}"
+        )
     caches = _load_and_validate_caches(frame_map, topology, flow_cache_specs)
-    del manifest
     for view_id, cache in zip(frame_map.view_ids, caches):
         if float(frequencies_hz[-1]) > 0.5 * cache.fps + 1e-12:
             raise ValueError(
@@ -1027,11 +1091,34 @@ def run_modal_frequency_selection(
                 "complex_pair_columns": ["real", "negative_imaginary"],
             },
             "source": {
-                "modal_manifest": str(manifest_source),
+                "observation_topology": str(topology_source),
+                "topology_id": topology_provenance["topology_id"],
+                "source_checkpoint": topology_provenance["source_checkpoint"],
+                "source_view_configs": topology_provenance["source_view_configs"],
+                "topology_view_ids": list(topology.view_ids),
+                "topology_sampling": {
+                    "mask_erode_iters": topology_provenance["mask_erode_iters"],
+                    "pixel_sample_stride": topology_provenance[
+                        "pixel_sample_stride"
+                    ],
+                    "pixel_candidate_k": topology_provenance[
+                        "pixel_candidate_k"
+                    ],
+                    "pixel_preselect_k": topology_provenance[
+                        "pixel_preselect_k"
+                    ],
+                    "pixel_render_acc_min": topology_provenance[
+                        "pixel_render_acc_min"
+                    ],
+                    "pixel_min_contribution": topology_provenance[
+                        "pixel_min_contribution"
+                    ],
+                    "pixel_candidate_method": topology_provenance[
+                        "pixel_candidate_method"
+                    ],
+                },
                 "modal_frame_map": str(frame_map.path),
                 "flow_caches": [str(cache.path.resolve()) for cache in caches],
-                "baseline_manifest_mode_indices": baseline_mode_indices.tolist(),
-                "baseline_manifest_frequencies_hz": baseline_frequencies.tolist(),
             },
             "timings_seconds": {
                 "input_validation": validation_seconds,

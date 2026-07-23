@@ -44,6 +44,7 @@ __all__ = [
     "SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS",
     "ModalFlowCoordinates",
     "evaluate_modal_flow_coordinate_sets",
+    "load_flow_observation_topology",
     "load_modal_coordinate_provenance",
     "load_modal_flow_coordinates",
     "parse_flow_cache_specs",
@@ -466,7 +467,7 @@ def _load_latent_mode(
 def _load_observation_topology(
     path: Path,
     manifest_path: Path,
-    source_checkpoint: str,
+    source_checkpoint: str | None,
     mode_index: int | None,
     frequency_hz: float | None,
 ) -> _ObservationTopology:
@@ -531,7 +532,7 @@ def _load_observation_topology(
 
     if point_type != "foreground_gaussian_center":
         raise ValueError(f"{path} point_type must be 'foreground_gaussian_center'")
-    if observation_source != source_checkpoint:
+    if source_checkpoint is not None and observation_source != source_checkpoint:
         raise ValueError(f"{path} source_checkpoint does not match {manifest_path}")
     if not split_format and observation_mode_index != mode_index:
         raise ValueError(f"{path} mode_index does not match {manifest_path}")
@@ -617,6 +618,15 @@ def _load_observation_topology(
         view_image_width=view_width.astype(np.int64),
         view_image_height=view_height.astype(np.int64),
     )
+
+
+def load_flow_observation_topology(
+    path_value: str | Path,
+) -> _ObservationTopology:
+    """Load standalone split observation topology for flow-space analysis."""
+
+    path = Path(path_value).expanduser().resolve(strict=True)
+    return _load_observation_topology(path, path, None, None, None)
 
 
 def _same_topology(current: _ObservationTopology, expected: _ObservationTopology, path: Path) -> None:

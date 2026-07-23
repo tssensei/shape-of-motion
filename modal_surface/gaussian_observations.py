@@ -23,46 +23,6 @@ OBSERVATION_TOPOLOGY_FORMAT = "gaussian_observation_topology"
 OBSERVATION_MEASUREMENT_FORMAT = "gaussian_observation_measurement"
 OBSERVATION_SPLIT_VERSION = 1
 
-
-def _load_view_inputs(
-    view_config_paths: Sequence[str | Path],
-    modal_npz_paths: Sequence[str | Path],
-    mode_index: int,
-    freq_tolerance_hz: float,
-) -> tuple[list[ViewConfig], list[dict[str, np.ndarray]], np.ndarray, float]:
-    if len(view_config_paths) != len(modal_npz_paths):
-        raise ValueError("--view-config and --modal-npz must be supplied the same number of times.")
-    if len(view_config_paths) < 1:
-        raise ValueError("At least one view is required.")
-    if mode_index < 0:
-        raise ValueError("mode_index must be non-negative.")
-    if freq_tolerance_hz < 0:
-        raise ValueError("freq_tolerance_hz must be non-negative.")
-
-    configs: list[ViewConfig] = []
-    modals: list[dict[str, np.ndarray]] = []
-    freqs: list[float] = []
-    for cfg_path, modal_path in zip(view_config_paths, modal_npz_paths):
-        cfg = load_view_config(cfg_path)
-        modal = load_modal_npz(modal_path)
-        ensure_modal_shape(modal, (cfg.image_height, cfg.image_width))
-        if mode_index >= modal["mode_u"].shape[0]:
-            raise ValueError(f"mode_index={mode_index} is out of range for {modal_path}.")
-        freq_hz = float(modal["selected_freqs_hz"][mode_index])
-        configs.append(cfg)
-        modals.append(modal)
-        freqs.append(freq_hz)
-
-    reference_freq_hz = freqs[0]
-    for cfg, freq_hz in zip(configs[1:], freqs[1:]):
-        if abs(reference_freq_hz - freq_hz) > freq_tolerance_hz:
-            raise ValueError(
-                f"Mode frequency mismatch for {cfg.view_id}: reference={reference_freq_hz:.6f}, "
-                f"target={freq_hz:.6f}."
-            )
-    return configs, modals, np.asarray(freqs, dtype=np.float32), reference_freq_hz
-
-
 def require_scipy_kdtree():
     try:
         from scipy.spatial import cKDTree # pyright: ignore[reportAttributeAccessIssue]
@@ -209,7 +169,7 @@ def score_pixel_gaussian_candidates(
     )
 
 
-def _append_view_pixel_candidate_observations(
+def _append_view_pixel_candidate_topology(
     points_world: np.ndarray,
     gaussian_tree: Any,
     gaussian_scales: np.ndarray,
@@ -219,13 +179,10 @@ def _append_view_pixel_candidate_observations(
     rendered_acc: np.ndarray,
     view_index: int,
     cfg: ViewConfig,
-    modal: dict[str, np.ndarray],
-    mode_index: int,
     mask_erode_iters: int,
     obs_point_indices: list[int],
     obs_view_indices: list[int],
     obs_pixels: list[list[float]],
-    obs_y: list[list[complex]],
     obs_j: list[np.ndarray],
     obs_camera_z: list[float],
     obs_contribution_weight: list[float],
@@ -248,9 +205,6 @@ def _append_view_pixel_candidate_observations(
     visible_mask = valid_mask & valid_depth & valid_acc
     if not np.any(visible_mask):
         return 0
-
-    mode_u = modal["mode_u"][mode_index].astype(np.complex64)
-    mode_v = modal["mode_v"][mode_index].astype(np.complex64)
 
     ys = np.arange(1, cfg.image_height - 1, int(pixel_sample_stride), dtype=np.int32)
     xs = np.arange(1, cfg.image_width - 1, int(pixel_sample_stride), dtype=np.int32)
@@ -317,8 +271,6 @@ def _append_view_pixel_candidate_observations(
             continue
         weights = (scores / denom).astype(np.float32)
         jacobians = projection_jacobian(points_world[candidate_indices], cfg.K, cfg.world_to_camera)
-        y_u = complex(mode_u[int(y), int(x)])
-        y_v = complex(mode_v[int(y), int(x)])
         for row_idx, (point_idx, score, contribution_weight) in enumerate(
             zip(candidate_indices.tolist(), scores.tolist(), weights.tolist())
         ):
@@ -326,7 +278,6 @@ def _append_view_pixel_candidate_observations(
             obs_point_indices.append(int(point_idx))
             obs_view_indices.append(view_index)
             obs_pixels.append([float(x), float(y)])
-            obs_y.append([y_u, y_v])
             obs_j.append(jacobians[row_idx].astype(np.float32))
             obs_camera_z.append(candidate_z)
             obs_contribution_weight.append(float(contribution_weight))
@@ -360,7 +311,53 @@ def build_gaussian_observation_graph(
     gaussian_tree: Any | None = None,
 ) -> Path:
     """Build an N-view observation graph, optionally reusing a Gaussian KD-tree."""
-    # data validation & format unification
+    topology = build_gaussian_observation_topology(
+        points_world=points_world,
+        view_config_paths=view_config_paths,
+        source_checkpoint=source_checkpoint,
+        mask_erode_iters=mask_erode_iters,
+        pixel_sample_stride=pixel_sample_stride,
+        pixel_candidate_k=pixel_candidate_k,
+        pixel_preselect_k=pixel_preselect_k,
+        pixel_render_acc_min=pixel_render_acc_min,
+        pixel_min_contribution=pixel_min_contribution,
+        gaussian_scales=gaussian_scales,
+        gaussian_quats=gaussian_quats,
+        gaussian_opacities=gaussian_opacities,
+        rendered_depths=rendered_depths,
+        rendered_accs=rendered_accs,
+        gaussian_tree=gaussian_tree,
+    )
+    measurement = build_gaussian_observation_measurements(
+        topology,
+        modal_npz_paths,
+        [mode_index],
+        freq_tolerance_hz,
+    )[0]
+    observations = compose_gaussian_observations(topology, measurement)
+    out = Path(out_path)
+    save_npz_compressed_atomic(out, observations)
+    return out
+
+
+def build_gaussian_observation_topology(
+    points_world: np.ndarray,
+    view_config_paths: Sequence[str | Path],
+    source_checkpoint: str | Path,
+    mask_erode_iters: int = 1,
+    pixel_sample_stride: int = 4,
+    pixel_candidate_k: int = 4,
+    pixel_preselect_k: int = 32,
+    pixel_render_acc_min: float = 0.05,
+    pixel_min_contribution: float = 1e-12,
+    gaussian_scales: np.ndarray | None = None,
+    gaussian_quats: np.ndarray | None = None,
+    gaussian_opacities: np.ndarray | None = None,
+    rendered_depths: Sequence[np.ndarray] | None = None,
+    rendered_accs: Sequence[np.ndarray] | None = None,
+    gaussian_tree: Any | None = None,
+) -> dict[str, np.ndarray]:
+    """Build mode-independent Gaussian/view/pixel observation topology."""
     validate_pixel_candidate_args(
         pixel_sample_stride,
         pixel_candidate_k,
@@ -368,12 +365,13 @@ def build_gaussian_observation_graph(
         pixel_render_acc_min,
         pixel_min_contribution,
     )
-    configs, modals, view_freqs_hz, reference_freq_hz = _load_view_inputs(
-        view_config_paths,
-        modal_npz_paths,
-        mode_index,
-        freq_tolerance_hz,
-    )
+    if not view_config_paths:
+        raise ValueError("At least one view is required.")
+    configs = [load_view_config(path) for path in view_config_paths]
+    view_ids = [cfg.view_id for cfg in configs]
+    if len(set(view_ids)) != len(view_ids):
+        raise ValueError("View configs must contain unique view IDs.")
+
     points_world_all = np.asarray(points_world, dtype=np.float32)
     if points_world_all.ndim != 2 or points_world_all.shape[1] != 3:
         raise ValueError(f"points_world must have shape (N,3), got {points_world_all.shape}.")
@@ -400,7 +398,6 @@ def build_gaussian_observation_graph(
     obs_point_indices: list[int] = []
     obs_view_indices: list[int] = []
     obs_pixels: list[list[float]] = []
-    obs_y: list[list[complex]] = []
     obs_j: list[np.ndarray] = []
     obs_camera_z: list[float] = []
     obs_contribution_weight: list[float] = []
@@ -409,8 +406,8 @@ def build_gaussian_observation_graph(
     obs_surface_pixels: list[list[float]] = []
     obs_surface_camera_z: list[float] = []
     observations_per_view: list[int] = []
-    for view_index, (cfg, modal) in enumerate(zip(configs, modals)):
-        count = _append_view_pixel_candidate_observations(
+    for view_index, cfg in enumerate(configs):
+        count = _append_view_pixel_candidate_topology(
             points_world_all,
             gaussian_tree,
             gaussian_scales,
@@ -420,13 +417,10 @@ def build_gaussian_observation_graph(
             rendered_accs[view_index],
             view_index,
             cfg,
-            modal,
-            mode_index,
             mask_erode_iters,
             obs_point_indices,
             obs_view_indices,
             obs_pixels,
-            obs_y,
             obs_j,
             obs_camera_z,
             obs_contribution_weight,
@@ -451,7 +445,6 @@ def build_gaussian_observation_graph(
     gaus_view_obs_mask = np.zeros((points_world_all.shape[0], len(configs)), dtype=bool)
     gaus_view_obs_mask[obs_point_arr, obs_view_arr] = True
     counts = gaus_view_obs_mask.sum(axis=1).astype(np.int32)
-
     for key, values in (
         ("obs_contribution_weight", obs_contribution_weight),
         ("obs_contribution_score", obs_contribution_score),
@@ -462,76 +455,63 @@ def build_gaussian_observation_graph(
         if len(values) != obs_point_arr.shape[0]:
             raise ValueError(f"Internal error: {key} count does not match observations.")
 
-    out = Path(out_path)
-    save_npz_compressed_atomic(
-        out,
-        {
-            "points_world": points_world_all,
-            "gaussian_indices": np.arange(points_world_all.shape[0], dtype=np.int32),
-            "point_type": np.array("foreground_gaussian_center"),
-            "source_checkpoint": np.array(str(source_checkpoint)),
-            "obs_point_index": obs_point_arr.astype(np.int32),
-            "obs_view_index": obs_view_arr.astype(np.int32),
-            "obs_pixels_xy": np.asarray(obs_pixels, dtype=np.float32),
-            "obs_y": np.asarray(obs_y, dtype=np.complex64),
-            "obs_J": np.asarray(obs_j, dtype=np.float32),
-            "obs_camera_z": np.asarray(obs_camera_z, dtype=np.float32),
-            "obs_count_per_point": counts,
-            "obs_sample_count_per_point": sample_counts.astype(np.int32),
-            "view_ids": np.asarray([cfg.view_id for cfg in configs]),
-            "view_image_width": np.asarray(
-                [cfg.image_width for cfg in configs], dtype=np.int32
-            ),
-            "view_image_height": np.asarray(
-                [cfg.image_height for cfg in configs], dtype=np.int32
-            ),
-            "view_freqs_hz": view_freqs_hz.astype(np.float32),
-            "freq_hz": np.array(reference_freq_hz, dtype=np.float32),
-            "mode_index": np.array(mode_index, dtype=np.int32),
-            "mask_erode_iters": np.array(mask_erode_iters, dtype=np.int32),
-            "candidate_point_count": np.array(
-                points_world_all.shape[0], dtype=np.int32
-            ),
-            "preserved_all_points": np.array(True),
-            "pixel_sample_stride": np.array(pixel_sample_stride, dtype=np.int32),
-            "pixel_candidate_k": np.array(pixel_candidate_k, dtype=np.int32),
-            "pixel_preselect_k": np.array(pixel_preselect_k, dtype=np.int32),
-            "pixel_render_acc_min": np.array(
-                pixel_render_acc_min, dtype=np.float32
-            ),
-            "pixel_min_contribution": np.array(
-                pixel_min_contribution, dtype=np.float32
-            ),
-            "pixel_candidate_method": np.array(
-                "rendered_depth_gaussian_contribution"
-            ),
-            "observations_per_view": np.asarray(
-                observations_per_view, dtype=np.int32
-            ),
-            "source_view_configs": np.asarray(
-                [str(path) for path in view_config_paths]
-            ),
-            "source_modal_npzs": np.asarray(
-                [str(path) for path in modal_npz_paths]
-            ),
-            "obs_contribution_weight": np.asarray(
-                obs_contribution_weight, dtype=np.float32
-            ),
-            "obs_contribution_score": np.asarray(
-                obs_contribution_score, dtype=np.float32
-            ),
-            "obs_contribution_sum": np.asarray(
-                obs_contribution_sum, dtype=np.float32
-            ),
-            "obs_surface_pixels_xy": np.asarray(
-                obs_surface_pixels, dtype=np.float32
-            ),
-            "obs_surface_camera_z": np.asarray(
-                obs_surface_camera_z, dtype=np.float32
-            ),
-        },
-    )
-    return out
+    topology_source = {
+        "points_world": points_world_all,
+        "gaussian_indices": np.arange(points_world_all.shape[0], dtype=np.int32),
+        "point_type": np.array("foreground_gaussian_center"),
+        "source_checkpoint": np.array(str(source_checkpoint)),
+        "obs_point_index": obs_point_arr.astype(np.int32),
+        "obs_view_index": obs_view_arr.astype(np.int32),
+        "obs_pixels_xy": np.asarray(obs_pixels, dtype=np.float32),
+        "obs_J": np.asarray(obs_j, dtype=np.float32),
+        "obs_camera_z": np.asarray(obs_camera_z, dtype=np.float32),
+        "obs_count_per_point": counts,
+        "obs_sample_count_per_point": sample_counts.astype(np.int32),
+        "view_ids": np.asarray(view_ids),
+        "view_image_width": np.asarray(
+            [cfg.image_width for cfg in configs], dtype=np.int32
+        ),
+        "view_image_height": np.asarray(
+            [cfg.image_height for cfg in configs], dtype=np.int32
+        ),
+        "mask_erode_iters": np.array(mask_erode_iters, dtype=np.int32),
+        "candidate_point_count": np.array(
+            points_world_all.shape[0], dtype=np.int32
+        ),
+        "preserved_all_points": np.array(True),
+        "pixel_sample_stride": np.array(pixel_sample_stride, dtype=np.int32),
+        "pixel_candidate_k": np.array(pixel_candidate_k, dtype=np.int32),
+        "pixel_preselect_k": np.array(pixel_preselect_k, dtype=np.int32),
+        "pixel_render_acc_min": np.array(pixel_render_acc_min, dtype=np.float32),
+        "pixel_min_contribution": np.array(
+            pixel_min_contribution, dtype=np.float32
+        ),
+        "pixel_candidate_method": np.array(
+            "rendered_depth_gaussian_contribution"
+        ),
+        "observations_per_view": np.asarray(
+            observations_per_view, dtype=np.int32
+        ),
+        "source_view_configs": np.asarray(
+            [str(path) for path in view_config_paths]
+        ),
+        "obs_contribution_weight": np.asarray(
+            obs_contribution_weight, dtype=np.float32
+        ),
+        "obs_contribution_score": np.asarray(
+            obs_contribution_score, dtype=np.float32
+        ),
+        "obs_contribution_sum": np.asarray(
+            obs_contribution_sum, dtype=np.float32
+        ),
+        "obs_surface_pixels_xy": np.asarray(
+            obs_surface_pixels, dtype=np.float32
+        ),
+        "obs_surface_camera_z": np.asarray(
+            obs_surface_camera_z, dtype=np.float32
+        ),
+    }
+    return split_gaussian_observation_topology(topology_source)
 
 
 def _observation_topology_id(topology: Mapping[str, np.ndarray]) -> str:
@@ -674,22 +654,35 @@ def load_gaussian_observation_topology(
 
 def build_gaussian_observation_measurements(
     topology: Mapping[str, np.ndarray],
-    view_config_paths: Sequence[str | Path],
     modal_npz_paths: Sequence[str | Path],
     mode_indices: Sequence[int],
     freq_tolerance_hz: float,
 ) -> list[dict[str, np.ndarray]]:
     if not mode_indices:
         raise ValueError("At least one mode index is required.")
-    configs, modals, _, _ = _load_view_inputs(
-        view_config_paths,
-        modal_npz_paths,
-        int(mode_indices[0]),
-        freq_tolerance_hz,
-    )
     topology_view_ids = np.asarray(topology["view_ids"]).astype(str)
-    if topology_view_ids.tolist() != [cfg.view_id for cfg in configs]:
-        raise ValueError("Observation topology views do not match the supplied view configs.")
+    view_widths = np.asarray(topology["view_image_width"], dtype=np.int32)
+    view_heights = np.asarray(topology["view_image_height"], dtype=np.int32)
+    if len(modal_npz_paths) != topology_view_ids.size:
+        raise ValueError(
+            "One --modal-npz must be supplied for each observation topology view."
+        )
+    if (
+        view_widths.shape != topology_view_ids.shape
+        or view_heights.shape != topology_view_ids.shape
+    ):
+        raise ValueError("Observation topology view dimensions have invalid shapes.")
+    if freq_tolerance_hz < 0:
+        raise ValueError("freq_tolerance_hz must be non-negative.")
+
+    modals: list[dict[str, np.ndarray]] = []
+    for view_index, modal_path in enumerate(modal_npz_paths):
+        modal = load_modal_npz(modal_path)
+        ensure_modal_shape(
+            modal,
+            (int(view_heights[view_index]), int(view_widths[view_index])),
+        )
+        modals.append(modal)
 
     sample_view_index = np.asarray(topology["sample_view_index"], dtype=np.int32)
     sample_pixels_xy = np.asarray(topology["sample_pixels_xy"], dtype=np.float32)
@@ -712,8 +705,12 @@ def build_gaussian_observation_measurements(
         values = np.empty((sample_view_index.size, 2), dtype=np.complex64)
         for view_index, modal in enumerate(modals):
             rows = sample_view_index == view_index
-            values[rows, 0] = modal["mode_u"][mode_index, sample_y[rows], sample_x[rows]]
-            values[rows, 1] = modal["mode_v"][mode_index, sample_y[rows], sample_x[rows]]
+            values[rows, 0] = modal["mode_u"][
+                mode_index, sample_y[rows], sample_x[rows]
+            ]
+            values[rows, 1] = modal["mode_v"][
+                mode_index, sample_y[rows], sample_x[rows]
+            ]
         measurements.append(
             {
                 "format": np.array(OBSERVATION_MEASUREMENT_FORMAT),
