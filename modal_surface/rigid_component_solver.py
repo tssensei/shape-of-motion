@@ -200,8 +200,6 @@ def select_trusted_rigid_component_seeds(
         np.int32
     )
     dominant_view_node_count = np.max(valid_view_node_count, axis=1)
-    if np.any(dominant_view_node_count < 1):
-        raise ValueError("a rigid component has no valid-view node support")
     supported_view_mask = (
         (valid_view_node_count > 0)
         & (
@@ -218,9 +216,11 @@ def select_trusted_rigid_component_seeds(
         secondary_view_node_count = sorted_view_node_count[:, -2]
     else:
         secondary_view_node_count = np.zeros((num_components,), dtype=np.int64)
-    secondary_view_node_ratio = (
-        secondary_view_node_count.astype(np.float64)
-        / dominant_view_node_count.astype(np.float64)
+    secondary_view_node_ratio = np.divide(
+        secondary_view_node_count.astype(np.float64),
+        dominant_view_node_count.astype(np.float64),
+        out=np.zeros((num_components,), dtype=np.float64),
+        where=dominant_view_node_count > 0,
     )
     singular_ratio = np.zeros((num_components,), dtype=np.float64)
     full_rank = (rank == 6) & (singular[:, 0] > 0.0)
@@ -611,22 +611,9 @@ def solve_rigid_components(
             row_offsets[component_idx] : row_offsets[component_idx + 1]
         ]
         if rows.size == 0:
-            graph_idx = int(selected_graph_components[component_idx])
-            component_nodes = ordered_rigid_indices[
-                node_offsets[component_idx] : node_offsets[component_idx + 1]
-            ]
-            involved_views = np.unique(
-                prepared.obs_view_index[
-                    np.concatenate(
-                        [prepared.rows_by_point[node] for node in component_nodes]
-                    )
-                ]
-            )
-            raise ValueError(
-                "rigid component has no positive-weight row in an alpha-identifiable "
-                f"view: rigid_component={component_idx}, graph_component={graph_idx}, "
-                f"nodes={component_nodes.tolist()}, views={involved_views.tolist()}"
-            )
+            # Alpha exclusion can remove a component's only observed views.
+            # Its zero field remains an ordinary downstream motion-fill target.
+            continue
 
         row_points = prepared.obs_point_index[rows]
         centered = points[row_points] - component_centroid[component_idx]

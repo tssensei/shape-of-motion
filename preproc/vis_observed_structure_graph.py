@@ -1585,7 +1585,7 @@ def load_rigid_manifest(
         if (
             component_valid_view_count.shape != (num_components,)
             or not np.issubdtype(component_valid_view_count.dtype, np.integer)
-            or np.any(component_valid_view_count < 1)
+            or np.any(component_valid_view_count < 0)
             or np.any(component_valid_view_count > len(graph.view_ids))
         ):
             raise ValueError(
@@ -1633,9 +1633,11 @@ def load_rigid_manifest(
             if len(graph.view_ids) > 1
             else np.zeros((num_components,), dtype=np.int32)
         )
-        expected_secondary_view_node_ratio = (
-            secondary_view_node_count.astype(np.float64)
-            / dominant_view_node_count.astype(np.float64)
+        expected_secondary_view_node_ratio = np.divide(
+            secondary_view_node_count.astype(np.float64),
+            dominant_view_node_count.astype(np.float64),
+            out=np.zeros((num_components,), dtype=np.float64),
+            where=dominant_view_node_count > 0,
         ).astype(np.float32)
         if (
             component_supported_view_count.shape != (num_components,)

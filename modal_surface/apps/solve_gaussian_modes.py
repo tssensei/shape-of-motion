@@ -1032,6 +1032,11 @@ def _rigid_gaussian_latent_stats(
             np.count_nonzero(prepared.obs_count_per_point == 0)
         ),
         "rigid_component_count": int(rigid.num_components),
+        "zero_usable_row_component_count": int(
+            np.count_nonzero(
+                rigid.component_usable_observation_row_count == 0
+            )
+        ),
         "rank_deficient_component_count": int(
             np.count_nonzero(rigid.component_rank < 6)
         ),
@@ -2330,9 +2335,15 @@ def run(args: argparse.Namespace) -> None:
             supported_view_count = (
                 seed_selection.component_supported_valid_view_count
             )
+            zero_usable_row_count = int(
+                np.count_nonzero(
+                    rigid.component_usable_observation_row_count == 0
+                )
+            )
             print(
                 "Rigid view support: "
                 f"components={rigid.num_components}, "
+                f"zero_usable_rows={zero_usable_row_count}, "
                 f"raw_multiview={int(np.count_nonzero(raw_view_count >= 2))}, "
                 f"supported_multiview={int(np.count_nonzero(supported_view_count >= 2))}, "
                 f"downgraded={int(np.count_nonzero(raw_view_count > supported_view_count))}, "

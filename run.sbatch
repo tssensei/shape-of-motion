@@ -54,8 +54,8 @@ done
 
 for output_name in "$PHASE_NAME" "$BOUNDED_COMPLEX_NAME"; do
   output_dir=$FIELD_ROOT/$output_name
-  if [[ -e "$output_dir" ]]; then
-    echo "Refusing to overwrite existing output: $output_dir" >&2
+  if [[ -e "$output_dir" && ! -f "$output_dir/modal_modes_manifest.json" ]]; then
+    echo "Refusing to overwrite incomplete existing output: $output_dir" >&2
     exit 1
   fi
 done
@@ -122,6 +122,11 @@ run_variant() {
   local output_name=$2
   local output_dir=$FIELD_ROOT/$output_name
   local log_path=$LOG_DIR/$output_name.log
+
+  if [[ -f "$output_dir/modal_modes_manifest.json" ]]; then
+    echo "[$(date --iso-8601=seconds)] Skipping completed $alpha_model -> $output_dir"
+    return
+  fi
 
   echo "[$(date --iso-8601=seconds)] Starting $alpha_model -> $output_dir"
   PYTHONPATH=. python -u -m modal_surface \
