@@ -26,17 +26,25 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
         choices=["staged", "rigid-components"],
         default="staged",
         help=(
-            "Run the existing staged per-Gaussian solve, or consume prebuilt "
-            "observed structure graphs and solve one rigid twist per component."
+            "Run the existing staged per-Gaussian solve, or consume one prebuilt "
+            "shared observed structure graph and solve one rigid twist per component."
         ),
     )
     parser.add_argument(
         "--rigid-component-graph",
+        type=str,
+        help=(
+            "One shared version-3 observed Gaussian structure graph NPZ for all "
+            "requested modes when --solve-method=rigid-components."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-component-observation",
         action="append",
         default=[],
         help=(
-            "Observed Gaussian structure graph NPZ. Repeat once per requested "
-            "mode when --solve-method=rigid-components."
+            "Gaussian observation NPZ for a requested mode. Repeat once per "
+            "requested mode when --solve-method=rigid-components."
         ),
     )
     parser.add_argument(

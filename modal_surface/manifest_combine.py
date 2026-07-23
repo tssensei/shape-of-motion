@@ -220,17 +220,14 @@ def _shared_parameters(
             "rigid_component_graph_count must be declared by every input manifest"
         )
     if rigid_count_declared:
-        graph_policy = shared.get("rigid_component_graph_policy", "mode_bound")
-        if graph_policy not in {"mode_bound", "shared_observation_topology"}:
+        if shared.get("rigid_component_graph_policy") != (
+            "shared_observation_topology"
+        ):
             raise ValueError(
-                "rigid_component_graph_policy must be mode_bound or "
+                "rigid_component_graph_policy must be "
                 "shared_observation_topology"
             )
-        shared["rigid_component_graph_count"] = (
-            1
-            if graph_policy == "shared_observation_topology"
-            else sum(rigid_count_declared)
-        )
+        shared["rigid_component_graph_count"] = 1
     return shared
 
 
@@ -337,25 +334,22 @@ def combine_modal_manifests(
     source_mode_indices: list[dict[str, Any]] = []
     expected_topology: dict[str, np.ndarray] | None = None
     shared_rigid_graph_path: Path | None = None
+    shared_rigid_graph_source_path: str | None = None
     seen_mode_indices: set[int] = set()
     for path, payload in manifests:
         indices = _validated_mode_indices(path, payload)
         parameters = payload["parameters"]
         graph_count = parameters.get("rigid_component_graph_count")
-        graph_policy = parameters.get(
-            "rigid_component_graph_policy",
-            "mode_bound",
-        )
         if graph_count is not None:
-            expected_graph_count = (
-                1
-                if graph_policy == "shared_observation_topology"
-                else len(indices)
-            )
-            if int(graph_count) != expected_graph_count:
+            if parameters.get("rigid_component_graph_policy") != (
+                "shared_observation_topology"
+            ):
                 raise ValueError(
-                    f"{path} rigid_component_graph_count does not match "
-                    f"{graph_policy} policy"
+                    f"{path} must use shared_observation_topology"
+                )
+            if int(graph_count) != 1:
+                raise ValueError(
+                    f"{path} rigid_component_graph_count must be 1"
                 )
         source_mode_indices.append(
             {
@@ -368,18 +362,30 @@ def combine_modal_manifests(
             if mode_index in seen_mode_indices:
                 raise ValueError(f"Duplicate mode index across manifests: {mode_index}")
             seen_mode_indices.add(mode_index)
-            if graph_policy == "shared_observation_topology":
+            if graph_count is not None:
                 mode_graph_path = _resolve_artifact_path(
                     path,
                     raw_mode.get("rigid_component_graph_path"),
                     "rigid_component_graph_path",
                 )
+                mode_graph_source_path = raw_mode.get(
+                    "rigid_component_graph_source_path"
+                )
+                if (
+                    not isinstance(mode_graph_source_path, str)
+                    or not mode_graph_source_path
+                ):
+                    raise ValueError(
+                        f"{path} is missing rigid_component_graph_source_path"
+                    )
                 if shared_rigid_graph_path is None:
                     shared_rigid_graph_path = mode_graph_path
-                elif mode_graph_path != shared_rigid_graph_path:
+                    shared_rigid_graph_source_path = mode_graph_source_path
+                elif mode_graph_source_path != shared_rigid_graph_source_path:
                     raise ValueError(
-                        "Shared rigid graph paths differ across modes or manifests: "
-                        f"{shared_rigid_graph_path} and {mode_graph_path}"
+                        "Shared rigid graph source paths differ across modes or "
+                        f"manifests: {shared_rigid_graph_source_path} and "
+                        f"{mode_graph_source_path}"
                     )
             topology = _load_observation_topology(path, raw_mode)
             observation_path = _resolve_artifact_path(
@@ -395,7 +401,13 @@ def combine_modal_manifests(
                     expected_topology,
                     observation_path,
                 )
-            combined_modes.append(_rebase_mode(path, raw_mode, output))
+            combined_mode = _rebase_mode(path, raw_mode, output)
+            if shared_rigid_graph_path is not None:
+                combined_mode["rigid_component_graph_path"] = _relative_to_output(
+                    shared_rigid_graph_path,
+                    output,
+                )
+            combined_modes.append(combined_mode)
 
     combined_modes.sort(key=lambda mode: int(mode["mode_index"]))
     combined_indices = [int(mode["mode_index"]) for mode in combined_modes]

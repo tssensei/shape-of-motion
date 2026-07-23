@@ -831,13 +831,9 @@ def _assert_observed_graph_identity(
     expected: ObservedGraphViewData,
     actual: ObservedGraphViewData,
 ) -> None:
-    if expected.mode_index != actual.mode_index:
-        raise ValueError(f"{actual.graph_path} mode_index does not match loaded graph")
-    if not np.isclose(expected.freq_hz, actual.freq_hz, rtol=0.0, atol=1.0e-6):
-        raise ValueError(f"{actual.graph_path} frequency does not match loaded graph")
     for field_name in (
         "source_checkpoint",
-        "source_observation_path",
+        "topology_source_observation_path",
         "num_foreground_gaussians",
         "view_ids",
     ):
@@ -956,8 +952,9 @@ def load_rigid_manifest(
     manifest_path = Path(path)
     if not manifest_path.is_file():
         raise ValueError(f"Rigid manifest does not exist: {manifest_path}")
-    if not graphs:
-        raise ValueError("Rigid manifest validation requires an observed graph")
+    if len(graphs) != 1:
+        raise ValueError("Rigid manifest validation requires one shared observed graph")
+    graph = graphs[0]
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     if not isinstance(manifest, dict):
@@ -991,9 +988,7 @@ def load_rigid_manifest(
     source_view_configs = tuple(
         load_view_config(path) for path in source_view_config_paths
     )
-    expected_view_ids = graphs[0].view_ids
-    if any(graph.view_ids != expected_view_ids for graph in graphs[1:]):
-        raise ValueError("Observed graph inputs do not share one view order")
+    expected_view_ids = graph.view_ids
     source_view_ids = tuple(config.view_id for config in source_view_configs)
     if source_view_ids != expected_view_ids:
         raise ValueError(
@@ -1027,6 +1022,14 @@ def load_rigid_manifest(
     parameters = manifest.get("parameters")
     if not isinstance(parameters, dict):
         raise ValueError(f"{manifest_path} parameters must be an object")
+    if parameters.get("rigid_component_graph_policy") != (
+        "shared_observation_topology"
+    ):
+        raise ValueError(
+            f"{manifest_path} must use shared_observation_topology"
+        )
+    if parameters.get("rigid_component_graph_count") != 1:
+        raise ValueError(f"{manifest_path} must declare one rigid component graph")
     motion_fill_enabled = parameters.get("motion_fill_enabled")
     if not isinstance(motion_fill_enabled, bool):
         raise ValueError(
@@ -1202,92 +1205,78 @@ def load_rigid_manifest(
     ]
     if normalized_mode_indices != listed_indices:
         raise ValueError(f"{manifest_path} mode_indices do not match modes")
-    graph_mode_indices = [graph.mode_index for graph in graphs]
-    if len(set(graph_mode_indices)) != len(graph_mode_indices):
-        raise ValueError("Observed graph inputs contain duplicate modes")
-    if set(mode_entries) != set(graph_mode_indices):
-        raise ValueError(
-            f"{manifest_path} modes do not exactly match observed graph inputs"
-        )
-
     loaded_modes: list[RigidModeViewData] = []
-    for graph in graphs:
-        if graph.source_checkpoint != source_checkpoint:
-            raise ValueError(
-                f"{manifest_path} source_checkpoint does not match {graph.graph_path}"
-            )
-        if graph.mode_index not in mode_entries:
-            raise ValueError(
-                f"{manifest_path} does not contain observed graph mode "
-                f"{graph.mode_index}"
-            )
-        entry = mode_entries[graph.mode_index]
+    if graph.source_checkpoint != source_checkpoint:
+        raise ValueError(
+            f"{manifest_path} source_checkpoint does not match {graph.graph_path}"
+        )
+    manifest_graph_path: Path | None = None
+    manifest_graph_source_path: str | None = None
+    for mode_index in listed_indices:
+        entry = mode_entries[mode_index]
         mode_freq = _manifest_number(
             entry.get("freq_hz"),
-            f"mode {graph.mode_index} freq_hz",
+            f"mode {mode_index} freq_hz",
             manifest_path,
         )
-        if not np.isclose(mode_freq, graph.freq_hz, rtol=0.0, atol=1.0e-6):
-            raise ValueError(
-                f"{manifest_path} mode {graph.mode_index} frequency does not "
-                "match graph"
-            )
-        if _manifest_string(
-            entry.get("source_observation_path"),
-            f"mode {graph.mode_index} source_observation_path",
-            manifest_path,
-        ) != graph.source_observation_path:
-            raise ValueError(
-                f"{manifest_path} mode {graph.mode_index} source observation "
-                "does not match graph"
-            )
 
         graph_path_value = _manifest_string(
             entry.get("rigid_component_graph_path"),
-            f"mode {graph.mode_index} rigid_component_graph_path",
+            f"mode {mode_index} rigid_component_graph_path",
             manifest_path,
         )
         graph_path = _manifest_artifact_path(
             manifest_path,
             graph_path_value,
-            f"mode {graph.mode_index} rigid_component_graph_path",
+            f"mode {mode_index} rigid_component_graph_path",
         )
         graph_source_path = _manifest_string(
             entry.get("rigid_component_graph_source_path"),
-            f"mode {graph.mode_index} rigid_component_graph_source_path",
+            f"mode {mode_index} rigid_component_graph_source_path",
             manifest_path,
         )
-        local_graph = _load_observed_graph_archive(graph_path)
-        _assert_observed_graph_identity(graph, local_graph)
-        allowed_graph_paths = {
-            _normalized_path(graph_path),
-            _normalized_path(graph_source_path),
-        }
-        if _normalized_path(graph.graph_path) not in allowed_graph_paths:
+        if manifest_graph_path is None:
+            manifest_graph_path = graph_path
+            manifest_graph_source_path = graph_source_path
+            local_graph = _load_observed_graph_archive(graph_path)
+            _assert_observed_graph_identity(graph, local_graph)
+            allowed_graph_paths = {
+                _normalized_path(graph_path),
+                _normalized_path(graph_source_path),
+            }
+            if _normalized_path(graph.graph_path) not in allowed_graph_paths:
+                raise ValueError(
+                    f"{graph.graph_path} is neither the manifest graph nor its "
+                    "source graph"
+                )
+        elif (
+            _normalized_path(graph_path) != _normalized_path(manifest_graph_path)
+            or graph_source_path != manifest_graph_source_path
+        ):
             raise ValueError(
-                f"{graph.graph_path} is neither the manifest graph nor its source graph"
+                f"{manifest_path} mode {mode_index} does not use the shared graph"
             )
 
         latent_path = _manifest_artifact_path(
             manifest_path,
             entry.get("latent_path"),
-            f"mode {graph.mode_index} latent_path",
+            f"mode {mode_index} latent_path",
         )
         diagnostics_path = _manifest_artifact_path(
             manifest_path,
             entry.get("diagnostics_path"),
-            f"mode {graph.mode_index} diagnostics_path",
+            f"mode {mode_index} diagnostics_path",
         )
         component_diagnostics_path = _manifest_artifact_path(
             manifest_path,
             entry.get("component_diagnostics_path"),
-            f"mode {graph.mode_index} component_diagnostics_path",
+            f"mode {mode_index} component_diagnostics_path",
         )
         if _normalized_path(diagnostics_path) != _normalized_path(
             component_diagnostics_path
         ):
             raise ValueError(
-                f"{manifest_path} mode {graph.mode_index} component diagnostics "
+                f"{manifest_path} mode {mode_index} component diagnostics "
                 "path differs"
             )
         latent = _load_npz_arrays(latent_path, _RIGID_LATENT_REQUIRED_FIELDS)
@@ -1329,15 +1318,15 @@ def load_rigid_manifest(
         latent_mode = _scalar(latent["mode_index"], "mode_index", latent_path)
         if not np.issubdtype(latent_mode.dtype, np.integer) or int(
             latent_mode.item()
-        ) != graph.mode_index:
-            raise ValueError(f"{latent_path} mode_index does not match graph")
+        ) != mode_index:
+            raise ValueError(f"{latent_path} mode_index does not match manifest")
         latent_freq = float(
             _scalar(latent["freq_hz"], "freq_hz", latent_path).item()
         )
         if not np.isfinite(latent_freq) or not np.isclose(
-            latent_freq, graph.freq_hz, rtol=0.0, atol=1.0e-6
+            latent_freq, mode_freq, rtol=0.0, atol=1.0e-6
         ):
-            raise ValueError(f"{latent_path} frequency does not match graph")
+            raise ValueError(f"{latent_path} frequency does not match manifest")
         obs_count = np.asarray(latent["obs_count_per_point"])
         if (
             obs_count.shape != (num_points,)
@@ -2401,8 +2390,8 @@ def load_rigid_manifest(
         loaded_modes.append(
             RigidModeViewData(
                 manifest_path=manifest_path,
-                mode_index=graph.mode_index,
-                freq_hz=graph.freq_hz,
+                mode_index=mode_index,
+                freq_hz=mode_freq,
                 latent_path=latent_path,
                 diagnostics_path=diagnostics_path,
                 graph_path=graph_path,
@@ -2783,7 +2772,10 @@ def load_observation_coverage(
     for graph in graphs:
         if graph.source_checkpoint != source_checkpoint:
             raise ValueError(f"{path} source_checkpoint does not match graph")
-        if graph.source_observation_path != reference_observation_path:
+        if (
+            graph.topology_source_observation_path
+            != reference_observation_path
+        ):
             raise ValueError(
                 f"{path} reference_observation_path does not match graph"
             )
@@ -2868,7 +2860,7 @@ def load_anchor_residual_diagnostics(
         "source_checkpoint",
         path,
     )
-    source_observation_path = _scalar_string(
+    _scalar_string(
         arrays["source_observation_path"],
         "source_observation_path",
         path,
@@ -2893,16 +2885,9 @@ def load_anchor_residual_diagnostics(
     num_views = len(view_ids)
     mode_index = int(_scalar(arrays["mode_index"], "mode_index", path))
     freq_hz = float(_scalar(arrays["freq_hz"], "freq_hz", path))
-    matching_graphs = [graph for graph in graphs if graph.mode_index == mode_index]
-    if len(matching_graphs) != 1:
-        raise ValueError(
-            f"{path} mode_index={mode_index} must match exactly one loaded graph"
-        )
-    matching_graph = matching_graphs[0]
-    if not np.isclose(freq_hz, matching_graph.freq_hz, rtol=0.0, atol=1.0e-6):
-        raise ValueError(f"{path} frequency does not match its observed graph")
-    if matching_graph.source_observation_path != source_observation_path:
-        raise ValueError(f"{path} source_observation_path does not match graph")
+    if len(graphs) != 1:
+        raise ValueError("Residual diagnostics require one shared observed graph")
+    matching_graph = graphs[0]
     if matching_graph.view_ids != view_ids:
         raise ValueError(f"{path} view_ids do not match graph")
     source_names = tuple(
@@ -3156,21 +3141,25 @@ class ObservedGraphViewer:
         world_center: np.ndarray,
         rigid_manifest: RigidManifestViewData | None = None,
     ) -> None:
-        if not graphs:
-            raise ValueError("Observed graph viewer requires at least one graph")
+        if len(graphs) != 1:
+            raise ValueError("Observed graph viewer requires one shared graph")
         self.server = server
         self.graphs = graphs
-        self.labels = tuple(graph.label for graph in graphs)
         self.scene_prefix = "/observed_structure_graph"
         self.rigid_modes = (
             {mode.mode_index: mode for mode in rigid_manifest.modes}
             if rigid_manifest is not None
             else {}
         )
-        if rigid_manifest is not None and set(self.rigid_modes) != {
-            graph.mode_index for graph in graphs
-        }:
-            raise ValueError("Rigid manifest modes do not match observed graphs")
+        self.rigid_modes_by_label = {
+            f"{mode.mode_index}: {mode.freq_hz:.3f} Hz": mode
+            for mode in self.rigid_modes.values()
+        }
+        self.labels = (
+            tuple(self.rigid_modes_by_label)
+            if rigid_manifest is not None
+            else (graphs[0].label,)
+        )
         self.world_center = np.asarray(world_center, dtype=np.float32)
         if self.world_center.shape != (3,) or not np.isfinite(
             self.world_center
@@ -3467,13 +3456,14 @@ class ObservedGraphViewer:
         selected = str(self.mode.value)
         if selected not in self.labels:
             raise ValueError(f"Unknown observed graph mode: {selected}")
-        return self.graphs[self.labels.index(selected)]
+        return self.graphs[0]
 
     def _selected_rigid_mode(
         self,
         graph: ObservedGraphViewData,
     ) -> RigidModeViewData | None:
-        return self.rigid_modes.get(graph.mode_index)
+        del graph
+        return self.rigid_modes_by_label.get(str(self.mode.value))
 
     def _on_playback_toggle(self, _event: Any = None) -> None:
         assert self.play is not None
@@ -3587,7 +3577,10 @@ class ObservedGraphViewer:
             graph, rigid_mode, centered_points, centered_all_points = (
                 self._current_display_geometry()
             )
-            if self._display_mode_index != graph.mode_index:
+            display_mode_index = (
+                -1 if rigid_mode is None else rigid_mode.mode_index
+            )
+            if self._display_mode_index != display_mode_index:
                 # A mode-change rebuild callback may still be queued while the
                 # playback thread advances phase. The rebuild owns that mode
                 # transition; the following playback tick will update it.
@@ -3645,7 +3638,9 @@ class ObservedGraphViewer:
             graph, rigid_mode, centered_points, centered_all_points = (
                 self._current_display_geometry()
             )
-            self._display_mode_index = graph.mode_index
+            self._display_mode_index = (
+                -1 if rigid_mode is None else rigid_mode.mode_index
+            )
             self._selected_edge_indices = np.empty((0,), dtype=np.int64)
             if bool(self.show_graph.value):
                 selected_edges = stable_uniform_edge_indices(
@@ -4413,11 +4408,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--observed-graph-npz",
         type=Path,
-        action="append",
         required=True,
         help=(
-            "Version-1 observed Gaussian structure graph NPZ artifact. Repeat "
-            "once per mode when viewing a multi-mode rigid manifest."
+            "One shared version-3 observed Gaussian structure graph NPZ artifact."
         ),
     )
     parser.add_argument(
@@ -4488,13 +4481,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 def main() -> None:
     args = build_parser().parse_args()
     _validate_args(args)
-    graphs = tuple(
-        _load_observed_graph_archive(path)
-        for path in args.observed_graph_npz
-    )
-    mode_indices = [graph.mode_index for graph in graphs]
-    if len(set(mode_indices)) != len(mode_indices):
-        raise ValueError("--observed-graph-npz inputs contain duplicate modes")
+    graphs = (_load_observed_graph_archive(args.observed_graph_npz),)
     world_center = observed_world_center(graphs)
     gaussians = (
         load_gaussian_visualization_sidecar(args.gaussian_npz, graphs)

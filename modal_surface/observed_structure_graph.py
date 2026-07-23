@@ -9,7 +9,7 @@ from typing import Mapping
 import numpy as np
 
 
-OBSERVED_STRUCTURE_GRAPH_VERSION = 2
+OBSERVED_STRUCTURE_GRAPH_VERSION = 3
 OBSERVED_STRUCTURE_GRAPH_EPSILON = 1.0e-8
 _MAD_SCALE = 1.4826
 _PROFILE_BATCH_SIZE = 65536
@@ -17,10 +17,8 @@ _OBSERVED_GRAPH_REQUIRED_FIELDS = {
     "version",
     "graph_type",
     "node_selection",
-    "mode_index",
-    "freq_hz",
     "source_checkpoint",
-    "source_observation_path",
+    "topology_source_observation_path",
     "num_foreground_gaussians",
     "node_gaussian_indices",
     "node_points_world",
@@ -273,17 +271,15 @@ class ObservedStructureGraph:
 @dataclass(frozen=True)
 class LoadedObservedStructureGraph:
     graph_path: Path
-    mode_index: int
-    freq_hz: float
     source_checkpoint: str
-    source_observation_path: str
+    topology_source_observation_path: str
     num_foreground_gaussians: int
     view_ids: tuple[str, ...]
     graph: ObservedStructureGraph
 
     @property
     def label(self) -> str:
-        return f"Mode {self.mode_index}: {self.freq_hz:.3f} Hz"
+        return "Shared observed topology"
 
     @property
     def node_gaussian_indices(self) -> np.ndarray:
@@ -1054,10 +1050,8 @@ def write_observed_structure_graph(
     path: str | Path,
     graph: ObservedStructureGraph,
     *,
-    mode_index: int,
-    freq_hz: float,
     source_checkpoint: str,
-    source_observation_path: str,
+    topology_source_observation_path: str,
     num_foreground_gaussians: int,
 ) -> Path:
     from modal_surface.io import save_npz_compressed_atomic
@@ -1067,10 +1061,10 @@ def write_observed_structure_graph(
         "version": np.array(OBSERVED_STRUCTURE_GRAPH_VERSION, dtype=np.int32),
         "graph_type": np.array("foreground_gaussian_observed_structure_graph"),
         "node_selection": np.array("positive_weight_observation_row"),
-        "mode_index": np.array(mode_index, dtype=np.int32),
-        "freq_hz": np.array(freq_hz, dtype=np.float32),
         "source_checkpoint": np.array(source_checkpoint),
-        "source_observation_path": np.array(source_observation_path),
+        "topology_source_observation_path": np.array(
+            topology_source_observation_path
+        ),
         "num_foreground_gaussians": np.array(
             num_foreground_gaussians,
             dtype=np.int32,
@@ -1271,7 +1265,7 @@ def _validate_adaptive_threshold_formula(
 def load_observed_structure_graph(
     path: str | Path,
 ) -> LoadedObservedStructureGraph:
-    """Load and strictly validate a version-2 observed structure graph."""
+    """Load and strictly validate a version-3 shared observed structure graph."""
     graph_path = Path(path)
     if not graph_path.is_file():
         raise ValueError(f"Observed graph does not exist: {graph_path}")
@@ -1285,7 +1279,7 @@ def load_observed_structure_graph(
     if not np.issubdtype(version_value.dtype, np.integer) or int(
         version_value.item()
     ) != OBSERVED_STRUCTURE_GRAPH_VERSION:
-        raise ValueError(f"{graph_path} must be a version 2 observed graph")
+        raise ValueError(f"{graph_path} must be a version 3 observed graph")
     if (
         _artifact_scalar_string(arrays["graph_type"], "graph_type", graph_path)
         != "foreground_gaussian_observed_structure_graph"
@@ -1300,9 +1294,9 @@ def load_observed_structure_graph(
         != "positive_weight_observation_row"
     ):
         raise ValueError(f"{graph_path} node_selection is incompatible")
-    source_observation_path = _artifact_scalar_string(
-        arrays["source_observation_path"],
-        "source_observation_path",
+    topology_source_observation_path = _artifact_scalar_string(
+        arrays["topology_source_observation_path"],
+        "topology_source_observation_path",
         graph_path,
     )
     source_checkpoint = _artifact_scalar_string(
@@ -1310,21 +1304,6 @@ def load_observed_structure_graph(
         "source_checkpoint",
         graph_path,
     )
-    mode_value = _artifact_scalar(arrays["mode_index"], "mode_index", graph_path)
-    if not np.issubdtype(mode_value.dtype, np.integer):
-        raise ValueError(f"{graph_path} mode_index must be an integer scalar")
-    mode_index = int(mode_value.item())
-    if mode_index < 0:
-        raise ValueError(f"{graph_path} mode_index must be non-negative")
-    freq_value = _artifact_scalar(arrays["freq_hz"], "freq_hz", graph_path)
-    if (
-        not np.issubdtype(freq_value.dtype, np.number)
-        or np.iscomplexobj(freq_value)
-        or not np.isfinite(freq_value.item())
-    ):
-        raise ValueError(f"{graph_path} freq_hz must be a finite real scalar")
-    freq_hz = float(freq_value.item())
-
     for field_name, expected_value in _EXPECTED_SEMANTICS.items():
         if (
             _artifact_scalar_string(arrays[field_name], field_name, graph_path)
@@ -1879,10 +1858,8 @@ def load_observed_structure_graph(
     )
     return LoadedObservedStructureGraph(
         graph_path=graph_path,
-        mode_index=mode_index,
-        freq_hz=freq_hz,
         source_checkpoint=source_checkpoint,
-        source_observation_path=source_observation_path,
+        topology_source_observation_path=topology_source_observation_path,
         num_foreground_gaussians=num_gaussians,
         view_ids=view_ids,
         graph=graph,
@@ -1895,36 +1872,16 @@ def validate_observed_structure_graph_sources(
     points_world: np.ndarray,
     gaussian_indices: np.ndarray,
     source_checkpoint: str,
-    source_observation_path: str | Path,
-    mode_index: int,
-    freq_hz: float,
     view_ids: np.ndarray,
     obs_point_index: np.ndarray,
     obs_view_index: np.ndarray,
     obs_weights: np.ndarray,
-    freq_tolerance_hz: float = 1.0e-6,
 ) -> None:
-    """Cross-check a loaded graph against its checkpoint and observation source."""
-    if not np.isfinite(freq_tolerance_hz) or freq_tolerance_hz < 0.0:
-        raise ValueError("freq_tolerance_hz must be finite and non-negative")
+    """Cross-check a shared graph against checkpoint and observation topology."""
     if loaded.source_checkpoint != str(source_checkpoint):
         raise ValueError(
             f"{loaded.graph_path} source_checkpoint does not match the checkpoint"
         )
-    if loaded.source_observation_path != str(source_observation_path):
-        raise ValueError(
-            f"{loaded.graph_path} source_observation_path does not match the "
-            "observation artifact"
-        )
-    if loaded.mode_index != int(mode_index):
-        raise ValueError(f"{loaded.graph_path} mode_index does not match observations")
-    if not np.isfinite(freq_hz) or not np.isclose(
-        loaded.freq_hz,
-        float(freq_hz),
-        rtol=0.0,
-        atol=freq_tolerance_hz,
-    ):
-        raise ValueError(f"{loaded.graph_path} frequency does not match observations")
 
     points = np.asarray(points_world)
     if (

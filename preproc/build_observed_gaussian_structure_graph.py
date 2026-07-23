@@ -27,8 +27,6 @@ _REFERENCE_REQUIRED_FIELDS = {
     "obs_view_index",
     "obs_contribution_weight",
     "view_ids",
-    "freq_hz",
-    "mode_index",
     "pixel_render_acc_min",
     "source_view_configs",
 }
@@ -218,14 +216,8 @@ def main() -> None:
     output = write_observed_structure_graph(
         args.out_npz,
         graph,
-        mode_index=int(
-            _scalar(reference["mode_index"], "mode_index", args.reference_observations)
-        ),
-        freq_hz=float(
-            _scalar(reference["freq_hz"], "freq_hz", args.reference_observations)
-        ),
         source_checkpoint=str(args.input_ckpt),
-        source_observation_path=str(args.reference_observations),
+        topology_source_observation_path=str(args.reference_observations),
         num_foreground_gaussians=fg_means.shape[0],
     )
     print(

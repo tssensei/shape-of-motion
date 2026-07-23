@@ -331,7 +331,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
-    graph_paths = list(args.rigid_component_graph)
+    graph_path = args.rigid_component_graph
+    observation_paths = list(args.rigid_component_observation)
     if args.solve_method == "rigid-components" and args.base_manifest is not None:
         raise ValueError(
             "--base-manifest is currently supported only with --solve-method=staged."
@@ -389,9 +390,14 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
             "--rigid-motion-fill-stage=single-view-components requires --motion-fill."
         )
     if args.solve_method == "staged":
-        if graph_paths:
+        if graph_path is not None:
             raise ValueError(
                 "--rigid-component-graph requires --solve-method=rigid-components."
+            )
+        if observation_paths:
+            raise ValueError(
+                "--rigid-component-observation requires "
+                "--solve-method=rigid-components."
             )
         if rcond != RIGID_COMPONENT_RCOND_DEFAULT:
             raise ValueError(
@@ -440,9 +446,14 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
                 "--solve-method=rigid-components."
             )
         return
-    if not graph_paths:
+    if graph_path is None:
         raise ValueError(
             "--solve-method=rigid-components requires --rigid-component-graph."
+        )
+    if not observation_paths:
+        raise ValueError(
+            "--solve-method=rigid-components requires "
+            "--rigid-component-observation."
         )
     if float(args.anchor_svd_ratio_min) != STAGED_ANCHOR_SVD_RATIO_DEFAULT:
         raise ValueError(
@@ -519,27 +530,39 @@ def _scalar_value(
     return value.item()
 
 
-def _load_rigid_component_graphs(
-    graph_paths: list[str],
+def _load_rigid_component_observations(
+    observation_paths: list[str],
     mode_indices: list[int],
-) -> dict[int, LoadedObservedStructureGraph]:
-    loaded_by_mode: dict[int, LoadedObservedStructureGraph] = {}
-    for raw_path in graph_paths:
-        loaded = load_observed_structure_graph(raw_path)
-        if loaded.mode_index in loaded_by_mode:
-            previous = loaded_by_mode[loaded.mode_index].graph_path
-            raise ValueError(
-                "Duplicate rigid component graph for mode "
-                f"{loaded.mode_index}: {previous} and {loaded.graph_path}."
+) -> dict[int, Path]:
+    loaded_by_mode: dict[int, Path] = {}
+    for raw_path in observation_paths:
+        path = Path(raw_path)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        with np.load(path, allow_pickle=False) as archive:
+            if "mode_index" not in archive.files:
+                raise ValueError(f"{path} is missing required field mode_index.")
+            mode_index = int(
+                _scalar_value(
+                    {"mode_index": np.asarray(archive["mode_index"])},
+                    "mode_index",
+                    path,
+                )
             )
-        loaded_by_mode[loaded.mode_index] = loaded
+        if mode_index in loaded_by_mode:
+            previous = loaded_by_mode[mode_index]
+            raise ValueError(
+                "Duplicate rigid component observation for mode "
+                f"{mode_index}: {previous} and {path}."
+            )
+        loaded_by_mode[mode_index] = path
     requested = set(mode_indices)
     supplied = set(loaded_by_mode)
     missing = sorted(requested - supplied)
     extra = sorted(supplied - requested)
     if missing or extra:
         raise ValueError(
-            "Rigid component graphs must match requested modes exactly: "
+            "Rigid component observations must match requested modes exactly: "
             f"missing={missing}, extra={extra}."
         )
     return loaded_by_mode
@@ -549,6 +572,7 @@ def _validate_rigid_source_observations(
     loaded_graph: LoadedObservedStructureGraph,
     observations: Mapping[str, np.ndarray],
     *,
+    source_path: Path,
     args: argparse.Namespace,
     view_config_paths: list[str],
     modal_npz_paths: list[str],
@@ -557,7 +581,6 @@ def _validate_rigid_source_observations(
     reference_freq: float,
     foreground_points: np.ndarray,
 ) -> PreparedObservations:
-    source_path = Path(loaded_graph.source_observation_path)
     required = {
         "points_world",
         "gaussian_indices",
@@ -757,14 +780,10 @@ def _validate_rigid_source_observations(
         points_world=points,
         gaussian_indices=indices,
         source_checkpoint=str(args.input_ckpt),
-        source_observation_path=loaded_graph.source_observation_path,
-        mode_index=mode_index,
-        freq_hz=observation_freq,
         view_ids=observation_view_ids,
         obs_point_index=observations["obs_point_index"],
         obs_view_index=observations["obs_view_index"],
         obs_weights=observations["obs_contribution_weight"],
-        freq_tolerance_hz=float(args.freq_tolerance_hz),
     )
     return prepare_observations(observations)
 
@@ -2036,9 +2055,14 @@ def run(args: argparse.Namespace) -> None:
     # np.array([0.359, 0.711]),  # view 2
     # np.array([0.356, 0.716]),  # view 3 ]
     mode_indices = parse_mode_indices(args.mode_indices, int(freqs_per_view[0].shape[0]))
-    rigid_graphs = (
-        _load_rigid_component_graphs(
-            list(args.rigid_component_graph),
+    rigid_graph = (
+        load_observed_structure_graph(args.rigid_component_graph)
+        if args.solve_method == "rigid-components"
+        else None
+    )
+    rigid_observations = (
+        _load_rigid_component_observations(
+            list(args.rigid_component_observation),
             mode_indices,
         )
         if args.solve_method == "rigid-components"
@@ -2138,6 +2162,13 @@ def run(args: argparse.Namespace) -> None:
             perf_counter() - graph_started
         )
 
+    rigid_graph_local_path: Path | None = None
+    if rigid_graph is not None:
+        rigid_graph_local_path = _copy_file_atomic(
+            rigid_graph.graph_path,
+            out_dir / "rigid_components" / "graph.npz",
+        )
+
     modes: list[dict[str, Any]] = []
     mode_time_profiles: dict[str, dict[str, Any]] = {}
     for mode_index in mode_indices:
@@ -2151,14 +2182,16 @@ def run(args: argparse.Namespace) -> None:
         print(f"Solving Gaussian mode {mode_name}")
         latent_path.unlink(missing_ok=True)
         if args.solve_method == "rigid-components":
+            assert rigid_graph is not None
+            assert rigid_graph_local_path is not None
             mode_profile: dict[str, Any] = {}
             stage_started = perf_counter()
-            loaded_graph = rigid_graphs[mode_index]
-            source_observation_path = Path(loaded_graph.source_observation_path)
+            source_observation_path = rigid_observations[mode_index]
             observations = _load_npz_arrays(source_observation_path)
             prepared = _validate_rigid_source_observations(
-                loaded_graph,
+                rigid_graph,
                 observations,
+                source_path=source_observation_path,
                 args=args,
                 view_config_paths=view_configs_paths,
                 modal_npz_paths=modal_npzs_paths,
@@ -2169,10 +2202,6 @@ def run(args: argparse.Namespace) -> None:
             )
             _print_observation_sanity(observations, fg_means.shape[0])
             _copy_file_atomic(source_observation_path, obs_path)
-            rigid_graph_local_path = _copy_file_atomic(
-                loaded_graph.graph_path,
-                out_dir / "rigid_components" / "graphs" / f"{mode_name}.npz",
-            )
             mode_profile["observation_input_seconds"] = float(
                 perf_counter() - stage_started
             )
@@ -2207,7 +2236,7 @@ def run(args: argparse.Namespace) -> None:
                 rigid = solve_rigid_components(
                     prepared,
                     alpha,
-                    loaded_graph.graph,
+                    rigid_graph.graph,
                     RigidComponentSolverConfig(
                         rcond=float(args.rigid_component_rcond),
                     ),
@@ -2283,7 +2312,7 @@ def run(args: argparse.Namespace) -> None:
                             alpha,
                             rigid,
                             seed_selection,
-                            loaded_graph.graph,
+                            rigid_graph.graph,
                             motion_fill_graph,
                             motion_fill_relative_path,
                             observable_singular_ratio_min=float(
@@ -2304,7 +2333,7 @@ def run(args: argparse.Namespace) -> None:
                             alpha,
                             rigid,
                             seed_selection,
-                            loaded_graph.graph,
+                            rigid_graph.graph,
                             motion_fill_graph,
                             motion_fill_relative_path,
                             observable_singular_ratio_min=float(
@@ -2333,7 +2362,7 @@ def run(args: argparse.Namespace) -> None:
                         rigid_graph_path=relative_path(
                             rigid_graph_local_path, out_dir
                         ),
-                        rigid_graph_source_path=str(loaded_graph.graph_path),
+                        rigid_graph_source_path=str(rigid_graph.graph_path),
                     )
                     raise
                 motion_fill_mode_diagnostics[mode_name] = (
@@ -2391,7 +2420,7 @@ def run(args: argparse.Namespace) -> None:
                 rigid,
                 seed_selection,
                 rigid_graph_path=relative_path(rigid_graph_local_path, out_dir),
-                rigid_graph_source_path=str(loaded_graph.graph_path),
+                rigid_graph_source_path=str(rigid_graph.graph_path),
                 motion_fill=rigid_motion_fill,
                 motion_fill_graph=motion_fill_graph,
                 motion_fill_graph_path=motion_fill_relative_path,
@@ -2422,7 +2451,7 @@ def run(args: argparse.Namespace) -> None:
                     "freqs_hz_by_view": freqs_by_view,
                     "label": f"{mode_index}: {reference_freq:.6f} Hz",
                     "observation_path": relative_path(obs_path, out_dir),
-                    "source_observation_path": loaded_graph.source_observation_path,
+                    "source_observation_path": str(source_observation_path),
                     "latent_path": relative_path(latent_path, out_dir),
                     "diagnostics_path": relative_path(diagnostics_path, out_dir),
                     "component_diagnostics_path": relative_path(
@@ -2432,7 +2461,7 @@ def run(args: argparse.Namespace) -> None:
                         rigid_graph_local_path, out_dir
                     ),
                     "rigid_component_graph_source_path": str(
-                        loaded_graph.graph_path
+                        rigid_graph.graph_path
                     ),
                     "vis_dir": relative_path(mode_vis_dir, out_dir),
                     "alpha_by_view": _alpha_by_view_diagnostics(
@@ -2585,9 +2614,10 @@ def run(args: argparse.Namespace) -> None:
     if args.solve_method == "rigid-components":
         manifest_parameters.update(
             {
-                "rigid_component_graph_count": len(rigid_graphs),
+                "rigid_component_graph_count": 1,
+                "rigid_component_graph_policy": "shared_observation_topology",
                 "rigid_component_observation_policy": (
-                    "reuse_graph_source_observation_no_rebuild"
+                    "explicit_per_mode_observation_no_rebuild"
                 ),
             }
         )
