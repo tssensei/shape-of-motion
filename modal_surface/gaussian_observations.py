@@ -184,7 +184,6 @@ def _append_view_pixel_candidate_topology(
     obs_view_indices: list[int],
     obs_pixels: list[list[float]],
     obs_j: list[np.ndarray],
-    obs_camera_z: list[float],
     obs_contribution_weight: list[float],
     obs_contribution_score: list[float],
     obs_contribution_sum: list[float],
@@ -274,12 +273,10 @@ def _append_view_pixel_candidate_topology(
         for row_idx, (point_idx, score, contribution_weight) in enumerate(
             zip(candidate_indices.tolist(), scores.tolist(), weights.tolist())
         ):
-            candidate_z = float(point_camera_z[int(point_idx)])
             obs_point_indices.append(int(point_idx))
             obs_view_indices.append(view_index)
             obs_pixels.append([float(x), float(y)])
             obs_j.append(jacobians[row_idx].astype(np.float32))
-            obs_camera_z.append(candidate_z)
             obs_contribution_weight.append(float(contribution_weight))
             obs_contribution_score.append(float(score))
             obs_contribution_sum.append(denom)
@@ -399,7 +396,6 @@ def build_gaussian_observation_topology(
     obs_view_indices: list[int] = []
     obs_pixels: list[list[float]] = []
     obs_j: list[np.ndarray] = []
-    obs_camera_z: list[float] = []
     obs_contribution_weight: list[float] = []
     obs_contribution_score: list[float] = []
     obs_contribution_sum: list[float] = []
@@ -422,7 +418,6 @@ def build_gaussian_observation_topology(
             obs_view_indices,
             obs_pixels,
             obs_j,
-            obs_camera_z,
             obs_contribution_weight,
             obs_contribution_score,
             obs_contribution_sum,
@@ -464,7 +459,6 @@ def build_gaussian_observation_topology(
         "obs_view_index": obs_view_arr.astype(np.int32),
         "obs_pixels_xy": np.asarray(obs_pixels, dtype=np.float32),
         "obs_J": np.asarray(obs_j, dtype=np.float32),
-        "obs_camera_z": np.asarray(obs_camera_z, dtype=np.float32),
         "obs_count_per_point": counts,
         "obs_sample_count_per_point": sample_counts.astype(np.int32),
         "view_ids": np.asarray(view_ids),
@@ -522,7 +516,6 @@ def _observation_topology_id(topology: Mapping[str, np.ndarray]) -> str:
         "obs_point_index",
         "obs_sample_index",
         "obs_J",
-        "obs_camera_z",
         "obs_contribution_weight",
         "obs_contribution_score",
         "sample_view_index",
@@ -571,7 +564,6 @@ def split_gaussian_observation_topology(
         "obs_point_index": np.asarray(observations["obs_point_index"], dtype=np.int32),
         "obs_sample_index": obs_sample_index.astype(np.int32),
         "obs_J": np.asarray(observations["obs_J"], dtype=np.float32),
-        "obs_camera_z": np.asarray(observations["obs_camera_z"], dtype=np.float32),
         "obs_count_per_point": np.asarray(observations["obs_count_per_point"], dtype=np.int32),
         "obs_sample_count_per_point": np.asarray(
             observations["obs_sample_count_per_point"], dtype=np.int32
