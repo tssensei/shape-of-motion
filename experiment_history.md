@@ -679,3 +679,20 @@ post-fit, checkpoint materialization, and reconstruction pipeline.
 - This is the regression baseline for the unified rigid/physics code path. Its
   Linux artifacts and comparison videos were not regenerated in the local
   Windows merge workspace.
+
+## `rigid_rgbdepth_v3_sequential_k60_bounded_complex_v1`
+
+Date: 2026-07-23
+
+### Failed run and follow-up
+
+- Output directory:
+  `/home/zs292/data_formal/bush4_3view_v1/modal_fields/greedy_0p2_4p0_step0p025_k60prefix_v1/rigid_rgbdepth_v3_sequential_k60_bounded_complex_v1`
+- The bounded-complex K60 rerun reached mode 11 at 1.025 Hz, excluded view2
+  during alpha synchronization, and then stopped in single-view partial
+  component preparation because a component member observed only in the
+  excluded view had no usable viewing ray.
+- The follow-up keeps alpha exclusion unchanged and restricts ray-direction
+  classification plus radial/tangent diagnostics to component members with
+  usable observations. Other members retain the shared rigid twist and
+  downstream KNN participation.

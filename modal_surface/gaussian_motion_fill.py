@@ -938,6 +938,7 @@ def apply_single_view_component_partial_fill(
     row_offsets[1:] = np.cumsum(component_row_count, dtype=np.int64)
 
     ray_by_point = np.zeros((num_points, 3), dtype=np.float64)
+    usable_ray_mask = np.zeros((num_points,), dtype=bool)
     row_points = prepared.obs_point_index[usable_rows]
     unique_points, first_row_positions = np.unique(
         row_points, return_index=True
@@ -949,8 +950,7 @@ def apply_single_view_component_partial_fill(
     if np.any(ray_norm <= MOTION_FILL_EPSILON):
         raise ValueError("an observation projection Jacobian has no viewing ray")
     ray_by_point[unique_points] = rays / ray_norm[:, None]
-    if np.any(np.linalg.norm(ray_by_point[membership.ordered_points], axis=1) < 0.5):
-        raise ValueError("a single-view component point has no usable viewing ray")
+    usable_ray_mask[unique_points] = True
 
     point_blocks = np.zeros((num_points, 3, 6), dtype=np.float64)
     observable_twist = np.zeros((num_components, 6), dtype=np.complex128)
@@ -1022,9 +1022,16 @@ def apply_single_view_component_partial_fill(
         ) / eigenvalues[positive]
 
         induced = np.einsum("nij,jk->nik", blocks, right_vectors)
-        induced_energy = np.sum(np.square(induced), axis=(0, 1))
+        member_usable_ray_mask = usable_ray_mask[members]
+        if not np.any(member_usable_ray_mask):
+            raise ValueError(
+                f"single-view component {component_idx} has no usable viewing ray"
+            )
+        ray_members = members[member_usable_ray_mask]
+        ray_induced = induced[member_usable_ray_mask]
+        induced_energy = np.sum(np.square(ray_induced), axis=(0, 1))
         radial = np.einsum(
-            "ni,nik->nk", ray_by_point[members], induced
+            "ni,nik->nk", ray_by_point[ray_members], ray_induced
         )
         radial_energy = np.sum(np.square(radial), axis=0)
         radial_fraction = np.sqrt(
@@ -1415,12 +1422,17 @@ def apply_single_view_component_partial_fill(
         members = membership.ordered_points[
             membership.offsets[group_idx] : membership.offsets[group_idx + 1]
         ]
-        member_phi = final_phi[members]
+        ray_members = members[usable_ray_mask[members]]
+        if ray_members.size == 0:
+            raise RuntimeError(
+                f"single-view component {component_idx} lost all usable viewing rays"
+            )
+        member_phi = final_phi[ray_members]
         radial_amplitude = np.einsum(
-            "ni,ni->n", ray_by_point[members], member_phi
+            "ni,ni->n", ray_by_point[ray_members], member_phi
         )
         tangent_phi = (
-            member_phi - radial_amplitude[:, None] * ray_by_point[members]
+            member_phi - radial_amplitude[:, None] * ray_by_point[ray_members]
         )
         ray_motion_rms[component_idx] = np.sqrt(
             float(np.mean(np.abs(radial_amplitude) ** 2))
