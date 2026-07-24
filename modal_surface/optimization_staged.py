@@ -101,6 +101,18 @@ class AlphaConstraint:
 
 
 @dataclass
+class ProfiledObservationBatch:
+    row_block_index: np.ndarray
+    row_local_view_index: np.ndarray
+    weighted_jacobian: np.ndarray
+    weighted_observation: np.ndarray
+    gram_by_block_view: np.ndarray
+    rhs_by_block_view: np.ndarray
+    normalization: np.ndarray
+    equation_count: np.ndarray
+
+
+@dataclass
 class AlphaCandidateSolve:
     alphas: np.ndarray
     consistency_residual: float
@@ -589,46 +601,163 @@ def _block_residuals(information_blocks: np.ndarray, beta: np.ndarray) -> np.nda
     return np.sqrt(np.maximum(squared, 0.0)).astype(np.float64)
 
 
-def _profiled_observation_residual_blocks(
+def _build_profiled_observation_batch(
     prepared: PreparedObservations,
     constraints: list[AlphaConstraint],
     candidate_views: np.ndarray,
+) -> ProfiledObservationBatch:
+    block_count = len(constraints)
+    row_count = np.asarray(
+        [constraint.rows.size for constraint in constraints], dtype=np.int64
+    )
+    rows = (
+        np.concatenate([constraint.rows for constraint in constraints])
+        if block_count
+        else np.zeros((0,), dtype=np.int64)
+    )
+    row_block_index = np.repeat(
+        np.arange(block_count, dtype=np.int64), row_count
+    )
+    global_to_local = np.full((prepared.num_views,), -1, dtype=np.int64)
+    global_to_local[candidate_views] = np.arange(
+        candidate_views.size, dtype=np.int64
+    )
+    row_local_view_index = global_to_local[prepared.obs_view_index[rows]]
+    if np.any(row_local_view_index < 0):
+        raise RuntimeError(
+            "Alpha constraint contains a view outside the solve candidate."
+        )
+    sqrt_weight = np.sqrt(prepared.obs_weights[rows]).astype(np.float64)
+    weighted_jacobian = (
+        sqrt_weight[:, None, None]
+        * prepared.obs_J[rows].astype(np.float64)
+    )
+    weighted_observation = (
+        sqrt_weight[:, None]
+        * prepared.obs_y[rows].astype(np.complex128)
+    )
+    gram_by_block_view = np.zeros(
+        (block_count, candidate_views.size, 3, 3), dtype=np.complex128
+    )
+    rhs_by_block_view = np.zeros(
+        (block_count, candidate_views.size, 3), dtype=np.complex128
+    )
+    gram_contribution = np.einsum(
+        "rki,rkj->rij",
+        np.conj(weighted_jacobian),
+        weighted_jacobian,
+    )
+    rhs_contribution = np.einsum(
+        "rki,rk->ri",
+        np.conj(weighted_jacobian),
+        weighted_observation,
+    )
+    np.add.at(
+        gram_by_block_view,
+        (row_block_index, row_local_view_index),
+        gram_contribution,
+    )
+    np.add.at(
+        rhs_by_block_view,
+        (row_block_index, row_local_view_index),
+        rhs_contribution,
+    )
+    observation_energy = np.bincount(
+        row_block_index,
+        weights=np.sum(np.abs(weighted_observation) ** 2, axis=1),
+        minlength=block_count,
+    )
+    normalization = np.maximum(np.sqrt(observation_energy), _EPS)
+    return ProfiledObservationBatch(
+        row_block_index=row_block_index,
+        row_local_view_index=row_local_view_index,
+        weighted_jacobian=weighted_jacobian,
+        weighted_observation=weighted_observation,
+        gram_by_block_view=gram_by_block_view,
+        rhs_by_block_view=rhs_by_block_view,
+        normalization=normalization.astype(np.float64),
+        equation_count=(2 * row_count).astype(np.int64),
+    )
+
+
+def _profiled_observation_residuals(
+    batch: ProfiledObservationBatch,
     parameters: np.ndarray,
     reference_local: int,
-) -> list[np.ndarray]:
+    block_weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    candidate_view_count = int(batch.gram_by_block_view.shape[1])
     beta = _parameterized_beta(
-        parameters, candidate_views.size, reference_local, "bounded-complex"
+        parameters, candidate_view_count, reference_local, "bounded-complex"
     )
     alpha = 1.0 / beta
-    global_to_local = np.full((prepared.num_views,), -1, dtype=np.int64)
-    global_to_local[candidate_views] = np.arange(candidate_views.size, dtype=np.int64)
-    blocks: list[np.ndarray] = []
-    for constraint in constraints:
-        rows = constraint.rows
-        sqrt_w = np.sqrt(prepared.obs_weights[rows])
-        local_views = global_to_local[prepared.obs_view_index[rows]]
-        alpha_rows = alpha[local_views]
-        A = (
-            sqrt_w[:, None, None]
-            * alpha_rows[:, None, None]
-            * prepared.obs_J[rows].astype(np.complex128)
-        ).reshape(-1, 3)
-        b = (sqrt_w[:, None] * prepared.obs_y[rows].astype(np.complex128)).reshape(-1)
-        point_phi = np.linalg.lstsq(A, b, rcond=None)[0]
-        normalization = max(float(np.linalg.norm(b)), _EPS)
-        blocks.append((A @ point_phi - b) / normalization)
-    return blocks
-
-
-def _flatten_weighted_complex_blocks(
-    blocks: list[np.ndarray],
-    block_weights: np.ndarray,
-) -> np.ndarray:
-    pieces: list[np.ndarray] = []
-    for block, weight in zip(blocks, block_weights, strict=True):
-        scale = np.sqrt(max(float(weight), 0.0))
-        pieces.append(scale * np.concatenate([np.real(block), np.imag(block)]))
-    return np.concatenate(pieces).astype(np.float64) if pieces else np.zeros((0,), dtype=np.float64)
+    gram = np.einsum(
+        "v,bvij->bij",
+        np.abs(alpha) ** 2,
+        batch.gram_by_block_view,
+    )
+    rhs = np.einsum(
+        "v,bvi->bi",
+        np.conj(alpha),
+        batch.rhs_by_block_view,
+    )
+    eigenvalues, eigenvectors = np.linalg.eigh(gram)
+    largest = np.maximum(eigenvalues[:, -1], 0.0)
+    singular_rcond = (
+        np.finfo(np.float64).eps
+        * np.maximum(batch.equation_count, 3)
+    )
+    eigenvalue_cutoff = singular_rcond**2 * largest
+    inverse_eigenvalues = np.zeros_like(eigenvalues)
+    retained = eigenvalues > eigenvalue_cutoff[:, None]
+    np.divide(
+        1.0,
+        eigenvalues,
+        out=inverse_eigenvalues,
+        where=retained,
+    )
+    projected_rhs = np.einsum(
+        "bji,bj->bi",
+        np.conj(eigenvectors),
+        rhs,
+    )
+    point_phi = np.einsum(
+        "bij,bj->bi",
+        eigenvectors,
+        inverse_eigenvalues * projected_rhs,
+    )
+    row_phi = point_phi[batch.row_block_index]
+    prediction = (
+        alpha[batch.row_local_view_index, None]
+        * np.einsum(
+            "rki,ri->rk",
+            batch.weighted_jacobian,
+            row_phi,
+        )
+    )
+    residual = (
+        prediction - batch.weighted_observation
+    ) / batch.normalization[batch.row_block_index, None]
+    squared_row_residual = np.sum(np.abs(residual) ** 2, axis=1)
+    block_squared_residual = np.bincount(
+        batch.row_block_index,
+        weights=squared_row_residual,
+        minlength=batch.normalization.shape[0],
+    )
+    block_residual = np.sqrt(
+        np.maximum(block_squared_residual, 0.0)
+    ).astype(np.float64)
+    row_scale = np.sqrt(
+        np.maximum(block_weights, 0.0)
+    )[batch.row_block_index, None]
+    weighted_residual = row_scale * residual
+    flattened = np.concatenate(
+        [
+            np.real(weighted_residual).reshape(-1),
+            np.imag(weighted_residual).reshape(-1),
+        ]
+    ).astype(np.float64)
+    return flattened, block_residual
 
 
 def _information_summary(
@@ -741,11 +870,16 @@ def _refine_alpha_candidate(
         optimizer_status = int(result.status)
         optimizer_message = str(result.message)
     else:
-        initial_blocks = _profiled_observation_residual_blocks(
-            prepared, constraints, candidate_views, x0, reference_local
+        profiled_batch = _build_profiled_observation_batch(
+            prepared,
+            constraints,
+            candidate_views,
         )
-        initial_norms = np.asarray(
-            [np.linalg.norm(block) for block in initial_blocks], dtype=np.float64
+        _, initial_norms = _profiled_observation_residuals(
+            profiled_batch,
+            x0,
+            reference_local,
+            np.ones((len(constraints),), dtype=np.float64),
         )
         f_scale = max(
             float(np.median(initial_norms)) if initial_norms.size else 1.0,
@@ -758,10 +892,13 @@ def _refine_alpha_candidate(
             parameters: np.ndarray,
             fixed_weights: np.ndarray,
         ) -> np.ndarray:
-            blocks = _profiled_observation_residual_blocks(
-                prepared, constraints, candidate_views, parameters, reference_local
+            residual, _ = _profiled_observation_residuals(
+                profiled_batch,
+                parameters,
+                reference_local,
+                fixed_weights,
             )
-            return _flatten_weighted_complex_blocks(blocks, fixed_weights)
+            return residual
 
         result = None
         irls_converged = False
@@ -775,11 +912,11 @@ def _refine_alpha_candidate(
                 max_nfev=100,
             )
             current = result.x
-            current_blocks = _profiled_observation_residual_blocks(
-                prepared, constraints, candidate_views, current, reference_local
-            )
-            current_norms = np.asarray(
-                [np.linalg.norm(block) for block in current_blocks], dtype=np.float64
+            _, current_norms = _profiled_observation_residuals(
+                profiled_batch,
+                current,
+                reference_local,
+                np.ones_like(robust_weights),
             )
             updated_weights = np.ones_like(current_norms)
             large = current_norms > f_scale
@@ -802,11 +939,11 @@ def _refine_alpha_candidate(
         beta = _parameterized_beta(
             result.x, candidate_views.size, reference_local, "bounded-complex"
         )
-        final_blocks = _profiled_observation_residual_blocks(
-            prepared, constraints, candidate_views, result.x, reference_local
-        )
-        final_block_residual = np.asarray(
-            [np.linalg.norm(block) for block in final_blocks], dtype=np.float64
+        _, final_block_residual = _profiled_observation_residuals(
+            profiled_batch,
+            result.x,
+            reference_local,
+            np.ones_like(robust_weights),
         )
         jacobian = np.asarray(result.jac, dtype=np.float64)
         parameter_information = jacobian.T @ jacobian
