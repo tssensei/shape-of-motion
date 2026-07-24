@@ -285,6 +285,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         required=True,
         help="Output directory for observations, diagnostics, latents, vis, and manifest.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Reuse completed rigid-component modes in an interrupted output "
+            "directory. A mode is complete only when its compact latent and "
+            "successful diagnostics are both present and compatible."
+        ),
+    )
     parser.add_argument("--mode-indices", default="all", help="Comma-separated zero-based mode indices, or 'all'.")
     parser.add_argument(
         "--base-manifest",
@@ -353,6 +362,11 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     if args.solve_method == "rigid-components" and args.base_manifest is not None:
         raise ValueError(
             "--base-manifest is currently supported only with --solve-method=staged."
+        )
+    if args.resume and args.solve_method != "rigid-components":
+        raise ValueError(
+            "--resume is currently supported only with "
+            "--solve-method=rigid-components."
         )
     rcond = float(args.rigid_component_rcond)
     min_valid_views = int(args.rigid_seed_min_valid_views)
@@ -803,6 +817,262 @@ def _validate_rigid_source_observations(
     return prepare_observations(observations)
 
 
+def _load_resumed_rigid_mode(
+    *,
+    args: argparse.Namespace,
+    prepared: PreparedObservations,
+    observations: Mapping[str, np.ndarray],
+    reference_freq: float,
+    mode_index: int,
+    source_measurement_path: Path,
+    latent_path: Path,
+    diagnostics_path: Path,
+    mode_vis_dir: Path,
+    rigid_graph_artifact_path: Path,
+    motion_fill_graph_path: Path | None,
+    out_dir: Path,
+    num_foreground_gaussians: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if not diagnostics_path.is_file():
+        raise ValueError(
+            f"Cannot resume {latent_path}: matching diagnostics are missing at "
+            f"{diagnostics_path}."
+        )
+    latent = _load_npz_arrays(latent_path)
+    diagnostics = _load_npz_arrays(diagnostics_path)
+    if str(
+        _scalar_value(diagnostics, "solver_diagnostics_type", diagnostics_path)
+    ) != "rigid_component_twist_v1":
+        raise ValueError(
+            f"Cannot resume {latent_path}: diagnostics do not record a "
+            "successful rigid-component solve."
+        )
+    if str(
+        _scalar_value(diagnostics, "solver_method", diagnostics_path)
+    ) != "rigid_components":
+        raise ValueError(
+            f"Cannot resume {latent_path}: diagnostics solver method differs."
+        )
+    if int(_scalar_value(latent, "mode_index", latent_path)) != mode_index:
+        raise ValueError(f"Cannot resume {latent_path}: mode_index differs.")
+    latent_freq = float(_scalar_value(latent, "freq_hz", latent_path))
+    if not np.isclose(
+        latent_freq,
+        reference_freq,
+        rtol=0.0,
+        atol=float(args.freq_tolerance_hz),
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: frequency differs.")
+    if str(_scalar_value(latent, "source_checkpoint", latent_path)) != str(
+        args.input_ckpt
+    ):
+        raise ValueError(
+            f"Cannot resume {latent_path}: source checkpoint differs."
+        )
+    if str(_scalar_value(latent, "point_type", latent_path)) != (
+        "foreground_gaussian_center"
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: point_type differs.")
+    num_points = int(prepared.points.shape[0])
+    expected_indices = np.arange(num_points, dtype=np.int32)
+    if not np.array_equal(
+        np.asarray(latent.get("gaussian_indices")),
+        expected_indices,
+    ):
+        raise ValueError(
+            f"Cannot resume {latent_path}: Gaussian indices differ."
+        )
+    if not np.array_equal(
+        np.asarray(latent.get("points_world"), dtype=np.float32),
+        prepared.points.astype(np.float32),
+    ):
+        raise ValueError(
+            f"Cannot resume {latent_path}: Gaussian centers differ."
+        )
+    if not np.array_equal(
+        np.asarray(latent.get("obs_count_per_point")),
+        prepared.obs_count_per_point.astype(np.int32),
+    ):
+        raise ValueError(
+            f"Cannot resume {latent_path}: observation counts differ."
+        )
+    final_phi = np.asarray(latent.get("phi"))
+    if final_phi.shape != (num_points, 3) or final_phi.dtype != np.complex64:
+        raise ValueError(
+            f"Cannot resume {latent_path}: phi must be complex64 with shape "
+            f"({num_points},3)."
+        )
+    if not np.array_equal(
+        np.asarray(diagnostics.get("final_phi")),
+        final_phi,
+    ):
+        raise ValueError(
+            f"Cannot resume {latent_path}: diagnostics and latent phi differ."
+        )
+    expected_view_ids = prepared.view_ids.astype(str)
+    if not np.array_equal(
+        np.asarray(diagnostics.get("view_ids")).astype(str),
+        expected_view_ids,
+    ):
+        raise ValueError(
+            f"Cannot resume {latent_path}: diagnostics view order differs."
+        )
+    if str(
+        _scalar_value(
+            diagnostics,
+            "rigid_component_graph_source_path",
+            diagnostics_path,
+        )
+    ) != str(rigid_graph_artifact_path):
+        raise ValueError(
+            f"Cannot resume {latent_path}: rigid-component graph differs."
+        )
+    expected_scalars: dict[str, float] = {
+        "rigid_component_rcond": float(args.rigid_component_rcond),
+        "rigid_seed_min_valid_views": float(
+            args.rigid_seed_min_valid_views
+        ),
+        "rigid_seed_min_secondary_view_node_ratio": float(
+            args.rigid_seed_min_secondary_view_node_ratio
+        ),
+        "rigid_seed_min_singular_ratio": float(
+            args.rigid_seed_min_singular_ratio
+        ),
+        "rigid_seed_max_finite_drift": float(
+            args.rigid_seed_max_finite_drift
+        ),
+    }
+    if args.motion_fill:
+        expected_scalars.update(
+            {
+                "motion_fill_graph_k": float(args.motion_fill_k),
+                "motion_fill_graph_max_distance": float(
+                    args.motion_fill_max_distance
+                ),
+                "single_view_observable_singular_ratio_min": float(
+                    args.rigid_single_view_observable_ratio
+                ),
+                "single_view_ray_direction_min_fraction": float(
+                    args.rigid_single_view_ray_direction_min_fraction
+                ),
+            }
+        )
+        if args.rigid_motion_fill_stage == "sequential":
+            expected_scalars["motion_fill_max_anchor_hops"] = float(
+                args.motion_fill_max_anchor_hops
+            )
+    for key, expected in expected_scalars.items():
+        actual = float(_scalar_value(diagnostics, key, diagnostics_path))
+        if not np.isclose(actual, expected, rtol=1.0e-6, atol=1.0e-9):
+            raise ValueError(
+                f"Cannot resume {latent_path}: {key} differs from the "
+                "current CLI value."
+            )
+    has_motion_fill = "motion_fill_method" in diagnostics
+    if has_motion_fill != bool(args.motion_fill):
+        raise ValueError(
+            f"Cannot resume {latent_path}: motion-fill setting differs."
+        )
+    if has_motion_fill:
+        assert motion_fill_graph_path is not None
+        expected_method = (
+            RIGID_SEQUENTIAL_MOTION_FILL_METHOD
+            if args.rigid_motion_fill_stage == "sequential"
+            else RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD
+        )
+        actual_method = str(
+            _scalar_value(diagnostics, "motion_fill_method", diagnostics_path)
+        )
+        if actual_method != expected_method:
+            raise ValueError(
+                f"Cannot resume {latent_path}: motion-fill method differs."
+            )
+        actual_graph_path = str(
+            _scalar_value(
+                diagnostics, "motion_fill_graph_path", diagnostics_path
+            )
+        )
+        if actual_graph_path != relative_path(motion_fill_graph_path, out_dir):
+            raise ValueError(
+                f"Cannot resume {latent_path}: motion-fill graph differs."
+            )
+    alpha = _alpha_from_rigid_diagnostics(diagnostics, diagnostics_path)
+    expected_parameter_order = (
+        "phase"
+        if args.alpha_model == "phase"
+        else "phase_then_log_gain"
+    )
+    if alpha.parameter_order != expected_parameter_order:
+        raise ValueError(
+            f"Cannot resume {latent_path}: alpha model differs."
+        )
+    if alpha.alphas.shape != (prepared.num_views,):
+        raise ValueError(
+            f"Cannot resume {latent_path}: alpha view count differs."
+        )
+    identifiable_gain = np.abs(alpha.alphas[alpha.identifiable_mask])
+    if (
+        identifiable_gain.size
+        and (
+            np.any(
+                identifiable_gain
+                < float(args.alpha_gain_min) - 1.0e-6
+            )
+            or np.any(
+                identifiable_gain
+                > float(args.alpha_gain_max) + 1.0e-6
+            )
+        )
+    ):
+        raise ValueError(
+            f"Cannot resume {latent_path}: alpha gain lies outside the "
+            "current bounds."
+        )
+    stats, motion_fill_diagnostics = (
+        _rigid_gaussian_latent_stats_from_artifacts(
+            prepared,
+            alpha,
+            diagnostics,
+            final_phi,
+            observations,
+            num_foreground_gaussians,
+            diagnostics_path,
+        )
+    )
+    freqs_by_view = _alpha_view_frequencies(prepared).astype(float).tolist()
+    mode_entry = {
+        "mode_index": int(mode_index),
+        "freq_hz": reference_freq,
+        "freqs_hz_by_view": freqs_by_view,
+        "label": f"{mode_index}: {reference_freq:.6f} Hz",
+        "observation_measurement_path": relative_path(
+            source_measurement_path, out_dir
+        ),
+        "source_observation_measurement_path": str(
+            source_measurement_path
+        ),
+        "latent_path": relative_path(latent_path, out_dir),
+        "diagnostics_path": relative_path(diagnostics_path, out_dir),
+        "component_diagnostics_path": relative_path(
+            diagnostics_path, out_dir
+        ),
+        "rigid_component_graph_path": relative_path(
+            rigid_graph_artifact_path, out_dir
+        ),
+        "rigid_component_graph_source_path": str(
+            rigid_graph_artifact_path
+        ),
+        "vis_dir": relative_path(mode_vis_dir, out_dir),
+        "alpha_by_view": _alpha_by_view_diagnostics(
+            prepared,
+            alpha,
+            _alpha_view_frequencies(prepared),
+        ),
+        "stats": stats,
+    }
+    return mode_entry, motion_fill_diagnostics
+
+
 def _validate_motion_fill_arguments(
     args: argparse.Namespace,
     num_points: int | None = None,
@@ -1127,6 +1397,393 @@ def _rigid_gaussian_latent_stats(
             }
         )
     return stats
+
+
+def _alpha_from_rigid_diagnostics(
+    arrays: Mapping[str, np.ndarray],
+    path: Path,
+) -> AlphaSyncResult:
+    return AlphaSyncResult(
+        alphas=np.asarray(arrays["alphas"], dtype=np.complex64),
+        identifiable_mask=np.asarray(
+            arrays["alpha_identifiable_mask"], dtype=bool
+        ),
+        reference_connected_mask=np.asarray(
+            arrays["alpha_reference_connected_mask"], dtype=bool
+        ),
+        exclusion_reason=np.asarray(arrays["alpha_exclusion_reason"]).astype(str),
+        shared_point_count=np.asarray(
+            arrays["alpha_shared_point_count"], dtype=np.int32
+        ),
+        edge_point_count=np.asarray(
+            arrays["alpha_edge_point_count"], dtype=np.int32
+        ),
+        edge_information=np.asarray(
+            arrays["alpha_edge_information"], dtype=np.float32
+        ),
+        constraint_count_per_view=np.asarray(
+            arrays["alpha_constraint_count_per_view"], dtype=np.int32
+        ),
+        information_matrix=np.asarray(
+            arrays["alpha_information_matrix"], dtype=np.complex64
+        ),
+        singular_values=np.asarray(
+            arrays["alpha_singular_values"], dtype=np.float32
+        ),
+        rank_ratio=float(_scalar_value(arrays, "alpha_rank_ratio", path)),
+        information_ratio=float(
+            _scalar_value(arrays, "alpha_information_ratio", path)
+        ),
+        condition=float(_scalar_value(arrays, "alpha_condition", path)),
+        consistency_residual=float(
+            _scalar_value(arrays, "alpha_consistency_residual", path)
+        ),
+        phase_std=np.asarray(arrays["alpha_phase_std"], dtype=np.float32),
+        log_gain_std=np.asarray(
+            arrays["alpha_log_gain_std"], dtype=np.float32
+        ),
+        parameter_information=np.asarray(
+            arrays["alpha_parameter_information"], dtype=np.float32
+        ),
+        parameter_view_indices=np.asarray(
+            arrays["alpha_parameter_view_indices"], dtype=np.int32
+        ),
+        parameter_order=str(
+            _scalar_value(arrays, "alpha_parameter_order", path)
+        ),
+        optimizer_success=bool(
+            _scalar_value(arrays, "alpha_optimizer_success", path)
+        ),
+        optimizer_status=int(
+            _scalar_value(arrays, "alpha_optimizer_status", path)
+        ),
+        optimizer_message=str(
+            _scalar_value(arrays, "alpha_optimizer_message", path)
+        ),
+        gain_bound_active_mask=np.asarray(
+            arrays["alpha_gain_bound_active_mask"], dtype=bool
+        ),
+        information_kind=str(
+            _scalar_value(arrays, "alpha_information_kind", path)
+        ),
+    )
+
+
+def _lsmr_diagnostics_from_arrays(
+    arrays: Mapping[str, np.ndarray],
+    prefix: str,
+    path: Path,
+) -> dict[str, Any]:
+    return {
+        "performed": bool(_scalar_value(arrays, f"{prefix}_performed", path)),
+        "converged": bool(_scalar_value(arrays, f"{prefix}_converged", path)),
+        "stop_code": int(_scalar_value(arrays, f"{prefix}_stop_code", path)),
+        "iterations": int(_scalar_value(arrays, f"{prefix}_iterations", path)),
+        "residual_norm": json_float(
+            _scalar_value(arrays, f"{prefix}_residual_norm", path)
+        ),
+        "normal_residual_norm": json_float(
+            _scalar_value(arrays, f"{prefix}_normal_residual_norm", path)
+        ),
+        "matrix_norm": json_float(
+            _scalar_value(arrays, f"{prefix}_matrix_norm", path)
+        ),
+        "condition_estimate": json_float(
+            _scalar_value(arrays, f"{prefix}_condition_estimate", path)
+        ),
+        "solution_norm": json_float(
+            _scalar_value(arrays, f"{prefix}_solution_norm", path)
+        ),
+    }
+
+
+def _resumed_rigid_motion_fill_diagnostics(
+    arrays: Mapping[str, np.ndarray],
+    path: Path,
+) -> dict[str, Any]:
+    method = str(_scalar_value(arrays, "motion_fill_method", path))
+    roles = np.asarray(arrays["motion_fill_role"], dtype=np.int8)
+    completion = np.asarray(arrays["completion_mask"], dtype=bool)
+    trusted = np.asarray(arrays["trusted_rigid_seed_mask"], dtype=bool)
+    observed = np.asarray(arrays["observed_mask"], dtype=bool)
+    diagnostics: dict[str, Any] = {
+        "method": method,
+        "version": int(_scalar_value(arrays, "motion_fill_version", path)),
+        "graph_path": str(
+            _scalar_value(arrays, "motion_fill_graph_path", path)
+        ),
+        "role_counts": {
+            name: int(np.count_nonzero(roles == index))
+            for index, name in enumerate(MOTION_FILL_ROLE_NAMES)
+        },
+        "completion": {
+            "completed_observed_count": int(
+                np.count_nonzero(completion & ~trusted & observed)
+            ),
+            "completed_unobserved_count": int(
+                np.count_nonzero(completion & ~trusted & ~observed)
+            ),
+            "unresolved_target_count": int(
+                np.count_nonzero(~trusted & ~completion)
+            ),
+        },
+        "system": {
+            "row_count": int(
+                _scalar_value(arrays, "motion_fill_system_row_count", path)
+            ),
+            "column_count": int(
+                _scalar_value(arrays, "motion_fill_system_column_count", path)
+            ),
+            "active_edge_count": int(
+                _scalar_value(arrays, "motion_fill_active_edge_count", path)
+            ),
+        },
+        "lsmr_real": _lsmr_diagnostics_from_arrays(
+            arrays, "motion_fill_lsmr_real", path
+        ),
+        "lsmr_imaginary": _lsmr_diagnostics_from_arrays(
+            arrays, "motion_fill_lsmr_imaginary", path
+        ),
+        "resumed_from_persisted_diagnostics": True,
+    }
+    if "motion_fill_max_anchor_hops" in arrays:
+        diagnostics["max_anchor_hops"] = int(
+            _scalar_value(arrays, "motion_fill_max_anchor_hops", path)
+        )
+        diagnostics["pipeline"] = (
+            "single_view_partial_components_then_independent_3d_gaussians"
+        )
+        diagnostics["completion"]["hop_limited_target_count"] = int(
+            np.count_nonzero(
+                np.asarray(
+                    arrays["completion_connected_to_anchor"], dtype=bool
+                )
+                & ~completion
+                & ~trusted
+            )
+        )
+    return diagnostics
+
+
+def _rigid_gaussian_latent_stats_from_artifacts(
+    prepared: PreparedObservations,
+    alpha: AlphaSyncResult,
+    diagnostics: Mapping[str, np.ndarray],
+    final_phi: np.ndarray,
+    observations: Mapping[str, np.ndarray],
+    num_fg: int,
+    diagnostics_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    _, obs_residual, obs_valid, point_residual, point_valid = (
+        compute_prediction_and_residuals(prepared, alpha, final_phi)
+    )
+    valid_obs_residual = np.asarray(obs_residual)[np.asarray(obs_valid, dtype=bool)]
+    valid_point_residual = np.asarray(point_residual)[
+        np.asarray(point_valid, dtype=bool)
+    ]
+    component_residual = np.asarray(
+        diagnostics["component_normalized_weighted_residual"]
+    )
+    component_drift = np.asarray(diagnostics["component_finite_drift_max"])
+    model_first_order_relative_max = float(
+        max(
+            np.max(
+                diagnostics["edge_model_first_order_relative_real"],
+                initial=0.0,
+            ),
+            np.max(
+                diagnostics["edge_model_first_order_relative_imag"],
+                initial=0.0,
+            ),
+        )
+    )
+    persisted_first_order_relative_max = float(
+        max(
+            np.max(
+                diagnostics["edge_first_order_relative_real"], initial=0.0
+            ),
+            np.max(
+                diagnostics["edge_first_order_relative_imag"], initial=0.0
+            ),
+        )
+    )
+    quantization_bound_relative_max = float(
+        max(
+            np.max(
+                diagnostics[
+                    "edge_first_order_quantization_bound_relative_real"
+                ],
+                initial=0.0,
+            ),
+            np.max(
+                diagnostics[
+                    "edge_first_order_quantization_bound_relative_imag"
+                ],
+                initial=0.0,
+            ),
+        )
+    )
+    rigid_seed_mask = np.asarray(diagnostics["rigid_seed_mask"], dtype=bool)
+    observed_mask = np.asarray(diagnostics["observed_mask"], dtype=bool)
+    fill_target_mask = np.asarray(
+        diagnostics["fill_target_mask"], dtype=bool
+    )
+    trusted_seed_mask = np.asarray(
+        diagnostics["trusted_rigid_seed_mask"], dtype=bool
+    )
+    effective_fill_target_mask = np.asarray(
+        diagnostics["effective_fill_target_mask"], dtype=bool
+    )
+    component_rank = np.asarray(diagnostics["component_rank"])
+    component_node_count = np.asarray(diagnostics["component_node_count"])
+    component_edge_count = np.asarray(diagnostics["component_edge_count"])
+    raw_view_count = np.asarray(
+        diagnostics["component_distinct_valid_view_count"]
+    )
+    supported_view_count = np.asarray(
+        diagnostics["component_supported_valid_view_count"]
+    )
+    stats: dict[str, Any] = {
+        "num_foreground_gaussians": int(num_fg),
+        "num_output_points": int(prepared.points.shape[0]),
+        "num_observations": int(prepared.obs_point_index.shape[0]),
+        "observations_per_view": observations["observations_per_view"].astype(
+            int
+        ).tolist(),
+        "solver_method": "rigid_component_twist",
+        "rigidity_model": "complex_infinitesimal_se3",
+        "alpha_identifiable_count": int(
+            np.count_nonzero(alpha.identifiable_mask)
+        ),
+        "alpha_optimizer_success": bool(alpha.optimizer_success),
+        "observed_point_count": int(np.count_nonzero(observed_mask)),
+        "rigid_seed_count": int(np.count_nonzero(rigid_seed_mask)),
+        "trusted_rigid_seed_count": int(np.count_nonzero(trusted_seed_mask)),
+        "quarantined_rigid_seed_count": int(
+            np.count_nonzero(rigid_seed_mask & ~trusted_seed_mask)
+        ),
+        "isolated_observed_count": int(
+            np.count_nonzero(observed_mask & ~rigid_seed_mask)
+        ),
+        "fill_target_count": int(np.count_nonzero(fill_target_mask)),
+        "effective_fill_target_count": int(
+            np.count_nonzero(effective_fill_target_mask)
+        ),
+        "unobserved_point_count": int(
+            np.count_nonzero(prepared.obs_count_per_point == 0)
+        ),
+        "rigid_component_count": int(component_node_count.shape[0]),
+        "zero_usable_row_component_count": int(
+            np.count_nonzero(
+                diagnostics["component_usable_observation_row_count"] == 0
+            )
+        ),
+        "rank_deficient_component_count": int(
+            np.count_nonzero(component_rank < 6)
+        ),
+        "trusted_rigid_component_count": int(
+            np.count_nonzero(diagnostics["component_seed_retained_mask"])
+        ),
+        "valid_view_rejected_component_count": int(
+            np.count_nonzero(
+                diagnostics["component_valid_view_rejected_mask"]
+            )
+        ),
+        "view_support_downgraded_component_count": int(
+            np.count_nonzero(raw_view_count > supported_view_count)
+        ),
+        "singular_rejected_component_count": int(
+            np.count_nonzero(diagnostics["component_singular_rejected_mask"])
+        ),
+        "finite_drift_rejected_component_count": int(
+            np.count_nonzero(
+                diagnostics["component_finite_drift_rejected_mask"]
+            )
+        ),
+        "largest_rigid_component_node_count": int(
+            np.max(component_node_count, initial=0)
+        ),
+        "largest_rigid_component_edge_count": int(
+            np.max(component_edge_count, initial=0)
+        ),
+        "component_residual_p50": _finite_percentile(
+            component_residual, 50
+        ),
+        "component_residual_p90": _finite_percentile(
+            component_residual, 90
+        ),
+        "component_residual_max": _finite_percentile(
+            component_residual, 100
+        ),
+        "component_finite_drift_p50": _finite_percentile(
+            component_drift, 50
+        ),
+        "component_finite_drift_p90": _finite_percentile(
+            component_drift, 90
+        ),
+        "component_finite_drift_max": _finite_percentile(
+            component_drift, 100
+        ),
+        "model_first_order_relative_max": model_first_order_relative_max,
+        "persisted_first_order_relative_max": (
+            persisted_first_order_relative_max
+        ),
+        "first_order_quantization_bound_relative_max": (
+            quantization_bound_relative_max
+        ),
+        "obs_residual_median": _finite_percentile(valid_obs_residual, 50),
+        "obs_residual_p90": _finite_percentile(valid_obs_residual, 90),
+        "point_residual_median": _finite_percentile(valid_point_residual, 50),
+        "point_residual_p90": _finite_percentile(valid_point_residual, 90),
+        "gaussian_indices_contiguous": bool(
+            np.array_equal(
+                np.asarray(prepared.arrays["gaussian_indices"]),
+                np.arange(prepared.points.shape[0], dtype=np.int32),
+            )
+        ),
+        "preserved_all_points": bool(
+            np.asarray(observations["preserved_all_points"]).item()
+        ),
+        "pixel_candidate_method": str(
+            np.asarray(observations["pixel_candidate_method"]).item()
+        ),
+    }
+    contribution_weight = np.asarray(
+        observations["obs_contribution_weight"], dtype=np.float32
+    )
+    contribution_sum = np.asarray(
+        observations["obs_contribution_sum"], dtype=np.float32
+    )
+    for label, values in (
+        ("contribution_weight", contribution_weight),
+        ("contribution_score", contribution_weight * contribution_sum),
+        ("contribution_sum", contribution_sum),
+    ):
+        stats[f"{label}_p50"] = _finite_percentile(values, 50)
+        stats[f"{label}_p90"] = _finite_percentile(values, 90)
+        stats[f"{label}_max"] = _finite_percentile(values, 100)
+    motion_fill_diagnostics = None
+    if "motion_fill_method" in diagnostics:
+        motion_fill_diagnostics = _resumed_rigid_motion_fill_diagnostics(
+            diagnostics, diagnostics_path
+        )
+        motion_fill_method = str(motion_fill_diagnostics["method"])
+        stats.update(
+            {
+                "motion_fill_method": motion_fill_method,
+                "effective_field_method": (
+                    "rigid_component_twist+single_view_partial_component_knn_lsmr"
+                    if motion_fill_method
+                    == RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD
+                    else (
+                        "rigid_component_twist+single_view_partial_component_"
+                        "knn_lsmr+independent_gaussian_knn_lsmr"
+                    )
+                ),
+                "motion_fill": motion_fill_diagnostics,
+            }
+        )
+    return stats, motion_fill_diagnostics
 
 
 def _required_scalar_array(
@@ -1967,6 +2624,12 @@ def _write_time_profile(
             f"{float(profile['rigid_component_solve_seconds']):.3f} / "
             f"{float(motion['total_seconds']):.3f} s"
         )
+        if bool(profile.get("resumed", False)):
+            print(
+                "    resumed validation         "
+                f"{float(profile['resume_validation_seconds']):.3f} s"
+            )
+            continue
         if bool(motion["enabled"]):
             motion_fill_stage = str(motion["stage"])
             if motion_fill_stage == RIGID_MOTION_FILL_STAGE_DEFAULT:
@@ -2236,7 +2899,6 @@ def run(args: argparse.Namespace) -> None:
         diagnostics_path = diagnostics_dir / f"{mode_name}.npz"
         mode_vis_dir = vis_dir / mode_name
         print(f"Solving Gaussian mode {mode_name}")
-        latent_path.unlink(missing_ok=True)
         if args.solve_method == "rigid-components":
             assert rigid_graph is not None
             assert rigid_graph_artifact_path is not None
@@ -2268,6 +2930,58 @@ def run(args: argparse.Namespace) -> None:
             mode_profile["observation_input_seconds"] = float(
                 perf_counter() - stage_started
             )
+            if args.resume and latent_path.is_file():
+                stage_started = perf_counter()
+                mode_entry, resumed_motion_fill_diagnostics = (
+                    _load_resumed_rigid_mode(
+                        args=args,
+                        prepared=prepared,
+                        observations=observations,
+                        reference_freq=reference_freq,
+                        mode_index=mode_index,
+                        source_measurement_path=source_measurement_path,
+                        latent_path=latent_path,
+                        diagnostics_path=diagnostics_path,
+                        mode_vis_dir=mode_vis_dir,
+                        rigid_graph_artifact_path=rigid_graph_artifact_path,
+                        motion_fill_graph_path=motion_fill_graph_path,
+                        out_dir=out_dir,
+                        num_foreground_gaussians=fg_means.shape[0],
+                    )
+                )
+                modes.append(mode_entry)
+                if resumed_motion_fill_diagnostics is not None:
+                    motion_fill_mode_diagnostics[mode_name] = (
+                        resumed_motion_fill_diagnostics
+                    )
+                mode_profile.update(
+                    {
+                        "resumed": True,
+                        "resume_validation_seconds": float(
+                            perf_counter() - stage_started
+                        ),
+                        "alpha_sync_seconds": 0.0,
+                        "rigid_component_solve_seconds": 0.0,
+                        "seed_selection_seconds": 0.0,
+                        "motion_fill": {
+                            "enabled": motion_fill_graph is not None,
+                            "stage": str(args.rigid_motion_fill_stage),
+                            "total_seconds": 0.0,
+                        },
+                        "visualization_and_output_seconds": 0.0,
+                        "solve_total_seconds": 0.0,
+                        "total_seconds": float(
+                            perf_counter() - mode_started
+                        ),
+                    }
+                )
+                mode_time_profiles[mode_name] = mode_profile
+                print(
+                    f"Resumed completed Gaussian mode {mode_name}",
+                    flush=True,
+                )
+                continue
+            latent_path.unlink(missing_ok=True)
             alpha_config = staged_solver_config(args)
             stage_started = perf_counter()
             alpha = solve_alpha_sync(prepared, alpha_config, enforce_failure=False)

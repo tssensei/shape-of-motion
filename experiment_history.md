@@ -696,3 +696,18 @@ Date: 2026-07-23
   classification plus radial/tangent diagnostics to component members with
   usable observations. Other members retain the shared rigid twist and
   downstream KNN participation.
+
+### Interrupted K60 continuation
+
+Date: 2026-07-24
+
+- The rerun in the same output directory reached 39 completed mode latents
+  after approximately 6 hours 53 minutes, while the Slurm allocation retained
+  its original 8-hour limit and could not be extended by the submitting user.
+- Profiling from the live log showed bounded-complex alpha synchronization,
+  rather than rigid solving or the roughly one-minute sequential motion fill,
+  as the dominant per-mode cost.
+- The solver and `run.sbatch` now use explicit rigid-component resume mode:
+  completed latent/diagnostic pairs are validated and reused, an interrupted
+  mode without its final latent is recomputed, and the remaining modes continue
+  in the same directory before one complete K60 manifest is written.

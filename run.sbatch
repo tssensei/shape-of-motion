@@ -53,11 +53,6 @@ for path in "${REQUIRED_FILES[@]}"; do
   fi
 done
 
-if [[ -e "$OUTPUT_DIR" && ! -f "$OUTPUT_DIR/modal_modes_manifest.json" ]]; then
-  echo "Refusing to overwrite incomplete existing output: $OUTPUT_DIR" >&2
-  exit 1
-fi
-
 shopt -s nullglob
 MEASUREMENT_ARGS=()
 for mode_index in $(seq 0 59); do
@@ -123,6 +118,7 @@ else
     "${COMMON_ARGS[@]}" \
     "${MEASUREMENT_ARGS[@]}" \
     --out-dir "$OUTPUT_DIR" \
+    --resume \
     --alpha-model bounded-complex \
     2>&1 | tee "$LOG_PATH"
   echo "[$(date --iso-8601=seconds)] Finished bounded-complex -> $OUTPUT_DIR"
