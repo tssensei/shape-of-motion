@@ -732,3 +732,12 @@ Date: 2026-07-24
 - The follow-up increases only the bounded-complex exact block-Huber
   evaluation budget to 500. Modes 0--46 remain reusable; mode 47 has no final
   latent and will be recomputed by the next resumed job.
+- The resumed bounded-complex solve subsequently completed all 60 modes and
+  wrote its final manifest in the same output directory.
+- The first per-frame flow-coordinate attempt stopped before creating its
+  output because the downstream manifest loader still required every
+  mode/view alpha to be identifiable; mode 11 correctly records view2 as
+  excluded. The follow-up accepts explicit alpha-unidentifiable entries while
+  retaining their ordered finite diagnostics because coordinate inversion
+  directly fits full reference flow from projected global `phi` and does not
+  consume alpha values.

@@ -709,9 +709,10 @@ def _load_manifest(path_value: str | Path) -> _ManifestData:
             alpha_view_id = alpha.get("view_id")
             if not isinstance(alpha_view_id, str) or not alpha_view_id:
                 raise ValueError(f"{path} mode {mode_index} alpha view_id must be non-empty")
-            if alpha.get("identifiable") is not True:
+            if not isinstance(alpha.get("identifiable"), bool):
                 raise ValueError(
-                    f"{path} mode {mode_index} alpha for view {alpha_view_id!r} is not identifiable"
+                    f"{path} mode {mode_index} alpha identifiable for view "
+                    f"{alpha_view_id!r} must be boolean"
                 )
             for field in ("real", "imag"):
                 value = alpha.get(field)
