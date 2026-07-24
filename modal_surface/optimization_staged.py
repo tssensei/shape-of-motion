@@ -923,7 +923,7 @@ def _refine_alpha_candidate(
             x0,
             bounds=(lower, upper),
             loss="linear",
-            max_nfev=100,
+            max_nfev=500,
         )
         beta = _parameterized_beta(
             result.x, candidate_views.size, reference_local, "bounded-complex"

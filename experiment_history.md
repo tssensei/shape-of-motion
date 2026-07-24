@@ -723,3 +723,12 @@ Date: 2026-07-24
   residual transformation while retaining the batched profiled point solve.
   Modes 0--41 remain reusable; mode 42 has no final latent and will be
   recomputed by the next resumed job.
+- The exact block-Huber resumed run subsequently completed through mode 46
+  and stopped on `mode_047_2p35hz`. Its final two-view candidate retained
+  strong overlap, rank ratio `0.973404`, information ratio `0.157430`,
+  condition `1.027323`, and no active gain bound, but SciPy stopped at
+  `max_nfev=100` before convergence and both non-reference views were
+  ultimately excluded as `optimizer_failure`.
+- The follow-up increases only the bounded-complex exact block-Huber
+  evaluation budget to 500. Modes 0--46 remain reusable; mode 47 has no final
+  latent and will be recomputed by the next resumed job.
