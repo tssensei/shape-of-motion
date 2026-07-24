@@ -684,7 +684,6 @@ def _profiled_observation_residuals(
     batch: ProfiledObservationBatch,
     parameters: np.ndarray,
     reference_local: int,
-    block_weights: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     candidate_view_count = int(batch.gram_by_block_view.shape[1])
     beta = _parameterized_beta(
@@ -747,17 +746,37 @@ def _profiled_observation_residuals(
     block_residual = np.sqrt(
         np.maximum(block_squared_residual, 0.0)
     ).astype(np.float64)
-    row_scale = np.sqrt(
-        np.maximum(block_weights, 0.0)
-    )[batch.row_block_index, None]
-    weighted_residual = row_scale * residual
+    return residual, block_residual
+
+
+def _flatten_scaled_profiled_residual(
+    batch: ProfiledObservationBatch,
+    residual: np.ndarray,
+    block_scale: np.ndarray,
+) -> np.ndarray:
+    scaled_residual = (
+        block_scale[batch.row_block_index, None] * residual
+    )
     flattened = np.concatenate(
         [
-            np.real(weighted_residual).reshape(-1),
-            np.imag(weighted_residual).reshape(-1),
+            np.real(scaled_residual).reshape(-1),
+            np.imag(scaled_residual).reshape(-1),
         ]
     ).astype(np.float64)
-    return flattened, block_residual
+    return flattened
+
+
+def _block_huber_scale(
+    block_residual: np.ndarray,
+    f_scale: float,
+) -> np.ndarray:
+    scale = np.ones_like(block_residual, dtype=np.float64)
+    large = block_residual > f_scale
+    ratio = f_scale / np.maximum(block_residual[large], _EPS)
+    scale[large] = np.sqrt(
+        np.maximum(2.0 * ratio - ratio**2, 0.0)
+    )
+    return scale
 
 
 def _information_summary(
@@ -879,63 +898,33 @@ def _refine_alpha_candidate(
             profiled_batch,
             x0,
             reference_local,
-            np.ones((len(constraints),), dtype=np.float64),
         )
         f_scale = max(
             float(np.median(initial_norms)) if initial_norms.size else 1.0,
             1e-6,
         )
-        robust_weights = np.ones((len(constraints),), dtype=np.float64)
-        current = x0
 
-        def profiled_residual(
+        def block_huber_residual(
             parameters: np.ndarray,
-            fixed_weights: np.ndarray,
         ) -> np.ndarray:
-            residual, _ = _profiled_observation_residuals(
+            residual, block_residual = _profiled_observation_residuals(
                 profiled_batch,
                 parameters,
                 reference_local,
-                fixed_weights,
             )
-            return residual
-
-        result = None
-        irls_converged = False
-        for _ in range(12):
-            weights_used = robust_weights.copy()
-            result = least_squares(
-                lambda parameters: profiled_residual(parameters, weights_used),
-                current,
-                bounds=(lower, upper),
-                loss="linear",
-                max_nfev=100,
-            )
-            current = result.x
-            _, current_norms = _profiled_observation_residuals(
+            return _flatten_scaled_profiled_residual(
                 profiled_batch,
-                current,
-                reference_local,
-                np.ones_like(robust_weights),
+                residual,
+                _block_huber_scale(block_residual, f_scale),
             )
-            updated_weights = np.ones_like(current_norms)
-            large = current_norms > f_scale
-            updated_weights[large] = f_scale / np.maximum(current_norms[large], _EPS)
-            if np.allclose(updated_weights, weights_used, atol=1e-4, rtol=1e-3):
-                robust_weights = weights_used
-                irls_converged = True
-                break
-            robust_weights = updated_weights
-        if not irls_converged:
-            result = least_squares(
-                lambda parameters: profiled_residual(parameters, robust_weights),
-                current,
-                bounds=(lower, upper),
-                loss="linear",
-                max_nfev=100,
-            )
-        if result is None:
-            raise RuntimeError("Internal error: bounded-complex optimizer did not run.")
+
+        result = least_squares(
+            block_huber_residual,
+            x0,
+            bounds=(lower, upper),
+            loss="linear",
+            max_nfev=100,
+        )
         beta = _parameterized_beta(
             result.x, candidate_views.size, reference_local, "bounded-complex"
         )
@@ -943,7 +932,11 @@ def _refine_alpha_candidate(
             profiled_batch,
             result.x,
             reference_local,
-            np.ones_like(robust_weights),
+        )
+        robust_weights = np.ones_like(final_block_residual)
+        large = final_block_residual > f_scale
+        robust_weights[large] = f_scale / np.maximum(
+            final_block_residual[large], _EPS
         )
         jacobian = np.asarray(result.jac, dtype=np.float64)
         parameter_information = jacobian.T @ jacobian
@@ -953,14 +946,10 @@ def _refine_alpha_candidate(
         active_mask = np.asarray(result.active_mask, dtype=np.int8)
         gain_active = active_mask[len(unknown) :] != 0
         gain_bound_active[np.asarray(unknown, dtype=np.int64)] = gain_active
-        information_kind = "profiled_frozen_huber_gauss_newton"
-        optimizer_success = bool(result.success) and irls_converged
-        optimizer_status = int(result.status) if irls_converged else -2
-        optimizer_message = (
-            str(result.message)
-            if irls_converged
-            else "bounded-complex Huber IRLS did not reach a fixed point"
-        )
+        information_kind = "profiled_exact_block_huber_gauss_newton"
+        optimizer_success = bool(result.success)
+        optimizer_status = int(result.status)
+        optimizer_message = str(result.message)
 
     alpha = 1.0 / beta
     alpha[reference_local] = 1.0 + 0.0j

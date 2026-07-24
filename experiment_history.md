@@ -711,3 +711,15 @@ Date: 2026-07-24
   completed latent/diagnostic pairs are validated and reused, an interrupted
   mode without its final latent is recomputed, and the remaining modes continue
   in the same directory before one complete K60 manifest is written.
+- Slurm job `317439` resumed through mode 41 and stopped on
+  `mode_042_0p5hz`: all three views were structurally reference-connected with
+  strong overlap, rank ratio `0.999868`, information ratio `0.139661`, condition
+  `1.000132`, and no active gain bound, but both non-reference views were
+  excluded as `optimizer_failure` because the bounded-complex frozen-weight
+  Huber IRLS did not reach its strict 12-round fixed point. The resulting
+  reference-only alpha left zero multiview rigid components and therefore no
+  trusted seed for motion fill.
+- The follow-up replaces the capped IRLS with a single exact block-Huber
+  residual transformation while retaining the batched profiled point solve.
+  Modes 0--41 remain reusable; mode 42 has no final latent and will be
+  recomputed by the next resumed job.
