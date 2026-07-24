@@ -120,6 +120,6 @@ else
     --out-dir "$OUTPUT_DIR" \
     --resume \
     --alpha-model bounded-complex \
-    2>&1 | tee "$LOG_PATH"
+    2>&1 | tee -a "$LOG_PATH"
   echo "[$(date --iso-8601=seconds)] Finished bounded-complex -> $OUTPUT_DIR"
 fi
