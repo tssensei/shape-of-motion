@@ -53,6 +53,8 @@ def main() -> None:
         )
 
     view_config_paths = [str(path) for path in view_configs]
+
+    # load static 3dgs from ckpt
     (
         foreground_means,
         foreground_scales,

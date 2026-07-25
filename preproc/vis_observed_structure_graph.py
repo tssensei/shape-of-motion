@@ -3139,7 +3139,6 @@ class ObservedGraphViewer:
         max_visible_edges: int,
         line_width: float,
         observed_point_size: float,
-        isolated_point_size: float,
         world_center: np.ndarray,
         rigid_manifest: RigidManifestViewData | None = None,
     ) -> None:
@@ -3169,7 +3168,6 @@ class ObservedGraphViewer:
             raise ValueError("world_center must be finite (3,)")
         self._line_handle = None
         self._node_handle = None
-        self._isolated_handle = None
         self._rigid_seed_handle = None
         self._quarantined_rigid_handle = None
         self._single_view_rigid_fill_handle = None
@@ -3179,6 +3177,7 @@ class ObservedGraphViewer:
         self._playback_thread = None
         self._display_mode_index = None
         self._selected_edge_indices = np.empty((0,), dtype=np.int64)
+        self._selected_node_indices = np.empty((0,), dtype=np.int64)
 
         max_edges = max(int(graph.edge_index.shape[0]) for graph in graphs)
         edge_step = max(max_edges // 200, 1)
@@ -3255,17 +3254,6 @@ class ObservedGraphViewer:
                 max=0.008,
                 step=0.0001,
                 initial_value=observed_point_size,
-            )
-            self.show_isolated = server.gui.add_checkbox(
-                "Show isolated observed nodes",
-                True,
-            )
-            self.isolated_point_size = server.gui.add_slider(
-                "Isolated-node point size",
-                min=0.0001,
-                max=0.008,
-                step=0.0001,
-                initial_value=isolated_point_size,
             )
             if rigid_manifest is None:
                 self.graph_geometry = None
@@ -3394,14 +3382,12 @@ class ObservedGraphViewer:
             self.edge_color,
             self.max_visible_edges,
             self.show_nodes,
-            self.show_isolated,
         )
         for handle in rebuild_handles:
             handle.on_update(self._update)
         for handle in (
             self.line_width,
             self.node_point_size,
-            self.isolated_point_size,
         ):
             handle.on_update(self._update_style)
         if rigid_manifest is not None:
@@ -3562,7 +3548,6 @@ class ObservedGraphViewer:
         for attribute in (
             "_line_handle",
             "_node_handle",
-            "_isolated_handle",
             "_rigid_seed_handle",
             "_quarantined_rigid_handle",
             "_single_view_rigid_fill_handle",
@@ -3573,6 +3558,30 @@ class ObservedGraphViewer:
             if handle is not None:
                 handle.remove()
                 setattr(self, attribute, None)
+
+    @staticmethod
+    def _final_anchor_graph_indices(
+        graph: ObservedGraphViewData,
+        rigid_mode: RigidModeViewData | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if rigid_mode is None:
+            return (
+                np.arange(graph.edge_index.shape[0], dtype=np.int64),
+                np.arange(graph.node_points_world.shape[0], dtype=np.int64),
+            )
+        final_anchor_mask = (
+            rigid_mode.rigid_seed_mask
+            | rigid_mode.single_view_rigid_fill_mask
+        )
+        anchor_node_mask = final_anchor_mask[graph.node_gaussian_indices]
+        anchor_edge_mask = np.all(
+            anchor_node_mask[graph.edge_index],
+            axis=1,
+        )
+        return (
+            np.flatnonzero(anchor_edge_mask).astype(np.int64),
+            np.flatnonzero(anchor_node_mask).astype(np.int64),
+        )
 
     def _update_geometry(self, _event: Any = None) -> None:
         with self._update_lock:
@@ -3591,9 +3600,9 @@ class ObservedGraphViewer:
                 edges = graph.edge_index[self._selected_edge_indices]
                 self._line_handle.points = centered_points[edges]
             if self._node_handle is not None:
-                self._node_handle.points = centered_points
-            if self._isolated_handle is not None:
-                self._isolated_handle.points = centered_points[graph.isolated_mask]
+                self._node_handle.points = centered_points[
+                    self._selected_node_indices
+                ]
             if rigid_mode is None:
                 return
             assert centered_all_points is not None
@@ -3629,10 +3638,6 @@ class ObservedGraphViewer:
                 handle = getattr(self, attribute)
                 if handle is not None:
                     handle.point_size = float(self.node_point_size.value)
-            if self._isolated_handle is not None:
-                self._isolated_handle.point_size = float(
-                    self.isolated_point_size.value
-                )
 
     def _update(self, _event: Any = None) -> None:
         with self._update_lock:
@@ -3644,11 +3649,15 @@ class ObservedGraphViewer:
                 -1 if rigid_mode is None else rigid_mode.mode_index
             )
             self._selected_edge_indices = np.empty((0,), dtype=np.int64)
+            anchor_edges, self._selected_node_indices = (
+                self._final_anchor_graph_indices(graph, rigid_mode)
+            )
             if bool(self.show_graph.value):
-                selected_edges = stable_uniform_edge_indices(
-                    graph.edge_index.shape[0],
+                sampled_anchor_edges = stable_uniform_edge_indices(
+                    anchor_edges.shape[0],
                     int(self.max_visible_edges.value),
                 )
+                selected_edges = anchor_edges[sampled_anchor_edges]
                 self._selected_edge_indices = selected_edges
                 edges = graph.edge_index[selected_edges]
                 if edges.shape[0]:
@@ -3931,28 +3940,14 @@ class ObservedGraphViewer:
                         colors=np.repeat(edge_colors[:, None, :], 2, axis=1),
                         line_width=float(self.line_width.value),
                     )
-            if bool(self.show_nodes.value) and graph.node_points_world.shape[0]:
+            if bool(self.show_nodes.value) and self._selected_node_indices.size:
                 self._node_handle = self.server.scene.add_point_cloud(
                     f"{self.scene_prefix}/nodes",
-                    points=centered_points,
-                    colors=graph.node_colors_rgb,
+                    points=centered_points[self._selected_node_indices],
+                    colors=graph.node_colors_rgb[self._selected_node_indices],
                     point_size=float(self.node_point_size.value),
                     point_shape="circle",
                 )
-            if bool(self.show_isolated.value):
-                isolated_points = centered_points[graph.isolated_mask]
-                if isolated_points.shape[0]:
-                    self._isolated_handle = self.server.scene.add_point_cloud(
-                        f"{self.scene_prefix}/isolated",
-                        points=isolated_points,
-                        colors=np.full(
-                            (isolated_points.shape[0], 3),
-                            [1.0, 0.0, 0.0],
-                            dtype=np.float32,
-                        ),
-                        point_size=float(self.isolated_point_size.value),
-                        point_shape="circle",
-                    )
             if rigid_mode is not None:
                 assert centered_all_points is not None
                 assert self.show_rigid_seeds is not None
@@ -4446,7 +4441,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-visible-edges", type=int, default=20000)
     parser.add_argument("--line-width", type=float, default=1.0)
     parser.add_argument("--observed-point-size", type=float, default=0.0009)
-    parser.add_argument("--isolated-point-size", type=float, default=0.002)
     parser.add_argument("--gaussian-scale", type=float, default=1.0)
     parser.add_argument("--coverage-max-visible-points", type=int, default=50000)
     parser.add_argument("--coverage-point-size", type=float, default=0.0009)
@@ -4470,7 +4464,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--gaussian-scale must lie in [0.1,3.0]")
     for name in (
         "observed_point_size",
-        "isolated_point_size",
         "coverage_point_size",
         "residual_point_size",
     ):
@@ -4569,7 +4562,6 @@ def main() -> None:
         max_visible_edges=args.max_visible_edges,
         line_width=args.line_width,
         observed_point_size=args.observed_point_size,
-        isolated_point_size=args.isolated_point_size,
         world_center=world_center,
         rigid_manifest=rigid_manifest,
     )
