@@ -872,3 +872,26 @@ Date: 2026-07-26
   tracked binary PNG immediately. Full-sequence preview construction and video
   encoding are removed because these experiments consume only foreground
   masks.
+
+## `corn_static_3dgs_sweep_rgbmask_v1`
+
+Date: 2026-07-26
+
+### Output and interruption
+
+- Work directory:
+  `/home/zs292/data_formal/corn_2view_v1/static_3dgs/sweep_rgbmask_v1`.
+- Slurm job 406180 was preempted at approximately epoch 82 of 300 after about
+  22 minutes. Its automatic restart correctly found `checkpoints/last.ckpt`
+  but exited because the original command did not pass `--resume`.
+- Resume job 406415 then exposed a zero-mode checkpoint placeholder mismatch:
+  foreground Gaussian densification had changed the foreground count while the
+  empty modal phi Gaussian axis retained its initialization-time size.
+
+### Follow-up
+
+- Zero-mode modal buffers now normalize to the checkpoint's current foreground
+  Gaussian count during reconstruction, allowing the existing checkpoint to
+  resume unchanged.
+- Future densify/cull steps update all Gaussian-indexed modal placeholders so
+  later preemptions remain resumable.

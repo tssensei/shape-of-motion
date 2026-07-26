@@ -118,7 +118,16 @@ class SceneModel(nn.Module):
             raise ValueError("modal phi real/imag tensors must have matching shapes")
         if modal_phi_real.ndim != 3 or modal_phi_real.shape[-1] != 3:
             raise ValueError("modal phi tensors must have shape (K, G, 3)")
-        if modal_phi_real.shape[1] != self.num_fg_gaussians:
+        num_modes = int(modal_phi_real.shape[0])
+        if num_modes == 0:
+            # Empty modal buffers still encode the foreground Gaussian axis.
+            modal_phi_real = modal_phi_real.new_empty(
+                (0, self.num_fg_gaussians, 3)
+            )
+            modal_phi_imag = modal_phi_imag.new_empty(
+                (0, self.num_fg_gaussians, 3)
+            )
+        elif modal_phi_real.shape[1] != self.num_fg_gaussians:
             raise ValueError("modal phi Gaussian dimension does not match foreground")
         if not torch.is_floating_point(modal_phi_real) or not torch.is_floating_point(
             modal_phi_imag
@@ -133,7 +142,6 @@ class SceneModel(nn.Module):
         ):
             raise ValueError("modal phi real/imag tensors must contain only finite values")
 
-        num_modes = int(modal_phi_real.shape[0])
         coordinate_input_count = sum(
             value is not None for value in (modal_coordinate_real, modal_coordinate_imag)
         )
@@ -231,6 +239,14 @@ class SceneModel(nn.Module):
                 device=frame_device,
                 dtype=torch.long,
             )
+        elif (
+            num_modes == 0
+            and modal_obs_count_per_point.ndim == 2
+            and modal_obs_count_per_point.shape[0] == 0
+        ):
+            modal_obs_count_per_point = modal_obs_count_per_point.new_empty(
+                (0, self.num_fg_gaussians)
+            )
         if modal_obs_count_per_point.shape != (
             num_modes,
             self.num_fg_gaussians,
@@ -315,6 +331,14 @@ class SceneModel(nn.Module):
                 self.num_fg_gaussians,
                 device=frame_device,
                 dtype=torch.bool,
+            )
+        elif (
+            num_modes == 0
+            and modal_phi_trainable_mask.ndim == 2
+            and modal_phi_trainable_mask.shape[0] == 0
+        ):
+            modal_phi_trainable_mask = modal_phi_trainable_mask.new_empty(
+                (0, self.num_fg_gaussians)
             )
         if modal_phi_trainable_mask.shape != (
             num_modes,
@@ -654,31 +678,29 @@ class SceneModel(nn.Module):
     def densify_modal_fields(self, should_split: torch.Tensor, should_dup: torch.Tensor):
         if self.has_trainable_modal_phi:
             raise RuntimeError("modal phi optimization forbids Gaussian densification")
-        if not self.has_modal_field:
-            return
         for name in ("modal_phi_real", "modal_phi_imag"):
             x = getattr(self, name)
             x_dup = x[:, should_dup]
             x_split = x[:, should_split].repeat(1, 2, 1)
             setattr(self, name, torch.cat([x[:, ~should_split], x_dup, x_split], dim=1))
-        if self.has_modal_obs_count:
-            x = self.modal_obs_count_per_point
+        for name in ("modal_obs_count_per_point", "modal_phi_trainable_mask"):
+            x = getattr(self, name)
             x_dup = x[:, should_dup]
             x_split = x[:, should_split].repeat(1, 2)
-            self.modal_obs_count_per_point = torch.cat(
-                [x[:, ~should_split], x_dup, x_split], dim=1
+            setattr(
+                self,
+                name,
+                torch.cat([x[:, ~should_split], x_dup, x_split], dim=1),
             )
 
     @torch.no_grad()
     def cull_modal_fields(self, should_cull: torch.Tensor):
         if self.has_trainable_modal_phi:
             raise RuntimeError("modal phi optimization forbids Gaussian culling")
-        if not self.has_modal_field:
-            return
         self.modal_phi_real = self.modal_phi_real[:, ~should_cull]
         self.modal_phi_imag = self.modal_phi_imag[:, ~should_cull]
-        if self.has_modal_obs_count:
-            self.modal_obs_count_per_point = self.modal_obs_count_per_point[:, ~should_cull]
+        self.modal_obs_count_per_point = self.modal_obs_count_per_point[:, ~should_cull]
+        self.modal_phi_trainable_mask = self.modal_phi_trainable_mask[:, ~should_cull]
 
     def compute_poses_fg(
         self, ts: torch.Tensor | None, inds: torch.Tensor | None = None
