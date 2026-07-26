@@ -18,6 +18,11 @@ from typing import Any, Sequence
 FRAME_DATASET_FORMAT = "fixed_camera_video_frames"
 FRAME_DATASET_VERSION = 1
 VIEW_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+ROTATION_CHOICES = ("auto", "clockwise", "counterclockwise")
+ROTATION_FILTERS = {
+    "clockwise": "transpose=clock",
+    "counterclockwise": "transpose=cclock",
+}
 
 
 @dataclass(frozen=True)
@@ -79,11 +84,37 @@ def format_float(value: float) -> str:
     return format(value, ".12g")
 
 
+def validate_frame_transform(rotation: str, scale: float) -> None:
+    if rotation not in ROTATION_CHOICES:
+        raise ValueError(
+            f"rotation must be one of {ROTATION_CHOICES}, got {rotation!r}"
+        )
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("scale must be finite and positive")
+
+
+def build_video_filter(fps: float | None, rotation: str, scale: float) -> str:
+    validate_frame_transform(rotation, scale)
+    filters = []
+    if fps is not None:
+        filters.append(f"fps={format_float(fps)}")
+    if rotation != "auto":
+        filters.append(ROTATION_FILTERS[rotation])
+    if scale != 1.0:
+        scale_text = format_float(scale)
+        filters.append(
+            f"scale=trunc(iw*{scale_text}):trunc(ih*{scale_text}):flags=lanczos"
+        )
+    return ",".join(filters)
+
+
 def validate_extraction_inputs(
     videos: Sequence[FixedCameraVideoSpec],
     start_sec: float,
     fps: float,
     out_dir: Path,
+    rotation: str = "auto",
+    scale: float = 1.0,
 ) -> None:
     if not videos:
         raise ValueError("At least one fixed-camera video is required")
@@ -94,6 +125,7 @@ def validate_extraction_inputs(
         raise ValueError("start_sec must be finite and non-negative")
     if not math.isfinite(fps) or fps <= 0.0:
         raise ValueError("fps must be finite and positive")
+    validate_frame_transform(rotation, scale)
     for video in videos:
         if not VIEW_LABEL_PATTERN.fullmatch(video.label):
             raise ValueError(f"Invalid fixed-camera video label: {video.label!r}")
@@ -148,6 +180,8 @@ def extract_fixed_camera_video_frames(
     fps: float,
     out_dir: Path,
     ffmpeg_command: str = "ffmpeg",
+    rotation: str = "auto",
+    scale: float = 1.0,
 ) -> Path:
     resolved_videos = tuple(
         FixedCameraVideoSpec(
@@ -158,7 +192,14 @@ def extract_fixed_camera_video_frames(
         for video in videos
     )
     out_dir = out_dir.expanduser().resolve()
-    validate_extraction_inputs(resolved_videos, start_sec, fps, out_dir)
+    validate_extraction_inputs(
+        resolved_videos,
+        start_sec,
+        fps,
+        out_dir,
+        rotation,
+        scale,
+    )
     ffmpeg = resolve_executable(ffmpeg_command)
 
     out_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -174,14 +215,18 @@ def extract_fixed_camera_video_frames(
             image_dir = temp_dir / "images" / video.label
             image_dir.mkdir(parents=True)
             output_pattern = image_dir / f"{video.label}_%06d.png"
-            _run_command(
+            command = [
+                ffmpeg,
+                "-hide_banner",
+                "-nostdin",
+                "-n",
+                "-ss",
+                format_float(start_sec),
+            ]
+            if rotation != "auto":
+                command.append("-noautorotate")
+            command.extend(
                 [
-                    ffmpeg,
-                    "-hide_banner",
-                    "-nostdin",
-                    "-n",
-                    "-ss",
-                    format_float(start_sec),
                     "-i",
                     str(video.video_path),
                     "-map",
@@ -189,11 +234,14 @@ def extract_fixed_camera_video_frames(
                     "-an",
                     "-sn",
                     "-vf",
-                    f"fps={format_float(fps)}",
+                    build_video_filter(fps, rotation, scale),
                     "-start_number",
                     "0",
                     str(output_pattern),
-                ],
+                ]
+            )
+            _run_command(
+                command,
                 command_log,
             )
             frames = sorted(image_dir.glob(f"{video.label}_*.png"))
@@ -232,9 +280,11 @@ def extract_fixed_camera_video_frames(
                 "version": FRAME_DATASET_VERSION,
                 "start_sec": start_sec,
                 "fps_hz": fps,
-                "ffmpeg_autorotate": True,
+                "ffmpeg_autorotate": rotation == "auto",
+                "manual_rotation": rotation,
+                "scale_factor": scale,
                 "cropping": False,
-                "resizing": False,
+                "resizing": scale != 1.0,
                 "views": view_records,
             },
         )
@@ -260,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Extract complete fixed-camera videos after an initial trim while "
-            "preserving their decoded dimensions and orientation."
+            "optionally applying an explicit rotation and uniform scale."
         )
     )
     parser.add_argument(
@@ -275,6 +325,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--start-sec", type=float, default=2.0)
     parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--rotation", choices=ROTATION_CHOICES, default="auto")
+    parser.add_argument("--scale", type=float, default=1.0)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--ffmpeg-command", default="ffmpeg")
     return parser
@@ -288,6 +340,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.fps,
         args.out_dir,
         args.ffmpeg_command,
+        args.rotation,
+        args.scale,
     )
 
 

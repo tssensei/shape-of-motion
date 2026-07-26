@@ -1,5 +1,39 @@
 # Experiment History
 
+## `corn_static_orientation_and_resolution_diagnosis`
+
+Date: 2026-07-26
+
+### Purpose
+
+Diagnose the fixed-camera orientation and memory issue before rebuilding the
+formal corn joint-COLMAP geometry.
+
+### Paths and observations
+
+- Current fixed-camera images:
+  `/home/zs292/datasets/custom/images/corn1` and
+  `/home/zs292/datasets/custom/images/corn2`.
+- Preserved full-resolution images:
+  `/home/zs292/datasets/custom/images/corn1_fullres_backup` and
+  `/home/zs292/datasets/custom/images/corn2_fullres_backup`.
+- `corn1` contains 1,789 current and 1,789 backup frames; `corn2` contains
+  1,763 current and 1,763 backup frames. No current frame is empty.
+- Current images are `1080x1920`; backups are `2160x3840`.
+
+### Result
+
+- The fixed-camera source videos are portrait-encoded, while their scene
+  content needs a manual 90-degree counterclockwise rotation to become upright
+  landscape imagery. This is not an FFmpeg autorotation correction.
+- The accepted replacement transform is counterclockwise rotation followed by
+  a `0.5` uniform scale, producing `1920x1080` static references and complete
+  fixed-camera sequences.
+- The portrait 1080 sweep is already correct and must not be rotated or scaled.
+- The successful `joint_colmap_v1` geometry is retained only as the previous
+  orientation baseline and will be superseded by a separately versioned
+  landscape-reference reconstruction after cluster validation.
+
 ## `corn_joint_colmap_v1_formal_success`
 
 Date: 2026-07-26

@@ -26,8 +26,11 @@ import numpy as np
 
 from preproc.extract_fixed_camera_video_frames import (
     FixedCameraVideoSpec,
+    ROTATION_CHOICES,
+    build_video_filter,
     extract_fixed_camera_video_frames,
     validate_extraction_inputs,
+    validate_frame_transform,
 )
 
 
@@ -218,6 +221,8 @@ def extract_reference_frame(
     reference: ReferenceSpec,
     output_dir: Path,
     log_path: Path,
+    rotation: str = "auto",
+    scale: float = 1.0,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{reference.label}_ref.png"
@@ -228,16 +233,25 @@ def extract_reference_frame(
         "-n",
         "-ss",
         format_float(reference.timestamp_sec),
-        "-i",
-        str(reference.video_path),
-        "-map",
-        "0:v:0",
-        "-frames:v",
-        "1",
-        "-an",
-        "-sn",
-        str(output_path),
     ]
+    if rotation != "auto":
+        command.append("-noautorotate")
+    video_filter = build_video_filter(None, rotation, scale)
+    command.extend(
+        [
+            "-i",
+            str(reference.video_path),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-an",
+            "-sn",
+        ]
+    )
+    if video_filter:
+        command.extend(["-vf", video_filter])
+    command.append(str(output_path))
     run_command(command, log_path)
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(
@@ -668,6 +682,13 @@ def build_summary(
             "ffmpeg_autorotate": True,
             "cropping": False,
             "resizing": False,
+            "static_references": {
+                "ffmpeg_autorotate": args.static_rotation == "auto",
+                "manual_rotation": args.static_rotation,
+                "scale_factor": args.static_scale,
+                "cropping": False,
+                "resizing": args.static_scale != 1.0,
+            },
         },
         "colmap": {
             "camera_model": args.camera_model,
@@ -717,8 +738,11 @@ def build_summary(
         summary["extraction"]["fixed_camera_videos"] = {
             "start_sec": args.static_video_start_sec,
             "fps_hz": args.static_video_fps,
+            "ffmpeg_autorotate": args.static_rotation == "auto",
+            "manual_rotation": args.static_rotation,
+            "scale_factor": args.static_scale,
             "cropping": False,
-            "resizing": False,
+            "resizing": args.static_scale != 1.0,
         }
         summary["outputs"]["fixed_camera_frames"] = str(fixed_camera_frames_dir)
     return summary
@@ -751,6 +775,18 @@ def main() -> None:
     )
     parser.add_argument("--static-video-start-sec", type=float, default=2.0)
     parser.add_argument("--static-video-fps", type=float, default=30.0)
+    parser.add_argument(
+        "--static-rotation",
+        choices=ROTATION_CHOICES,
+        default="auto",
+        help="Orientation transform applied to static references and videos",
+    )
+    parser.add_argument(
+        "--static-scale",
+        type=float,
+        default=1.0,
+        help="Uniform scale applied after static rotation",
+    )
     parser.add_argument("--sweep-fps", type=float, default=3.0)
     parser.add_argument("--sweep-start-sec", type=float, default=0.0)
     parser.add_argument("--sweep-end-sec", type=float, default=None)
@@ -794,6 +830,7 @@ def main() -> None:
         args.sweep_start_sec,
         args.sweep_end_sec,
     )
+    validate_frame_transform(args.static_rotation, args.static_scale)
     fixed_camera_videos = tuple(
         FixedCameraVideoSpec(
             label=reference.label,
@@ -808,6 +845,8 @@ def main() -> None:
             args.static_video_start_sec,
             args.static_video_fps,
             args.static_frames_out_dir,
+            args.static_rotation,
+            args.static_scale,
         )
     if (
         not math.isfinite(args.min_sweep_registration_ratio)
@@ -852,6 +891,8 @@ def main() -> None:
             reference,
             static_reference_dir,
             command_log,
+            args.static_rotation,
+            args.static_scale,
         )
 
     run_colmap(
@@ -936,6 +977,8 @@ def main() -> None:
             args.static_video_fps,
             args.static_frames_out_dir,
             ffmpeg,
+            args.static_rotation,
+            args.static_scale,
         )
     summary = build_summary(
         args,
