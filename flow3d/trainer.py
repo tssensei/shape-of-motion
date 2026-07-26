@@ -936,9 +936,7 @@ class Trainer:
         if not self.model.has_bg:
             mask_loss = F.mse_loss(rendered_all["acc"], masks[..., None])  # type: ignore
         else:
-            mask_loss = F.mse_loss(
-                rendered_all["acc"], torch.ones_like(rendered_all["acc"])  # type: ignore
-            ) + masked_l1_loss(
+            mask_loss = masked_l1_loss(
                 rendered_all["mask"],
                 masks[..., None],
                 quantile=0.98,  # type: ignore
