@@ -211,7 +211,7 @@ def extract_reference_frame(
     output_dir: Path,
     log_path: Path,
 ) -> Path:
-    output_dir.mkdir(parents=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{reference.label}_ref.png"
     command = [
         ffmpeg,

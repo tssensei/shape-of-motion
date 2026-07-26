@@ -1,5 +1,35 @@
 # Experiment History
 
+## `corn_joint_colmap_v1_shared_reference_directory_failure`
+
+Date: 2026-07-26
+
+### Purpose
+
+Run the first video-only joint-COLMAP preparation for corn using a 15 FPS
+portrait sweep and one 3.0-second landscape reference from each fixed view.
+
+### Paths and configuration
+
+- Output directory: `/home/zs292/outputs_modal/corn/geometry/joint_colmap_v1`
+- Sweep video: `/home/zs292/datasets/custom/videos/corn_sweep.MOV`
+- Static videos: `/home/zs292/datasets/custom/videos/corn1.mov` and
+  `/home/zs292/datasets/custom/videos/corn2.mov`
+- Reference timestamps: 3.0 seconds for both fixed views.
+- Sweep sampling rate: 15 FPS.
+
+### Result
+
+- The run failed before COLMAP feature extraction while exporting the second
+  reference image.
+- Root cause: both static references intentionally share
+  `colmap_workspace/images/static_refs`, but the directory creation rejected
+  the folder already created for the first reference.
+- The extraction helper now permits the shared directory to exist while each
+  reference image still uses FFmpeg no-overwrite behavior.
+- `joint_colmap_v1` is a partial failed output and should not be reused; rerun
+  into a new versioned output directory.
+
 ## `bush4_stage2b_k3_cubic_envelope_full_5ep`
 
 Date: 2026-07-17
