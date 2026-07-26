@@ -157,10 +157,21 @@ class Renderer:
             if isinstance(init_metadata, dict)
             else None
         )
-        if present_coordinate_keys or parameterization is not None:
+        missing_coordinate_keys = sorted(coordinate_keys - set(state_dict))
+        if present_coordinate_keys and missing_coordinate_keys:
+            raise ValueError(
+                "Flow-coordinate checkpoint is missing required state: "
+                f"{missing_coordinate_keys}"
+            )
+        for key in present_coordinate_keys:
+            if not isinstance(state_dict[key], torch.Tensor):
+                raise ValueError(f"Checkpoint state {key!r} must be a tensor")
+        has_nonempty_coordinate_state = any(
+            state_dict[key].numel() > 0 for key in present_coordinate_keys
+        )
+        if has_nonempty_coordinate_state or parameterization is not None:
             if not isinstance(init_metadata, dict):
                 raise ValueError("Flow-coordinate checkpoint metadata must be a mapping")
-            missing_coordinate_keys = sorted(coordinate_keys - set(state_dict))
             if missing_coordinate_keys:
                 raise ValueError(
                     "Flow-coordinate checkpoint is missing required state: "

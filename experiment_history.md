@@ -895,3 +895,15 @@ Date: 2026-07-26
   resume unchanged.
 - Future densify/cull steps update all Gaussian-indexed modal placeholders so
   later preemptions remain resumable.
+
+### 100-epoch completion and Viser inspection
+
+- The static training run completed at 100 epochs in
+  `/home/zs292/data_formal/corn_2view_v1/static_3dgs/sweep_rgbmask_v1`.
+- Initial Viser loading of `checkpoints/last.ckpt` failed because the renderer
+  interpreted the static model's empty `modal_coordinate_real` and
+  `modal_coordinate_imag` placeholder tensors as populated modal state and
+  consequently required modal parameterization metadata.
+- Renderer checkpoint detection now treats only populated coordinate tensors
+  or explicit modal parameterization metadata as a modal checkpoint; the same
+  static checkpoint can be inspected without retraining or conversion.
