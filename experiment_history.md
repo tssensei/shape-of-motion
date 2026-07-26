@@ -23,16 +23,21 @@ formal corn joint-COLMAP geometry.
 
 ### Result
 
-- The fixed-camera source videos are portrait-encoded, while their scene
-  content needs a manual 90-degree counterclockwise rotation to become upright
-  landscape imagery. This is not an FFmpeg autorotation correction.
-- The accepted replacement transform is counterclockwise rotation followed by
-  a `0.5` uniform scale, producing `1920x1080` static references and complete
-  fixed-camera sequences.
+- FFprobe confirmed that both fixed-camera MOV files store `3840x2160` encoded
+  pixels with display metadata `rotation=-90`. The encoded pixels are already
+  in the required landscape orientation; only metadata-aware playback appears
+  portrait.
+- The first landscape v2 attempt incorrectly combined `-noautorotate` with a
+  counterclockwise transpose. Its COLMAP reference remained `1080x1920` with
+  sideways scene content, so that reconstruction and its extracted fixed-camera
+  frames are invalid and must not be reused.
+- The accepted replacement transform is `-noautorotate` with no transpose,
+  followed by a `0.5` uniform scale. It should produce `1920x1080` static
+  references and complete fixed-camera sequences.
 - The portrait 1080 sweep is already correct and must not be rotated or scaled.
-- The successful `joint_colmap_v1` geometry is retained only as the previous
-  orientation baseline and will be superseded by a separately versioned
-  landscape-reference reconstruction after cluster validation.
+- The next reconstruction must use a separately versioned v3 output and replace
+  both the previous v1 orientation baseline and the invalid v2 attempt after
+  cluster validation.
 
 ## `corn_joint_colmap_v1_formal_success`
 

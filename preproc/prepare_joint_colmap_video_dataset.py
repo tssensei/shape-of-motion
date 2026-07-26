@@ -779,7 +779,10 @@ def main() -> None:
         "--static-rotation",
         choices=ROTATION_CHOICES,
         default="auto",
-        help="Orientation transform applied to static references and videos",
+        help=(
+            "Display-metadata or encoded-frame orientation transform applied "
+            "to static references and videos"
+        ),
     )
     parser.add_argument(
         "--static-scale",

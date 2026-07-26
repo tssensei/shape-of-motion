@@ -18,7 +18,12 @@ from typing import Any, Sequence
 FRAME_DATASET_FORMAT = "fixed_camera_video_frames"
 FRAME_DATASET_VERSION = 1
 VIEW_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
-ROTATION_CHOICES = ("auto", "clockwise", "counterclockwise")
+ROTATION_CHOICES = (
+    "auto",
+    "noautorotate",
+    "clockwise",
+    "counterclockwise",
+)
 ROTATION_FILTERS = {
     "clockwise": "transpose=clock",
     "counterclockwise": "transpose=cclock",
@@ -98,7 +103,7 @@ def build_video_filter(fps: float | None, rotation: str, scale: float) -> str:
     filters = []
     if fps is not None:
         filters.append(f"fps={format_float(fps)}")
-    if rotation != "auto":
+    if rotation in ROTATION_FILTERS:
         filters.append(ROTATION_FILTERS[rotation])
     if scale != 1.0:
         scale_text = format_float(scale)
@@ -325,7 +330,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--start-sec", type=float, default=2.0)
     parser.add_argument("--fps", type=float, default=30.0)
-    parser.add_argument("--rotation", choices=ROTATION_CHOICES, default="auto")
+    parser.add_argument(
+        "--rotation",
+        choices=ROTATION_CHOICES,
+        default="auto",
+        help=(
+            "Use auto display rotation, ignore display rotation metadata, or "
+            "apply an explicit encoded-frame rotation"
+        ),
+    )
     parser.add_argument("--scale", type=float, default=1.0)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--ffmpeg-command", default="ffmpeg")
