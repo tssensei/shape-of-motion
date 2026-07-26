@@ -4,6 +4,8 @@ The script intentionally uses only decoded RGB video frames. It assigns the
 calibration sweep to one COLMAP camera and all static reference images to a
 second shared camera, requires every reference to register in one sparse model,
 and packages that model for the repository's static COLMAP dataset loader.
+Optionally, it also exports each complete fixed-camera sequence after an
+initial trim without adding those dynamic frames to COLMAP.
 """
 
 from __future__ import annotations
@@ -21,6 +23,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+
+from preproc.extract_fixed_camera_video_frames import (
+    FixedCameraVideoSpec,
+    extract_fixed_camera_video_frames,
+    validate_extraction_inputs,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -626,6 +634,7 @@ def build_summary(
     scene_transform: np.ndarray,
     camera_group_ids: dict[str, int],
     dataset_dir: Path,
+    fixed_camera_frames_dir: Path | None,
 ) -> dict[str, Any]:
     registered_sweep_names = sorted(
         record["image_name"] for record in records if record["source"] == "sweep"
@@ -638,7 +647,7 @@ def build_summary(
         [float(point.error) for point in points.values()],
         dtype=np.float64,
     )
-    return {
+    summary: dict[str, Any] = {
         "format": "joint_colmap_video_dataset",
         "version": 1,
         "inputs": {
@@ -704,6 +713,15 @@ def build_summary(
             "Foreground/background masks under sweep_colmap_dataset/masks",
         ],
     }
+    if fixed_camera_frames_dir is not None:
+        summary["extraction"]["fixed_camera_videos"] = {
+            "start_sec": args.static_video_start_sec,
+            "fps_hz": args.static_video_fps,
+            "cropping": False,
+            "resizing": False,
+        }
+        summary["outputs"]["fixed_camera_frames"] = str(fixed_camera_frames_dir)
+    return summary
 
 
 def main() -> None:
@@ -722,6 +740,17 @@ def main() -> None:
         type=parse_reference_spec,
         help="LABEL=VIDEO_PATH=TIMESTAMP_SECONDS; repeat once per static view",
     )
+    parser.add_argument(
+        "--static-frames-out-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional separate output for complete fixed-camera sequences. "
+            "These frames are not added to COLMAP."
+        ),
+    )
+    parser.add_argument("--static-video-start-sec", type=float, default=2.0)
+    parser.add_argument("--static-video-fps", type=float, default=30.0)
     parser.add_argument("--sweep-fps", type=float, default=3.0)
     parser.add_argument("--sweep-start-sec", type=float, default=0.0)
     parser.add_argument("--sweep-end-sec", type=float, default=None)
@@ -751,6 +780,12 @@ def main() -> None:
         )
         for reference in args.reference
     ]
+    if args.static_frames_out_dir is not None:
+        args.static_frames_out_dir = (
+            args.static_frames_out_dir.expanduser().resolve()
+        )
+        if args.static_frames_out_dir == args.out_dir:
+            raise ValueError("--static-frames-out-dir must differ from --out-dir")
     validate_inputs(
         args.sweep_video,
         args.reference,
@@ -759,6 +794,21 @@ def main() -> None:
         args.sweep_start_sec,
         args.sweep_end_sec,
     )
+    fixed_camera_videos = tuple(
+        FixedCameraVideoSpec(
+            label=reference.label,
+            video_path=reference.video_path,
+            reference_timestamp_sec=reference.timestamp_sec,
+        )
+        for reference in args.reference
+    )
+    if args.static_frames_out_dir is not None:
+        validate_extraction_inputs(
+            fixed_camera_videos,
+            args.static_video_start_sec,
+            args.static_video_fps,
+            args.static_frames_out_dir,
+        )
     if (
         not math.isfinite(args.min_sweep_registration_ratio)
         or args.min_sweep_registration_ratio <= 0.0
@@ -878,6 +928,15 @@ def main() -> None:
             "references": reference_records,
         },
     )
+    fixed_camera_frames_dir = None
+    if args.static_frames_out_dir is not None:
+        fixed_camera_frames_dir = extract_fixed_camera_video_frames(
+            fixed_camera_videos,
+            args.static_video_start_sec,
+            args.static_video_fps,
+            args.static_frames_out_dir,
+            ffmpeg,
+        )
     summary = build_summary(
         args,
         selected,
@@ -888,6 +947,7 @@ def main() -> None:
         scene_transform,
         camera_group_ids,
         dataset_dir,
+        fixed_camera_frames_dir,
     )
     write_json(reports_dir / "colmap_registration_summary.json", summary)
 
