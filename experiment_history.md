@@ -1,5 +1,43 @@
 # Experiment History
 
+## `corn_joint_colmap_v1_formal_success`
+
+Date: 2026-07-26
+
+### Purpose
+
+Build the formal video-only joint-COLMAP geometry for corn from a complete
+15 FPS portrait sweep and one 3.0-second landscape reference from each of the
+two fixed-camera videos.
+
+### Paths and configuration
+
+- Output directory:
+  `/home/zs292/data_formal/corn_2view_v1/shared/preprocessing/joint_colmap_v1`
+- Sweep video: `/home/zs292/datasets/custom/videos/corn_sweep.MOV`
+- Static videos: `/home/zs292/datasets/custom/videos/corn1.mov` and
+  `/home/zs292/datasets/custom/videos/corn2.mov`
+- Reference timestamps: 3.0 seconds for both fixed views.
+- Sweep sampling rate: 15 FPS.
+- Camera model: `SIMPLE_RADIAL`.
+- Camera grouping: one camera for the portrait sweep and one shared camera for
+  both landscape references.
+
+### Result
+
+- The sole complete model registered all 280 sweep frames and both static
+  references, for 282/282 registered images and a sweep registration ratio of
+  1.0.
+- The reconstruction contains 125,061 sparse points, 1,787,878 observations,
+  a mean track length of 14.296, and a mean reprojection error of 0.642464 px.
+- COLMAP reported two cameras with the intended group IDs: sweep camera 2 and
+  shared static-reference camera 1.
+- The packaged sweep dataset, normalized scene transform,
+  `scene_norm_dict.pth`, registered-camera report, and fixed-reference camera
+  manifest were all written successfully.
+- No VGGT alignment is required. The next required input for static 3DGS is a
+  foreground/background mask for every packaged sweep image.
+
 ## `corn_joint_colmap_v1_shared_reference_directory_failure`
 
 Date: 2026-07-26
