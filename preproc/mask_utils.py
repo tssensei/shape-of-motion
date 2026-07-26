@@ -1,5 +1,7 @@
 import glob
+from collections.abc import Callable
 
+import imageio.v2 as iio
 import numpy as np
 from loguru import logger as guru
 from segment_anything import SamPredictor, sam_model_registry
@@ -29,39 +31,55 @@ def init_tracker(checkpoint_dir, device) -> BaseTracker:
 
 def track_masks(
     tracker: BaseTracker,
-    imgs_np: np.ndarray | list,
+    img_paths: list[str],
     cano_mask: np.ndarray,
     cano_t: int,
-):
+    save_mask: Callable[[int, np.ndarray], None],
+) -> None:
     """
-    :param imgs_np: (T, H, W, 3)
+    :param img_paths: ordered paths to the RGB frames
     :param cano_mask: (H, W) index mask
     :param cano_t: canonical frame index
+    :param save_mask: callback that saves one tracked index mask
     """
-    T = len(imgs_np)
+    T = len(img_paths)
+    if T == 0:
+        raise ValueError("Cannot track masks without input frames.")
+    if cano_t < 0 or cano_t >= T:
+        raise IndexError(f"Canonical frame index {cano_t} is outside [0, {T}).")
     cano_mask = cano_mask > 0.5
 
+    def load_frame(t: int) -> np.ndarray:
+        frame = iio.imread(img_paths[t])
+        if frame.ndim != 3 or frame.shape[2] < 3:
+            raise ValueError(f"Expected an RGB image, got {frame.shape}: {img_paths[t]}")
+        return frame[:, :, :3]
+
     # forward from canonical_id
-    masks_forward = []
-    for t in range(int(cano_t), T):
-        frame = imgs_np[t]
-        if t == cano_t:
-            mask = tracker.track(frame, cano_mask)
-        else:
-            mask = tracker.track(frame)
-        masks_forward.append(mask)
-    tracker.clear_memory()
+    forward_total = T - cano_t
+    guru.info(f"Tracking {forward_total} frames forward from frame {cano_t}.")
+    try:
+        for step, t in enumerate(range(int(cano_t), T), start=1):
+            frame = load_frame(t)
+            if t == cano_t:
+                mask = tracker.track(frame, cano_mask)
+            else:
+                mask = tracker.track(frame)
+            save_mask(t, mask)
+            if step % 25 == 0 or step == forward_total:
+                guru.info(f"Forward tracking: {step} / {forward_total} frames saved.")
+    finally:
+        tracker.clear_memory()
 
     # backward from canonical_id
-    masks_backward = []
-    for t in range(int(cano_t), -1, -1):
-        frame = imgs_np[t]
-        if t == cano_t:
-            mask = tracker.track(frame, cano_mask)
-        else:
-            mask = tracker.track(frame)
-        masks_backward.append(mask)
-    tracker.clear_memory()
-
-    masks_all = masks_backward[::-1] + masks_forward[1:]
-    return masks_all
+    if cano_t > 0:
+        guru.info(f"Tracking {cano_t} frames backward from frame {cano_t}.")
+        try:
+            tracker.track(load_frame(cano_t), cano_mask)
+            for step, t in enumerate(range(int(cano_t) - 1, -1, -1), start=1):
+                mask = tracker.track(load_frame(t))
+                save_mask(t, mask)
+                if step % 25 == 0 or step == cano_t:
+                    guru.info(f"Backward tracking: {step} / {cano_t} frames saved.")
+        finally:
+            tracker.clear_memory()

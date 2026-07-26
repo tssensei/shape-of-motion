@@ -31,8 +31,6 @@ class PromptGUI(object):
         # saves the masks and logits for each mask index
         self.cur_masks = {}
         self.cur_logits = {}
-        self.index_masks_all = []
-        self.color_masks_all = []
 
         self.img_dir = ""
         self.img_paths = []
@@ -47,11 +45,11 @@ class PromptGUI(object):
         if self.tracker is None:
             self.tracker = init_tracker(self.checkpoint_dir, self.device)
 
-    def clear_points(self) -> tuple[None, None, str]:
+    def clear_points(self) -> tuple[None, str]:
         self.selected_points.clear()
         self.selected_labels.clear()
         message = "Cleared points, select new points to update mask"
-        return None, None, message
+        return None, message
 
     def add_new_mask(self):
         self.cur_mask_idx += 1
@@ -77,8 +75,6 @@ class PromptGUI(object):
         self.frame_index = 0
         self.cur_masks = {}
         self.cur_logits = {}
-        self.index_masks_all = []
-        self.color_masks_all = []
 
     def set_img_dir(self, img_dir: str) -> int:
         self._clear_image()
@@ -157,35 +153,29 @@ class PromptGUI(object):
         idx_sel = np.argmax(scores)
         return masks[idx_sel], logits[idx_sel]
 
-    def run_tracker(self) -> tuple[str, str]:
+    def run_tracker(self, output_dir: str) -> str:
+        if not output_dir:
+            raise gr.Error("Select an image sequence before submitting the mask.")
         idx_mask = self.make_index_mask()
         self.lazy_init_tracker()
         assert self.tracker is not None
         self.tracker.clear_memory()
-
-        # read images and drop the alpha channel
-        images = [iio.imread(p)[:, :, :3] for p in self.img_paths]
-        
-        # binary masks
-        self.index_masks_all = track_masks(
-            self.tracker, images, idx_mask, self.frame_index
-        )
-
-        out_frames, self.color_masks_all = colorize_masks(images, self.index_masks_all)
-        out_vidpath = "tracked_colors.mp4"
-        iio.mimwrite(out_vidpath, out_frames)
-        message = f"Wrote current tracked video to {out_vidpath}."
-        instruct = "Save the masks to an output directory if it looks good!"
-        return out_vidpath, f"{message} {instruct}"
-
-    def save_masks_to_dir(self, output_dir: str) -> str:
-        assert self.color_masks_all is not None
         os.makedirs(output_dir, exist_ok=True)
-        for img_path, clr_mask in zip(self.img_paths, self.color_masks_all):
-            name = os.path.basename(img_path)
-            out_path = f"{output_dir}/{name}"
-            iio.imwrite(out_path, clr_mask)
-        message = f"Saved masks to {output_dir}!"
+
+        def save_mask(frame_index: int, index_mask: np.ndarray) -> None:
+            name = os.path.basename(self.img_paths[frame_index])
+            output_path = os.path.join(output_dir, name)
+            binary_mask = (index_mask > 0).astype(np.uint8) * 255
+            iio.imwrite(output_path, binary_mask)
+
+        track_masks(
+            self.tracker,
+            self.img_paths,
+            idx_mask,
+            self.frame_index,
+            save_mask,
+        )
+        message = f"Saved {len(self.img_paths)} masks to {output_dir}!"
         guru.debug(message)
         return message
 
@@ -219,20 +209,6 @@ def get_hls_palette(
         colorsys.hls_to_rgb(h_i, lightness, saturation) for h_i in hues
     ]
     return (255 * np.asarray(palette)).astype("uint8")
-
-
-def colorize_masks(images, index_masks, fac: float = 0.5):
-    max_idx = max([m.max() for m in index_masks])
-    guru.debug(f"{max_idx=}")
-    palette = get_hls_palette(max_idx + 1)
-    color_masks = []
-    out_frames = []
-    for img, mask in zip(images, index_masks):
-        clr_mask = palette[mask.astype("int")]
-        color_masks.append(clr_mask)
-        out_u = compose_img_mask(img, clr_mask, fac)
-        out_frames.append(out_u)
-    return out_frames, color_masks
 
 
 def compose_img_mask(img, color_mask, fac: float = 0.5):
@@ -317,11 +293,9 @@ def make_demo(
                 output_img = gr.Image(label="Current selection")
                 add_button = gr.Button("Add new mask")
                 submit_button = gr.Button("Submit mask for tracking")
-                final_video = gr.Video(label="Masked video")
                 mask_dir_field = gr.Text(
                     None, label="Path to save masks", interactive=False
                 )
-                save_button = gr.Button("Save masks")
 
         def update_vid_root(root_dir, vid_name):
             vid_root = f"{root_dir}/{vid_name}"
@@ -501,16 +475,13 @@ def make_demo(
         input_image.select(get_select_coords, [input_image], [output_img])
 
         sam_button.click(prompts.get_sam_features, outputs=[instruction, input_image])
-        clear_button.click(
-            prompts.clear_points, outputs=[output_img, final_video, instruction]
-        )
+        clear_button.click(prompts.clear_points, outputs=[output_img, instruction])
         pos_button.click(prompts.set_positive, outputs=[instruction])
         neg_button.click(prompts.set_negative, outputs=[instruction])
 
         add_button.click(prompts.add_new_mask, outputs=[output_img, instruction])
-        submit_button.click(prompts.run_tracker, outputs=[final_video, instruction])
-        save_button.click(
-            prompts.save_masks_to_dir, [mask_dir_field], outputs=[instruction]
+        submit_button.click(
+            prompts.run_tracker, [mask_dir_field], outputs=[instruction]
         )
 
     return demo
@@ -537,6 +508,7 @@ if __name__ == "__main__":
         args.root_dir,
         args.vid_name,
         args.img_name,
+        args.mask_name,
     )
     allowed_video_dir = os.path.abspath(f"{args.root_dir}/{args.vid_name}")
     demo.launch(server_port=args.port, allowed_paths=[allowed_video_dir])

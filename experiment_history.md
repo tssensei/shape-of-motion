@@ -848,3 +848,27 @@ Date: 2026-07-24
   retaining their ordered finite diagnostics because coordinate inversion
   directly fits full reference flow from projected global `phi` and does not
   consume alpha values.
+
+## `corn_static_mask_tracking_fullres_v1`
+
+Date: 2026-07-26
+
+### Inputs and output targets
+
+- corn1 frames: `/home/zs292/datasets/custom/images/corn1`, 1789 frames at
+  `1920x1080`.
+- corn2 frames: `/home/zs292/datasets/custom/images/corn2`, 1763 frames at
+  `1920x1080`.
+- Mask output targets: `/home/zs292/datasets/custom/masks/corn1` and
+  `/home/zs292/datasets/custom/masks/corn2`.
+
+### Observed bottleneck and follow-up
+
+- The corn1 interactive run used canonical frame 819. XMem tracking reached
+  the colorization stage in about eight minutes, but the original app then
+  spent more than thirty minutes retaining and composing all full-resolution
+  colored masks and preview frames before writing `tracked_colors.mp4`.
+- The follow-up changes mask tracking to read one frame at a time and save each
+  tracked binary PNG immediately. Full-sequence preview construction and video
+  encoding are removed because these experiments consume only foreground
+  masks.
