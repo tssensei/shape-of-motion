@@ -907,3 +907,25 @@ Date: 2026-07-26
 - Renderer checkpoint detection now treats only populated coordinate tensors
   or explicit modal parameterization metadata as a modal checkpoint; the same
   static checkpoint can be inspected without retraining or conversion.
+
+## `corn_colmap_modal_view_configs_v1`
+
+Date: 2026-07-26
+
+### Inputs and intended output
+
+- Static checkpoint:
+  `/home/zs292/data_formal/corn_2view_v1/static_3dgs/sweep_rgbmask_v1/checkpoints/last.ckpt`.
+- Joint-COLMAP reference cameras:
+  `/home/zs292/data_formal/corn_2view_v1/shared/preprocessing/joint_colmap_v3_landscape_1080/references/reference_cameras.json`.
+- Modal ROI masks are the 960x540 union masks from the direct corn1/corn2
+  optical-flow inputs.
+- Intended formal output:
+  `/home/zs292/data_formal/corn_2view_v1/shared/inputs/view_configs_colmap_v1`.
+
+### Pipeline change
+
+- A dedicated COLMAP-only exporter now replaces the deleted VGGT/UniDepth
+  geometry bridge. It uses the normalized reference-camera coordinate system
+  shared with the static 3DGS, scales 1920x1080 intrinsics to 960x540, and
+  renders foreground depth directly from the accepted 100-epoch checkpoint.
