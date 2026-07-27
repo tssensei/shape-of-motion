@@ -93,6 +93,7 @@ class DynamicViewer(Viewer):
         playback_groups: tuple[ViewerPlaybackGroup, ...] = (),
         modal_freqs_hz: tuple[float, ...] = (),
         has_modal_obs_count: bool = False,
+        has_background: bool = False,
         modal_anchor_count: int = 0,
         modal_anchor_role_classes: np.ndarray | None = None,
         modal_anchor_role_mode_labels: tuple[str, ...] = (),
@@ -106,6 +107,7 @@ class DynamicViewer(Viewer):
         self.modal_freqs_hz = tuple(float(freq) for freq in modal_freqs_hz)
         self.has_modal_obs_count = bool(has_modal_obs_count)
         self._enable_hide_gaussian_render = mode == "rendering"
+        self._enable_hide_background = mode == "rendering" and bool(has_background)
         self.modal_anchor_count = int(modal_anchor_count)
         self.modal_anchor_role_mode_labels = tuple(modal_anchor_role_mode_labels)
         self.modal_anchor_role_classes = None
@@ -364,6 +366,11 @@ class DynamicViewer(Viewer):
                 if self._enable_hide_gaussian_render
                 else None
             )
+            hide_background = (
+                self.server.gui.add_checkbox("Hide background", False)
+                if self._enable_hide_background
+                else None
+            )
             show_anchors = None
             anchor_count = None
             anchor_point_size = None
@@ -414,6 +421,7 @@ class DynamicViewer(Viewer):
                     )
         self._debug_point_handles = {
             "hide_render": hide_render,
+            "hide_background": hide_background,
             "show_anchors": show_anchors,
             "anchor_count": anchor_count,
             "anchor_point_size": anchor_point_size,
@@ -428,6 +436,8 @@ class DynamicViewer(Viewer):
 
         if hide_render is not None:
             hide_render.on_update(_on_update)
+        if hide_background is not None:
+            hide_background.on_update(_on_update)
         if show_anchors is not None:
             show_anchors.on_update(_on_update)
         if anchor_count is not None:
@@ -451,6 +461,14 @@ class DynamicViewer(Viewer):
             handles is not None
             and handles["hide_render"] is not None
             and bool(handles["hide_render"].value)
+        )
+
+    def hide_background(self) -> bool:
+        handles = getattr(self, "_debug_point_handles", None)
+        return (
+            handles is not None
+            and handles["hide_background"] is not None
+            and bool(handles["hide_background"].value)
         )
 
     def wants_modal_anchors(self) -> bool:

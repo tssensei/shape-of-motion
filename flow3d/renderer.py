@@ -58,6 +58,12 @@ class Renderer:
 
         self.model = model
         self.num_frames = model.num_frames
+        self._foreground_render_filter = None
+        if model.has_bg:
+            self._foreground_render_filter = torch.arange(
+                model.num_gaussians,
+                device=device,
+            ) < model.num_fg_gaussians
 
         self.work_dir = work_dir
         self.global_step = 0
@@ -111,6 +117,7 @@ class Renderer:
                 playback_groups=playback_groups,
                 modal_freqs_hz=modal_freqs_hz,
                 has_modal_obs_count=model.has_modal_obs_count,
+                has_background=model.has_bg,
                 modal_anchor_count=(
                     0
                     if self.modal_anchor_points is None
@@ -632,6 +639,11 @@ class Renderer:
         if self.viewer.hide_gaussian_render():
             return np.full((H, W, 3), 255, dtype=np.uint8)
         colors_override = self._current_gaussian_color_override(w2c, K)
+        filter_mask = (
+            self._foreground_render_filter
+            if self.viewer.hide_background()
+            else None
+        )
         img = self.model.render(
             render_t,
             w2c[None],
@@ -640,6 +652,7 @@ class Renderer:
             means=means,
             quats=quats,
             colors_override=colors_override,
+            filter_mask=filter_mask,
         )["img"][0]
         render_track_checkbox = getattr(self.viewer, "_render_track_checkbox", None)
         render_tracks = bool(render_track_checkbox.value) if render_track_checkbox is not None else False

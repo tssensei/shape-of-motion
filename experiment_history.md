@@ -939,3 +939,28 @@ Date: 2026-07-26
 - The exporter now recognizes this exact registered reference-camera source
   resolution and reduces it to 960x540 with nearest-neighbor sampling. This
   preserves the binary ROI boundary and records the resize in output metadata.
+
+## `corn_rigid_components_k20_fixed_flow_ridge1e4_v1`
+
+Date: 2026-07-26
+
+### Reusable outputs
+
+- Rigid K20 modal field:
+  `/home/zs292/data_formal/corn_2view_v1/modal_fields/greedy_0p2_4p0_step0p025_k20prefix_v1/rigid_rgbdepth_v3_sequential_k20_bounded_complex_v1`.
+- Flow coordinates:
+  `/home/zs292/data_formal/corn_2view_v1/flow_coordinates/greedy_0p2_4p0_step0p025_k20prefix_v1/ridge1e4_v1`.
+- Fixed modal checkpoint:
+  `/home/zs292/data_formal/corn_2view_v1/modal_checkpoints/greedy_0p2_4p0_step0p025_k20prefix_v1/fixed_flow_ridge1e4_v1`.
+
+### Result
+
+- All 20 priority modes completed with the unchanged rigid-component and
+  sequential motion-fill settings; the lower-priority 0.525 Hz mode that
+  stopped the K60 attempt is not part of this K20 basis.
+- Per-frame coordinate inversion solved 3552 frames at full rank 40/40 for
+  both views. Overall flow fit was RMSE 0.531278, relative residual 0.488788,
+  and R2 0.761086; corn1/corn2 R2 values were 0.791124 and 0.738118.
+- Viser inspection considered the K20 motion acceptable for continuing, and
+  the modal renderer now offers an optional background-hide control for
+  foreground-only inspection without changing the stored checkpoint.
