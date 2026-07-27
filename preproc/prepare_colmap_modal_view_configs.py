@@ -47,6 +47,9 @@ class PreparedView:
     world_to_camera: np.ndarray
     mask: np.ndarray
     mask_source: Path
+    mask_source_width: int
+    mask_source_height: int
+    mask_resized: bool
 
 
 def parse_view_spec(value: str) -> ViewSpec:
@@ -104,7 +107,11 @@ def _finite_matrix(value: Any, shape: tuple[int, int], label: str) -> np.ndarray
     return matrix
 
 
-def _load_binary_mask(path: Path, expected_shape: tuple[int, int]) -> np.ndarray:
+def _load_binary_mask(
+    path: Path,
+    source_shape: tuple[int, int],
+    target_shape: tuple[int, int],
+) -> tuple[np.ndarray, tuple[int, int], bool]:
     mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if mask is None:
         raise FileNotFoundError(f"Cannot read foreground ROI mask: {path}")
@@ -114,13 +121,25 @@ def _load_binary_mask(path: Path, expected_shape: tuple[int, int]) -> np.ndarray
         mask = mask > 0
     else:
         raise ValueError(f"Foreground ROI mask must be 2-D or 3-D, got {mask.shape}: {path}")
-    if mask.shape != expected_shape:
+    loaded_shape = (int(mask.shape[0]), int(mask.shape[1]))
+    resized = False
+    if loaded_shape == target_shape:
+        pass
+    elif loaded_shape == source_shape:
+        mask = cv2.resize(
+            mask.astype(np.uint8),
+            (target_shape[1], target_shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ) > 0
+        resized = True
+    else:
         raise ValueError(
-            f"Foreground ROI mask shape {mask.shape} does not match target {expected_shape}: {path}"
+            f"Foreground ROI mask shape {loaded_shape} matches neither reference "
+            f"source {source_shape} nor target {target_shape}: {path}"
         )
     if not bool(np.any(mask)):
         raise ValueError(f"Foreground ROI mask is empty: {path}")
-    return mask.astype(np.uint8)
+    return mask.astype(np.uint8), loaded_shape, resized
 
 
 def _prepare_view(
@@ -154,7 +173,11 @@ def _prepare_view(
     scaled_K[1, :] *= target_height / source_height
 
     mask_path = spec.mask_path.resolve(strict=True)
-    mask = _load_binary_mask(mask_path, (target_height, target_width))
+    mask, mask_source_shape, mask_resized = _load_binary_mask(
+        mask_path,
+        (source_height, source_width),
+        (target_height, target_width),
+    )
     return PreparedView(
         view_id=spec.view_id,
         source_width=source_width,
@@ -165,6 +188,9 @@ def _prepare_view(
         world_to_camera=world_to_camera,
         mask=mask,
         mask_source=mask_path,
+        mask_source_width=mask_source_shape[1],
+        mask_source_height=mask_source_shape[0],
+        mask_resized=mask_resized,
     )
 
 
@@ -298,6 +324,11 @@ def prepare_colmap_modal_view_configs(
                         "height": view.target_height,
                     },
                     "mask_source": str(view.mask_source),
+                    "mask_source_resolution": {
+                        "width": view.mask_source_width,
+                        "height": view.mask_source_height,
+                    },
+                    "mask_resized_with_nearest": view.mask_resized,
                     "mask_pixel_count": mask_count,
                     "render_overlap_pixel_count": visible_count,
                     "render_overlap_fraction_of_mask": visible_count / mask_count,

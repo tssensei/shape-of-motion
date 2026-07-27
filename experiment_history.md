@@ -929,3 +929,13 @@ Date: 2026-07-26
   geometry bridge. It uses the normalized reference-camera coordinate system
   shared with the static 3DGS, scales 1920x1080 intrinsics to 960x540, and
   renders foreground depth directly from the accepted 100-epoch checkpoint.
+
+### First exporter run
+
+- The corn1 ROI union at
+  `/home/zs292/data_formal/corn_2view_v1/modal_2d/direct_960/corn1/roi_union.png`
+  was measured as 1920x1080 even though the compensated RGB input and flow
+  cache use 960x540. The run stopped before publishing the output directory.
+- The exporter now recognizes this exact registered reference-camera source
+  resolution and reduces it to 960x540 with nearest-neighbor sampling. This
+  preserves the binary ROI boundary and records the resize in output metadata.
