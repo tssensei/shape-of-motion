@@ -273,6 +273,7 @@ class DynamicViewer(Viewer):
                 step=0.001,
                 initial_value=0.04,
             )
+            disable_all_modes = self.server.gui.add_button("Turn off all modes")
             modes = []
             for mode_idx, freq_hz in enumerate(self.modal_freqs_hz):
                 enabled = self.server.gui.add_checkbox(f"Mode {mode_idx} enable", True)
@@ -301,6 +302,13 @@ class DynamicViewer(Viewer):
                 enabled.on_update(self.rerender)
                 gain.on_update(self.rerender)
                 phase.on_update(self.rerender)
+
+            def _disable_all_modes(event) -> None:
+                for mode in modes:
+                    mode["enabled"].value = False
+                self.rerender(event)
+
+            disable_all_modes.on_click(_disable_all_modes)
             drive.on_update(self.rerender)
             motion_scale.on_update(self.rerender)
         self._modal_playback_handles = {
