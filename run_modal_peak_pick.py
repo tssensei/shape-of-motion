@@ -71,6 +71,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_pick.add_argument("--snap-window-hz", type=float, default=1.0, help="Peak snapping window.")
     p_pick.add_argument("--out-json", default="outputs_modal/selected_peaks.json", help="Selected peaks JSON path.")
 
+    p_compare = sub.add_parser(
+        "compare-reconstruction",
+        help="Open a browser GUI comparing original and reconstructed view1 modal spectra.",
+    )
+    p_compare.add_argument("--cache-dir", required=True, help="View1 modal-analysis cache directory.")
+    p_compare.add_argument("--modal-manifest", required=True, help="Solved Gaussian modal manifest.")
+    p_compare.add_argument(
+        "--preview-percentile",
+        type=float,
+        default=99.0,
+        help="Shared phase-HSV magnitude display percentile.",
+    )
+    p_compare.add_argument("--host", default="0.0.0.0", help="Gradio server host.")
+    p_compare.add_argument("--port", type=int, default=8894, help="Gradio server port.")
+
     p_export = sub.add_parser("export", help="Export selected complex 2D mode slices.")
     p_export.add_argument("--cache-dir", required=True, help="Modal-analysis cache directory.")
     p_export.add_argument("--out", default="outputs_modal/modal_analysis.npz", help="Output .npz path.")
@@ -134,6 +149,11 @@ def main(argv: list[str] | None = None) -> None:
         from modal_peak_pick.apps import pick_ui
 
         pick_ui.run(args)
+        return
+    if args.command == "compare-reconstruction":
+        from modal_peak_pick.apps import compare_reconstruction_ui
+
+        compare_reconstruction_ui.run(args)
         return
     if args.command == "export":
         from modal_peak_pick.apps import export_modes
