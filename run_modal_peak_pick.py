@@ -88,6 +88,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p_compare.add_argument("--modal-manifest", required=True, help="Solved Gaussian modal manifest.")
     p_compare.add_argument(
+        "--comparison-cache-dir",
+        default=None,
+        help="Optional persistent cache directory for comparison projections and exact modes.",
+    )
+    p_compare.add_argument(
         "--preview-percentile",
         type=float,
         default=99.0,

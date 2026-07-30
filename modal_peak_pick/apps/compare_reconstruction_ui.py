@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -15,9 +17,12 @@ from flow3d.modal_flow_coordinates import (
 )
 from flow3d.modal_frequency_selection import _temporal_basis
 from modal_peak_pick.core.cache import ModalAnalysisCache, load_analysis_cache
+from modal_surface.io import save_npz_compressed_atomic
 
 
 _PIXEL_CHUNK_SIZE = 2048
+_COMPARISON_CACHE_FORMAT = "modal_reconstruction_comparison"
+_COMPARISON_CACHE_VERSION = 1
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -36,6 +41,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--modal-manifest",
         required=True,
         help="Solved Gaussian modal manifest used for the reconstruction.",
+    )
+    parser.add_argument(
+        "--comparison-cache-dir",
+        default=None,
+        help="Optional persistent cache directory for comparison projections and exact modes.",
     )
     parser.add_argument(
         "--preview-percentile",
@@ -176,6 +186,312 @@ def _figure_rgb(figure: Figure) -> np.ndarray:
     return np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
 
 
+def _hash_array(hasher: Any, name: str, value: np.ndarray) -> None:
+    array = np.asarray(value)
+    hasher.update(name.encode("utf-8"))
+    hasher.update(array.dtype.str.encode("ascii"))
+    hasher.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+    contiguous = np.ascontiguousarray(array)
+    hasher.update(memoryview(contiguous).cast("B"))
+
+
+def _manifest_projection_identity(manifest: Any) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(_COMPARISON_CACHE_FORMAT.encode("ascii"))
+    hasher.update(str(_COMPARISON_CACHE_VERSION).encode("ascii"))
+    hasher.update(str(manifest.path).encode("utf-8"))
+    _hash_array(hasher, "mode_indices", manifest.mode_indices)
+    _hash_array(hasher, "frequencies_hz", manifest.frequencies_hz)
+    _hash_array(hasher, "phi", manifest.phi)
+    topology = manifest.topology
+    for name in (
+        "obs_point_index",
+        "obs_view_index",
+        "obs_pixels_xy",
+        "obs_J",
+        "obs_contribution_weight",
+        "view_image_width",
+        "view_image_height",
+    ):
+        _hash_array(hasher, name, getattr(topology, name))
+    hasher.update(json.dumps(list(topology.view_ids)).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def _flow_cache_identity(cache: ModalAnalysisCache) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(str(cache.path.resolve()).encode("utf-8"))
+    hasher.update(
+        json.dumps(cache.metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    arrays = cache.metadata.get("arrays")
+    if not isinstance(arrays, dict):
+        raise ValueError(f"Modal-analysis cache {cache.path} has invalid array metadata")
+    for name in sorted(arrays):
+        entry = arrays[name]
+        if not isinstance(entry, dict) or not isinstance(entry.get("file"), str):
+            raise ValueError(
+                f"Modal-analysis cache {cache.path} has invalid metadata for array {name!r}"
+            )
+        array_path = cache.path / entry["file"]
+        stat = array_path.stat()
+        hasher.update(name.encode("utf-8"))
+        hasher.update(str(stat.st_size).encode("ascii"))
+        hasher.update(str(stat.st_mtime_ns).encode("ascii"))
+    return hasher.hexdigest()
+
+
+def _view_source_identity(
+    manifest_identity: str,
+    cache: ModalAnalysisCache,
+    view_id: str,
+    view_index: int,
+    alphas: np.ndarray,
+) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(manifest_identity.encode("ascii"))
+    hasher.update(_flow_cache_identity(cache).encode("ascii"))
+    hasher.update(view_id.encode("utf-8"))
+    hasher.update(str(view_index).encode("ascii"))
+    _hash_array(hasher, "alphas", alphas)
+    return hasher.hexdigest()
+
+
+def _scalar_string(value: np.ndarray, name: str, path: Path) -> str:
+    array = np.asarray(value)
+    if array.shape != ():
+        raise ValueError(f"{path} {name} must be a scalar string")
+    item = array.item()
+    if not isinstance(item, str) or not item:
+        raise ValueError(f"{path} {name} must be a non-empty scalar string")
+    return item
+
+
+def _scalar_int(value: np.ndarray, name: str, path: Path) -> int:
+    array = np.asarray(value)
+    if array.shape != () or not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(f"{path} {name} must be an integer scalar")
+    return int(array.item())
+
+
+@dataclass(frozen=True)
+class _ViewState:
+    cache: ModalAnalysisCache
+    view_index: int
+    source_identity: str
+    disk_directory: Path | None
+    pixels: np.ndarray
+    raw_power: np.ndarray
+    reconstructed_modes: np.ndarray
+    reconstructed_power: np.ndarray
+    frequency_limits: tuple[float, float]
+
+
+def _load_view_disk_cache(
+    path: Path,
+    source_identity: str,
+    view_id: str,
+    view_index: int,
+    cache: ModalAnalysisCache,
+    manifest: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    required = {
+        "cache_format",
+        "cache_version",
+        "source_identity",
+        "view_id",
+        "view_index",
+        "mode_indices",
+        "frequencies_hz",
+        "pixels",
+        "raw_power",
+        "reconstructed_modes",
+        "reconstructed_power",
+    }
+    with np.load(path, allow_pickle=False) as archive:
+        if set(archive.files) != required:
+            raise ValueError(
+                f"{path} fields must be exactly {sorted(required)}; got {sorted(archive.files)}"
+            )
+        if _scalar_string(archive["cache_format"], "cache_format", path) != (
+            _COMPARISON_CACHE_FORMAT
+        ):
+            raise ValueError(f"{path} has an unsupported comparison cache format")
+        if _scalar_int(archive["cache_version"], "cache_version", path) != (
+            _COMPARISON_CACHE_VERSION
+        ):
+            raise ValueError(f"{path} has an unsupported comparison cache version")
+        if _scalar_string(archive["source_identity"], "source_identity", path) != (
+            source_identity
+        ):
+            raise ValueError(f"{path} source identity does not match its cache directory")
+        if _scalar_string(archive["view_id"], "view_id", path) != view_id:
+            raise ValueError(f"{path} view_id does not match {view_id!r}")
+        if _scalar_int(archive["view_index"], "view_index", path) != view_index:
+            raise ValueError(f"{path} view_index does not match {view_index}")
+        mode_indices = np.asarray(archive["mode_indices"])
+        frequencies_hz = np.asarray(archive["frequencies_hz"])
+        pixels = np.asarray(archive["pixels"])
+        raw_power = np.asarray(archive["raw_power"])
+        reconstructed_modes = np.asarray(archive["reconstructed_modes"])
+        reconstructed_power = np.asarray(archive["reconstructed_power"])
+
+    if not np.array_equal(mode_indices, manifest.mode_indices):
+        raise ValueError(f"{path} mode_indices do not match the modal manifest")
+    if not np.array_equal(frequencies_hz, manifest.frequencies_hz):
+        raise ValueError(f"{path} frequencies_hz do not match the modal manifest")
+    if pixels.dtype != np.int64 or pixels.ndim != 2 or pixels.shape[1] != 2:
+        raise ValueError(f"{path} pixels must be int64 with shape [P,2]")
+    if pixels.shape[0] == 0:
+        raise ValueError(f"{path} pixels must not be empty")
+    height, width = cache.reference_frame.shape
+    if (
+        np.any(pixels[:, 0] < 0)
+        or np.any(pixels[:, 0] >= width)
+        or np.any(pixels[:, 1] < 0)
+        or np.any(pixels[:, 1] >= height)
+    ):
+        raise ValueError(f"{path} pixels fall outside the view image")
+    if raw_power.dtype != np.float32 or raw_power.shape != cache.freqs_hz.shape:
+        raise ValueError(f"{path} raw_power must be float32 and match cache frequencies")
+    expected_modes_shape = (manifest.frequencies_hz.size, pixels.shape[0], 2)
+    if (
+        reconstructed_modes.dtype != np.complex64
+        or reconstructed_modes.shape != expected_modes_shape
+    ):
+        raise ValueError(
+            f"{path} reconstructed_modes must be complex64 with shape {expected_modes_shape}"
+        )
+    if (
+        reconstructed_power.dtype != np.float32
+        or reconstructed_power.shape != manifest.frequencies_hz.shape
+    ):
+        raise ValueError(
+            f"{path} reconstructed_power must be float32 and match manifest frequencies"
+        )
+    if (
+        not np.isfinite(raw_power).all()
+        or not np.isfinite(reconstructed_modes.real).all()
+        or not np.isfinite(reconstructed_modes.imag).all()
+        or not np.isfinite(reconstructed_power).all()
+    ):
+        raise ValueError(f"{path} contains non-finite comparison values")
+    expected_power = np.mean(
+        np.sqrt(
+            np.abs(reconstructed_modes[:, :, 0]) ** 2
+            + np.abs(reconstructed_modes[:, :, 1]) ** 2
+        ),
+        axis=1,
+    ).astype(np.float32)
+    if not np.allclose(reconstructed_power, expected_power, rtol=1e-6, atol=1e-7):
+        raise ValueError(f"{path} reconstructed_power does not match reconstructed_modes")
+    return pixels, raw_power, reconstructed_modes, reconstructed_power
+
+
+def _write_view_disk_cache(
+    path: Path,
+    source_identity: str,
+    view_id: str,
+    view_index: int,
+    manifest: Any,
+    pixels: np.ndarray,
+    raw_power: np.ndarray,
+    reconstructed_modes: np.ndarray,
+    reconstructed_power: np.ndarray,
+) -> None:
+    save_npz_compressed_atomic(
+        path,
+        {
+            "cache_format": np.array(_COMPARISON_CACHE_FORMAT),
+            "cache_version": np.array(_COMPARISON_CACHE_VERSION, dtype=np.int64),
+            "source_identity": np.array(source_identity),
+            "view_id": np.array(view_id),
+            "view_index": np.array(view_index, dtype=np.int64),
+            "mode_indices": np.asarray(manifest.mode_indices),
+            "frequencies_hz": np.asarray(manifest.frequencies_hz),
+            "pixels": np.asarray(pixels, dtype=np.int64),
+            "raw_power": np.asarray(raw_power, dtype=np.float32),
+            "reconstructed_modes": np.asarray(reconstructed_modes, dtype=np.complex64),
+            "reconstructed_power": np.asarray(reconstructed_power, dtype=np.float32),
+        },
+    )
+
+
+def _exact_mode_cache_path(directory: Path, frequency_hz: float) -> Path:
+    frequency_bytes = np.float64(frequency_hz).tobytes()
+    digest = hashlib.sha256(frequency_bytes).hexdigest()
+    return directory / "exact_modes" / f"frequency_{digest}.npz"
+
+
+def _load_exact_mode_disk_cache(
+    path: Path,
+    source_identity: str,
+    view_id: str,
+    frequency_hz: float,
+    num_pixels: int,
+) -> np.ndarray:
+    required = {
+        "cache_format",
+        "cache_version",
+        "source_identity",
+        "view_id",
+        "frequency_hz",
+        "mode",
+    }
+    with np.load(path, allow_pickle=False) as archive:
+        if set(archive.files) != required:
+            raise ValueError(
+                f"{path} fields must be exactly {sorted(required)}; got {sorted(archive.files)}"
+            )
+        if _scalar_string(archive["cache_format"], "cache_format", path) != (
+            _COMPARISON_CACHE_FORMAT
+        ):
+            raise ValueError(f"{path} has an unsupported exact-mode cache format")
+        if _scalar_int(archive["cache_version"], "cache_version", path) != (
+            _COMPARISON_CACHE_VERSION
+        ):
+            raise ValueError(f"{path} has an unsupported exact-mode cache version")
+        if _scalar_string(archive["source_identity"], "source_identity", path) != (
+            source_identity
+        ):
+            raise ValueError(f"{path} source identity does not match its cache directory")
+        if _scalar_string(archive["view_id"], "view_id", path) != view_id:
+            raise ValueError(f"{path} view_id does not match {view_id!r}")
+        stored_frequency = np.asarray(archive["frequency_hz"])
+        mode = np.asarray(archive["mode"])
+    if stored_frequency.shape != () or stored_frequency.dtype != np.float64:
+        raise ValueError(f"{path} frequency_hz must be a float64 scalar")
+    if stored_frequency.tobytes() != np.float64(frequency_hz).tobytes():
+        raise ValueError(f"{path} frequency_hz does not match its filename key")
+    if mode.dtype != np.complex64 or mode.shape != (num_pixels, 2):
+        raise ValueError(
+            f"{path} mode must be complex64 with shape {(num_pixels, 2)}"
+        )
+    if not np.isfinite(mode.real).all() or not np.isfinite(mode.imag).all():
+        raise ValueError(f"{path} mode contains non-finite values")
+    return mode
+
+
+def _write_exact_mode_disk_cache(
+    path: Path,
+    source_identity: str,
+    view_id: str,
+    frequency_hz: float,
+    mode: np.ndarray,
+) -> None:
+    save_npz_compressed_atomic(
+        path,
+        {
+            "cache_format": np.array(_COMPARISON_CACHE_FORMAT),
+            "cache_version": np.array(_COMPARISON_CACHE_VERSION, dtype=np.int64),
+            "source_identity": np.array(source_identity),
+            "view_id": np.array(view_id),
+            "frequency_hz": np.array(frequency_hz, dtype=np.float64),
+            "mode": np.asarray(mode, dtype=np.complex64),
+        },
+    )
+
+
 class SpectrumComparisonController:
     def __init__(
         self,
@@ -183,6 +499,7 @@ class SpectrumComparisonController:
         preview_percentile: float,
         cache_dir: str | Path | None = None,
         flow_caches: Sequence[str] | None = None,
+        comparison_cache_dir: str | Path | None = None,
     ) -> None:
         if not (0.0 < preview_percentile <= 100.0):
             raise ValueError("preview_percentile must be in (0, 100]")
@@ -211,6 +528,18 @@ class SpectrumComparisonController:
 
         if np.unique(self.manifest.frequencies_hz).size != self.manifest.frequencies_hz.size:
             raise ValueError("Reconstructed modal frequencies must be unique")
+        self.comparison_cache_dir = (
+            None
+            if comparison_cache_dir is None
+            else Path(comparison_cache_dir).expanduser()
+        )
+        self.manifest_identity = (
+            None
+            if self.comparison_cache_dir is None
+            else _manifest_projection_identity(self.manifest)
+        )
+        self._view_states: dict[str, _ViewState] = {}
+        self._exact_modes: dict[tuple[str, bytes], np.ndarray] = {}
         self.component_index = 0
         self.raw_frequency_hz = float(self.manifest.frequencies_hz[0])
         self.reconstructed_index = 0
@@ -221,55 +550,125 @@ class SpectrumComparisonController:
     def _load_view(self, view_id: str) -> None:
         if view_id not in self.cache_paths:
             raise ValueError(f"Unknown comparison view {view_id!r}")
+        state = self._view_states.get(view_id)
+        if state is None:
+            state = self._prepare_view_state(view_id)
+            self._view_states[view_id] = state
         self.view_id = view_id
-        self.view_index = list(self.manifest.topology.view_ids).index(view_id)
-        self.cache = load_analysis_cache(self.cache_paths[view_id])
+        self.view_index = state.view_index
+        self.cache = state.cache
+        self.source_identity = state.source_identity
+        self.disk_directory = state.disk_directory
+        self.pixels = state.pixels
+        self.raw_power = state.raw_power
+        self.reconstructed_modes = state.reconstructed_modes
+        self.reconstructed_power = state.reconstructed_power
+        self.frequency_limits = state.frequency_limits
+        self.raw_mode = np.empty((self.pixels.shape[0], 2), dtype=np.complex64)
+        self._set_frequencies(self.raw_frequency_hz, self.reconstructed_index)
+
+    def _prepare_view_state(self, view_id: str) -> _ViewState:
+        view_index = list(self.manifest.topology.view_ids).index(view_id)
+        cache = load_analysis_cache(self.cache_paths[view_id])
 
         expected_shape = (
-            int(self.manifest.topology.view_image_height[self.view_index]),
-            int(self.manifest.topology.view_image_width[self.view_index]),
+            int(self.manifest.topology.view_image_height[view_index]),
+            int(self.manifest.topology.view_image_width[view_index]),
         )
-        if self.cache.flow_u.shape[1:] != expected_shape:
+        if cache.flow_u.shape[1:] != expected_shape:
             raise ValueError(
-                f"Cache shape {self.cache.flow_u.shape[1:]} does not match "
-                f"manifest view {self.view_id!r} shape {expected_shape}"
+                f"Cache shape {cache.flow_u.shape[1:]} does not match "
+                f"manifest view {view_id!r} shape {expected_shape}"
             )
-        if self.cache.mask is None:
+        if cache.mask is None:
             raise ValueError(
-                f"Modal-analysis cache for view {self.view_id!r} must contain a foreground mask"
+                f"Modal-analysis cache for view {view_id!r} must contain a foreground mask"
             )
 
-        (
-            self.sorted_rows,
-            self.starts,
-            self.pixels,
-            self.sorted_weights,
-            _,
-        ) = _view_pixel_groups(self.manifest.topology, self.view_index, self.cache)
-        self.raw_power = _candidate_power_spectrum(self.cache, self.pixels)
-        self.alphas = _view_alphas(
+        alphas = _view_alphas(
             self.manifest.path,
             self.manifest,
-            self.view_index,
+            view_index,
         )
-        self.reconstructed_modes = _project_reconstructed_modes(
-            self.manifest,
-            self.sorted_rows,
-            self.starts,
-            self.sorted_weights,
-            self.alphas,
+        disk_directory: Path | None = None
+        if self.comparison_cache_dir is None:
+            source_identity = f"memory:{view_id}"
+        else:
+            assert self.manifest_identity is not None
+            source_identity = _view_source_identity(
+                self.manifest_identity,
+                cache,
+                view_id,
+                view_index,
+                alphas,
+            )
+            view_digest = hashlib.sha256(view_id.encode("utf-8")).hexdigest()[:12]
+            disk_directory = (
+                self.comparison_cache_dir
+                / f"view_{view_index:03d}_{view_digest}"
+                / source_identity
+            )
+
+        view_cache_path = (
+            None if disk_directory is None else disk_directory / "view_cache.npz"
         )
-        self.reconstructed_power = np.mean(
-            np.sqrt(
-                np.abs(self.reconstructed_modes[:, :, 0]) ** 2
-                + np.abs(self.reconstructed_modes[:, :, 1]) ** 2
-            ),
-            axis=1,
-        ).astype(np.float32)
-        if not np.isfinite(self.reconstructed_power).all():
-            raise ValueError("Reconstructed power spectrum is non-finite")
-        raw_frequency_min = float(self.cache.freqs_hz[0])
-        raw_frequency_max = float(self.cache.freqs_hz[-1])
+        if view_cache_path is not None and view_cache_path.is_file():
+            (
+                pixels,
+                raw_power,
+                reconstructed_modes,
+                reconstructed_power,
+            ) = _load_view_disk_cache(
+                view_cache_path,
+                source_identity,
+                view_id,
+                view_index,
+                cache,
+                self.manifest,
+            )
+            print(f"Loaded comparison view cache -> {view_cache_path}")
+        else:
+            (
+                sorted_rows,
+                starts,
+                pixels,
+                sorted_weights,
+                _,
+            ) = _view_pixel_groups(self.manifest.topology, view_index, cache)
+            pixels = np.asarray(pixels, dtype=np.int64)
+            raw_power = _candidate_power_spectrum(cache, pixels)
+            reconstructed_modes = _project_reconstructed_modes(
+                self.manifest,
+                sorted_rows,
+                starts,
+                sorted_weights,
+                alphas,
+            )
+            reconstructed_power = np.mean(
+                np.sqrt(
+                    np.abs(reconstructed_modes[:, :, 0]) ** 2
+                    + np.abs(reconstructed_modes[:, :, 1]) ** 2
+                ),
+                axis=1,
+            ).astype(np.float32)
+            if not np.isfinite(reconstructed_power).all():
+                raise ValueError("Reconstructed power spectrum is non-finite")
+            if view_cache_path is not None:
+                _write_view_disk_cache(
+                    view_cache_path,
+                    source_identity,
+                    view_id,
+                    view_index,
+                    self.manifest,
+                    pixels,
+                    raw_power,
+                    reconstructed_modes,
+                    reconstructed_power,
+                )
+                print(f"Saved comparison view cache -> {view_cache_path}")
+
+        raw_frequency_min = float(cache.freqs_hz[0])
+        raw_frequency_max = float(cache.freqs_hz[-1])
         if np.any(self.manifest.frequencies_hz < raw_frequency_min) or np.any(
             self.manifest.frequencies_hz > raw_frequency_max
         ):
@@ -279,15 +678,63 @@ class SpectrumComparisonController:
         selected_max = float(np.max(self.manifest.frequencies_hz))
         selected_span = max(
             selected_max - selected_min,
-            float(self.cache.freqs_hz[1] - self.cache.freqs_hz[0]),
+            float(cache.freqs_hz[1] - cache.freqs_hz[0]),
         )
         margin = 0.05 * selected_span
-        self.frequency_limits = (
+        frequency_limits = (
             max(raw_frequency_min, selected_min - margin),
             min(raw_frequency_max, selected_max + margin),
         )
-        self.raw_mode = np.empty((self.pixels.shape[0], 2), dtype=np.complex64)
-        self._set_frequencies(self.raw_frequency_hz, self.reconstructed_index)
+        return _ViewState(
+            cache=cache,
+            view_index=view_index,
+            source_identity=source_identity,
+            disk_directory=disk_directory,
+            pixels=pixels,
+            raw_power=raw_power,
+            reconstructed_modes=reconstructed_modes,
+            reconstructed_power=reconstructed_power,
+            frequency_limits=frequency_limits,
+        )
+
+    def _load_exact_mode(self, frequency_hz: float) -> np.ndarray:
+        frequency_bytes = np.float64(frequency_hz).tobytes()
+        memory_key = (self.source_identity, frequency_bytes)
+        cached = self._exact_modes.get(memory_key)
+        if cached is not None:
+            return cached
+
+        disk_path = (
+            None
+            if self.disk_directory is None
+            else _exact_mode_cache_path(self.disk_directory, frequency_hz)
+        )
+        if disk_path is not None and disk_path.is_file():
+            mode = _load_exact_mode_disk_cache(
+                disk_path,
+                self.source_identity,
+                self.view_id,
+                frequency_hz,
+                self.pixels.shape[0],
+            )
+            print(f"Loaded exact-mode cache -> {disk_path}")
+        else:
+            mode = _exact_candidate_mode(
+                self.cache,
+                self.pixels,
+                frequency_hz,
+            )
+            if disk_path is not None:
+                _write_exact_mode_disk_cache(
+                    disk_path,
+                    self.source_identity,
+                    self.view_id,
+                    frequency_hz,
+                    mode,
+                )
+                print(f"Saved exact-mode cache -> {disk_path}")
+        self._exact_modes[memory_key] = mode
+        return mode
 
     def _set_frequencies(self, raw_frequency_hz: float, reconstructed_index: int) -> None:
         raw_min = float(self.cache.freqs_hz[0])
@@ -296,11 +743,7 @@ class SpectrumComparisonController:
         self.reconstructed_index = int(reconstructed_index)
         if not (0 <= self.reconstructed_index < self.manifest.frequencies_hz.size):
             raise ValueError("Reconstructed frequency index is outside the manifest")
-        self.raw_mode = _exact_candidate_mode(
-            self.cache,
-            self.pixels,
-            self.raw_frequency_hz,
-        )
+        self.raw_mode = self._load_exact_mode(self.raw_frequency_hz)
         self._render_all()
 
     def _render_spectrum(
@@ -614,6 +1057,7 @@ def run(args: argparse.Namespace) -> None:
         preview_percentile=args.preview_percentile,
         cache_dir=args.cache_dir,
         flow_caches=args.flow_caches,
+        comparison_cache_dir=args.comparison_cache_dir,
     )
     print(
         f"Loaded views {list(controller.available_view_ids)!r}; "
