@@ -318,24 +318,28 @@ class DynamicViewer(Viewer):
         options = ["rgb", "modal phase"]
         if self.has_modal_obs_count:
             options.append("obs count")
-        phase_component_options = []
-        for mode_index, freq_hz in enumerate(self.modal_freqs_hz):
-            phase_component_options.append(
-                f"Mode {mode_index} {freq_hz:.3f} Hz projected u"
-            )
-            phase_component_options.append(
-                f"Mode {mode_index} {freq_hz:.3f} Hz projected v"
-            )
         with self.server.gui.add_folder("Gaussian color"):
             color_mode = self.server.gui.add_dropdown(
                 "Render color mode",
                 options=tuple(options),
                 initial_value="rgb",
             )
-            phase_component = self.server.gui.add_dropdown(
-                "Phase component",
-                options=tuple(phase_component_options),
-                initial_value=phase_component_options[0],
+            phase_mode_index = self.server.gui.add_slider(
+                "Phase frequency index",
+                min=0,
+                max=len(self.modal_freqs_hz) - 1,
+                step=1,
+                initial_value=0,
+            )
+            phase_frequency = self.server.gui.add_number(
+                "Selected frequency (Hz)",
+                initial_value=self.modal_freqs_hz[0],
+                disabled=True,
+            )
+            phase_direction = self.server.gui.add_dropdown(
+                "Projection direction",
+                options=("u", "v"),
+                initial_value="u",
             )
             mode_index = self.server.gui.add_slider(
                 "Obs count mode index",
@@ -346,12 +350,20 @@ class DynamicViewer(Viewer):
             )
         self._gaussian_color_handles = {
             "color_mode": color_mode,
-            "phase_component": phase_component,
-            "phase_component_options": tuple(phase_component_options),
+            "phase_mode_index": phase_mode_index,
+            "phase_frequency": phase_frequency,
+            "phase_direction": phase_direction,
             "mode_index": mode_index,
         }
+
+        def update_phase_mode(event) -> None:
+            selected_index = int(phase_mode_index.value)
+            phase_frequency.value = self.modal_freqs_hz[selected_index]
+            self.rerender(event)
+
         color_mode.on_update(self.rerender)
-        phase_component.on_update(self.rerender)
+        phase_mode_index.on_update(update_phase_mode)
+        phase_direction.on_update(self.rerender)
         mode_index.on_update(self.rerender)
 
     def _define_debug_point_guis(self) -> None:
@@ -502,12 +514,11 @@ class DynamicViewer(Viewer):
         handles = getattr(self, "_gaussian_color_handles", None)
         if handles is None:
             return 0, 0
-        options = handles["phase_component_options"]
-        selected = str(handles["phase_component"].value)
-        if selected not in options:
-            raise ValueError(f"Unknown Gaussian phase component: {selected}")
-        flat_index = options.index(selected)
-        return flat_index // 2, flat_index % 2
+        mode_index = int(handles["phase_mode_index"].value)
+        direction = str(handles["phase_direction"].value)
+        if direction not in ("u", "v"):
+            raise ValueError(f"Unknown Gaussian phase projection direction: {direction}")
+        return mode_index, (0 if direction == "u" else 1)
 
     def update_modal_anchors(self, points: np.ndarray, update_key) -> None:
         if not self.wants_modal_anchors():
