@@ -274,6 +274,7 @@ class SpectrumComparisonController:
         selected_power: float,
         title: str,
         discrete: bool,
+        power_limits: tuple[float, float],
     ) -> tuple[np.ndarray, tuple[float, float, float, float, int]]:
         figure = Figure(figsize=(8.0, 3.3), dpi=100)
         axis = figure.add_subplot(111)
@@ -298,6 +299,7 @@ class SpectrumComparisonController:
             zorder=3,
         )
         axis.set_xlim(*self.frequency_limits)
+        axis.set_ylim(*power_limits)
         axis.set_xlabel("Frequency (Hz)")
         axis.set_ylabel("Mean image-plane amplitude")
         axis.set_title(title)
@@ -360,6 +362,26 @@ class SpectrumComparisonController:
             self.manifest.frequencies_hz[self.reconstructed_index]
         )
         reconstructed_power = float(self.reconstructed_power[self.reconstructed_index])
+        raw_visible = (
+            (self.cache.freqs_hz >= self.frequency_limits[0])
+            & (self.cache.freqs_hz <= self.frequency_limits[1])
+        )
+        reconstructed_visible = (
+            (self.manifest.frequencies_hz >= self.frequency_limits[0])
+            & (self.manifest.frequencies_hz <= self.frequency_limits[1])
+        )
+        visible_power_maxima = [raw_power, reconstructed_power]
+        if np.any(raw_visible):
+            visible_power_maxima.append(float(np.max(self.raw_power[raw_visible])))
+        if np.any(reconstructed_visible):
+            visible_power_maxima.append(
+                float(np.max(self.reconstructed_power[reconstructed_visible]))
+            )
+        shared_power_max = max(visible_power_maxima)
+        power_limits = (
+            0.0,
+            1.05 * shared_power_max if shared_power_max > 0.0 else 1.0,
+        )
         self.raw_spectrum_image, self.raw_spectrum_mapping = self._render_spectrum(
             self.cache.freqs_hz,
             self.raw_power,
@@ -367,6 +389,7 @@ class SpectrumComparisonController:
             raw_power,
             f"Original view1 spectrum - {self.raw_frequency_hz:.5f} Hz",
             discrete=False,
+            power_limits=power_limits,
         )
         (
             self.reconstructed_spectrum_image,
@@ -378,6 +401,7 @@ class SpectrumComparisonController:
             reconstructed_power,
             f"Reconstructed view1 spectrum - {reconstructed_frequency:.5f} Hz",
             discrete=True,
+            power_limits=power_limits,
         )
 
         component_label = "U" if self.component_index == 0 else "V"
