@@ -73,9 +73,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p_compare = sub.add_parser(
         "compare-reconstruction",
-        help="Open a browser GUI comparing original and reconstructed view1 modal spectra.",
+        help="Open a browser GUI comparing original and reconstructed modal spectra.",
     )
-    p_compare.add_argument("--cache-dir", required=True, help="View1 modal-analysis cache directory.")
+    compare_caches = p_compare.add_mutually_exclusive_group(required=True)
+    compare_caches.add_argument(
+        "--cache-dir",
+        help="Modal-analysis cache directory for the first manifest view.",
+    )
+    compare_caches.add_argument(
+        "--flow-caches",
+        nargs="+",
+        metavar="VIEW_ID=PATH",
+        help="Modal-analysis cache for every manifest view, in any order.",
+    )
     p_compare.add_argument("--modal-manifest", required=True, help="Solved Gaussian modal manifest.")
     p_compare.add_argument(
         "--preview-percentile",

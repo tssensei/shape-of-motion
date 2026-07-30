@@ -1,14 +1,18 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import hsv_to_rgb
 from matplotlib.figure import Figure
 import numpy as np
 
-from flow3d.modal_flow_coordinates import _load_manifest, _view_pixel_groups
+from flow3d.modal_flow_coordinates import (
+    _load_manifest,
+    _view_pixel_groups,
+    parse_flow_cache_specs,
+)
 from flow3d.modal_frequency_selection import _temporal_basis
 from modal_peak_pick.core.cache import ModalAnalysisCache, load_analysis_cache
 
@@ -17,10 +21,16 @@ _PIXEL_CHUNK_SIZE = 2048
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    cache_group = parser.add_mutually_exclusive_group(required=True)
+    cache_group.add_argument(
         "--cache-dir",
-        required=True,
         help="Modal-analysis cache directory for the first manifest view.",
+    )
+    cache_group.add_argument(
+        "--flow-caches",
+        nargs="+",
+        metavar="VIEW_ID=PATH",
+        help="Modal-analysis cache for every manifest view, in any order.",
     )
     parser.add_argument(
         "--modal-manifest",
@@ -169,17 +179,51 @@ def _figure_rgb(figure: Figure) -> np.ndarray:
 class SpectrumComparisonController:
     def __init__(
         self,
-        cache_dir: str | Path,
         modal_manifest: str | Path,
         preview_percentile: float,
+        cache_dir: str | Path | None = None,
+        flow_caches: Sequence[str] | None = None,
     ) -> None:
         if not (0.0 < preview_percentile <= 100.0):
             raise ValueError("preview_percentile must be in (0, 100]")
         self.preview_percentile = float(preview_percentile)
-        self.cache = load_analysis_cache(cache_dir)
         self.manifest = _load_manifest(modal_manifest)
-        self.view_index = 0
-        self.view_id = self.manifest.topology.view_ids[self.view_index]
+        manifest_view_ids = tuple(str(view_id) for view_id in self.manifest.topology.view_ids)
+        if not manifest_view_ids:
+            raise ValueError("Modal manifest contains no views")
+        if flow_caches is not None:
+            parsed_caches = parse_flow_cache_specs(flow_caches)
+            cache_paths = dict(parsed_caches)
+            missing = [view_id for view_id in manifest_view_ids if view_id not in cache_paths]
+            extra = [view_id for view_id in cache_paths if view_id not in manifest_view_ids]
+            if missing or extra:
+                raise ValueError(
+                    "--flow-caches must match all manifest views exactly; "
+                    f"missing={missing}, extra={extra}"
+                )
+            self.available_view_ids = manifest_view_ids
+            self.cache_paths = cache_paths
+        elif cache_dir is not None:
+            self.available_view_ids = (manifest_view_ids[0],)
+            self.cache_paths = {manifest_view_ids[0]: Path(cache_dir).expanduser()}
+        else:
+            raise ValueError("Either cache_dir or flow_caches must be provided")
+
+        if np.unique(self.manifest.frequencies_hz).size != self.manifest.frequencies_hz.size:
+            raise ValueError("Reconstructed modal frequencies must be unique")
+        self.component_index = 0
+        self.raw_frequency_hz = float(self.manifest.frequencies_hz[0])
+        self.reconstructed_index = 0
+        self.raw_spectrum_mapping: tuple[float, float, float, float, int] | None = None
+        self.reconstructed_spectrum_mapping: tuple[float, float, float, float, int] | None = None
+        self._load_view(self.available_view_ids[0])
+
+    def _load_view(self, view_id: str) -> None:
+        if view_id not in self.cache_paths:
+            raise ValueError(f"Unknown comparison view {view_id!r}")
+        self.view_id = view_id
+        self.view_index = list(self.manifest.topology.view_ids).index(view_id)
+        self.cache = load_analysis_cache(self.cache_paths[view_id])
 
         expected_shape = (
             int(self.manifest.topology.view_image_height[self.view_index]),
@@ -187,11 +231,13 @@ class SpectrumComparisonController:
         )
         if self.cache.flow_u.shape[1:] != expected_shape:
             raise ValueError(
-                f"View1 cache shape {self.cache.flow_u.shape[1:]} does not match "
+                f"Cache shape {self.cache.flow_u.shape[1:]} does not match "
                 f"manifest view {self.view_id!r} shape {expected_shape}"
             )
         if self.cache.mask is None:
-            raise ValueError("View1 modal-analysis cache must contain a foreground mask")
+            raise ValueError(
+                f"Modal-analysis cache for view {self.view_id!r} must contain a foreground mask"
+            )
 
         (
             self.sorted_rows,
@@ -222,8 +268,6 @@ class SpectrumComparisonController:
         ).astype(np.float32)
         if not np.isfinite(self.reconstructed_power).all():
             raise ValueError("Reconstructed power spectrum is non-finite")
-        if np.unique(self.manifest.frequencies_hz).size != self.manifest.frequencies_hz.size:
-            raise ValueError("Reconstructed modal frequencies must be unique")
         raw_frequency_min = float(self.cache.freqs_hz[0])
         raw_frequency_max = float(self.cache.freqs_hz[-1])
         if np.any(self.manifest.frequencies_hz < raw_frequency_min) or np.any(
@@ -242,12 +286,7 @@ class SpectrumComparisonController:
             max(raw_frequency_min, selected_min - margin),
             min(raw_frequency_max, selected_max + margin),
         )
-        self.component_index = 0
-        self.raw_frequency_hz = float(self.manifest.frequencies_hz[0])
-        self.reconstructed_index = 0
         self.raw_mode = np.empty((self.pixels.shape[0], 2), dtype=np.complex64)
-        self.raw_spectrum_mapping: tuple[float, float, float, float, int] | None = None
-        self.reconstructed_spectrum_mapping: tuple[float, float, float, float, int] | None = None
         self._set_frequencies(self.raw_frequency_hz, self.reconstructed_index)
 
     def _set_frequencies(self, raw_frequency_hz: float, reconstructed_index: int) -> None:
@@ -385,7 +424,7 @@ class SpectrumComparisonController:
             self.raw_power,
             self.raw_frequency_hz,
             raw_power,
-            f"Original view1 spectrum - {self.raw_frequency_hz:.5f} Hz",
+            f"Original {self.view_id} spectrum - {self.raw_frequency_hz:.5f} Hz",
             discrete=False,
             power_limits=power_limits,
         )
@@ -397,7 +436,7 @@ class SpectrumComparisonController:
             self.reconstructed_power,
             reconstructed_frequency,
             reconstructed_power,
-            f"Reconstructed view1 spectrum - {reconstructed_frequency:.5f} Hz",
+            f"Reconstructed {self.view_id} spectrum - {reconstructed_frequency:.5f} Hz",
             discrete=True,
             power_limits=power_limits,
         )
@@ -492,16 +531,26 @@ class SpectrumComparisonController:
         self._render_all()
         return self.outputs()
 
+    def select_view(self, view_id: str):
+        self._load_view(view_id)
+        return self.outputs()
+
 
 def make_demo(controller: SpectrumComparisonController):
     import gradio as gr
 
     with gr.Blocks(title="Modal spectrum reconstruction comparison") as demo:
         gr.Markdown(
-            "# View1 modal spectrum comparison\n"
+            "# Modal spectrum comparison\n"
             "Click either spectrum to select a frequency. Original clicks retain the "
             "exact clicked frequency; reconstructed clicks snap both rows to the nearest "
             "solved frequency."
+        )
+        view = gr.Dropdown(
+            choices=controller.available_view_ids,
+            value=controller.view_id,
+            label="View",
+            interactive=True,
         )
         component = gr.Dropdown(
             choices=("U", "V"),
@@ -554,18 +603,21 @@ def make_demo(controller: SpectrumComparisonController):
 
         raw_spectrum.select(select_raw, outputs=outputs)
         reconstructed_spectrum.select(select_reconstructed, outputs=outputs)
+        view.change(controller.select_view, inputs=[view], outputs=outputs)
         component.change(controller.select_component, inputs=[component], outputs=outputs)
     return demo
 
 
 def run(args: argparse.Namespace) -> None:
     controller = SpectrumComparisonController(
-        cache_dir=args.cache_dir,
         modal_manifest=args.modal_manifest,
         preview_percentile=args.preview_percentile,
+        cache_dir=args.cache_dir,
+        flow_caches=args.flow_caches,
     )
     print(
-        f"Loaded view1 {controller.view_id!r}: "
+        f"Loaded views {list(controller.available_view_ids)!r}; "
+        f"active={controller.view_id!r}: "
         f"candidate_pixels={controller.pixels.shape[0]}, "
         f"reconstructed_modes={controller.manifest.frequencies_hz.size}"
     )
@@ -575,7 +627,7 @@ def run(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Compare original and projected reconstructed view1 modal spectra."
+        description="Compare original and projected reconstructed modal spectra."
     )
     add_arguments(parser)
     run(parser.parse_args(argv))
