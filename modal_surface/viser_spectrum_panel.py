@@ -58,6 +58,7 @@ class ModalSpectrumPanel:
         controller: SpectrumComparisonController,
         on_mode_selected: Callable[[int], None],
         on_component_selected: Callable[[str], None],
+        on_normalization_selected: Callable[[str], None],
         on_solo_selected: Callable[[int], None],
         on_enable_all: Callable[[], None],
     ) -> None:
@@ -65,6 +66,7 @@ class ModalSpectrumPanel:
         self.controller = controller
         self._on_mode_selected = on_mode_selected
         self._on_component_selected = on_component_selected
+        self._on_normalization_selected = on_normalization_selected
         self._on_solo_selected = on_solo_selected
         self._on_enable_all = on_enable_all
         self._updating = False
@@ -82,6 +84,11 @@ class ModalSpectrumPanel:
             "Modal image component",
             options=("U", "V"),
             initial_value="U" if controller.component_index == 0 else "V",
+        )
+        self.amplitude_normalization = server.gui.add_dropdown(
+            "Amplitude normalization",
+            options=("per mode", "entire spectrum"),
+            initial_value=controller.amplitude_normalization,
         )
         self.mode_index = server.gui.add_slider(
             "Selected mode",
@@ -166,6 +173,14 @@ class ModalSpectrumPanel:
                 return
             self._on_component_selected(str(self.component.value))
 
+        @self.amplitude_normalization.on_update
+        def _(_) -> None:
+            if self._updating:
+                return
+            self._on_normalization_selected(
+                str(self.amplitude_normalization.value)
+            )
+
         @self.mode_index.on_update
         def _(_) -> None:
             if self._updating:
@@ -240,6 +255,9 @@ class ModalSpectrumPanel:
         power_max = self._shared_power_max()
         self.mode_index.value = selected_index
         self.frequency.value = selected_frequency
+        self.amplitude_normalization.value = (
+            self.controller.amplitude_normalization
+        )
         self.status.content = self.controller.status
         self.raw_plot.data = _spectrum_plot_data(
             self.controller.cache.freqs_hz,
@@ -298,6 +316,28 @@ class ModalSpectrumPanel:
         try:
             self.component.value = value
             self.controller.select_component(value)
+            self._refresh()
+        finally:
+            self._updating = False
+
+    def set_amplitude_normalization(self, normalization: str) -> None:
+        value = str(normalization)
+        if value not in ("per mode", "entire spectrum"):
+            raise ValueError(
+                f"Unknown modal spectrum amplitude normalization: {value!r}"
+            )
+        if value == self.controller.amplitude_normalization:
+            if str(self.amplitude_normalization.value) != value:
+                self._updating = True
+                try:
+                    self.amplitude_normalization.value = value
+                finally:
+                    self._updating = False
+            return
+        self._updating = True
+        try:
+            self.amplitude_normalization.value = value
+            self.controller.select_amplitude_normalization(value)
             self._refresh()
         finally:
             self._updating = False

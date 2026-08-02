@@ -260,6 +260,9 @@ class DynamicViewer(Viewer):
                     self.modal_spectrum_controller,
                     on_mode_selected=self._set_selected_modal_mode,
                     on_component_selected=self._set_selected_modal_component,
+                    on_normalization_selected=(
+                        self._set_selected_modal_amplitude_normalization
+                    ),
                     on_solo_selected=self._solo_selected_modal_mode,
                     on_enable_all=self._enable_all_modal_modes,
                 )
@@ -428,10 +431,18 @@ class DynamicViewer(Viewer):
         def update_phase_direction(event) -> None:
             self._set_selected_modal_component(str(phase_direction.value), event)
 
+        def update_phase_amplitude_normalization(event) -> None:
+            self._set_selected_modal_amplitude_normalization(
+                str(phase_amplitude_normalization.value),
+                event,
+            )
+
         color_mode.on_update(self.rerender)
         phase_mode_index.on_update(update_phase_mode)
         phase_direction.on_update(update_phase_direction)
-        phase_amplitude_normalization.on_update(self.rerender)
+        phase_amplitude_normalization.on_update(
+            update_phase_amplitude_normalization
+        )
         mode_index.on_update(self.rerender)
 
     def _set_selected_modal_mode(self, mode_index: int, event=None) -> None:
@@ -470,6 +481,31 @@ class DynamicViewer(Viewer):
                 handles["phase_direction"].value = value
             if self._modal_spectrum_panel is not None:
                 self._modal_spectrum_panel.set_component(value.upper())
+        finally:
+            self._modal_selection_sync = False
+        self.rerender(event)
+
+    def _set_selected_modal_amplitude_normalization(
+        self,
+        normalization: str,
+        event=None,
+    ) -> None:
+        value = str(normalization)
+        if value not in ("per mode", "entire spectrum"):
+            raise ValueError(
+                f"Unknown modal amplitude normalization: {value!r}"
+            )
+        if self._modal_selection_sync:
+            return
+        self._modal_selection_sync = True
+        try:
+            handles = self._gaussian_color_handles
+            assert handles is not None
+            normalization_handle = handles["phase_amplitude_normalization"]
+            if str(normalization_handle.value) != value:
+                normalization_handle.value = value
+            if self._modal_spectrum_panel is not None:
+                self._modal_spectrum_panel.set_amplitude_normalization(value)
         finally:
             self._modal_selection_sync = False
         self.rerender(event)

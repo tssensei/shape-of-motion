@@ -543,6 +543,8 @@ class SpectrumComparisonController:
         self.component_index = 0
         self.raw_frequency_hz = float(self.manifest.frequencies_hz[0])
         self.reconstructed_index = 0
+        self.amplitude_normalization = "per mode"
+        self._spectrum_magnitude_hi_cache: dict[tuple[str, int], float] = {}
         self.raw_spectrum_mapping: tuple[float, float, float, float, int] | None = None
         self.reconstructed_spectrum_mapping: tuple[float, float, float, float, int] | None = None
         self._load_view(self.available_view_ids[0])
@@ -829,6 +831,53 @@ class SpectrumComparisonController:
         figure.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.91)
         return _figure_rgb(figure)
 
+    def _entire_spectrum_magnitude_hi(self) -> float:
+        cache_key = (self.source_identity, int(self.component_index))
+        cached = self._spectrum_magnitude_hi_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        lower, upper = self.frequency_limits
+        raw_frequency_indices = np.nonzero(
+            (self.cache.freqs_hz >= lower) & (self.cache.freqs_hz <= upper)
+        )[0]
+        spectrum = (
+            self.cache.spectrum_u
+            if self.component_index == 0
+            else self.cache.spectrum_v
+        )
+        x = self.pixels[:, 0]
+        y = self.pixels[:, 1]
+        magnitude_hi = 0.0
+        for frequency_index in raw_frequency_indices:
+            magnitudes = np.abs(
+                np.asarray(spectrum[int(frequency_index), y, x])
+            )
+            finite = magnitudes[np.isfinite(magnitudes)]
+            if finite.size > 0:
+                magnitude_hi = max(
+                    magnitude_hi,
+                    float(np.percentile(finite, self.preview_percentile)),
+                )
+        for mode_index in range(self.reconstructed_modes.shape[0]):
+            magnitudes = np.abs(
+                self.reconstructed_modes[
+                    mode_index,
+                    :,
+                    self.component_index,
+                ]
+            )
+            finite = magnitudes[np.isfinite(magnitudes)]
+            if finite.size > 0:
+                magnitude_hi = max(
+                    magnitude_hi,
+                    float(np.percentile(finite, self.preview_percentile)),
+                )
+        if not np.isfinite(magnitude_hi) or magnitude_hi <= 0.0:
+            magnitude_hi = 1.0
+        self._spectrum_magnitude_hi_cache[cache_key] = magnitude_hi
+        return magnitude_hi
+
     def _render_all(self) -> None:
         raw_power = float(
             np.mean(
@@ -889,12 +938,22 @@ class SpectrumComparisonController:
         reconstructed_values = self.reconstructed_modes[
             self.reconstructed_index, :, self.component_index
         ]
-        magnitudes = np.concatenate(
-            [np.abs(raw_values), np.abs(reconstructed_values)]
-        )
-        magnitude_hi = float(np.percentile(magnitudes, self.preview_percentile))
-        if not np.isfinite(magnitude_hi) or magnitude_hi <= 0.0:
-            magnitude_hi = 1.0
+        if self.amplitude_normalization == "per mode":
+            magnitudes = np.concatenate(
+                [np.abs(raw_values), np.abs(reconstructed_values)]
+            )
+            magnitude_hi = float(
+                np.percentile(magnitudes, self.preview_percentile)
+            )
+            if not np.isfinite(magnitude_hi) or magnitude_hi <= 0.0:
+                magnitude_hi = 1.0
+        elif self.amplitude_normalization == "entire spectrum":
+            magnitude_hi = self._entire_spectrum_magnitude_hi()
+        else:
+            raise ValueError(
+                "Unknown modal image amplitude normalization: "
+                f"{self.amplitude_normalization!r}"
+            )
         self.raw_modal_image = self._render_modal_image(
             raw_values,
             magnitude_hi,
@@ -909,7 +968,8 @@ class SpectrumComparisonController:
             f"**View:** `{self.view_id}` &nbsp; **candidate pixels:** {self.pixels.shape[0]}  \n"
             f"**Original:** {self.raw_frequency_hz:.6f} Hz, power={raw_power:.6g} &nbsp; "
             f"**Reconstructed:** {reconstructed_frequency:.6f} Hz, "
-            f"power={reconstructed_power:.6g} &nbsp; **component:** {component_label}"
+            f"power={reconstructed_power:.6g} &nbsp; **component:** {component_label}  \n"
+            f"**Amplitude normalization:** `{self.amplitude_normalization}`"
         )
 
     def outputs(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
@@ -979,6 +1039,15 @@ class SpectrumComparisonController:
         if component not in ("U", "V"):
             raise ValueError(f"Unknown modal image component {component!r}")
         self.component_index = 0 if component == "U" else 1
+        self._render_all()
+        return self.outputs()
+
+    def select_amplitude_normalization(self, normalization: str):
+        if normalization not in ("per mode", "entire spectrum"):
+            raise ValueError(
+                f"Unknown modal image amplitude normalization {normalization!r}"
+            )
+        self.amplitude_normalization = normalization
         self._render_all()
         return self.outputs()
 
