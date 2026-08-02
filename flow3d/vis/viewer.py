@@ -235,12 +235,12 @@ class DynamicViewer(Viewer):
 
             self._canonical_checkbox.on_update(_toggle_gui_playing)
 
+        self._define_camera_guis()
         self._render_track_checkbox = server.gui.add_checkbox("Render tracks", False)
         self._render_track_checkbox.on_update(self.rerender)
         self._define_modal_playback_guis()
         self._define_gaussian_color_guis()
         self._define_debug_point_guis()
-        self._define_camera_guis()
 
         tabs = server.gui.add_tab_group()
         with tabs.add_tab("Render", Icon.CAMERA):
@@ -794,7 +794,7 @@ class DynamicViewer(Viewer):
             (80, 220, 220),
         ]
         camera_handles = {}
-        self._camera_folder = self.server.gui.add_folder("VGGT Cameras")
+        self._camera_folder = self.server.gui.add_folder("Cameras")
         with self._camera_folder:
             show_cameras = self.server.gui.add_checkbox("Show cameras", True)
             reset_orbit = self.server.gui.add_button("Reset orbit center")
