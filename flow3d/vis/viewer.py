@@ -236,8 +236,8 @@ class DynamicViewer(Viewer):
             self._canonical_checkbox.on_update(_toggle_gui_playing)
 
         self._define_camera_guis()
-        self._define_modal_playback_guis()
         self._define_gaussian_color_guis()
+        self._define_modal_playback_guis()
         self._define_debug_point_guis()
 
         tabs = server.gui.add_tab_group()
