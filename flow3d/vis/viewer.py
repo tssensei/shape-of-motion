@@ -117,6 +117,7 @@ class DynamicViewer(Viewer):
         self.modal_anchor_count = int(modal_anchor_count)
         self.modal_anchor_role_mode_labels = tuple(modal_anchor_role_mode_labels)
         self.modal_spectrum_controller = modal_spectrum_controller
+        self._modal_spectrum_window = None
         self._modal_spectrum_panel = None
         self._modal_selection_sync = False
         self.modal_anchor_role_classes = None
@@ -249,7 +250,13 @@ class DynamicViewer(Viewer):
         if self.modal_spectrum_controller is not None:
             from modal_surface.viser_spectrum_panel import ModalSpectrumPanel
 
-            with tabs.add_tab("Spectrum"):
+            if not hasattr(server.gui, "add_panel"):
+                raise RuntimeError(
+                    "Modal spectrum visualization requires a Viser build with "
+                    "GuiApi.add_panel() support"
+                )
+            self._modal_spectrum_window = server.gui.add_panel()
+            with self._modal_spectrum_window.add_tab("Spectrum"):
                 self._modal_spectrum_panel = ModalSpectrumPanel(
                     server,
                     self.modal_spectrum_controller,
@@ -258,6 +265,12 @@ class DynamicViewer(Viewer):
                     on_solo_selected=self._solo_selected_modal_mode,
                     on_enable_all=self._enable_all_modal_modes,
                 )
+            self._modal_spectrum_window.float(
+                x=16.0,
+                y=16.0,
+                width=720.0,
+                height=800.0,
+            )
 
     def _active_playback_group(self) -> ViewerPlaybackGroup | None:
         if self._active_playback_group_label is None:
