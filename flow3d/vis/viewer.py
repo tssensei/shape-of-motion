@@ -346,34 +346,41 @@ class DynamicViewer(Viewer):
                 initial_value=0.04,
             )
             disable_all_modes = self.server.gui.add_button("Turn off all modes")
-            modes = []
-            for mode_idx, freq_hz in enumerate(self.modal_freqs_hz):
-                enabled = self.server.gui.add_checkbox(f"Mode {mode_idx} enable", True)
+            modes_by_index = {}
+            for display_index, mode_idx in enumerate(self._modal_frequency_order):
+                freq_hz = self.modal_freqs_hz[mode_idx]
+                enabled = self.server.gui.add_checkbox(
+                    f"Mode {display_index} ({freq_hz:.3f} Hz) enable",
+                    True,
+                )
                 gain = self.server.gui.add_slider(
-                    f"Mode {mode_idx} gain",
+                    f"Mode {display_index} gain",
                     min=0.0,
                     max=5.0,
                     step=0.01,
                     initial_value=1.0,
                 )
                 phase = self.server.gui.add_slider(
-                    f"Mode {mode_idx} phase",
+                    f"Mode {display_index} phase",
                     min=-np.pi,
                     max=np.pi,
                     step=0.01,
                     initial_value=0.0,
                 )
-                modes.append(
-                    {
-                        "enabled": enabled,
-                        "gain": gain,
-                        "phase": phase,
-                        "freq_hz": float(freq_hz),
-                    }
-                )
+                modes_by_index[mode_idx] = {
+                    "enabled": enabled,
+                    "gain": gain,
+                    "phase": phase,
+                    "freq_hz": float(freq_hz),
+                }
                 enabled.on_update(self.rerender)
                 gain.on_update(self.rerender)
                 phase.on_update(self.rerender)
+
+            modes = tuple(
+                modes_by_index[mode_idx]
+                for mode_idx in range(len(self.modal_freqs_hz))
+            )
 
             def _disable_all_modes(event) -> None:
                 for mode in modes:
@@ -386,7 +393,7 @@ class DynamicViewer(Viewer):
         self._modal_playback_handles = {
             "drive": drive,
             "motion_scale": motion_scale,
-            "modes": tuple(modes),
+            "modes": modes,
         }
 
     def _define_gaussian_color_guis(self) -> None:
