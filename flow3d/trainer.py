@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from loguru import logger as guru
-from nerfview import CameraState
+from nerfview import CameraState, RenderTabState
 from pytorch_msssim import SSIM
 from torch.utils.tensorboard import SummaryWriter  # type: ignore
 
@@ -268,7 +268,15 @@ class Trainer:
             v.load_state_dict(sched_ckpt[k])
 
     @torch.inference_mode()
-    def render_fn(self, camera_state: CameraState, img_wh: tuple[int, int]):
+    def render_fn(
+        self,
+        camera_state: CameraState,
+        render_tab_state: RenderTabState,
+    ):
+        img_wh = (
+            render_tab_state.viewer_width,
+            render_tab_state.viewer_height,
+        )
         W, H = img_wh
 
         focal = 0.5 * H / np.tan(0.5 * camera_state.fov).item()
@@ -293,7 +301,7 @@ class Trainer:
 
     def train_step(self, batch):
         if self.viewer is not None:
-            while self.viewer.state.status == "paused":
+            while self.viewer.state == "paused":
                 time.sleep(0.1)
             self.viewer.lock.acquire()
 
@@ -353,7 +361,7 @@ class Trainer:
 
         if self.viewer is not None:
             self.viewer.lock.release()
-            self.viewer.state.num_train_rays_per_sec = num_rays_per_sec
+            self.viewer.render_tab_state.num_train_rays_per_sec = num_rays_per_sec
             if self.viewer.mode == "training":
                 self.viewer.update(self.global_step, num_rays_per_step)
 

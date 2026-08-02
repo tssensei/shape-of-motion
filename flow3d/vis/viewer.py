@@ -4,7 +4,7 @@ from typing import Callable, Literal, Optional, Tuple, Union
 
 import numpy as np
 from jaxtyping import Float32, UInt8
-from nerfview import CameraState, Viewer
+from nerfview import CameraState, RenderTabState, Viewer
 from viser import Icon, ViserServer
 import viser.transforms as vtf
 
@@ -78,7 +78,7 @@ class DynamicViewer(Viewer):
         self,
         server: ViserServer,
         render_fn: Callable[
-            [CameraState, Tuple[int, int]],
+            [CameraState, RenderTabState],
             Union[
                 UInt8[np.ndarray, "H W 3"],
                 Tuple[UInt8[np.ndarray, "H W 3"], Optional[Float32[np.ndarray, "H W"]]],
@@ -158,11 +158,31 @@ class DynamicViewer(Viewer):
         self._active_playback_group_label = (
             self.playback_groups[0].label if self.playback_groups else None
         )
-        super().__init__(server, render_fn, mode)
+        super().__init__(
+            server=server,
+            render_fn=render_fn,
+            output_dir=self.work_dir,
+            mode=mode,
+        )
 
-    def _define_guis(self):
-        super()._define_guis()
+    def _populate_rendering_tab(self):
         server = self.server
+        with self._rendering_folder:
+            viewer_res_slider = server.gui.add_slider(
+                "Viewer Res",
+                min=64,
+                max=2048,
+                step=1,
+                initial_value=self.render_tab_state.viewer_res,
+                hint="Maximum resolution of the viewer rendered image.",
+            )
+
+            @viewer_res_slider.on_update
+            def _(_) -> None:
+                self.render_tab_state.viewer_res = int(viewer_res_slider.value)
+                self.rerender(_)
+
+        self._rendering_tab_handles["viewer_res_slider"] = viewer_res_slider
         self._set_default_orbit_center()
         self._time_folder = server.gui.add_folder("Time")
         with self._time_folder:
@@ -214,7 +234,7 @@ class DynamicViewer(Viewer):
 
         tabs = server.gui.add_tab_group()
         with tabs.add_tab("Render", Icon.CAMERA):
-            self.render_tab_state = populate_render_tab(
+            self._camera_path_render_tab_state = populate_render_tab(
                 server, Path(self.work_dir) / "camera_paths", self._playback_guis[0]
             )
 
@@ -349,6 +369,11 @@ class DynamicViewer(Viewer):
                 options=("u", "v"),
                 initial_value="u",
             )
+            phase_amplitude_normalization = self.server.gui.add_dropdown(
+                "Amplitude normalization",
+                options=("per mode", "entire spectrum"),
+                initial_value="per mode",
+            )
             mode_index = self.server.gui.add_slider(
                 "Obs count mode index",
                 min=0,
@@ -361,6 +386,7 @@ class DynamicViewer(Viewer):
             "phase_mode_index": phase_mode_index,
             "phase_frequency": phase_frequency,
             "phase_direction": phase_direction,
+            "phase_amplitude_normalization": phase_amplitude_normalization,
             "mode_index": mode_index,
         }
 
@@ -372,6 +398,7 @@ class DynamicViewer(Viewer):
         color_mode.on_update(self.rerender)
         phase_mode_index.on_update(update_phase_mode)
         phase_direction.on_update(self.rerender)
+        phase_amplitude_normalization.on_update(self.rerender)
         mode_index.on_update(self.rerender)
 
     def _define_debug_point_guis(self) -> None:
@@ -527,6 +554,17 @@ class DynamicViewer(Viewer):
         if direction not in ("u", "v"):
             raise ValueError(f"Unknown Gaussian phase projection direction: {direction}")
         return mode_index, (0 if direction == "u" else 1)
+
+    def current_gaussian_phase_amplitude_normalization(self) -> str:
+        handles = getattr(self, "_gaussian_color_handles", None)
+        if handles is None:
+            return "per mode"
+        normalization = str(handles["phase_amplitude_normalization"].value)
+        if normalization not in ("per mode", "entire spectrum"):
+            raise ValueError(
+                f"Unknown Gaussian phase amplitude normalization: {normalization}"
+            )
+        return normalization
 
     def update_modal_anchors(self, points: np.ndarray, update_key) -> None:
         if not self.wants_modal_anchors():

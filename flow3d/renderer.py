@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from loguru import logger as guru
-from nerfview import CameraState
+from nerfview import CameraState, RenderTabState
 
 from flow3d.modal_utils import (
     load_modal_modes,
@@ -464,12 +464,18 @@ class Renderer:
         self,
         mode_index: int,
         component_index: int,
+        amplitude_normalization: str,
         w2c: torch.Tensor,
         K: torch.Tensor,
     ) -> torch.Tensor:
         if component_index not in (0, 1):
             raise ValueError(
                 f"Projected phase component must be 0 for u or 1 for v, got {component_index}"
+            )
+        if amplitude_normalization not in ("per mode", "entire spectrum"):
+            raise ValueError(
+                "Modal phase amplitude normalization must be 'per mode' or "
+                f"'entire spectrum', got {amplitude_normalization!r}"
             )
         means = self.model.fg.params["means"]
         R = w2c[:3, :3]
@@ -506,11 +512,40 @@ class Renderer:
         amp = torch.sqrt(real.square() + imag.square())
         phase = torch.atan2(imag, real)
         finite = torch.isfinite(amp) & torch.isfinite(phase)
-        finite_amp = amp[finite]
-        if finite_amp.numel() == 0:
+        hi = None
+        if amplitude_normalization == "per mode":
+            finite_amp = amp[finite]
+            if finite_amp.numel() > 0:
+                hi = torch.quantile(finite_amp, 0.95).clamp_min(1.0e-8)
+        else:
+            J_component = J[:, component_index]
+            for spectrum_mode_index in range(effective_real.shape[0]):
+                if spectrum_mode_index == mode_index:
+                    spectrum_amp = amp
+                else:
+                    spectrum_real = torch.einsum(
+                        "nj,nj->n",
+                        J_component,
+                        effective_real[spectrum_mode_index],
+                    )
+                    spectrum_imag = torch.einsum(
+                        "nj,nj->n",
+                        J_component,
+                        effective_imag[spectrum_mode_index],
+                    )
+                    spectrum_amp = torch.sqrt(
+                        spectrum_real.square() + spectrum_imag.square()
+                    )
+                finite_spectrum_amp = spectrum_amp[torch.isfinite(spectrum_amp)]
+                if finite_spectrum_amp.numel() == 0:
+                    continue
+                mode_hi = torch.quantile(
+                    finite_spectrum_amp, 0.95
+                ).clamp_min(1.0e-8)
+                hi = mode_hi if hi is None else torch.maximum(hi, mode_hi)
+        if hi is None:
             value = torch.zeros_like(amp)
         else:
-            hi = torch.quantile(finite_amp, 0.95).clamp_min(1.0e-8)
             value = torch.zeros_like(amp)
             value[finite] = (amp[finite] / hi).clamp(0.0, 1.0)
         phase = torch.where(torch.isfinite(phase), phase, torch.zeros_like(phase))
@@ -558,6 +593,9 @@ class Renderer:
             phase_mode_index, component_index = (
                 self.viewer.current_gaussian_phase_component()
             )
+            amplitude_normalization = (
+                self.viewer.current_gaussian_phase_amplitude_normalization()
+            )
             if phase_mode_index < 0 or phase_mode_index >= self.model.modal_phi_real.shape[0]:
                 raise ValueError(
                     f"Gaussian phase mode index {phase_mode_index} is outside "
@@ -566,6 +604,7 @@ class Renderer:
             fg_colors = self._modal_phase_colors(
                 phase_mode_index,
                 component_index,
+                amplitude_normalization,
                 w2c,
                 K,
             )
@@ -588,7 +627,15 @@ class Renderer:
         return colors
 
     @torch.inference_mode()
-    def render_fn(self, camera_state: CameraState, img_wh: tuple[int, int]):
+    def render_fn(
+        self,
+        camera_state: CameraState,
+        render_tab_state: RenderTabState,
+    ):
+        img_wh = (
+            render_tab_state.viewer_width,
+            render_tab_state.viewer_height,
+        )
         if self.viewer is None:
             return np.full((img_wh[1], img_wh[0], 3), 255, dtype=np.uint8)
 

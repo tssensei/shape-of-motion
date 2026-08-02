@@ -374,7 +374,7 @@ class CameraPath:
         self._spline_nodes.append(
             self._server.scene.add_spline_catmull_rom(
                 "/render_camera_spline",
-                positions=points_array,
+                points=points_array,
                 color=(220, 220, 220),
                 closed=self.loop,
                 line_width=1.0,
