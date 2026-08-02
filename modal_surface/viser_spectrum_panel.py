@@ -9,16 +9,6 @@ import viser.uplot
 from modal_surface.spectrum_comparison import SpectrumComparisonController
 
 
-def _reference_rgb(reference_frame: np.ndarray) -> np.ndarray:
-    frame = np.asarray(reference_frame)
-    if frame.ndim != 2:
-        raise ValueError(
-            f"Modal reference frame must have shape [H,W], got {frame.shape}"
-        )
-    clipped = np.clip(frame.astype(np.float32), 0.0, 1.0)
-    return np.repeat((255.0 * clipped)[..., None], 3, axis=2).astype(np.uint8)
-
-
 def _spectrum_plot_data(
     frequencies_hz: np.ndarray,
     power: np.ndarray,
@@ -146,12 +136,6 @@ class ModalSpectrumPanel:
             legend=viser.uplot.Legend(show=True),
             height=260,
         )
-        self.reference_image = server.gui.add_image(
-            _reference_rgb(controller.cache.reference_frame),
-            label="Reference frame",
-            format="jpeg",
-            jpeg_quality=90,
-        )
         self.raw_modal_image = server.gui.add_image(
             controller.raw_modal_image,
             label="Original modal image",
@@ -275,9 +259,6 @@ class ModalSpectrumPanel:
             f"Reconstructed {self.controller.view_id} spectrum"
         )
         self.reconstructed_plot.scales = self._plot_scales(power_max)
-        self.reference_image.image = _reference_rgb(
-            self.controller.cache.reference_frame
-        )
         self.raw_modal_image.image = self.controller.raw_modal_image
         self.reconstructed_modal_image.image = (
             self.controller.reconstructed_modal_image
