@@ -387,6 +387,16 @@ class DynamicViewer(Viewer):
                 options=tuple(options),
                 initial_value="rgb",
             )
+            phase_direction = self.server.gui.add_dropdown(
+                "Projection direction",
+                options=("u", "v"),
+                initial_value="u",
+            )
+            phase_amplitude_normalization = self.server.gui.add_dropdown(
+                "Amplitude normalization",
+                options=("per mode", "entire spectrum"),
+                initial_value="per mode",
+            )
             phase_mode_index = self.server.gui.add_slider(
                 "Phase frequency index",
                 min=0,
@@ -398,16 +408,6 @@ class DynamicViewer(Viewer):
                 "Selected frequency (Hz)",
                 initial_value=self.modal_freqs_hz[0],
                 disabled=True,
-            )
-            phase_direction = self.server.gui.add_dropdown(
-                "Projection direction",
-                options=("u", "v"),
-                initial_value="u",
-            )
-            phase_amplitude_normalization = self.server.gui.add_dropdown(
-                "Amplitude normalization",
-                options=("per mode", "entire spectrum"),
-                initial_value="per mode",
             )
             mode_index = self.server.gui.add_slider(
                 "Obs count mode index",
