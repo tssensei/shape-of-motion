@@ -111,6 +111,21 @@ class DynamicViewer(Viewer):
         self.camera_frustum_scale = float(camera_frustum_scale)
         self.playback_groups = tuple(playback_groups)
         self.modal_freqs_hz = tuple(float(freq) for freq in modal_freqs_hz)
+        modal_frequency_order = np.argsort(
+            np.asarray(self.modal_freqs_hz, dtype=np.float64),
+            kind="stable",
+        )
+        self._modal_frequency_order = tuple(
+            int(index) for index in modal_frequency_order
+        )
+        modal_display_indices = np.empty(len(self.modal_freqs_hz), dtype=np.int64)
+        modal_display_indices[modal_frequency_order] = np.arange(
+            len(self.modal_freqs_hz),
+            dtype=np.int64,
+        )
+        self._modal_display_indices = tuple(
+            int(index) for index in modal_display_indices
+        )
         self.has_modal_obs_count = bool(has_modal_obs_count)
         self._enable_hide_gaussian_render = mode == "rendering"
         self._enable_hide_background = mode == "rendering" and bool(has_background)
@@ -402,7 +417,7 @@ class DynamicViewer(Viewer):
                 min=0,
                 max=len(self.modal_freqs_hz) - 1,
                 step=1,
-                initial_value=0,
+                initial_value=self._modal_display_indices[0],
             )
             phase_frequency = self.server.gui.add_number(
                 "Selected frequency (Hz)",
@@ -426,7 +441,11 @@ class DynamicViewer(Viewer):
         }
 
         def update_phase_mode(event) -> None:
-            self._set_selected_modal_mode(int(phase_mode_index.value), event)
+            display_index = int(phase_mode_index.value)
+            self._set_selected_modal_mode(
+                self._modal_frequency_order[display_index],
+                event,
+            )
 
         def update_phase_direction(event) -> None:
             self._set_selected_modal_component(str(phase_direction.value), event)
@@ -458,8 +477,9 @@ class DynamicViewer(Viewer):
         try:
             handles = self._gaussian_color_handles
             assert handles is not None
-            if int(handles["phase_mode_index"].value) != index:
-                handles["phase_mode_index"].value = index
+            display_index = self._modal_display_indices[index]
+            if int(handles["phase_mode_index"].value) != display_index:
+                handles["phase_mode_index"].value = display_index
             handles["phase_frequency"].value = self.modal_freqs_hz[index]
             if self._modal_spectrum_panel is not None:
                 self._modal_spectrum_panel.set_mode_index(index)
@@ -678,7 +698,8 @@ class DynamicViewer(Viewer):
         handles = getattr(self, "_gaussian_color_handles", None)
         if handles is None:
             return 0, 0
-        mode_index = int(handles["phase_mode_index"].value)
+        display_index = int(handles["phase_mode_index"].value)
+        mode_index = self._modal_frequency_order[display_index]
         direction = str(handles["phase_direction"].value)
         if direction not in ("u", "v"):
             raise ValueError(f"Unknown Gaussian phase projection direction: {direction}")

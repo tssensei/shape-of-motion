@@ -74,6 +74,14 @@ class ModalSpectrumPanel:
         num_modes = int(controller.manifest.frequencies_hz.size)
         if num_modes <= 0:
             raise ValueError("Modal spectrum controller contains no reconstructed modes")
+        frequency_order = np.argsort(
+            controller.manifest.frequencies_hz,
+            kind="stable",
+        )
+        self._frequency_order = tuple(int(index) for index in frequency_order)
+        display_indices = np.empty(num_modes, dtype=np.int64)
+        display_indices[frequency_order] = np.arange(num_modes, dtype=np.int64)
+        self._display_indices = tuple(int(index) for index in display_indices)
 
         self.view = server.gui.add_dropdown(
             "Spectrum view",
@@ -95,7 +103,7 @@ class ModalSpectrumPanel:
             min=0,
             max=num_modes - 1,
             step=1,
-            initial_value=int(controller.reconstructed_index),
+            initial_value=self._display_indices[controller.reconstructed_index],
         )
         self.frequency = server.gui.add_number(
             "Selected frequency (Hz)",
@@ -185,19 +193,25 @@ class ModalSpectrumPanel:
         def _(_) -> None:
             if self._updating:
                 return
-            self._on_mode_selected(int(self.mode_index.value))
+            self._on_mode_selected(
+                self._frequency_order[int(self.mode_index.value)]
+            )
 
         @previous_mode.on_click
         def _(_) -> None:
-            self._on_mode_selected((int(self.mode_index.value) - 1) % num_modes)
+            display_index = (int(self.mode_index.value) - 1) % num_modes
+            self._on_mode_selected(self._frequency_order[display_index])
 
         @next_mode.on_click
         def _(_) -> None:
-            self._on_mode_selected((int(self.mode_index.value) + 1) % num_modes)
+            display_index = (int(self.mode_index.value) + 1) % num_modes
+            self._on_mode_selected(self._frequency_order[display_index])
 
         @solo_selected.on_click
         def _(_) -> None:
-            self._on_solo_selected(int(self.mode_index.value))
+            self._on_solo_selected(
+                self._frequency_order[int(self.mode_index.value)]
+            )
 
         @enable_all.on_click
         def _(_) -> None:
@@ -253,7 +267,7 @@ class ModalSpectrumPanel:
             self.controller.manifest.frequencies_hz[selected_index]
         )
         power_max = self._shared_power_max()
-        self.mode_index.value = selected_index
+        self.mode_index.value = self._display_indices[selected_index]
         self.frequency.value = selected_frequency
         self.amplitude_normalization.value = (
             self.controller.amplitude_normalization
@@ -284,11 +298,14 @@ class ModalSpectrumPanel:
 
     def set_mode_index(self, mode_index: int) -> None:
         index = int(mode_index)
+        if not (0 <= index < len(self._display_indices)):
+            raise ValueError(f"Unknown modal spectrum mode index: {index}")
+        display_index = self._display_indices[index]
         if index == int(self.controller.reconstructed_index):
-            if int(self.mode_index.value) != index:
+            if int(self.mode_index.value) != display_index:
                 self._updating = True
                 try:
-                    self.mode_index.value = index
+                    self.mode_index.value = display_index
                 finally:
                     self._updating = False
             return
