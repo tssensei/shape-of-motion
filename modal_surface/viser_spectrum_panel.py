@@ -112,8 +112,6 @@ class ModalSpectrumPanel:
             ),
             disabled=True,
         )
-        previous_mode = server.gui.add_button("Previous mode")
-        next_mode = server.gui.add_button("Next mode")
         solo_selected = server.gui.add_button("Solo selected mode")
         enable_all = server.gui.add_button("Enable all modes")
         self.status = server.gui.add_markdown(controller.status)
@@ -196,16 +194,6 @@ class ModalSpectrumPanel:
             self._on_mode_selected(
                 self._frequency_order[int(self.mode_index.value)]
             )
-
-        @previous_mode.on_click
-        def _(_) -> None:
-            display_index = (int(self.mode_index.value) - 1) % num_modes
-            self._on_mode_selected(self._frequency_order[display_index])
-
-        @next_mode.on_click
-        def _(_) -> None:
-            display_index = (int(self.mode_index.value) + 1) % num_modes
-            self._on_mode_selected(self._frequency_order[display_index])
 
         @solo_selected.on_click
         def _(_) -> None:
