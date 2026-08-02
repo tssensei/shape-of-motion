@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Literal, Optional, Tuple, Union
 
 import numpy as np
 from jaxtyping import Float32, UInt8
@@ -15,6 +17,9 @@ from flow3d.modal_utils import (
 )
 from flow3d.vis.playback_panel import add_gui_playback_group
 from flow3d.vis.render_panel import populate_render_tab
+
+if TYPE_CHECKING:
+    from modal_surface.spectrum_comparison import SpectrumComparisonController
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,7 @@ class DynamicViewer(Viewer):
         modal_anchor_count: int = 0,
         modal_anchor_role_classes: np.ndarray | None = None,
         modal_anchor_role_mode_labels: tuple[str, ...] = (),
+        modal_spectrum_controller: SpectrumComparisonController | None = None,
     ):
         self.num_frames = num_frames
         self.work_dir = Path(work_dir)
@@ -110,6 +116,9 @@ class DynamicViewer(Viewer):
         self._enable_hide_background = mode == "rendering" and bool(has_background)
         self.modal_anchor_count = int(modal_anchor_count)
         self.modal_anchor_role_mode_labels = tuple(modal_anchor_role_mode_labels)
+        self.modal_spectrum_controller = modal_spectrum_controller
+        self._modal_spectrum_panel = None
+        self._modal_selection_sync = False
         self.modal_anchor_role_classes = None
         if modal_anchor_role_classes is not None:
             role_classes = np.asarray(modal_anchor_role_classes)
@@ -237,6 +246,18 @@ class DynamicViewer(Viewer):
             self._camera_path_render_tab_state = populate_render_tab(
                 server, Path(self.work_dir) / "camera_paths", self._playback_guis[0]
             )
+        if self.modal_spectrum_controller is not None:
+            from modal_surface.viser_spectrum_panel import ModalSpectrumPanel
+
+            with tabs.add_tab("Spectrum"):
+                self._modal_spectrum_panel = ModalSpectrumPanel(
+                    server,
+                    self.modal_spectrum_controller,
+                    on_mode_selected=self._set_selected_modal_mode,
+                    on_component_selected=self._set_selected_modal_component,
+                    on_solo_selected=self._solo_selected_modal_mode,
+                    on_enable_all=self._enable_all_modal_modes,
+                )
 
     def _active_playback_group(self) -> ViewerPlaybackGroup | None:
         if self._active_playback_group_label is None:
@@ -391,15 +412,76 @@ class DynamicViewer(Viewer):
         }
 
         def update_phase_mode(event) -> None:
-            selected_index = int(phase_mode_index.value)
-            phase_frequency.value = self.modal_freqs_hz[selected_index]
-            self.rerender(event)
+            self._set_selected_modal_mode(int(phase_mode_index.value), event)
+
+        def update_phase_direction(event) -> None:
+            self._set_selected_modal_component(str(phase_direction.value), event)
 
         color_mode.on_update(self.rerender)
         phase_mode_index.on_update(update_phase_mode)
-        phase_direction.on_update(self.rerender)
+        phase_direction.on_update(update_phase_direction)
         phase_amplitude_normalization.on_update(self.rerender)
         mode_index.on_update(self.rerender)
+
+    def _set_selected_modal_mode(self, mode_index: int, event=None) -> None:
+        index = int(mode_index)
+        if not (0 <= index < len(self.modal_freqs_hz)):
+            raise ValueError(
+                f"Selected modal mode index {index} is outside "
+                f"[0,{len(self.modal_freqs_hz)})"
+            )
+        if self._modal_selection_sync:
+            return
+        self._modal_selection_sync = True
+        try:
+            handles = self._gaussian_color_handles
+            assert handles is not None
+            if int(handles["phase_mode_index"].value) != index:
+                handles["phase_mode_index"].value = index
+            handles["phase_frequency"].value = self.modal_freqs_hz[index]
+            if self._modal_spectrum_panel is not None:
+                self._modal_spectrum_panel.set_mode_index(index)
+        finally:
+            self._modal_selection_sync = False
+        self.rerender(event)
+
+    def _set_selected_modal_component(self, component: str, event=None) -> None:
+        value = str(component).lower()
+        if value not in ("u", "v"):
+            raise ValueError(f"Unknown modal component: {component!r}")
+        if self._modal_selection_sync:
+            return
+        self._modal_selection_sync = True
+        try:
+            handles = self._gaussian_color_handles
+            assert handles is not None
+            if str(handles["phase_direction"].value) != value:
+                handles["phase_direction"].value = value
+            if self._modal_spectrum_panel is not None:
+                self._modal_spectrum_panel.set_component(value.upper())
+        finally:
+            self._modal_selection_sync = False
+        self.rerender(event)
+
+    def _solo_selected_modal_mode(self, mode_index: int) -> None:
+        handles = self._modal_playback_handles
+        if handles is None:
+            raise RuntimeError("Modal playback controls are not initialized")
+        index = int(mode_index)
+        modes = handles["modes"]
+        if not (0 <= index < len(modes)):
+            raise ValueError(f"Cannot solo modal mode index {index}")
+        for current_index, mode in enumerate(modes):
+            mode["enabled"].value = current_index == index
+        self.rerender(None)
+
+    def _enable_all_modal_modes(self) -> None:
+        handles = self._modal_playback_handles
+        if handles is None:
+            raise RuntimeError("Modal playback controls are not initialized")
+        for mode in handles["modes"]:
+            mode["enabled"].value = True
+        self.rerender(None)
 
     def _define_debug_point_guis(self) -> None:
         self._debug_point_handles = None

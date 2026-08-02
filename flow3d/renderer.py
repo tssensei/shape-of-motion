@@ -53,6 +53,10 @@ class Renderer:
         port: int | None = None,
         vggt_view_configs: tuple[str, ...] = (),
         modal_anchor_manifest: str | None = None,
+        modal_spectrum_manifest: str | None = None,
+        modal_spectrum_flow_caches: tuple[str, ...] = (),
+        modal_spectrum_comparison_cache_dir: str | None = None,
+        modal_spectrum_preview_percentile: float = 99.0,
     ):
         self.device = device
 
@@ -104,6 +108,48 @@ class Renderer:
                 )
             elif modal_anchor_freqs_hz:
                 modal_freqs_hz = modal_anchor_freqs_hz
+            spectrum_requested = (
+                modal_spectrum_manifest is not None
+                or bool(modal_spectrum_flow_caches)
+                or modal_spectrum_comparison_cache_dir is not None
+            )
+            modal_spectrum_controller = None
+            if spectrum_requested:
+                if modal_spectrum_manifest is None:
+                    raise ValueError(
+                        "Modal spectrum visualization requires "
+                        "modal_spectrum_manifest"
+                    )
+                if not modal_spectrum_flow_caches:
+                    raise ValueError(
+                        "Modal spectrum visualization requires "
+                        "modal_spectrum_flow_caches"
+                    )
+                from modal_surface.spectrum_comparison import (
+                    SpectrumComparisonController,
+                )
+
+                modal_spectrum_controller = SpectrumComparisonController(
+                    modal_manifest=modal_spectrum_manifest,
+                    preview_percentile=modal_spectrum_preview_percentile,
+                    flow_caches=modal_spectrum_flow_caches,
+                    comparison_cache_dir=modal_spectrum_comparison_cache_dir,
+                )
+                spectrum_frequencies = np.asarray(
+                    modal_spectrum_controller.manifest.frequencies_hz,
+                    dtype=np.float64,
+                )
+                viewer_frequencies = np.asarray(modal_freqs_hz, dtype=np.float64)
+                if spectrum_frequencies.shape != viewer_frequencies.shape or not np.allclose(
+                    spectrum_frequencies,
+                    viewer_frequencies,
+                    rtol=1.0e-6,
+                    atol=1.0e-6,
+                ):
+                    raise ValueError(
+                        "Modal spectrum manifest frequencies do not match the "
+                        "checkpoint modal frequencies"
+                    )
             server = get_server(port=port)
             self.viewer = DynamicViewer(
                 server,
@@ -125,6 +171,7 @@ class Renderer:
                 ),
                 modal_anchor_role_classes=self.modal_anchor_role_classes,
                 modal_anchor_role_mode_labels=modal_anchor_role_mode_labels,
+                modal_spectrum_controller=modal_spectrum_controller,
             )
 
         self.tracks_3d = self.model.compute_poses_fg(

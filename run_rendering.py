@@ -22,6 +22,10 @@ class RenderConfig:
     ckpt_path: str | None = None
     vggt_view_config: tuple[str, ...] = ()
     modal_anchor_manifest: str | None = None
+    modal_spectrum_manifest: str | None = None
+    modal_spectrum_flow_caches: tuple[str, ...] = ()
+    modal_spectrum_comparison_cache_dir: str | None = None
+    modal_spectrum_preview_percentile: float = 99.0
 
 
 def _ordered_vggt_view_configs(
@@ -107,6 +111,12 @@ def main(cfg: RenderConfig):
         port=cfg.port,
         vggt_view_configs=vggt_view_configs,
         modal_anchor_manifest=modal_anchor_manifest,
+        modal_spectrum_manifest=cfg.modal_spectrum_manifest,
+        modal_spectrum_flow_caches=cfg.modal_spectrum_flow_caches,
+        modal_spectrum_comparison_cache_dir=(
+            cfg.modal_spectrum_comparison_cache_dir
+        ),
+        modal_spectrum_preview_percentile=cfg.modal_spectrum_preview_percentile,
     )
 
     guru.info(f"Starting rendering from {renderer.global_step=}")

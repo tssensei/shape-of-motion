@@ -967,6 +967,14 @@ class SpectrumComparisonController:
         self._set_frequencies(snapped_frequency, reconstructed_index)
         return self.outputs()
 
+    def select_reconstructed_index(self, reconstructed_index: int):
+        index = int(reconstructed_index)
+        if not (0 <= index < self.manifest.frequencies_hz.size):
+            raise ValueError("Reconstructed frequency index is outside the manifest")
+        frequency = float(self.manifest.frequencies_hz[index])
+        self._set_frequencies(frequency, index)
+        return self.outputs()
+
     def select_component(self, component: str):
         if component not in ("U", "V"):
             raise ValueError(f"Unknown modal image component {component!r}")
