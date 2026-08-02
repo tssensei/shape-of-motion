@@ -193,7 +193,7 @@ class DynamicViewer(Viewer):
                 self.rerender(_)
 
         self._rendering_tab_handles["viewer_res_slider"] = viewer_res_slider
-        self._set_default_orbit_center()
+        self._set_default_camera()
         self._time_folder = server.gui.add_folder("Time")
         with self._time_folder:
             self._playback_view_dropdown = None
@@ -782,13 +782,16 @@ class DynamicViewer(Viewer):
             q_values.append(amp * np.exp(1j * phase))
         return np.asarray(q_values, dtype=np.complex64), float(handles["motion_scale"].value)
 
-    def _set_default_orbit_center(self) -> None:
-        if self.orbit_center is None or not hasattr(self.server, "on_client_connect"):
+    def _set_default_camera(self) -> None:
+        if not hasattr(self.server, "on_client_connect"):
             return
 
         @self.server.on_client_connect
         def _(client) -> None:
-            client.camera.look_at = self.orbit_center
+            if self.viewer_cameras:
+                self._apply_camera_to_client(client, self.viewer_cameras[0])
+            elif self.orbit_center is not None:
+                client.camera.look_at = self.orbit_center
 
     @staticmethod
     def _camera_pose_fields(camera: ViewerCamera) -> tuple[np.ndarray, np.ndarray]:
@@ -797,16 +800,19 @@ class DynamicViewer(Viewer):
             camera.c2w[:3, 3],
         )
 
+    def _apply_camera_to_client(self, client, camera: ViewerCamera) -> None:
+        wxyz, position = self._camera_pose_fields(camera)
+        with client.atomic():
+            client.camera.position = position
+            if self.orbit_center is not None:
+                client.camera.look_at = self.orbit_center
+            client.camera.wxyz = wxyz
+            client.camera.fov = camera.fov
+
     def _set_client_to_camera(self, event, camera: ViewerCamera) -> None:
         if event.client is None:
             return
-        wxyz, position = self._camera_pose_fields(camera)
-        with event.client.atomic():
-            event.client.camera.position = position
-            if self.orbit_center is not None:
-                event.client.camera.look_at = self.orbit_center
-            event.client.camera.wxyz = wxyz
-            event.client.camera.fov = camera.fov
+        self._apply_camera_to_client(event.client, camera)
         self.rerender(event)
 
     def _reset_client_orbit_center(self, event) -> None:
