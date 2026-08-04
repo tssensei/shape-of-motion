@@ -1,7 +1,7 @@
 import functools
 import time
 from dataclasses import asdict
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -20,23 +20,6 @@ from flow3d.loss_utils import (
     masked_l1_loss,
 )
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
-from flow3d.modal_canonical_optimization import (
-    MODAL_CANONICAL_OBJECTIVE,
-    MODAL_CANONICAL_TRAINABLE_FIELDS,
-    MODAL_CANONICAL_TRAINABLE_NAMES,
-    configure_canonical_only_trainability,
-)
-from flow3d.modal_joint_optimization import (
-    ModalJointTrainingContext,
-    weighted_delta_phi_local_loss,
-    weighted_mode_rigidity_loss,
-    weighted_rigidity_loss,
-)
-from flow3d.modal_utils import (
-    MOTION_FILL_DISPLAY_ANCHOR,
-    MOTION_FILL_DISPLAY_FILLED,
-    MOTION_FILL_DISPLAY_PARTIAL,
-)
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import get_server
 from flow3d.vis.viewer import DynamicViewer
@@ -60,7 +43,6 @@ class Trainer:
         validate_video_every: int = 1000,
         validate_viewer_assets_every: int = 100,
         init_metadata: dict[str, Any] | None = None,
-        modal_joint_context: ModalJointTrainingContext | None = None,
     ):
         self.device = device
         self.log_every = log_every
@@ -76,71 +58,10 @@ class Trainer:
         self.losses_cfg = losses_cfg
         self.optim_cfg = optim_cfg
         self.init_metadata = init_metadata
-        self.modal_optimization = (
-            init_metadata.get("modal_optimization")
-            if isinstance(init_metadata, dict)
-            else None
-        )
         if self.model.trajectory_type == "modal_activation":
-            if self.modal_optimization == "canonical_only":
-                assert isinstance(init_metadata, dict)
-                if modal_joint_context is not None:
-                    raise ValueError(
-                        "Canonical-only optimization does not accept a modal "
-                        "joint training context"
-                    )
-                if self.model.has_modal_joint or self.model.has_modal_phi_refinement:
-                    raise ValueError(
-                        "Canonical-only optimization requires fixed q and fixed phi"
-                    )
-                if init_metadata.get("modal_training_objective") != (
-                    MODAL_CANONICAL_OBJECTIVE
-                ):
-                    raise ValueError(
-                        "Canonical-only checkpoint has an incompatible objective"
-                    )
-                trainable_names = {
-                    name
-                    for name, parameter in self.model.named_parameters()
-                    if parameter.requires_grad
-                }
-                if trainable_names != MODAL_CANONICAL_TRAINABLE_NAMES:
-                    raise ValueError(
-                        "Canonical-only optimizer received unexpected trainable "
-                        f"parameters: {sorted(trainable_names)}"
-                    )
-            elif not self.model.has_trainable_modal_phi or modal_joint_context is None:
-                raise ValueError(
-                    "Trainer only accepts trainable-phi modal checkpoints with a "
-                    "validated training context"
-                )
-            else:
-                trainable_names = {
-                    name
-                    for name, parameter in self.model.named_parameters()
-                    if parameter.requires_grad
-                }
-                expected_names = (
-                    {
-                        "modal_joint.params.delta_coordinate_real",
-                        "modal_joint.params.delta_coordinate_imag",
-                        "modal_joint.params.delta_phi_real",
-                        "modal_joint.params.delta_phi_imag",
-                    }
-                    if self.model.has_modal_joint
-                    else {
-                        "modal_phi_refinement.params.delta_phi_real",
-                        "modal_phi_refinement.params.delta_phi_imag",
-                    }
-                )
-                if trainable_names != expected_names:
-                    raise ValueError(
-                        "Joint q/phi optimizer received unexpected trainable "
-                        f"parameters: {sorted(trainable_names)}"
-                    )
-        elif modal_joint_context is not None:
-            raise ValueError("modal joint training context requires modal_activation")
-        self.modal_joint_context = modal_joint_context
+            raise ValueError(
+                "Fixed modal checkpoints are materialized without creating a Trainer"
+            )
 
         self.reset_opacity_every = (
             self.optim_cfg.reset_opacity_every_n_controls * self.optim_cfg.control_every
@@ -209,9 +130,6 @@ class Trainer:
         device: torch.device,
         use_2dgs,
         *args,
-        modal_joint_context_loader: (
-            Callable[[SceneModel], ModalJointTrainingContext] | None
-        ) = None,
         **kwargs,
     ) -> tuple["Trainer", int]:
         guru.info(f"Loading checkpoint from {path}")
@@ -220,34 +138,13 @@ class Trainer:
         model = SceneModel.init_from_state_dict(state_dict)
         model = model.to(device)
         init_metadata = ckpt.get("init_metadata")
-        modal_optimization = (
-            init_metadata.get("modal_optimization")
-            if isinstance(init_metadata, dict)
-            else None
-        )
-        if modal_optimization == "canonical_only":
-            configure_canonical_only_trainability(model)
-        elif model.has_modal_joint:
-            model.requires_grad_(False)
-            assert model.modal_joint is not None
-            model.modal_joint.requires_grad_(True)
-        elif model.has_modal_phi_refinement:
-            model.requires_grad_(False)
-            assert model.modal_phi_refinement is not None
-            model.modal_phi_refinement.requires_grad_(True)
         print(use_2dgs)
         model.use_2dgs = use_2dgs
-        modal_joint_context = (
-            None
-            if modal_joint_context_loader is None
-            else modal_joint_context_loader(model)
-        )
         trainer = Trainer(
             model,
             device,
             *args,
             init_metadata=init_metadata,
-            modal_joint_context=modal_joint_context,
             **kwargs,
         )
         if "optimizers" in ckpt:
@@ -309,46 +206,6 @@ class Trainer:
         if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError(f"Non-finite loss at step {self.global_step}")
         loss.backward()
-        if self.model.has_modal_joint:
-            assert self.model.modal_joint is not None
-            for name, parameter in self.model.modal_joint.params.items():
-                if parameter.grad is None:
-                    raise RuntimeError(f"Missing gradient for modal_joint.params.{name}")
-                if not bool(torch.isfinite(parameter.grad).all().item()):
-                    raise FloatingPointError(
-                        f"Non-finite gradient for modal_joint.params.{name}"
-                    )
-                stats[f"train/modal_{name}_grad_norm"] = float(
-                    torch.linalg.vector_norm(parameter.grad).item()
-                )
-        elif self.model.has_modal_phi_refinement:
-            assert self.model.modal_phi_refinement is not None
-            for name, parameter in self.model.modal_phi_refinement.params.items():
-                if parameter.grad is None:
-                    raise RuntimeError(
-                        f"Missing gradient for modal_phi_refinement.params.{name}"
-                    )
-                if not bool(torch.isfinite(parameter.grad).all().item()):
-                    raise FloatingPointError(
-                        f"Non-finite gradient for modal_phi_refinement.params.{name}"
-                    )
-                stats[f"train/modal_{name}_grad_norm"] = float(
-                    torch.linalg.vector_norm(parameter.grad).item()
-                )
-        elif self.modal_optimization == "canonical_only":
-            for field in MODAL_CANONICAL_TRAINABLE_FIELDS:
-                parameter = self.model.fg.params[field]
-                if parameter.grad is None:
-                    raise RuntimeError(
-                        f"Missing gradient for foreground canonical field {field!r}"
-                    )
-                if not bool(torch.isfinite(parameter.grad).all().item()):
-                    raise FloatingPointError(
-                        f"Non-finite gradient for foreground canonical field {field!r}"
-                    )
-                stats[f"train/canonical_{field}_grad_norm"] = float(
-                    torch.linalg.vector_norm(parameter.grad).item()
-                )
         for opt in self.optimizers.values():
             opt.step()
             opt.zero_grad(set_to_none=True)
@@ -370,409 +227,8 @@ class Trainer:
 
         return loss.item()
 
-    def _modal_reference_coordinates(
-        self,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        context = self.modal_joint_context
-        if context is None:
-            raise RuntimeError("modal joint training context is not initialized")
-        all_real, all_imag = self.model.get_all_modal_coefficients()
-        real_rows: list[torch.Tensor] = []
-        imag_rows: list[torch.Tensor] = []
-        for view_index in range(len(context.view_ids)):
-            active_ts = int(context.reference_active_ts[view_index].item())
-            if active_ts >= 0:
-                real_rows.append(all_real[active_ts])
-                imag_rows.append(all_imag[active_ts])
-            else:
-                real_rows.append(context.reference_coordinate_real[view_index])
-                imag_rows.append(context.reference_coordinate_imag[view_index])
-        return torch.stack(real_rows), torch.stack(imag_rows)
-
-    @staticmethod
-    def _project_points(
-        points: torch.Tensor,
-        w2c: torch.Tensor,
-        K: torch.Tensor,
-    ) -> torch.Tensor:
-        camera = torch.einsum(
-            "ij,gj->gi",
-            w2c[:3],
-            F.pad(points, (0, 1), value=1.0),
-        )
-        pixels_h = torch.einsum("ij,gj->gi", K, camera)
-        depth = pixels_h[:, 2:3].clamp_min(1e-6)
-        return pixels_h[:, :2] / depth
-
-    def _modal_coordinate_prior_loss(self) -> torch.Tensor:
-        context = self.modal_joint_context
-        if context is None:
-            raise RuntimeError("modal joint training context is not initialized")
-        delta_real, delta_imag = self.model.get_centered_modal_coordinate_deltas()
-        view_indices = self.model.modal_frame_view_indices
-        losses: list[torch.Tensor] = []
-        for view_index in range(len(context.view_ids)):
-            rows = view_indices == view_index
-            normalized = (
-                delta_real[rows].square() + delta_imag[rows].square()
-            ) / context.coordinate_scale[view_index].square().clamp_min(1e-12)
-            losses.append(normalized.mean(dim=0))
-        return torch.stack(losses).mean()
-
-    def _modal_coordinate_temporal_loss(self) -> torch.Tensor:
-        context = self.modal_joint_context
-        if context is None:
-            raise RuntimeError("modal joint training context is not initialized")
-        real, imag = self.model.get_all_modal_coefficients()
-        view_indices = self.model.modal_frame_view_indices
-        local_indices = self.model.modal_frame_local_indices
-        times = self.model.modal_frame_times_sec
-        frequencies = self.model.modal_freqs_hz
-        theta = 2.0 * torch.pi * times[:, None] * frequencies[None]
-        cosine = torch.cos(theta)
-        sine = torch.sin(theta)
-        envelope_real = real * cosine + imag * sine
-        envelope_imag = imag * cosine - real * sine
-        losses: list[torch.Tensor] = []
-        time_scale = float(self.losses_cfg.modal_coordinate_temporal_scale_sec)
-        for view_index in range(len(context.view_ids)):
-            rows = torch.nonzero(view_indices == view_index, as_tuple=False).flatten()
-            order = torch.argsort(local_indices[rows])
-            rows = rows[order]
-            if rows.numel() < 2:
-                raise RuntimeError(
-                    f"View {context.view_ids[view_index]!r} needs at least two frames"
-                )
-            dt = times[rows[1:]] - times[rows[:-1]]
-            if bool((dt <= 0).any().item()):
-                raise RuntimeError("modal frame times must increase within each view")
-            delta_real = envelope_real[rows[1:]] - envelope_real[rows[:-1]]
-            delta_imag = envelope_imag[rows[1:]] - envelope_imag[rows[:-1]]
-            normalized = (
-                delta_real.square() + delta_imag.square()
-            ) / context.coordinate_scale[view_index].square().clamp_min(1e-12)
-            normalized = normalized / (dt[:, None] / time_scale).square()
-            losses.append(normalized.mean(dim=0))
-        return torch.stack(losses).mean()
-
-    def _modal_phi_prior_loss(
-        self,
-        effective_real: torch.Tensor,
-        effective_imag: torch.Tensor,
-    ) -> torch.Tensor:
-        context = self.modal_joint_context
-        if context is None:
-            raise RuntimeError("modal joint training context is not initialized")
-        delta_energy = (
-            effective_real - self.model.modal_phi_real
-        ).square() + (effective_imag - self.model.modal_phi_imag).square()
-        staged_energy = self.model.modal_phi_real.square() + self.model.modal_phi_imag.square()
-        losses: list[torch.Tensor] = []
-        for role in (
-            MOTION_FILL_DISPLAY_ANCHOR,
-            MOTION_FILL_DISPLAY_PARTIAL,
-            MOTION_FILL_DISPLAY_FILLED,
-        ):
-            selected = (
-                (context.display_class == role)
-                & self.model.modal_phi_trainable_mask
-            )
-            for mode_slot in range(selected.shape[0]):
-                mode_selected = selected[mode_slot]
-                if bool(mode_selected.any().item()):
-                    denominator = staged_energy[mode_slot, mode_selected].mean()
-                    losses.append(
-                        delta_energy[mode_slot, mode_selected].mean()
-                        / denominator.clamp_min(1e-12)
-                    )
-        if not losses:
-            raise RuntimeError("modal phi prior has no trainable role groups")
-        return torch.stack(losses).mean()
-
-    def _compute_modal_canonical_losses(self, batch):
-        if self.modal_optimization != "canonical_only":
-            raise RuntimeError("Canonical RGB loss requires canonical-only mode")
-        started = time.time()
-        ts = batch["ts"]
-        w2cs = batch["w2cs"]
-        Ks = batch["Ks"]
-        imgs = batch["imgs"]
-        valid_masks = batch.get(
-            "valid_masks", torch.ones_like(batch["imgs"][..., 0])
-        ) > 0.5
-        batch_size, height, width = imgs.shape[:3]
-        img_wh = (width, height)
-
-        rgb_losses: list[torch.Tensor] = []
-        support_fractions: list[torch.Tensor] = []
-        for batch_index in range(batch_size):
-            rendered = self.model.render(
-                int(ts[batch_index].item()),
-                w2cs[batch_index : batch_index + 1],
-                Ks[batch_index : batch_index + 1],
-                img_wh,
-                bg_color=1.0,
-            )["img"][0]
-            support = valid_masks[batch_index]
-            if not bool(support.any().item()):
-                raise ValueError("Canonical-only RGB support is empty")
-            rgb_losses.append(
-                torch.abs(rendered[support] - imgs[batch_index][support]).mean()
-            )
-            support_fractions.append(support.float().mean())
-        rgb_loss = torch.stack(rgb_losses).mean()
-        loss = self.losses_cfg.w_rgb * rgb_loss
-        if not bool(torch.isfinite(loss).item()):
-            raise FloatingPointError(
-                "Canonical-only RGB objective produced a non-finite loss"
-            )
-
-        num_rays_per_step = height * width * batch_size
-        num_rays_per_sec = num_rays_per_step / (time.time() - started)
-        stats = {
-            "train/loss": float(loss.detach().item()),
-            "train/rgb_loss": float(rgb_loss.detach().item()),
-            "train/rgb_support_fraction": float(
-                torch.stack(support_fractions).mean().item()
-            ),
-            "train/num_rays_per_sec": num_rays_per_sec,
-            "train/num_rays_per_step": float(num_rays_per_step),
-        }
-        return loss, stats, num_rays_per_step, num_rays_per_sec
-
-    def _compute_modal_joint_losses(self, batch):
-        context = self.modal_joint_context
-        if context is None or not self.model.has_trainable_modal_phi:
-            raise RuntimeError("modal phi loss requires a validated context")
-        started = time.time()
-        ts = batch["ts"]
-        w2cs = batch["w2cs"]
-        Ks = batch["Ks"]
-        imgs = batch["imgs"]
-        masks = batch["masks"] > 0.5
-        valid_masks = batch.get("valid_masks", torch.ones_like(batch["masks"])) > 0.5
-        batch_size, height, width = imgs.shape[:3]
-        if (height, width) != (context.flow_height, context.flow_width):
-            raise ValueError(
-                "Training image resolution does not match modal flow cache: "
-                f"{(height, width)} versus {(context.flow_height, context.flow_width)}"
-            )
-        img_wh = (width, height)
-
-        coordinate_real, coordinate_imag = self.model.compute_modal_coefficients(ts)
-        effective_phi_real, effective_phi_imag = self.model.get_effective_modal_phi()
-        dynamic_offsets = torch.einsum(
-            "bk,kgc->gbc", coordinate_real, effective_phi_real
-        ) - torch.einsum("bk,kgc->gbc", coordinate_imag, effective_phi_imag)
-        canonical_fg = self.model.fg.params["means"]
-        dynamic_fg = canonical_fg[:, None] + dynamic_offsets
-        foreground_quats = self.model.fg.get_quats()[:, None].expand(
-            -1, batch_size, -1
-        )
-        if self.model.bg is None:
-            means_all = dynamic_fg.transpose(0, 1)
-            quats_all = foreground_quats.transpose(0, 1)
-        else:
-            background_means, background_quats = self.model.compute_poses_bg()
-            means_all = torch.cat(
-                [
-                    dynamic_fg,
-                    background_means[:, None].expand(-1, batch_size, -1),
-                ],
-                dim=0,
-            ).transpose(0, 1)
-            quats_all = torch.cat(
-                [
-                    foreground_quats,
-                    background_quats[:, None].expand(-1, batch_size, -1),
-                ],
-                dim=0,
-            ).transpose(0, 1)
-
-        rgb_losses: list[torch.Tensor] = []
-        for batch_index in range(batch_size):
-            rendered = self.model.render(
-                int(ts[batch_index].item()),
-                w2cs[batch_index : batch_index + 1],
-                Ks[batch_index : batch_index + 1],
-                img_wh,
-                means=means_all[batch_index],
-                quats=quats_all[batch_index],
-            )["img"][0]
-            support = masks[batch_index] & valid_masks[batch_index]
-            if not bool(support.any().item()):
-                raise ValueError("Foreground RGB support is empty")
-            rgb_losses.append(torch.abs(rendered[support] - imgs[batch_index][support]).mean())
-        rgb_loss = torch.stack(rgb_losses).mean()
-
-        frame_view_indices = self.model.modal_frame_view_indices[ts]
-        frame_local_indices = self.model.modal_frame_local_indices[ts]
-        observed_flow, cache_masks = context.load_flow_batch(
-            frame_view_indices,
-            frame_local_indices,
-            device=self.device,
-            dtype=dynamic_fg.dtype,
-        )
-        reference_real, reference_imag = self._modal_reference_coordinates()
-        batch_reference_real = reference_real[frame_view_indices]
-        batch_reference_imag = reference_imag[frame_view_indices]
-        reference_offsets = torch.einsum(
-            "bk,kgc->gbc", batch_reference_real, effective_phi_real
-        ) - torch.einsum(
-            "bk,kgc->gbc", batch_reference_imag, effective_phi_imag
-        )
-        reference_fg = canonical_fg[:, None] + reference_offsets
-        canonical_quats = self.model.fg.get_quats()
-
-        flow_losses: list[torch.Tensor] = []
-        flow_support_fractions: list[torch.Tensor] = []
-        epsilon = float(self.losses_cfg.modal_flow_charbonnier_epsilon_px)
-        image_diagonal = float((height * height + width * width) ** 0.5)
-        for batch_index in range(batch_size):
-            reference_points = reference_fg[:, batch_index]
-            current_points = dynamic_fg[:, batch_index]
-            uv_reference = self._project_points(
-                reference_points, w2cs[batch_index], Ks[batch_index]
-            )
-            uv_current = self._project_points(
-                current_points, w2cs[batch_index], Ks[batch_index]
-            )
-            gaussian_flow = uv_current - uv_reference
-            flow_render = self.model.render(
-                None,
-                w2cs[batch_index : batch_index + 1],
-                Ks[batch_index : batch_index + 1],
-                img_wh,
-                bg_color=torch.zeros(1, 2, device=self.device),
-                colors_override=gaussian_flow,
-                means=reference_points,
-                quats=canonical_quats,
-                fg_only=True,
-            )
-            accumulation = flow_render["acc"][0, ..., 0]
-            predicted_flow = flow_render["img"][0] / accumulation[..., None].clamp_min(1e-6)
-            support = cache_masks[batch_index] & (
-                accumulation >= self.losses_cfg.modal_flow_render_acc_min
-            )
-            if not bool(support.any().item()):
-                raise ValueError("Rendered flow support is empty")
-            residual = predicted_flow[support] - observed_flow[batch_index][support]
-            robust = torch.sqrt(residual.square().sum(dim=-1) + epsilon**2) - epsilon
-            flow_losses.append(robust.mean() / image_diagonal)
-            flow_support_fractions.append(support.float().mean())
-        flow_loss = torch.stack(flow_losses).mean()
-        flow_support_fraction = torch.stack(flow_support_fractions).mean()
-
-        rigidity_loss, mean_abs_strain, max_abs_strain = weighted_rigidity_loss(
-            dynamic_fg,
-            canonical_fg,
-            context.edge_index,
-            context.edge_weight,
-            self.losses_cfg.modal_rigidity_huber_beta,
-        )
-        zero = torch.zeros((), device=self.device, dtype=dynamic_fg.dtype)
-        if self.model.has_modal_joint:
-            coordinate_prior_loss = self._modal_coordinate_prior_loss()
-            coordinate_temporal_loss = self._modal_coordinate_temporal_loss()
-        else:
-            coordinate_prior_loss = zero
-            coordinate_temporal_loss = zero
-        phi_prior_loss = self._modal_phi_prior_loss(
-            effective_phi_real,
-            effective_phi_imag,
-        )
-        if self.model.has_modal_phi_refinement:
-            mode_count = effective_phi_real.shape[0]
-            modes_per_step = min(
-                int(self.losses_cfg.modal_structure_modes_per_step),
-                mode_count,
-            )
-            start = (self.global_step * modes_per_step) % mode_count
-            mode_slots = (
-                torch.arange(modes_per_step, device=self.device) + start
-            ) % mode_count
-            mode_rigidity_loss, mode_mean_strain, mode_max_strain = (
-                weighted_mode_rigidity_loss(
-                    effective_phi_real,
-                    effective_phi_imag,
-                    canonical_fg,
-                    context.edge_index,
-                    context.edge_weight,
-                    context.mode_rigidity_probe_scale,
-                    mode_slots,
-                    self.model.modal_phi_trainable_mask,
-                    self.losses_cfg.modal_rigidity_huber_beta,
-                )
-            )
-            delta_phi_local_loss = weighted_delta_phi_local_loss(
-                effective_phi_real - self.model.modal_phi_real,
-                effective_phi_imag - self.model.modal_phi_imag,
-                canonical_fg,
-                context.edge_index,
-                context.edge_weight,
-                mode_slots,
-                self.model.modal_phi_trainable_mask,
-            )
-        else:
-            mode_slots = torch.empty(0, device=self.device, dtype=torch.long)
-            mode_rigidity_loss = zero
-            mode_mean_strain = zero
-            mode_max_strain = zero
-            delta_phi_local_loss = zero
-
-        loss = (
-            self.losses_cfg.w_rgb * rgb_loss
-            + self.losses_cfg.w_modal_flow * flow_loss
-            + self.losses_cfg.w_modal_rigidity * rigidity_loss
-            + self.losses_cfg.w_modal_mode_rigidity * mode_rigidity_loss
-            + self.losses_cfg.w_modal_delta_phi_local * delta_phi_local_loss
-            + self.losses_cfg.w_modal_coordinate_prior * coordinate_prior_loss
-            + self.losses_cfg.w_modal_coordinate_temporal * coordinate_temporal_loss
-            + self.losses_cfg.w_modal_phi_prior * phi_prior_loss
-        )
-        if not bool(torch.isfinite(loss).item()):
-            raise FloatingPointError("Joint modal objective produced a non-finite loss")
-
-        num_rays_per_step = height * width * batch_size
-        num_rays_per_sec = num_rays_per_step / (time.time() - started)
-        stats = {
-            "train/loss": float(loss.detach().item()),
-            "train/rgb_loss": float(rgb_loss.detach().item()),
-            "train/modal_flow_loss": float(flow_loss.detach().item()),
-            "train/modal_flow_support_fraction": float(flow_support_fraction.item()),
-            "train/modal_rigidity_loss": float(rigidity_loss.detach().item()),
-            "train/modal_rigidity_mean_abs_strain": float(mean_abs_strain.detach().item()),
-            "train/modal_rigidity_max_abs_strain": float(max_abs_strain.detach().item()),
-            "train/modal_mode_rigidity_loss": float(mode_rigidity_loss.detach().item()),
-            "train/modal_mode_rigidity_mean_abs_strain": float(mode_mean_strain.detach().item()),
-            "train/modal_mode_rigidity_max_abs_strain": float(mode_max_strain.detach().item()),
-            "train/modal_delta_phi_local_loss": float(delta_phi_local_loss.detach().item()),
-            "train/modal_mode_probe_scale_min": float(
-                context.mode_rigidity_probe_scale.amin().item()
-            ),
-            "train/modal_mode_probe_scale_median": float(
-                context.mode_rigidity_probe_scale.median().item()
-            ),
-            "train/modal_mode_probe_scale_max": float(
-                context.mode_rigidity_probe_scale.amax().item()
-            ),
-            "train/modal_structure_mode_slot_mean": (
-                -1.0 if mode_slots.numel() == 0 else float(mode_slots.float().mean().item())
-            ),
-            "train/modal_coordinate_prior_loss": float(coordinate_prior_loss.detach().item()),
-            "train/modal_coordinate_temporal_loss": float(coordinate_temporal_loss.detach().item()),
-            "train/modal_phi_prior_loss": float(phi_prior_loss.detach().item()),
-            "train/num_rays_per_sec": num_rays_per_sec,
-            "train/num_rays_per_step": float(num_rays_per_step),
-        }
-        return loss, stats, num_rays_per_step, num_rays_per_sec
-
     def compute_losses(self, batch):
         self.model.training = True
-        if self.model.trajectory_type == "modal_activation":
-            if self.modal_optimization == "canonical_only":
-                return self._compute_modal_canonical_losses(batch)
-            return self._compute_modal_joint_losses(batch)
         use_track_terms = self.model.trajectory_type in ("som_basis", "dct_center")
 
         B = batch["imgs"].shape[0]

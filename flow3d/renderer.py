@@ -8,21 +8,10 @@ from flow3d.modal_utils import (
     load_modal_modes,
     stack_modal_motion_fill_display_classes,
 )
-from flow3d.modal_canonical_optimization import (
-    MODAL_CANONICAL_GAUSSIAN_CONTROL,
-    MODAL_CANONICAL_OBJECTIVE,
-    MODAL_CANONICAL_TRAINABLE_FIELDS,
-)
 from flow3d.modal_flow_coordinates import (
     MODAL_FLOW_COORDINATE_GAUGE,
     MODAL_FLOW_COORDINATE_PARAMETERIZATION,
     SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS,
-)
-from flow3d.modal_joint_optimization import (
-    MODAL_JOINT_OBJECTIVE,
-    MODAL_JOINT_PARAMETERIZATION,
-    MODAL_PHI_OBJECTIVE,
-    MODAL_PHI_PARAMETERIZATION,
 )
 from flow3d.scene_model import SceneModel
 from flow3d.vis.utils import draw_tracks_2d_th, get_server
@@ -36,11 +25,6 @@ from modal_surface.io import load_view_config
 
 MODAL_PARAMETERIZATION = MODAL_FLOW_COORDINATE_PARAMETERIZATION
 MODAL_COORDINATE_GAUGE = MODAL_FLOW_COORDINATE_GAUGE
-SUPPORTED_MODAL_PARAMETERIZATIONS = {
-    MODAL_PARAMETERIZATION,
-    MODAL_JOINT_PARAMETERIZATION,
-    MODAL_PHI_PARAMETERIZATION,
-}
 
 
 class Renderer:
@@ -86,10 +70,6 @@ class Renderer:
                     "Modal overlay point count does not match foreground Gaussians"
                 )
             self.modal_anchor_points = self.model.fg.params["means"].detach()
-            if self.model.has_trainable_modal_phi:
-                effective_real, effective_imag = self.model.get_effective_modal_phi()
-                self.modal_anchor_phi_real = effective_real.detach()
-                self.modal_anchor_phi_imag = effective_imag.detach()
 
         self.viewer = None
         if port is not None:
@@ -204,6 +184,32 @@ class Renderer:
                 f"route ({present_legacy_keys}); rebuild it from the static checkpoint, "
                 "modal manifest, and a per-frame flow-coordinate artifact"
             )
+        unsupported_state_prefixes = (
+            "modal_joint.",
+            "modal_phi_refinement.",
+        )
+        unsupported_state = sorted(
+            key
+            for key in state_dict
+            if key.startswith(unsupported_state_prefixes)
+        )
+        if unsupported_state:
+            raise ValueError(
+                "Checkpoint uses the removed joint or phi-only modal refinement "
+                f"state ({unsupported_state}); rebuild it with fixed per-frame "
+                "flow coordinates"
+            )
+        phi_trainable_mask = state_dict.get("modal_phi_trainable_mask")
+        if phi_trainable_mask is not None:
+            if not isinstance(phi_trainable_mask, torch.Tensor):
+                raise ValueError(
+                    "Checkpoint state 'modal_phi_trainable_mask' must be a tensor"
+                )
+            if bool(phi_trainable_mask.any().item()):
+                raise ValueError(
+                    "Checkpoint contains removed trainable modal-phi state; rebuild "
+                    "it with fixed per-frame flow coordinates"
+                )
         coordinate_keys = {"modal_coordinate_real", "modal_coordinate_imag"}
         present_coordinate_keys = coordinate_keys & set(state_dict)
         parameterization = (
@@ -211,6 +217,16 @@ class Renderer:
             if isinstance(init_metadata, dict)
             else None
         )
+        modal_optimization = (
+            init_metadata.get("modal_optimization")
+            if isinstance(init_metadata, dict)
+            else None
+        )
+        if modal_optimization is not None and modal_optimization != "fixed":
+            raise ValueError(
+                "Checkpoint uses a removed modal optimization route "
+                f"({modal_optimization!r}); expected 'fixed'"
+            )
         missing_coordinate_keys = sorted(coordinate_keys - set(state_dict))
         if present_coordinate_keys and missing_coordinate_keys:
             raise ValueError(
@@ -247,11 +263,20 @@ class Renderer:
                     "Flow-coordinate checkpoint is missing required modal state: "
                     f"{missing_coordinate_state}"
                 )
-            if parameterization not in SUPPORTED_MODAL_PARAMETERIZATIONS:
+            if parameterization != MODAL_PARAMETERIZATION:
                 raise ValueError(
                     "Checkpoint uses an incompatible modal parameterization "
-                    f"({parameterization!r}); expected one of "
-                    f"{sorted(SUPPORTED_MODAL_PARAMETERIZATIONS)!r}"
+                    f"({parameterization!r}); expected {MODAL_PARAMETERIZATION!r}"
+                )
+            if modal_optimization != "fixed":
+                raise ValueError(
+                    "Checkpoint uses a removed modal optimization route "
+                    f"({modal_optimization!r}); expected 'fixed'"
+                )
+            if init_metadata.get("modal_training_objective") is not None:
+                raise ValueError(
+                    "Fixed flow-coordinate checkpoints must not declare a modal "
+                    "training objective"
                 )
             if (
                 init_metadata.get("modal_coordinate_solver")
@@ -267,57 +292,10 @@ class Renderer:
                 raise ValueError(
                     "Checkpoint has an incompatible modal coordinate gauge"
                 )
-            expected_phi_trainable = parameterization in {
-                MODAL_JOINT_PARAMETERIZATION,
-                MODAL_PHI_PARAMETERIZATION,
-            }
-            expected_coordinate_trainable = (
-                parameterization == MODAL_JOINT_PARAMETERIZATION
-            )
-            expected_objective = {
-                MODAL_JOINT_PARAMETERIZATION: MODAL_JOINT_OBJECTIVE,
-                MODAL_PHI_PARAMETERIZATION: MODAL_PHI_OBJECTIVE,
-            }.get(parameterization)
-            if expected_objective is not None and init_metadata.get(
-                "modal_training_objective"
-            ) != expected_objective:
-                raise ValueError("Checkpoint has an incompatible modal objective")
-            if init_metadata.get("modal_phi_trainable") is not expected_phi_trainable:
-                raise ValueError("Checkpoint modal phi trainability is inconsistent")
-            if init_metadata.get(
-                "modal_coordinates_trainable"
-            ) is not expected_coordinate_trainable:
-                raise ValueError("Checkpoint coordinate trainability is inconsistent")
-            if init_metadata.get("modal_optimization") == "canonical_only":
-                if parameterization != MODAL_FLOW_COORDINATE_PARAMETERIZATION:
-                    raise ValueError(
-                        "Canonical-only checkpoint must keep the fixed coordinate "
-                        "parameterization"
-                    )
-                if init_metadata.get("modal_training_objective") != (
-                    MODAL_CANONICAL_OBJECTIVE
-                ):
-                    raise ValueError(
-                        "Canonical-only checkpoint has an incompatible objective"
-                    )
-                if init_metadata.get("canonical_gaussians_trainable") != (
-                    "foreground_all"
-                ):
-                    raise ValueError(
-                        "Canonical-only checkpoint has inconsistent trainability"
-                    )
-                if init_metadata.get("canonical_trainable_fields") != list(
-                    MODAL_CANONICAL_TRAINABLE_FIELDS
-                ):
-                    raise ValueError(
-                        "Canonical-only checkpoint has inconsistent canonical fields"
-                    )
-                if init_metadata.get("canonical_gaussian_control") != (
-                    MODAL_CANONICAL_GAUSSIAN_CONTROL
-                ):
-                    raise ValueError(
-                        "Canonical-only checkpoint must disable Gaussian control"
-                    )
+            if init_metadata.get("modal_phi_trainable") is not False:
+                raise ValueError("Checkpoint modal phi must be fixed")
+            if init_metadata.get("modal_coordinates_trainable") is not False:
+                raise ValueError("Checkpoint modal coordinates must be fixed")
             coordinate_source = init_metadata.get("modal_coordinate_source")
             if not isinstance(coordinate_source, str) or not coordinate_source:
                 raise ValueError("Checkpoint has no modal coordinate source artifact")
@@ -332,16 +310,6 @@ class Renderer:
                     "Checkpoint has an invalid modal coordinate ridge value"
                 )
         model = SceneModel.init_from_state_dict(state_dict)
-        if parameterization is not None and model.has_modal_joint != (
-            parameterization == MODAL_JOINT_PARAMETERIZATION
-        ):
-            raise ValueError("Checkpoint modal parameterization does not match model state")
-        if parameterization is not None and model.has_modal_phi_refinement != (
-            parameterization == MODAL_PHI_PARAMETERIZATION
-        ):
-            raise ValueError(
-                "Checkpoint phi-only parameterization does not match model state"
-            )
         model.use_2dgs = use_2dgs
         model = model.to(device)
         print(f"num gs: {model.num_gaussians}")

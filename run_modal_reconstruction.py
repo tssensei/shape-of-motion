@@ -18,32 +18,16 @@ from loguru import logger as guru
 
 from flow3d.data.casual_dataset import CasualDataset
 from flow3d.metrics import mSSIM
-from flow3d.modal_canonical_optimization import (
-    MODAL_CANONICAL_GAUSSIAN_CONTROL,
-    MODAL_CANONICAL_OBJECTIVE,
-    MODAL_CANONICAL_TRAINABLE_FIELDS,
-)
 from flow3d.modal_flow_coordinates import (
     MODAL_FLOW_COORDINATE_GAUGE,
     MODAL_FLOW_COORDINATE_PARAMETERIZATION,
     SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS,
-)
-from flow3d.modal_joint_optimization import (
-    MODAL_JOINT_OBJECTIVE,
-    MODAL_JOINT_PARAMETERIZATION,
-    MODAL_PHI_OBJECTIVE,
-    MODAL_PHI_PARAMETERIZATION,
 )
 from flow3d.scene_model import SceneModel
 
 
 MODAL_PARAMETERIZATION = MODAL_FLOW_COORDINATE_PARAMETERIZATION
 MODAL_COORDINATE_GAUGE = MODAL_FLOW_COORDINATE_GAUGE
-SUPPORTED_MODAL_PARAMETERIZATIONS = {
-    MODAL_PARAMETERIZATION,
-    MODAL_JOINT_PARAMETERIZATION,
-    MODAL_PHI_PARAMETERIZATION,
-}
 
 
 @dataclass
@@ -281,64 +265,60 @@ def _load_checkpoint_model(
             f"route ({present_legacy_keys}); rebuild it from the static checkpoint, "
             "modal manifest, and a per-frame flow-coordinate artifact"
         )
+    unsupported_state_prefixes = (
+        "modal_joint.",
+        "modal_phi_refinement.",
+    )
+    unsupported_state = sorted(
+        key
+        for key in state_dict
+        if key.startswith(unsupported_state_prefixes)
+    )
+    if unsupported_state:
+        raise ValueError(
+            "Checkpoint uses the removed joint or phi-only modal refinement "
+            f"state ({unsupported_state}); rebuild it with fixed per-frame "
+            "flow coordinates"
+        )
+    phi_trainable_mask = state_dict.get("modal_phi_trainable_mask")
+    if phi_trainable_mask is not None:
+        if not isinstance(phi_trainable_mask, torch.Tensor):
+            raise ValueError(
+                "Checkpoint state 'modal_phi_trainable_mask' must be a tensor"
+            )
+        if bool(phi_trainable_mask.any().item()):
+            raise ValueError(
+                "Checkpoint contains removed trainable modal-phi state; rebuild it "
+                "with fixed per-frame flow coordinates"
+            )
     init_metadata = checkpoint.get("init_metadata")
     if not isinstance(init_metadata, dict):
         raise ValueError("Flow-coordinate checkpoint init_metadata must be a mapping")
     parameterization = init_metadata.get("modal_parameterization")
-    if parameterization not in SUPPORTED_MODAL_PARAMETERIZATIONS:
+    if parameterization != MODAL_PARAMETERIZATION:
         raise ValueError(
             "Checkpoint uses an incompatible modal parameterization "
-            f"({parameterization!r}); expected one of "
-            f"{sorted(SUPPORTED_MODAL_PARAMETERIZATIONS)!r}"
+            f"({parameterization!r}); expected {MODAL_PARAMETERIZATION!r}"
+        )
+    modal_optimization = init_metadata.get("modal_optimization")
+    if modal_optimization != "fixed":
+        raise ValueError(
+            "Checkpoint uses a removed modal optimization route "
+            f"({modal_optimization!r}); expected 'fixed'"
+        )
+    if init_metadata.get("modal_training_objective") is not None:
+        raise ValueError(
+            "Fixed flow-coordinate checkpoints must not declare a modal training "
+            "objective"
         )
     if init_metadata.get("modal_coordinate_solver") not in SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS:
         raise ValueError("Checkpoint has an incompatible modal coordinate solver")
     if init_metadata.get("modal_coordinate_gauge") != MODAL_COORDINATE_GAUGE:
         raise ValueError("Checkpoint has an incompatible modal coordinate gauge")
-    expected_phi_trainable = parameterization in {
-        MODAL_JOINT_PARAMETERIZATION,
-        MODAL_PHI_PARAMETERIZATION,
-    }
-    expected_coordinate_trainable = parameterization == MODAL_JOINT_PARAMETERIZATION
-    expected_objective = {
-        MODAL_JOINT_PARAMETERIZATION: MODAL_JOINT_OBJECTIVE,
-        MODAL_PHI_PARAMETERIZATION: MODAL_PHI_OBJECTIVE,
-    }.get(parameterization)
-    if expected_objective is not None and init_metadata.get(
-        "modal_training_objective"
-    ) != expected_objective:
-        raise ValueError("Checkpoint has an incompatible modal training objective")
-    if init_metadata.get("modal_phi_trainable") is not expected_phi_trainable:
-        raise ValueError("Checkpoint modal phi trainability metadata is inconsistent")
-    if init_metadata.get("modal_coordinates_trainable") is not expected_coordinate_trainable:
-        raise ValueError("Checkpoint coordinate trainability metadata is inconsistent")
-    modal_optimization = init_metadata.get("modal_optimization")
-    if modal_optimization == "canonical_only":
-        if parameterization != MODAL_FLOW_COORDINATE_PARAMETERIZATION:
-            raise ValueError(
-                "Canonical-only checkpoint must keep the fixed coordinate "
-                "parameterization"
-            )
-        if init_metadata.get("modal_training_objective") != MODAL_CANONICAL_OBJECTIVE:
-            raise ValueError(
-                "Canonical-only checkpoint has an incompatible training objective"
-            )
-        if init_metadata.get("canonical_gaussians_trainable") != "foreground_all":
-            raise ValueError(
-                "Canonical-only checkpoint has inconsistent Gaussian trainability"
-            )
-        if init_metadata.get("canonical_trainable_fields") != list(
-            MODAL_CANONICAL_TRAINABLE_FIELDS
-        ):
-            raise ValueError(
-                "Canonical-only checkpoint has inconsistent canonical fields"
-            )
-        if init_metadata.get("canonical_gaussian_control") != (
-            MODAL_CANONICAL_GAUSSIAN_CONTROL
-        ):
-            raise ValueError(
-                "Canonical-only checkpoint must disable Gaussian control"
-            )
+    if init_metadata.get("modal_phi_trainable") is not False:
+        raise ValueError("Checkpoint modal phi must be fixed")
+    if init_metadata.get("modal_coordinates_trainable") is not False:
+        raise ValueError("Checkpoint modal coordinates must be fixed")
     coordinate_source = init_metadata.get("modal_coordinate_source")
     if not isinstance(coordinate_source, str) or not coordinate_source:
         raise ValueError("Checkpoint has no modal coordinate source artifact")
@@ -377,12 +357,6 @@ def _load_checkpoint_model(
     model.eval()
     if model.trajectory_type != "modal_activation" or not model.has_modal:
         raise ValueError("Checkpoint does not contain a modal_activation model")
-    if model.has_modal_joint != (parameterization == MODAL_JOINT_PARAMETERIZATION):
-        raise ValueError("Checkpoint modal parameterization does not match model state")
-    if model.has_modal_phi_refinement != (
-        parameterization == MODAL_PHI_PARAMETERIZATION
-    ):
-        raise ValueError("Checkpoint phi-only parameterization does not match model state")
     return model, init_metadata
 
 
@@ -816,164 +790,6 @@ def _write_metrics(path: Path, payload: Mapping[str, Any]) -> None:
         f.write("\n")
 
 
-def _joint_refinement_metrics(model: SceneModel) -> dict[str, Any] | None:
-    if not model.has_trainable_modal_phi:
-        return None
-    with torch.inference_mode():
-        coordinate_real, coordinate_imag = model.get_all_modal_coefficients()
-        coordinate_delta = torch.sqrt(
-            (coordinate_real - model.modal_coordinate_real).square()
-            + (coordinate_imag - model.modal_coordinate_imag).square()
-        )
-        phi_real, phi_imag = model.get_effective_modal_phi()
-        phi_delta = torch.sqrt(
-            (phi_real - model.modal_phi_real).square()
-            + (phi_imag - model.modal_phi_imag).square()
-        )
-        phi_initial = torch.sqrt(
-            model.modal_phi_real.square() + model.modal_phi_imag.square()
-        )
-        mode_summaries = []
-        for mode_slot in range(model.modal_phi_real.shape[0]):
-            selected = model.modal_phi_trainable_mask[mode_slot]
-            frozen = ~selected
-            delta_values = phi_delta[mode_slot, selected]
-            initial_values = phi_initial[mode_slot, selected]
-            mode_summaries.append(
-                {
-                    "mode_slot": mode_slot,
-                    "frequency_hz": float(model.modal_freqs_hz[mode_slot].item()),
-                    "trainable_point_count": int(selected.sum().item()),
-                    "delta_rms": float(torch.sqrt(delta_values.square().mean()).item()),
-                    "delta_max": float(delta_values.amax().item()),
-                    "relative_delta_rms": float(
-                        torch.sqrt(delta_values.square().mean()).item()
-                        / max(torch.sqrt(initial_values.square().mean()).item(), 1e-12)
-                    ),
-                    "frozen_delta_max": float(
-                        phi_delta[mode_slot, frozen].amax().item()
-                        if bool(frozen.any().item())
-                        else 0.0
-                    ),
-                }
-            )
-    return {
-        "coordinate_delta_rms": float(
-            torch.sqrt(coordinate_delta.square().mean()).item()
-        ),
-        "coordinate_delta_max": float(coordinate_delta.amax().item()),
-        "phi_modes": mode_summaries,
-    }
-
-
-def _change_stats(values: torch.Tensor) -> dict[str, float]:
-    values = values.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
-    if values.numel() == 0 or not bool(torch.isfinite(values).all().item()):
-        raise ValueError("Canonical change diagnostics require finite values")
-    if bool((values < 0).any().item()):
-        raise ValueError("Canonical change magnitudes must be non-negative")
-    return {
-        "rms": float(torch.sqrt(values.square().mean()).item()),
-        "p50": float(torch.quantile(values, 0.50).item()),
-        "p90": float(torch.quantile(values, 0.90).item()),
-        "p99": float(torch.quantile(values, 0.99).item()),
-        "max": float(values.amax().item()),
-    }
-
-
-def _checkpoint_model_state(path: Path) -> dict[str, torch.Tensor]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
-        raise ValueError(f"Checkpoint has no model state: {path}")
-    state = payload["model"]
-    if any(not isinstance(value, torch.Tensor) for value in state.values()):
-        raise ValueError(f"Checkpoint model state must contain tensors: {path}")
-    return state
-
-
-def _canonical_change_metrics(
-    checkpoint_path: Path,
-    init_checkpoint_path: Path,
-    init_metadata: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    if init_metadata.get("modal_optimization") != "canonical_only":
-        return None
-    if not init_checkpoint_path.is_file():
-        raise FileNotFoundError(
-            "Canonical-only diagnostics require the initialization checkpoint: "
-            f"{init_checkpoint_path}"
-        )
-    initial = _checkpoint_model_state(init_checkpoint_path)
-    current = (
-        initial
-        if checkpoint_path.resolve() == init_checkpoint_path.resolve()
-        else _checkpoint_model_state(checkpoint_path)
-    )
-    if set(initial) != set(current):
-        raise ValueError("Canonical-only init/last model state keys do not match")
-    allowed = {
-        f"fg.params.{field}" for field in MODAL_CANONICAL_TRAINABLE_FIELDS
-    }
-    changed_frozen = [
-        key
-        for key in initial
-        if key not in allowed and not torch.equal(initial[key], current[key])
-    ]
-    if changed_frozen:
-        raise ValueError(
-            "Canonical-only checkpoint changed frozen model state: "
-            + ", ".join(changed_frozen[:10])
-        )
-    for key in allowed:
-        if key not in initial or initial[key].shape != current[key].shape:
-            raise ValueError(
-                f"Canonical-only Gaussian identity/shape changed for {key}"
-            )
-
-    means_delta = torch.linalg.vector_norm(
-        current["fg.params.means"] - initial["fg.params.means"], dim=-1
-    )
-    initial_rgb = torch.sigmoid(initial["fg.params.colors"])
-    current_rgb = torch.sigmoid(current["fg.params.colors"])
-    rgb_delta = torch.linalg.vector_norm(current_rgb - initial_rgb, dim=-1)
-    opacity_delta = torch.abs(
-        torch.sigmoid(current["fg.params.opacities"])
-        - torch.sigmoid(initial["fg.params.opacities"])
-    )
-    scale_ratio = torch.exp(
-        current["fg.params.scales"] - initial["fg.params.scales"]
-    )
-    symmetric_scale_ratio = torch.maximum(scale_ratio, scale_ratio.reciprocal())
-    initial_quats = initial["fg.params.quats"] / torch.linalg.vector_norm(
-        initial["fg.params.quats"], dim=-1, keepdim=True
-    ).clamp_min(1e-12)
-    current_quats = current["fg.params.quats"] / torch.linalg.vector_norm(
-        current["fg.params.quats"], dim=-1, keepdim=True
-    ).clamp_min(1e-12)
-    quat_dot = torch.abs((initial_quats * current_quats).sum(dim=-1)).clamp(0, 1)
-    quaternion_angle = 2.0 * torch.acos(quat_dot)
-    identical_quats = (
-        current["fg.params.quats"] == initial["fg.params.quats"]
-    ).all(dim=-1)
-    quaternion_angle = torch.where(
-        identical_quats,
-        torch.zeros_like(quaternion_angle),
-        quaternion_angle,
-    )
-    return {
-        "reference_checkpoint": str(init_checkpoint_path.resolve()),
-        "foreground_gaussian_count": int(initial["fg.params.means"].shape[0]),
-        "frozen_state_unchanged": True,
-        "mean_displacement": _change_stats(means_delta),
-        "rgb_change": _change_stats(rgb_delta),
-        "opacity_change": _change_stats(opacity_delta),
-        "symmetric_scale_ratio": _change_stats(symmetric_scale_ratio),
-        "scale_ratio_min": float(scale_ratio.amin().item()),
-        "scale_ratio_max": float(scale_ratio.amax().item()),
-        "quaternion_angle_rad": _change_stats(quaternion_angle),
-    }
-
-
 def _write_modal_coordinates(
     path: Path,
     model: SceneModel,
@@ -1274,17 +1090,6 @@ def run(cfg: ModalReconstructionConfig) -> None:
             metrics["modal_coordinate_prephysics_source"] = init_metadata.get(
                 "modal_coordinate_prephysics_source"
             )
-        joint_refinement = _joint_refinement_metrics(model)
-        if joint_refinement is not None:
-            key = "joint_refinement" if model.has_modal_joint else "phi_refinement"
-            metrics[key] = joint_refinement
-        canonical_refinement = _canonical_change_metrics(
-            checkpoint_path,
-            work_dir / "checkpoints" / "init.ckpt",
-            init_metadata,
-        )
-        if canonical_refinement is not None:
-            metrics["canonical_refinement"] = canonical_refinement
         all_frames = [
             frame
             for view_id in view_ids

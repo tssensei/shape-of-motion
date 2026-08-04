@@ -8,8 +8,6 @@ from torch import Tensor
 
 from flow3d.params import (
     GaussianParams,
-    ModalJointParams,
-    ModalPhiRefinementParams,
     MotionBases,
     CameraPoses,
     build_dct_basis,
@@ -47,8 +45,6 @@ class SceneModel(nn.Module):
         modal_frame_local_indices: Tensor | None = None,
         modal_frame_times_sec: Tensor | None = None,
         modal_synthetic_enabled: bool | Tensor = False,
-        modal_joint_params: ModalJointParams | None = None,
-        modal_phi_refinement_params: ModalPhiRefinementParams | None = None,
         modal_phi_trainable_mask: Tensor | None = None,
     ):
         super().__init__()
@@ -351,67 +347,12 @@ class SceneModel(nn.Module):
         if modal_phi_trainable_mask.dtype != torch.bool:
             raise ValueError("modal_phi_trainable_mask must have boolean dtype")
         modal_phi_trainable_mask = modal_phi_trainable_mask.to(device=frame_device)
-        if modal_joint_params is not None and modal_phi_refinement_params is not None:
-            raise ValueError("modal joint and phi-only parameters are mutually exclusive")
-        if modal_joint_params is not None:
-            if trajectory_type != "modal_activation":
-                raise ValueError("modal joint parameters require modal_activation")
-            expected_coordinate_shape = (self.num_frames, num_modes)
-            expected_phi_shape = (num_modes, self.num_fg_gaussians, 3)
-            for name in ("delta_coordinate_real", "delta_coordinate_imag"):
-                value = modal_joint_params.params[name]
-                if value.shape != expected_coordinate_shape:
-                    raise ValueError(
-                        f"modal_joint.params.{name} must have shape "
-                        f"{expected_coordinate_shape}"
-                    )
-            for name in ("delta_phi_real", "delta_phi_imag"):
-                value = modal_joint_params.params[name]
-                if value.shape != expected_phi_shape:
-                    raise ValueError(
-                        f"modal_joint.params.{name} must have shape {expected_phi_shape}"
-                    )
-                if bool((value[~modal_phi_trainable_mask] != 0).any().item()):
-                    raise ValueError(
-                        f"modal_joint.params.{name} must be exactly zero outside "
-                        "the trainable phi mask"
-                    )
-            for name, value in modal_joint_params.params.items():
-                if value.device != frame_device or value.dtype != frame_dtype:
-                    raise ValueError(
-                        f"modal_joint.params.{name} must match the foreground "
-                        "Gaussian device and dtype"
-                    )
-            if not bool(modal_phi_trainable_mask.any().item()):
-                raise ValueError("modal joint optimization requires trainable phi points")
-        elif modal_phi_refinement_params is not None:
-            if trajectory_type != "modal_activation":
-                raise ValueError("modal phi refinement requires modal_activation")
-            expected_phi_shape = (num_modes, self.num_fg_gaussians, 3)
-            for name in ("delta_phi_real", "delta_phi_imag"):
-                value = modal_phi_refinement_params.params[name]
-                if value.shape != expected_phi_shape:
-                    raise ValueError(
-                        f"modal_phi_refinement.params.{name} must have shape "
-                        f"{expected_phi_shape}"
-                    )
-                if value.device != frame_device or value.dtype != frame_dtype:
-                    raise ValueError(
-                        f"modal_phi_refinement.params.{name} must match the "
-                        "foreground Gaussian device and dtype"
-                    )
-                if bool((value[~modal_phi_trainable_mask] != 0).any().item()):
-                    raise ValueError(
-                        f"modal_phi_refinement.params.{name} must be exactly zero "
-                        "outside the trainable phi mask"
-                    )
-            if not bool(modal_phi_trainable_mask.any().item()):
-                raise ValueError("modal phi refinement requires trainable phi points")
-        elif bool(modal_phi_trainable_mask.any().item()):
-            raise ValueError("modal phi trainable mask requires trainable phi parameters")
+        if bool(modal_phi_trainable_mask.any().item()):
+            raise ValueError(
+                "modal_phi_trainable_mask must be all false; joint and phi-only "
+                "modal refinement are no longer supported"
+            )
 
-        self.modal_joint = modal_joint_params
-        self.modal_phi_refinement = modal_phi_refinement_params
         self.register_buffer("modal_coordinate_real", modal_coordinate_real)
         self.register_buffer("modal_coordinate_imag", modal_coordinate_imag)
         self.register_buffer("modal_phi_real", modal_phi_real)
@@ -459,18 +400,6 @@ class SceneModel(nn.Module):
     @property
     def has_modal_field(self) -> bool:
         return self.modal_phi_real.numel() > 0 and self.modal_phi_imag.numel() > 0
-
-    @property
-    def has_modal_joint(self) -> bool:
-        return self.modal_joint is not None
-
-    @property
-    def has_modal_phi_refinement(self) -> bool:
-        return self.modal_phi_refinement is not None
-
-    @property
-    def has_trainable_modal_phi(self) -> bool:
-        return self.has_modal_joint or self.has_modal_phi_refinement
 
     @property
     def has_modal_obs_count(self) -> bool:
@@ -531,45 +460,10 @@ class SceneModel(nn.Module):
         real, imag = self.get_all_modal_coefficients()
         return real[ts], imag[ts]
 
-    def get_centered_modal_coordinate_deltas(
-        self,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.has_modal_joint:
-            return (
-                torch.zeros_like(self.modal_coordinate_real),
-                torch.zeros_like(self.modal_coordinate_imag),
-            )
-        assert self.modal_joint is not None
-        view_indices = self.modal_frame_view_indices
-        num_views = int(view_indices.max().item()) + 1
-        counts = torch.bincount(view_indices, minlength=num_views).to(
-            dtype=self.modal_coordinate_real.dtype
-        )
-        if bool((counts <= 0).any().item()):
-            raise RuntimeError("modal joint optimization requires every view to have frames")
-
-        centered: list[torch.Tensor] = []
-        for name in ("delta_coordinate_real", "delta_coordinate_imag"):
-            delta = self.modal_joint.params[name]
-            sums = torch.zeros(
-                num_views,
-                delta.shape[1],
-                device=delta.device,
-                dtype=delta.dtype,
-            )
-            sums.index_add_(0, view_indices, delta)
-            means = sums / counts[:, None]
-            centered.append(delta - means[view_indices])
-        return centered[0], centered[1]
-
     def get_all_modal_coefficients(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        delta_real, delta_imag = self.get_centered_modal_coordinate_deltas()
-        return (
-            self.modal_coordinate_real + delta_real,
-            self.modal_coordinate_imag + delta_imag,
-        )
+        return self.modal_coordinate_real, self.modal_coordinate_imag
 
     def compute_modal_offsets_from_coefficients(
         self,
@@ -599,53 +493,6 @@ class SceneModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         phi_real = self.modal_phi_real
         phi_imag = self.modal_phi_imag
-        if self.has_trainable_modal_phi:
-            residuals = (
-                self.modal_joint.params
-                if self.modal_joint is not None
-                else self.modal_phi_refinement.params
-            )
-            mask = self.modal_phi_trainable_mask[..., None]
-            raw_real = phi_real + torch.where(
-                mask,
-                residuals["delta_phi_real"],
-                torch.zeros_like(phi_real),
-            )
-            raw_imag = phi_imag + torch.where(
-                mask,
-                residuals["delta_phi_imag"],
-                torch.zeros_like(phi_imag),
-            )
-
-            mask_float = mask.to(dtype=phi_real.dtype)
-            inner_real = torch.sum(
-                mask_float * (phi_real * raw_real + phi_imag * raw_imag),
-                dim=(1, 2),
-            )
-            inner_imag = torch.sum(
-                mask_float * (phi_real * raw_imag - phi_imag * raw_real),
-                dim=(1, 2),
-            )
-            phase = torch.atan2(inner_imag, inner_real)
-            cosine = torch.cos(phase)[:, None, None]
-            sine = torch.sin(phase)[:, None, None]
-            aligned_real = raw_real * cosine + raw_imag * sine
-            aligned_imag = raw_imag * cosine - raw_real * sine
-
-            target_energy = torch.sum(
-                mask_float * (phi_real.square() + phi_imag.square()), dim=(1, 2)
-            )
-            aligned_energy = torch.sum(
-                mask_float * (aligned_real.square() + aligned_imag.square()),
-                dim=(1, 2),
-            )
-            if bool((target_energy <= 0).any().item()):
-                raise RuntimeError("trainable staged phi must have positive energy")
-            scale = torch.sqrt(target_energy / aligned_energy.clamp_min(1e-20))
-            aligned_real = aligned_real * scale[:, None, None]
-            aligned_imag = aligned_imag * scale[:, None, None]
-            phi_real = torch.where(mask, aligned_real, phi_real)
-            phi_imag = torch.where(mask, aligned_imag, phi_imag)
         if inds is not None:
             phi_real = phi_real[:, inds]
             phi_imag = phi_imag[:, inds]
@@ -676,8 +523,6 @@ class SceneModel(nn.Module):
 
     @torch.no_grad()
     def densify_modal_fields(self, should_split: torch.Tensor, should_dup: torch.Tensor):
-        if self.has_trainable_modal_phi:
-            raise RuntimeError("modal phi optimization forbids Gaussian densification")
         for name in ("modal_phi_real", "modal_phi_imag"):
             x = getattr(self, name)
             x_dup = x[:, should_dup]
@@ -695,8 +540,6 @@ class SceneModel(nn.Module):
 
     @torch.no_grad()
     def cull_modal_fields(self, should_cull: torch.Tensor):
-        if self.has_trainable_modal_phi:
-            raise RuntimeError("modal phi optimization forbids Gaussian culling")
         self.modal_phi_real = self.modal_phi_real[:, ~should_cull]
         self.modal_phi_imag = self.modal_phi_imag[:, ~should_cull]
         self.modal_obs_count_per_point = self.modal_obs_count_per_point[:, ~should_cull]
@@ -783,6 +626,22 @@ class SceneModel(nn.Module):
 
     @staticmethod
     def init_from_state_dict(state_dict, prefix=""):
+        unsupported_modal_prefixes = (
+            f"{prefix}modal_joint.params.",
+            f"{prefix}modal_phi_refinement.params.",
+        )
+        unsupported_modal_keys = [
+            key
+            for key in state_dict
+            if any(key.startswith(value) for value in unsupported_modal_prefixes)
+        ]
+        if unsupported_modal_keys:
+            raise ValueError(
+                "Joint and phi-only modal refinement checkpoints are no longer "
+                "supported; materialize a fixed flow-coordinate checkpoint instead. "
+                f"Found unsupported state: {unsupported_modal_keys}"
+            )
+
         legacy_modal_keys = (
             f"{prefix}modal.params.activations",
             f"{prefix}modal.params.envelope_knots",
@@ -852,9 +711,17 @@ class SceneModel(nn.Module):
         modal_frame_view_indices = None
         modal_frame_local_indices = None
         modal_frame_times_sec = None
-        modal_joint_params = None
-        modal_phi_refinement_params = None
         modal_phi_trainable_mask = None
+
+        mask_key = f"{prefix}modal_phi_trainable_mask"
+        if mask_key in state_dict:
+            stored_mask = state_dict[mask_key]
+            if bool(stored_mask.any().item()):
+                raise ValueError(
+                    "Checkpoint has a nonzero modal_phi_trainable_mask, but joint "
+                    "and phi-only modal refinement are no longer supported"
+                )
+            modal_phi_trainable_mask = stored_mask
 
         modal_field_keys = (
             f"{prefix}modal_phi_real",
@@ -904,49 +771,6 @@ class SceneModel(nn.Module):
             ]
             modal_frame_times_sec = state_dict[f"{prefix}modal_frame_times_sec"]
 
-            joint_prefix = f"{prefix}modal_joint.params."
-            phi_refinement_prefix = f"{prefix}modal_phi_refinement.params."
-            joint_keys = [key for key in state_dict if key.startswith(joint_prefix)]
-            phi_refinement_keys = [
-                key for key in state_dict if key.startswith(phi_refinement_prefix)
-            ]
-            if joint_keys and phi_refinement_keys:
-                raise ValueError(
-                    "Checkpoint contains both joint and phi-only modal parameters"
-                )
-            if joint_keys:
-                modal_joint_params = ModalJointParams.init_from_state_dict(
-                    state_dict,
-                    prefix=joint_prefix,
-                )
-                mask_key = f"{prefix}modal_phi_trainable_mask"
-                if mask_key not in state_dict:
-                    raise ValueError(
-                        "Joint modal checkpoint is missing modal_phi_trainable_mask"
-                )
-                modal_phi_trainable_mask = state_dict[mask_key]
-            elif phi_refinement_keys:
-                modal_phi_refinement_params = (
-                    ModalPhiRefinementParams.init_from_state_dict(
-                        state_dict,
-                        prefix=phi_refinement_prefix,
-                    )
-                )
-                mask_key = f"{prefix}modal_phi_trainable_mask"
-                if mask_key not in state_dict:
-                    raise ValueError(
-                        "Phi-only modal checkpoint is missing "
-                        "modal_phi_trainable_mask"
-                    )
-                modal_phi_trainable_mask = state_dict[mask_key]
-            elif f"{prefix}modal_phi_trainable_mask" in state_dict:
-                stored_mask = state_dict[f"{prefix}modal_phi_trainable_mask"]
-                if bool(stored_mask.any().item()):
-                    raise ValueError(
-                        "Checkpoint has a non-empty modal phi mask without joint parameters"
-                    )
-                modal_phi_trainable_mask = stored_mask
-
         modal_synthetic_enabled = state_dict.get(
             f"{prefix}modal_synthetic_enabled",
             torch.tensor(False),
@@ -972,8 +796,6 @@ class SceneModel(nn.Module):
             modal_frame_local_indices=modal_frame_local_indices,
             modal_frame_times_sec=modal_frame_times_sec,
             modal_synthetic_enabled=modal_synthetic_enabled,
-            modal_joint_params=modal_joint_params,
-            modal_phi_refinement_params=modal_phi_refinement_params,
             modal_phi_trainable_mask=modal_phi_trainable_mask,
         )
 

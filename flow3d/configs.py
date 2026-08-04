@@ -37,28 +37,12 @@ class CameraPoseLRConfig:
 
 
 @dataclass
-class ModalJointLRConfig:
-    delta_coordinate_real: float = 1e-4
-    delta_coordinate_imag: float = 1e-4
-    delta_phi_real: float = 1e-4
-    delta_phi_imag: float = 1e-4
-
-
-@dataclass
-class ModalPhiRefinementLRConfig:
-    delta_phi_real: float = 1e-4
-    delta_phi_imag: float = 1e-4
-
-
-@dataclass
 class SceneLRConfig:
     fg: FGLRConfig
     bg: BGLRConfig
     motion_bases: MotionLRConfig
     camera_poses: CameraPoseLRConfig
     camera_scales: CameraScalesLRConfig
-    modal_joint: ModalJointLRConfig
-    modal_phi_refinement: ModalPhiRefinementLRConfig
 
 
 @dataclass
@@ -82,19 +66,6 @@ class LossesConfig:
     local_iso_huber_beta: float = 0.05
     local_iso_start_step: int = 100
     local_iso_edge_weight_temp: float = 1.0
-    w_modal_flow: float = 1.0
-    w_modal_rigidity: float = 0.1
-    w_modal_mode_rigidity: float = 1.0
-    w_modal_delta_phi_local: float = 0.05
-    modal_structure_modes_per_step: int = 3
-    modal_rigidity_huber_beta: float = 0.01
-    w_modal_coordinate_prior: float = 0.1
-    w_modal_coordinate_temporal: float = 0.01
-    modal_coordinate_temporal_scale_sec: float = 0.5
-    w_modal_phi_prior: float = 0.01
-    modal_flow_charbonnier_epsilon_px: float = 0.5
-    modal_flow_render_acc_min: float = 0.05
-
     # w_smooth_bases: float = 0.0
     # w_smooth_tracks: float = 0.0
     # w_scale_var: float = 0.0
