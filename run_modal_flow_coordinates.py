@@ -13,13 +13,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Invert cached reference-frame optical flow into fixed per-frame "
-            "complex coordinates for solved 3D Gaussian modal fields."
+            "complex coordinates using a rendered modal projection design."
         )
     )
     parser.add_argument(
-        "--modal-manifest",
+        "--rendered-design",
         required=True,
-        help="Gaussian modal_modes_manifest.json containing latent and observation artifacts.",
+        help="Rendered modal design artifact or its immutable output directory.",
     )
     parser.add_argument(
         "--modal-frame-map",
@@ -55,7 +55,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> None:
     result = solve_modal_flow_coordinates(
-        modal_manifest=args.modal_manifest,
+        rendered_design=args.rendered_design,
         modal_frame_map=args.modal_frame_map,
         flow_caches=args.flow_caches,
         out_dir=args.out_dir,

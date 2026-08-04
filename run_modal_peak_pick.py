@@ -78,15 +78,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     compare_caches = p_compare.add_mutually_exclusive_group(required=True)
     compare_caches.add_argument(
         "--cache-dir",
-        help="Modal-analysis cache directory for the first manifest view.",
+        help="Modal-analysis cache directory for the first projection-source view.",
     )
     compare_caches.add_argument(
         "--flow-caches",
         nargs="+",
         metavar="VIEW_ID=PATH",
-        help="Modal-analysis cache for every manifest view, in any order.",
+        help="Modal-analysis cache for every projection-source view, in any order.",
     )
-    p_compare.add_argument("--modal-manifest", required=True, help="Solved Gaussian modal manifest.")
+    compare_projection = p_compare.add_mutually_exclusive_group(required=True)
+    compare_projection.add_argument(
+        "--modal-manifest",
+        help="Legacy solved Gaussian modal manifest and observation topology.",
+    )
+    compare_projection.add_argument(
+        "--rendered-design",
+        help="Rendered modal-design artifact used for the reconstruction.",
+    )
     p_compare.add_argument(
         "--comparison-cache-dir",
         default=None,

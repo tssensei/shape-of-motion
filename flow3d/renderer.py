@@ -11,6 +11,7 @@ from flow3d.modal_utils import (
 from flow3d.modal_flow_coordinates import (
     MODAL_FLOW_COORDINATE_GAUGE,
     MODAL_FLOW_COORDINATE_PARAMETERIZATION,
+    MODAL_FLOW_COORDINATE_SOLVER,
     SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS,
 )
 from flow3d.scene_model import SceneModel
@@ -278,12 +279,30 @@ class Renderer:
                     "Fixed flow-coordinate checkpoints must not declare a modal "
                     "training objective"
                 )
-            if (
-                init_metadata.get("modal_coordinate_solver")
-                not in SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS
-            ):
+            coordinate_solver = init_metadata.get("modal_coordinate_solver")
+            if coordinate_solver not in SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS:
                 raise ValueError(
                     "Checkpoint has an incompatible modal coordinate solver"
+                )
+            rendered_design_keys = (
+                "modal_rendered_design_source",
+                "modal_rendered_design_identity",
+                "modal_rendered_design_normalization",
+            )
+            rendered_design_values = [
+                init_metadata.get(name) for name in rendered_design_keys
+            ]
+            if any(value is not None for value in rendered_design_values) and not all(
+                isinstance(value, str) and value for value in rendered_design_values
+            ):
+                raise ValueError(
+                    "Checkpoint has incomplete rendered-design provenance"
+                )
+            if coordinate_solver == MODAL_FLOW_COORDINATE_SOLVER and not all(
+                isinstance(value, str) and value for value in rendered_design_values
+            ):
+                raise ValueError(
+                    "Rendered-projection checkpoint has no rendered-design provenance"
                 )
             if (
                 init_metadata.get("modal_coordinate_gauge")

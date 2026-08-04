@@ -12,6 +12,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from scipy.linalg import solve_triangular
 
+from flow3d.modal_rendered_design import (
+    RenderedModalDesign,
+    compute_flow_cache_identity,
+    load_rendered_modal_design,
+)
 from modal_peak_pick.core.cache import ModalAnalysisCache, load_analysis_cache
 from modal_surface.gaussian_observations import load_gaussian_observation_topology
 
@@ -19,10 +24,12 @@ from modal_surface.gaussian_observations import load_gaussian_observation_topolo
 MODAL_FLOW_COORDINATE_FORMAT = "modal_flow_coordinates"
 MODAL_FLOW_COORDINATE_VERSION = 1
 MODAL_FLOW_COORDINATE_PARAMETERIZATION = "per_frame_flow_coordinates_v1"
-MODAL_FLOW_COORDINATE_SOLVER = "reference_flow_ridge_v1"
+LEGACY_MODAL_FLOW_COORDINATE_SOLVER = "reference_flow_ridge_v1"
+MODAL_FLOW_COORDINATE_SOLVER = "rendered_projection_ridge_v1"
 MODAL_PHYSICS_COORDINATE_SOLVER = "latent_force_oscillator_postfit_v1"
 MODAL_FLOW_COORDINATE_GAUGE = "per_view_temporal_mean_zero"
 SUPPORTED_MODAL_FLOW_COORDINATE_SOLVERS = {
+    LEGACY_MODAL_FLOW_COORDINATE_SOLVER,
     MODAL_FLOW_COORDINATE_SOLVER,
     MODAL_PHYSICS_COORDINATE_SOLVER,
 }
@@ -35,6 +42,7 @@ __all__ = [
     "COORDINATE_FILENAME",
     "DIAGNOSTICS_JSON_FILENAME",
     "DIAGNOSTICS_NPZ_FILENAME",
+    "LEGACY_MODAL_FLOW_COORDINATE_SOLVER",
     "MODAL_FLOW_COORDINATE_FORMAT",
     "MODAL_FLOW_COORDINATE_GAUGE",
     "MODAL_FLOW_COORDINATE_PARAMETERIZATION",
@@ -136,7 +144,7 @@ def load_modal_coordinate_provenance(
     """Read solver provenance without changing the strict version-1 NPZ schema."""
 
     provenance: dict[str, Any] = {
-        "solver": MODAL_FLOW_COORDINATE_SOLVER,
+        "solver": LEGACY_MODAL_FLOW_COORDINATE_SOLVER,
         "gauge": MODAL_FLOW_COORDINATE_GAUGE,
     }
     diagnostics_path = coordinates.path.parent / DIAGNOSTICS_JSON_FILENAME
@@ -147,10 +155,19 @@ def load_modal_coordinate_provenance(
     if artifact_format == MODAL_FLOW_COORDINATE_FORMAT:
         solver = payload.get("solver")
         gauge = payload.get("gauge")
-        if solver != MODAL_FLOW_COORDINATE_SOLVER or gauge != MODAL_FLOW_COORDINATE_GAUGE:
+        if (
+            solver not in {
+                LEGACY_MODAL_FLOW_COORDINATE_SOLVER,
+                MODAL_FLOW_COORDINATE_SOLVER,
+            }
+            or gauge != MODAL_FLOW_COORDINATE_GAUGE
+        ):
             raise ValueError(
                 f"{diagnostics_path} has incompatible coordinate solver provenance"
             )
+        provenance["solver"] = solver
+        if solver == MODAL_FLOW_COORDINATE_SOLVER:
+            provenance.update(_rendered_design_provenance(payload, diagnostics_path))
         return provenance
     if artifact_format != "modal_physics_coordinates" or payload.get("version") != 1:
         raise ValueError(
@@ -178,7 +195,30 @@ def load_modal_coordinate_provenance(
             "source_coordinate": payload.get("source_coordinate"),
         }
     )
+    source_solver = payload.get("source_coordinate_solver")
+    if source_solver == MODAL_FLOW_COORDINATE_SOLVER:
+        provenance.update(_rendered_design_provenance(payload, diagnostics_path))
+    elif source_solver != LEGACY_MODAL_FLOW_COORDINATE_SOLVER:
+        raise ValueError(
+            f"{diagnostics_path} has unsupported source coordinate solver"
+        )
     return provenance
+
+
+def _rendered_design_provenance(
+    payload: Mapping[str, Any], path: Path
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for name in (
+        "rendered_design_source",
+        "rendered_design_identity",
+        "rendered_design_normalization",
+    ):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{path} {name} must be a non-empty string")
+        result[name] = value
+    return result
 
 
 @dataclass(frozen=True)
@@ -862,6 +902,120 @@ def _load_and_validate_caches(
     return tuple(caches)
 
 
+def _load_and_validate_rendered_caches(
+    frame_map: _FrameMapData,
+    rendered_design: RenderedModalDesign,
+    cache_specs: Sequence[str],
+) -> tuple[ModalAnalysisCache, ...]:
+    parsed = parse_flow_cache_specs(cache_specs)
+    parsed_view_ids = tuple(view_id for view_id, _ in parsed)
+    if parsed_view_ids != frame_map.view_ids:
+        raise ValueError(
+            "--flow-caches view IDs and order must exactly match modal frame map views: "
+            f"expected {frame_map.view_ids}, got {parsed_view_ids}"
+        )
+    if rendered_design.view_ids != frame_map.view_ids:
+        raise ValueError(
+            f"Rendered design views {rendered_design.view_ids} do not match frame map "
+            f"views {frame_map.view_ids}"
+        )
+
+    expected_cache_paths = tuple(
+        path.resolve() for path in rendered_design.source_flow_cache_dirs
+    )
+    parsed_cache_paths = tuple(path.resolve() for _, path in parsed)
+    if parsed_cache_paths != expected_cache_paths:
+        raise ValueError(
+            "--flow-caches paths must exactly match the ordered caches used to build "
+            f"the rendered design: expected {expected_cache_paths}, got {parsed_cache_paths}"
+        )
+
+    caches: list[ModalAnalysisCache] = []
+    for view_index, (view_id, cache_path) in enumerate(parsed):
+        actual_identity = compute_flow_cache_identity(cache_path)
+        expected_identity = rendered_design.source_flow_cache_identities[view_index]
+        if actual_identity != expected_identity:
+            raise ValueError(
+                f"Flow cache identity for {view_id!r} differs from the cache used to "
+                "build the rendered design"
+            )
+        cache = load_analysis_cache(cache_path)
+        flow_method = cache.metadata["analysis"]["flow_method"]
+        if flow_method != "farneback":
+            raise ValueError(
+                f"Flow cache for {view_id!r} uses {flow_method!r}; expected 'farneback'"
+            )
+        frame_range = cache.metadata["video"]["frame_range"]
+        t0_s = float(frame_range["t0_s"])
+        if abs(t0_s) > 1e-12:
+            raise ValueError(f"Flow cache for {view_id!r} must start at t0_s=0, got {t0_s}")
+        expected_fps = float(frame_map.fps_hz[view_index])
+        if not np.isclose(cache.fps, expected_fps, rtol=0.0, atol=1e-9):
+            raise ValueError(
+                f"Flow cache FPS for {view_id!r} is {cache.fps}, expected {expected_fps}"
+            )
+        frame_rows = np.flatnonzero(frame_map.frame_view_indices == view_index)
+        if cache.flow_u.shape[0] != frame_rows.size:
+            raise ValueError(
+                f"Flow cache for {view_id!r} has {cache.flow_u.shape[0]} frames, "
+                f"expected {frame_rows.size}"
+            )
+        expected_shape = (
+            int(rendered_design.view_image_height[view_index]),
+            int(rendered_design.view_image_width[view_index]),
+        )
+        if cache.flow_u.shape[1:] != expected_shape:
+            raise ValueError(
+                f"Flow cache for {view_id!r} has spatial shape {cache.flow_u.shape[1:]}, "
+                f"expected {expected_shape}"
+            )
+        if cache.mask is None:
+            raise ValueError(f"Flow cache for {view_id!r} must contain a foreground mask")
+        reference_index = int(cache.metadata["analysis"]["reference_frame_index"])
+        expected_reference_index = cache.flow_u.shape[0] // 2
+        if reference_index != expected_reference_index:
+            raise ValueError(
+                f"Flow cache reference index for {view_id!r} is {reference_index}, "
+                f"expected middle frame {expected_reference_index}"
+            )
+        expected_reference_time = reference_index / expected_fps
+        if abs(cache.t_ref_s - expected_reference_time) > 1e-9:
+            raise ValueError(
+                f"Flow cache reference time for {view_id!r} does not match reference index/FPS"
+            )
+        caches.append(cache)
+    return tuple(caches)
+
+
+def _rendered_view_design(
+    rendered_design: RenderedModalDesign,
+    view_index: int,
+    cache: ModalAnalysisCache,
+) -> tuple[np.ndarray, np.ndarray]:
+    sample_rows = np.flatnonzero(rendered_design.sample_view_index == view_index)
+    if sample_rows.size == 0:
+        raise ValueError(
+            f"Rendered design has no samples for view {rendered_design.view_ids[view_index]!r}"
+        )
+    pixels = np.asarray(rendered_design.sample_pixels_xy[sample_rows], dtype=np.int64)
+    mask = cache.mask
+    assert mask is not None
+    if not bool(np.all(mask[pixels[:, 1], pixels[:, 0]])):
+        raise ValueError(
+            f"Rendered-design pixels for view {rendered_design.view_ids[view_index]!r} "
+            "fall outside the source flow-cache mask"
+        )
+    per_pixel = np.asarray(rendered_design.design_matrix[sample_rows], dtype=np.float64)
+    num_modes = rendered_design.mode_indices.size
+    expected_shape = (sample_rows.size, 2, 2 * num_modes)
+    if per_pixel.shape != expected_shape or not np.isfinite(per_pixel).all():
+        raise ValueError(
+            f"Rendered design for view {rendered_design.view_ids[view_index]!r} must be "
+            f"finite with shape {expected_shape}"
+        )
+    return pixels, per_pixel.reshape(2 * sample_rows.size, 2 * num_modes)
+
+
 def _view_pixel_groups(
     topology: _ObservationTopology,
     view_index: int,
@@ -996,28 +1150,40 @@ def _coordinate_spectral_diagnostics(
     return dominant, assigned_ratio, correlation
 
 
-def _solve_view(
-    manifest: _ManifestData,
+def _solve_design_view(
+    mode_indices: np.ndarray,
+    frequencies_hz: np.ndarray,
     frame_map: _FrameMapData,
     cache: ModalAnalysisCache,
     view_index: int,
+    design: np.ndarray,
+    pixels: np.ndarray,
     ridge_relative: float,
     frame_chunk_size: int,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     solve_start = time.perf_counter()
-    topology = manifest.topology
-    sorted_rows, starts, pixels, sorted_weights, weight_sums = _view_pixel_groups(
-        topology, view_index, cache
-    )
-    design, pair_scales = _build_design_matrix(
-        manifest, sorted_rows, starts, sorted_weights
-    )
     num_pixels = pixels.shape[0]
-    num_modes = manifest.mode_indices.size
+    num_modes = mode_indices.size
+    expected_shape = (2 * num_pixels, 2 * num_modes)
+    if design.shape != expected_shape or not np.isfinite(design).all():
+        raise ValueError(
+            f"Rendered design for view {frame_map.view_ids[view_index]!r} must be "
+            f"finite with shape {expected_shape}"
+        )
+    pair_scales = np.empty((num_modes,), dtype=np.float64)
+    normalizer = float(2 * num_pixels)
+    for mode_slot in range(num_modes):
+        pair = design[:, 2 * mode_slot : 2 * mode_slot + 2]
+        pair_scales[mode_slot] = np.sqrt(float(np.sum(pair * pair)) / normalizer)
+    if not np.isfinite(pair_scales).all():
+        raise ValueError(
+            f"Rendered design for view {frame_map.view_ids[view_index]!r} has "
+            "non-finite mode-pair scales"
+        )
+    pair_scales[pair_scales <= np.finfo(np.float64).eps] = 1.0
     normalized = design.copy()
     for mode_slot, scale in enumerate(pair_scales):
         normalized[:, 2 * mode_slot : 2 * mode_slot + 2] /= scale
-    normalizer = float(2 * num_pixels)
     gram = normalized.T @ normalized / normalizer
     system = gram + ridge_relative * np.eye(2 * num_modes, dtype=np.float64)
     cholesky = np.linalg.cholesky(system)
@@ -1133,15 +1299,15 @@ def _solve_view(
     dominant, assigned_ratio, correlation = _coordinate_spectral_diagnostics(
         coordinates,
         float(frame_map.fps_hz[view_index]),
-        manifest.frequencies_hz,
+        frequencies_hz,
     )
     coordinate_abs = np.abs(coordinates)
     diagnostics = {
-        "candidate_row_count": int(sorted_rows.size),
+        "candidate_row_count": int(num_pixels),
         "unique_pixel_count": int(num_pixels),
-        "candidate_weight_sum_min": float(np.min(weight_sums)),
-        "candidate_weight_sum_max": float(np.max(weight_sums)),
-        "candidate_weight_sum_max_abs_error": float(np.max(np.abs(weight_sums - 1.0))),
+        "candidate_weight_sum_min": 1.0,
+        "candidate_weight_sum_max": 1.0,
+        "candidate_weight_sum_max_abs_error": 0.0,
         "mode_pair_scales": pair_scales,
         "singular_values": scaled_singular_values,
         "numerical_rank": numerical_rank,
@@ -1176,7 +1342,7 @@ def _json_float(value: float) -> float | None:
 
 
 def _diagnostics_json(
-    manifest: _ManifestData,
+    rendered_design: RenderedModalDesign,
     frame_map: _FrameMapData,
     view_diagnostics: Sequence[Mapping[str, Any]],
     ridge_relative: float,
@@ -1203,12 +1369,12 @@ def _diagnostics_json(
     views: list[dict[str, Any]] = []
     for view_index, values in enumerate(view_diagnostics):
         mode_summaries = []
-        for mode_slot, mode_index in enumerate(manifest.mode_indices):
+        for mode_slot, mode_index in enumerate(rendered_design.mode_indices):
             mode_summaries.append(
                 {
                     "mode_slot": mode_slot,
                     "mode_index": int(mode_index),
-                    "frequency_hz": float(manifest.frequencies_hz[mode_slot]),
+                    "frequency_hz": float(rendered_design.frequencies_hz[mode_slot]),
                     "pair_scale": float(values["mode_pair_scales"][mode_slot]),
                     "coordinate_rms": float(values["coordinate_rms"][mode_slot]),
                     "coordinate_max": float(values["coordinate_max"][mode_slot]),
@@ -1235,7 +1401,7 @@ def _diagnostics_json(
                     values["candidate_weight_sum_max_abs_error"]
                 ),
                 "numerical_rank": int(values["numerical_rank"]),
-                "column_count": int(2 * manifest.mode_indices.size),
+                "column_count": int(2 * rendered_design.mode_indices.size),
                 "condition_number": _json_float(values["condition_number"]),
                 "ridge_condition_number": float(values["ridge_condition_number"]),
                 "reference_local_index": int(values["reference_local_index"]),
@@ -1253,18 +1419,21 @@ def _diagnostics_json(
         "parameterization": MODAL_FLOW_COORDINATE_PARAMETERIZATION,
         "solver": MODAL_FLOW_COORDINATE_SOLVER,
         "gauge": MODAL_FLOW_COORDINATE_GAUGE,
-        "projection_basis": "candidate_weighted_J_phi_without_alpha",
+        "projection_basis": "foreground_alpha_normalized_gsplat_J_phi",
         "frequency_forward_role": "label_only",
         "temporal_regularization": "none",
         "spectral_diagnostics": {
             "transform": "complex_fft_of_mean_zero_coordinates",
             "assigned_frequency_energy": "nearest_positive_and_negative_fft_bins",
         },
-        "source_modal_manifest": str(manifest.path),
+        "source_modal_manifest": str(rendered_design.source_modal_manifest),
+        "rendered_design_source": str(rendered_design.path),
+        "rendered_design_identity": rendered_design.artifact_identity,
+        "rendered_design_normalization": rendered_design.normalization,
         "source_modal_frame_map": str(frame_map.path),
         "ridge_relative": float(ridge_relative),
         "frame_chunk_size": int(frame_chunk_size),
-        "mode_count": int(manifest.mode_indices.size),
+        "mode_count": int(rendered_design.mode_indices.size),
         "frame_count": len(frame_map.frame_names),
         "overall": {
             "flow_rmse": overall_rmse,
@@ -1282,7 +1451,7 @@ def _diagnostics_json(
 
 def _write_artifacts(
     output_dir: Path,
-    manifest: _ManifestData,
+    rendered_design: RenderedModalDesign,
     frame_map: _FrameMapData,
     caches: Sequence[ModalAnalysisCache],
     coordinates: np.ndarray,
@@ -1306,19 +1475,19 @@ def _write_artifacts(
         frame_view_indices=frame_map.frame_view_indices.astype(np.int64),
         frame_local_indices=frame_map.frame_local_indices.astype(np.int64),
         frame_times_sec=frame_map.frame_times_sec.astype(np.float64),
-        mode_indices=manifest.mode_indices.astype(np.int64),
-        frequencies_hz=manifest.frequencies_hz.astype(np.float64),
+        mode_indices=rendered_design.mode_indices.astype(np.int64),
+        frequencies_hz=rendered_design.frequencies_hz.astype(np.float64),
         coordinate_real=coordinate_real,
         coordinate_imag=coordinate_imag,
         reference_local_indices=reference_indices,
         ridge_relative=np.array(ridge_relative, dtype=np.float64),
-        source_modal_manifest=np.array(str(manifest.path)),
+        source_modal_manifest=np.array(str(rendered_design.source_modal_manifest)),
         source_modal_frame_map=np.array(str(frame_map.path)),
         source_flow_cache_dirs=np.asarray([str(cache.path.resolve()) for cache in caches]),
     )
 
     num_views = len(frame_map.view_ids)
-    num_modes = manifest.mode_indices.size
+    num_modes = rendered_design.mode_indices.size
     num_columns = 2 * num_modes
     per_frame_rmse = np.empty((len(frame_map.frame_names),), dtype=np.float64)
     per_frame_relative = np.empty_like(per_frame_rmse)
@@ -1336,8 +1505,8 @@ def _write_artifacts(
         frame_names=np.asarray(frame_map.frame_names),
         frame_view_indices=frame_map.frame_view_indices.astype(np.int64),
         frame_local_indices=frame_map.frame_local_indices.astype(np.int64),
-        mode_indices=manifest.mode_indices.astype(np.int64),
-        frequencies_hz=manifest.frequencies_hz.astype(np.float64),
+        mode_indices=rendered_design.mode_indices.astype(np.int64),
+        frequencies_hz=rendered_design.frequencies_hz.astype(np.float64),
         candidate_row_count=np.asarray(
             [values["candidate_row_count"] for values in view_diagnostics], dtype=np.int64
         ),
@@ -1410,7 +1579,7 @@ def _write_artifacts(
 
     write_seconds = float(time.perf_counter() - write_start)
     diagnostics = _diagnostics_json(
-        manifest,
+        rendered_design,
         frame_map,
         view_diagnostics,
         ridge_relative,
@@ -1531,8 +1700,9 @@ def _validate_diagnostic_artifacts(output_dir: Path, coordinate_data: ModalFlowC
         raise ValueError(f"{json_path} has unsupported coordinate solver")
     if payload.get("gauge") != MODAL_FLOW_COORDINATE_GAUGE:
         raise ValueError(f"{json_path} has unsupported coordinate gauge")
-    if payload.get("projection_basis") != "candidate_weighted_J_phi_without_alpha":
+    if payload.get("projection_basis") != "foreground_alpha_normalized_gsplat_J_phi":
         raise ValueError(f"{json_path} has unsupported projection basis")
+    _rendered_design_provenance(payload, json_path)
     if payload.get("frequency_forward_role") != "label_only":
         raise ValueError(f"{json_path} has unsupported frequency forward role")
     if payload.get("temporal_regularization") != "none":
@@ -1742,7 +1912,7 @@ def evaluate_modal_flow_coordinate_sets(
         validated_sets[label] = array
 
     frame_map = _load_frame_map(source.source_modal_frame_map)
-    manifest = _load_manifest(source.source_modal_manifest)
+    provenance = load_modal_coordinate_provenance(source)
     if frame_map.view_ids != source.view_ids:
         raise ValueError("Coordinate source view order differs from its frame map")
     if frame_map.frame_names != source.frame_names:
@@ -1753,15 +1923,51 @@ def evaluate_modal_flow_coordinate_sets(
         raise ValueError("Coordinate source local indices differ from its frame map")
     if not np.allclose(frame_map.frame_times_sec, source.frame_times_sec, rtol=0.0, atol=0.0):
         raise ValueError("Coordinate source frame times differ from its frame map")
-    if not np.array_equal(manifest.mode_indices, source.mode_indices) or not np.allclose(
-        manifest.frequencies_hz, source.frequencies_hz, rtol=0.0, atol=0.0
-    ):
-        raise ValueError("Coordinate source modes differ from its modal manifest")
     cache_specs = [
         f"{view_id}={cache_path}"
         for view_id, cache_path in zip(source.view_ids, source.source_flow_cache_dirs)
     ]
-    caches = _load_and_validate_caches(frame_map, manifest.topology, cache_specs)
+    rendered_design: RenderedModalDesign | None = None
+    manifest: _ManifestData | None = None
+    if "rendered_design_source" in provenance:
+        rendered_design = load_rendered_modal_design(
+            provenance["rendered_design_source"]
+        )
+        if rendered_design.artifact_identity != provenance["rendered_design_identity"]:
+            raise ValueError(
+                "Coordinate rendered-design identity differs from its source artifact"
+            )
+        if rendered_design.normalization != provenance["rendered_design_normalization"]:
+            raise ValueError(
+                "Coordinate rendered-design normalization differs from its source artifact"
+            )
+        if Path(rendered_design.source_modal_manifest).resolve() != Path(
+            source.source_modal_manifest
+        ).resolve():
+            raise ValueError(
+                "Coordinate source modal manifest differs from its rendered design"
+            )
+        if not np.array_equal(
+            rendered_design.mode_indices, source.mode_indices
+        ) or not np.allclose(
+            rendered_design.frequencies_hz,
+            source.frequencies_hz,
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError("Coordinate source modes differ from its rendered design")
+        caches = _load_and_validate_rendered_caches(
+            frame_map, rendered_design, cache_specs
+        )
+    else:
+        manifest = _load_manifest(source.source_modal_manifest)
+        if not np.array_equal(
+            manifest.mode_indices, source.mode_indices
+        ) or not np.allclose(
+            manifest.frequencies_hz, source.frequencies_hz, rtol=0.0, atol=0.0
+        ):
+            raise ValueError("Coordinate source modes differ from its modal manifest")
+        caches = _load_and_validate_caches(frame_map, manifest.topology, cache_specs)
 
     num_frames = len(source.frame_names)
     num_views = len(source.view_ids)
@@ -1782,10 +1988,18 @@ def evaluate_modal_flow_coordinate_sets(
         accumulators[label] = {"residual_sum_squares": 0.0, "flow_sum_squares": 0.0}
 
     for view_index, cache in enumerate(caches):
-        sorted_rows, starts, pixels, sorted_weights, _ = _view_pixel_groups(
-            manifest.topology, view_index, cache
-        )
-        design, _ = _build_design_matrix(manifest, sorted_rows, starts, sorted_weights)
+        if rendered_design is not None:
+            pixels, design = _rendered_view_design(
+                rendered_design, view_index, cache
+            )
+        else:
+            assert manifest is not None
+            sorted_rows, starts, pixels, sorted_weights, _ = _view_pixel_groups(
+                manifest.topology, view_index, cache
+            )
+            design, _ = _build_design_matrix(
+                manifest, sorted_rows, starts, sorted_weights
+            )
         normalizer = float(2 * pixels.shape[0])
         reference_index = int(source.reference_local_indices[view_index])
         cache_reference_index = int(cache.metadata["analysis"]["reference_frame_index"])
@@ -1889,7 +2103,7 @@ def evaluate_modal_flow_coordinate_sets(
 
 def solve_modal_flow_coordinates(
     *,
-    modal_manifest: str | Path,
+    rendered_design: str | Path,
     modal_frame_map: str | Path,
     flow_caches: Sequence[str],
     out_dir: str | Path,
@@ -1910,24 +2124,32 @@ def solve_modal_flow_coordinates(
 
     solve_start = time.perf_counter()
     frame_map = _load_frame_map(modal_frame_map)
-    manifest = _load_manifest(modal_manifest)
-    if manifest.topology.view_ids != frame_map.view_ids:
+    design_data = load_rendered_modal_design(rendered_design)
+    if design_data.view_ids != frame_map.view_ids:
         raise ValueError(
-            f"Manifest observation views {manifest.topology.view_ids} do not match "
+            f"Rendered design views {design_data.view_ids} do not match "
             f"frame map views {frame_map.view_ids}"
         )
-    caches = _load_and_validate_caches(frame_map, manifest.topology, flow_caches)
+    caches = _load_and_validate_rendered_caches(frame_map, design_data, flow_caches)
 
     num_frames = len(frame_map.frame_names)
-    num_modes = manifest.mode_indices.size
+    num_modes = design_data.mode_indices.size
     coordinates = np.empty((num_frames, num_modes), dtype=np.complex64)
     view_diagnostics: list[dict[str, Any]] = []
     for view_index, cache in enumerate(caches):
-        view_coordinates, diagnostics = _solve_view(
-            manifest,
+        pixels, view_design = _rendered_view_design(
+            design_data,
+            view_index,
+            cache,
+        )
+        view_coordinates, diagnostics = _solve_design_view(
+            design_data.mode_indices,
+            design_data.frequencies_hz,
             frame_map,
             cache,
             view_index,
+            view_design,
+            pixels,
             ridge,
             chunk_size,
         )
@@ -1946,7 +2168,7 @@ def solve_modal_flow_coordinates(
     try:
         _write_artifacts(
             temporary,
-            manifest,
+            design_data,
             frame_map,
             caches,
             coordinates,

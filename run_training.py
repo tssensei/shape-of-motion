@@ -798,6 +798,14 @@ def _make_init_metadata(cfg: TrainConfig) -> dict[str, Any]:
             modal_metadata["modal_coordinate_prephysics_source"] = (
                 coordinate_provenance["source_coordinate"]
             )
+        rendered_design_metadata = {
+            "rendered_design_source": "modal_rendered_design_source",
+            "rendered_design_identity": "modal_rendered_design_identity",
+            "rendered_design_normalization": "modal_rendered_design_normalization",
+        }
+        for provenance_key, metadata_key in rendered_design_metadata.items():
+            if provenance_key in coordinate_provenance:
+                modal_metadata[metadata_key] = coordinate_provenance[provenance_key]
         metadata.update(modal_metadata)
     return {key: _metadata_value(value) for key, value in metadata.items()}
 

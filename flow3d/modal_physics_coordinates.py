@@ -16,6 +16,7 @@ from scipy.sparse.linalg import LinearOperator, onenormest, splu
 
 from flow3d.modal_flow_coordinates import (
     COORDINATE_FILENAME,
+    LEGACY_MODAL_FLOW_COORDINATE_SOLVER,
     MODAL_FLOW_COORDINATE_FORMAT,
     MODAL_FLOW_COORDINATE_GAUGE,
     MODAL_FLOW_COORDINATE_SOLVER,
@@ -394,9 +395,13 @@ def postfit_modal_physics_coordinates(
     total_start = time.perf_counter()
     source = load_modal_flow_coordinates(input_coordinates)
     input_provenance = load_modal_coordinate_provenance(source)
-    if input_provenance["solver"] != MODAL_FLOW_COORDINATE_SOLVER:
+    if input_provenance["solver"] not in {
+        LEGACY_MODAL_FLOW_COORDINATE_SOLVER,
+        MODAL_FLOW_COORDINATE_SOLVER,
+    }:
         raise ValueError(
-            "Physics post-fit requires the original reference-flow ridge coordinate artifact"
+            "Physics post-fit requires a reference-flow or rendered-projection ridge "
+            "coordinate artifact"
         )
     input_values = source.coordinates.astype(np.complex128)
     output_values = np.empty_like(input_values)
@@ -591,6 +596,17 @@ def postfit_modal_physics_coordinates(
             },
             "views": views,
         }
+        if input_provenance["solver"] == MODAL_FLOW_COORDINATE_SOLVER:
+            payload.update(
+                {
+                    name: input_provenance[name]
+                    for name in (
+                        "rendered_design_source",
+                        "rendered_design_identity",
+                        "rendered_design_normalization",
+                    )
+                }
+            )
         with (temporary / PHYSICS_DIAGNOSTICS_JSON_FILENAME).open(
             "w", encoding="utf-8"
         ) as file:

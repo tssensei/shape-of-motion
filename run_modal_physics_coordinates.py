@@ -19,7 +19,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-coordinates",
         required=True,
-        help="Original reference-flow ridge modal_flow_coordinates.npz.",
+        help="Reference-flow or rendered-projection ridge modal_flow_coordinates.npz.",
     )
     parser.add_argument(
         "--out-dir",
