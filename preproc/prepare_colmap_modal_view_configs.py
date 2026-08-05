@@ -111,6 +111,7 @@ def _load_binary_mask(
     path: Path,
     source_shape: tuple[int, int],
     target_shape: tuple[int, int],
+    allow_resize: bool = True,
 ) -> tuple[np.ndarray, tuple[int, int], bool]:
     mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if mask is None:
@@ -125,17 +126,22 @@ def _load_binary_mask(
     resized = False
     if loaded_shape == target_shape:
         pass
-    elif loaded_shape == source_shape:
+    elif allow_resize and loaded_shape == source_shape:
         mask = cv2.resize(
             mask.astype(np.uint8),
             (target_shape[1], target_shape[0]),
             interpolation=cv2.INTER_NEAREST,
         ) > 0
         resized = True
-    else:
+    elif allow_resize:
         raise ValueError(
             f"Foreground ROI mask shape {loaded_shape} matches neither reference "
             f"source {source_shape} nor target {target_shape}: {path}"
+        )
+    else:
+        raise ValueError(
+            f"Native-resolution foreground ROI mask shape {loaded_shape} must exactly "
+            f"match the registered reference shape {target_shape}: {path}"
         )
     if not bool(np.any(mask)):
         raise ValueError(f"Foreground ROI mask is empty: {path}")
@@ -145,7 +151,8 @@ def _load_binary_mask(
 def _prepare_view(
     spec: ViewSpec,
     record: dict[str, Any],
-    target_width: int,
+    target_width: int | None,
+    native_resolution: bool = False,
 ) -> PreparedView:
     source_width = record.get("image_width")
     source_height = record.get("image_height")
@@ -158,9 +165,16 @@ def _prepare_view(
         or source_height <= 0
     ):
         raise ValueError(f"Reference {spec.view_id!r} has invalid source dimensions")
-    target_height = int(round(target_width * source_height / source_width))
-    if target_height <= 0:
-        raise ValueError(f"Reference {spec.view_id!r} produced an invalid target height")
+    if native_resolution:
+        prepared_width = source_width
+        target_height = source_height
+    else:
+        if target_width is None or target_width <= 0:
+            raise ValueError("--target-width must be positive")
+        prepared_width = target_width
+        target_height = int(round(prepared_width * source_height / source_width))
+        if target_height <= 0:
+            raise ValueError(f"Reference {spec.view_id!r} produced an invalid target height")
 
     K = _finite_matrix(record.get("K"), (3, 3), f"{spec.view_id} K")
     world_to_camera = _finite_matrix(
@@ -169,20 +183,22 @@ def _prepare_view(
         f"{spec.view_id} normalized_world_to_camera",
     )
     scaled_K = K.copy()
-    scaled_K[0, :] *= target_width / source_width
-    scaled_K[1, :] *= target_height / source_height
+    if not native_resolution:
+        scaled_K[0, :] *= prepared_width / source_width
+        scaled_K[1, :] *= target_height / source_height
 
     mask_path = spec.mask_path.resolve(strict=True)
     mask, mask_source_shape, mask_resized = _load_binary_mask(
         mask_path,
         (source_height, source_width),
-        (target_height, target_width),
+        (target_height, prepared_width),
+        allow_resize=not native_resolution,
     )
     return PreparedView(
         view_id=spec.view_id,
         source_width=source_width,
         source_height=source_height,
-        target_width=target_width,
+        target_width=prepared_width,
         target_height=target_height,
         K=scaled_K,
         world_to_camera=world_to_camera,
@@ -223,7 +239,41 @@ def prepare_colmap_modal_view_configs(
     target_width: int,
     out_dir: Path,
 ) -> Path:
-    if target_width <= 0:
+    return _prepare_colmap_modal_view_configs(
+        input_checkpoint=input_checkpoint,
+        reference_cameras=reference_cameras,
+        views=views,
+        target_width=target_width,
+        out_dir=out_dir,
+        native_resolution=False,
+    )
+
+
+def prepare_colmap_modal_view_configs_native(
+    input_checkpoint: Path,
+    reference_cameras: Path,
+    views: Sequence[ViewSpec],
+    out_dir: Path,
+) -> Path:
+    return _prepare_colmap_modal_view_configs(
+        input_checkpoint=input_checkpoint,
+        reference_cameras=reference_cameras,
+        views=views,
+        target_width=None,
+        out_dir=out_dir,
+        native_resolution=True,
+    )
+
+
+def _prepare_colmap_modal_view_configs(
+    input_checkpoint: Path,
+    reference_cameras: Path,
+    views: Sequence[ViewSpec],
+    target_width: int | None,
+    out_dir: Path,
+    native_resolution: bool,
+) -> Path:
+    if not native_resolution and (target_width is None or target_width <= 0):
         raise ValueError("--target-width must be positive")
     if not views:
         raise ValueError("At least one --view is required")
@@ -242,7 +292,13 @@ def prepare_colmap_modal_view_configs(
     if missing:
         raise KeyError(f"Reference-camera manifest is missing requested views: {missing}")
     prepared = [
-        _prepare_view(spec, references[spec.view_id], target_width) for spec in views
+        _prepare_view(
+            spec,
+            references[spec.view_id],
+            target_width,
+            native_resolution=native_resolution,
+        )
+        for spec in views
     ]
     target_shapes = {(view.target_height, view.target_width) for view in prepared}
     if len(target_shapes) != 1:
@@ -344,6 +400,11 @@ def prepare_colmap_modal_view_configs(
                 "source_reference_cameras": str(reference_path),
                 "coordinate_system": "scene_norm_dict.pth world",
                 "depth_source": "foreground render from static 3DGS checkpoint",
+                "spatial_processing": {
+                    "mode": "native_resolution" if native_resolution else "target_width",
+                    "intrinsics_scaled": not native_resolution,
+                    "roi_resize_allowed": not native_resolution,
+                },
                 "view_order": view_ids,
                 "views": view_diagnostics,
             },
@@ -372,20 +433,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_view_spec,
         help="VIEW_ID=MASK_PATH; repeat once per fixed-camera view",
     )
-    parser.add_argument("--target-width", required=True, type=int)
+    resolution_group = parser.add_mutually_exclusive_group(required=True)
+    resolution_group.add_argument("--target-width", type=int)
+    resolution_group.add_argument("--native-resolution", action="store_true")
     parser.add_argument("--out-dir", required=True, type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    output_path = prepare_colmap_modal_view_configs(
-        input_checkpoint=args.input_ckpt,
-        reference_cameras=args.reference_cameras,
-        views=args.view,
-        target_width=args.target_width,
-        out_dir=args.out_dir,
-    )
+    if args.native_resolution:
+        output_path = prepare_colmap_modal_view_configs_native(
+            input_checkpoint=args.input_ckpt,
+            reference_cameras=args.reference_cameras,
+            views=args.view,
+            out_dir=args.out_dir,
+        )
+    else:
+        output_path = prepare_colmap_modal_view_configs(
+            input_checkpoint=args.input_ckpt,
+            reference_cameras=args.reference_cameras,
+            views=args.view,
+            target_width=args.target_width,
+            out_dir=args.out_dir,
+        )
     print(f"Saved COLMAP modal view configs -> {output_path}")
 
 

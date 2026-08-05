@@ -1,4 +1,6 @@
 import functools
+import os
+import tempfile
 import time
 from dataclasses import asdict
 from typing import Any, cast
@@ -121,7 +123,20 @@ class Trainer:
             "epoch": self.epoch,
             "init_metadata": self.init_metadata,
         }
-        torch.save(ckpt, path)
+        checkpoint_dir = os.path.dirname(path)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+            dir=checkpoint_dir,
+        )
+        os.close(descriptor)
+        try:
+            torch.save(ckpt, temporary_path)
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
         guru.info(f"Saved checkpoint at {self.global_step=} to {path}")
 
     @staticmethod

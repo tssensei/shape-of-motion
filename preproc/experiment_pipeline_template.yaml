@@ -1,0 +1,112 @@
+# Copy this file for each experiment. The basename of scene_root must match
+# scene_id, and prestatic_run_id must name a completed pre-static pipeline run.
+format: som_modal_experiment_pipeline
+version: 1
+scene_id: example_scene_v1
+scene_root: /home/zs292/data_formal/example_scene_v1
+pipeline_id: modal_pipeline_v1
+prestatic_run_id: prestatic_v1
+
+static:
+  artifact_id: sweep_rgbmask_v1
+  initial_epochs: 100
+  num_fg: 40000
+  num_bg: 0
+  batch_size: 8
+  num_workers: 4
+  use_2dgs: false
+
+modal_inputs:
+  artifact_id: native_modal_inputs_v1
+  flow_artifact_id: direct_native_v1
+  no_smooth: true
+  sigma_b: 3.0
+  sigma_c: 0.0
+  analysis_mask_dilate_iters: 0
+
+view_configs:
+  artifact_id: colmap_v1
+
+topology:
+  artifact_id: static_stride2_k4_v1
+  pixel_sample_stride: 2
+  pixel_candidate_k: 4
+  pixel_preselect_k: 32
+  pixel_render_acc_min: 0.05
+  pixel_min_contribution: 1.0e-12
+  mask_erode_iters: 1
+
+frequency_selection:
+  artifact_id: greedy_0p2_4p0_step0p025_k20_40_60_v1
+  basis_id: greedy_0p2_4p0_step0p025_k60prefix_v1
+  min_freq_hz: 0.2
+  max_freq_hz: 4.0
+  frequency_step_hz: 0.025
+  mode_counts: [20, 40, 60]
+  selected_k: 60
+  pixel_stride: 2
+
+solver:
+  artifact_id: rigid_rgbdepth_v3_sequential_k60_bounded_complex_v1
+  method: rigid-components
+  freq_tolerance_hz: 0.1
+  alpha_model: bounded-complex
+  alpha_gain_min: 0.25
+  alpha_gain_max: 4.0
+  alpha_min_shared_points: 16
+  alpha_rank_ratio_min: 1.0e-4
+  alpha_info_ratio_min: 1.0e-4
+  alpha_failure: exclude
+  anchor_svd_ratio_min: 0.01
+  anchor_residual_max: 0.1
+  rigid_component_rcond: 1.0e-8
+  rigid_seed_min_valid_views: 2
+  rigid_seed_min_secondary_view_node_ratio: 0.3333333333333333
+  rigid_seed_min_singular_ratio: 0.001
+  rigid_seed_max_finite_drift: 2.0
+  rigid_single_view_observable_ratio: 0.01
+  rigid_single_view_ray_direction_min_fraction: 0.8
+
+rigid_graph:
+  default_candidate_id: knn8_maxdist0p008_v1
+  max_distance: 0.008
+  max_neighbors: 8
+  color_mad_multiplier: 3.0
+  depth_mad_multiplier: 3.0
+  depth_samples: 5
+  min_shared_views: 1
+  min_component_nodes: 4
+  min_component_edges: 3
+
+motion_fill:
+  artifact_id: knn8_maxdist0p008_hop8_v1
+  k: 8
+  max_distance: 0.008
+  max_anchor_hops: 8
+
+rendered_design:
+  artifact_id: stride2_alpha0p05_v1
+  pixel_sample_stride: 2
+  alpha_min: 0.05
+  mask_erode_iters: 1
+  modes_per_batch: 8
+  use_2dgs: false
+  write_role_diagnostics: true
+
+flow_coordinates:
+  artifact_id: rendered_ridge1e4_v1
+  ridge_relative: 1.0e-4
+  frame_chunk_size: 64
+
+physics:
+  enabled: true
+  artifact_id: rendered_ridge1e4_zeta0p05_force0p1_v1
+  damping_ratio: 0.05
+  forcing_weight: 0.1
+  forcing_difference_weight: 0.0
+  assigned_band_half_width_hz: 0.1
+  frame_chunk_size: 64
+
+checkpoints:
+  direct_artifact_id: fixed_rendered_ridge1e4_v1
+  physics_artifact_id: fixed_rendered_ridge1e4_zeta0p05_force0p1_v1

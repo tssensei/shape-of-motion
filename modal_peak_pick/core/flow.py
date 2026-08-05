@@ -68,9 +68,13 @@ def compute_dense_flow_pair(
 def compute_dense_flow_to_reference(
     frames_gray: np.ndarray,
     method: str = "farneback",
+    reference_frame_index: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute dense optical flow from the middle reference frame to every frame.
+    Compute dense optical flow from one reference frame to every frame.
+
+    The middle frame remains the default when ``reference_frame_index`` is not
+    provided.
 
     Returns horizontal and vertical image-plane displacements with shape [T,H,W].
     """
@@ -83,7 +87,20 @@ def compute_dense_flow_to_reference(
     u = np.zeros((num_frames, h, w), dtype=np.float32)
     v = np.zeros((num_frames, h, w), dtype=np.float32)
 
-    t_ref = num_frames // 2
+    if reference_frame_index is None:
+        t_ref = num_frames // 2
+    else:
+        if (
+            isinstance(reference_frame_index, (bool, np.bool_))
+            or not isinstance(reference_frame_index, (int, np.integer))
+        ):
+            raise ValueError("reference_frame_index must be an integer when provided.")
+        t_ref = int(reference_frame_index)
+        if t_ref < 0 or t_ref >= num_frames:
+            raise ValueError(
+                "reference_frame_index is outside the frame sequence: "
+                f"{t_ref} not in [0,{num_frames - 1}]."
+            )
     reference = frames_gray[t_ref]
     for t in range(num_frames):
         flow = compute_dense_flow_pair(reference, frames_gray[t], method=method)

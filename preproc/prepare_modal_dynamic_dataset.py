@@ -316,9 +316,35 @@ def prepare_modal_dynamic_dataset(
     target_width: int,
     out_dir: Path,
 ) -> Path:
+    return _prepare_modal_dynamic_dataset(
+        views=views,
+        target_width=target_width,
+        out_dir=out_dir,
+        native_resolution=False,
+    )
+
+
+def prepare_modal_dynamic_dataset_native(
+    views: Sequence[ViewSpec],
+    out_dir: Path,
+) -> Path:
+    return _prepare_modal_dynamic_dataset(
+        views=views,
+        target_width=None,
+        out_dir=out_dir,
+        native_resolution=True,
+    )
+
+
+def _prepare_modal_dynamic_dataset(
+    views: Sequence[ViewSpec],
+    target_width: int | None,
+    out_dir: Path,
+    native_resolution: bool,
+) -> Path:
     if not views:
         raise ValueError("At least one --view is required")
-    if target_width <= 0:
+    if not native_resolution and (target_width is None or target_width <= 0):
         raise ValueError("target_width must be positive")
     for view in views:
         if not VIEW_ID_PATTERN.fullmatch(view.view_id):
@@ -335,7 +361,17 @@ def prepare_modal_dynamic_dataset(
     validated_views = [_validate_view(view) for view in views]
     reference = validated_views[0]
     for view in validated_views[1:]:
-        if (
+        if native_resolution and (
+            view.source_height != reference.source_height
+            or view.source_width != reference.source_width
+        ):
+            raise ValueError(
+                "All views must have the same native resolution: "
+                f"{reference.spec.view_id}="
+                f"{reference.source_width}x{reference.source_height}, "
+                f"{view.spec.view_id}={view.source_width}x{view.source_height}"
+            )
+        if not native_resolution and (
             view.source_height * reference.source_width
             != reference.source_height * view.source_width
         ):
@@ -345,9 +381,17 @@ def prepare_modal_dynamic_dataset(
                 f"{reference.source_width}x{reference.source_height}, "
                 f"{view.spec.view_id}={view.source_width}x{view.source_height}"
             )
-    target_height = int(round(target_width * reference.source_height / reference.source_width))
-    if target_height <= 0:
-        raise ValueError("target_width produces a zero-height output")
+    if native_resolution:
+        output_width = reference.source_width
+        output_height = reference.source_height
+    else:
+        assert target_width is not None
+        output_width = target_width
+        output_height = int(
+            round(output_width * reference.source_height / reference.source_width)
+        )
+        if output_height <= 0:
+            raise ValueError("target_width produces a zero-height output")
 
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(
@@ -365,24 +409,47 @@ def prepare_modal_dynamic_dataset(
                 zip(view.frame_names, view.image_paths, view.mask_paths)
             ):
                 frame_name = f"{view.spec.view_id}_{local_index:06d}"
-                image = _read_image(image_path, cv2.IMREAD_COLOR, "RGB image")
                 mask = _read_image(mask_path, cv2.IMREAD_UNCHANGED, "mask")
                 if mask.ndim == 2:
                     binary_mask = mask > 0
                 else:
                     binary_mask = np.any(mask > 0, axis=2)
-                resized_image = cv2.resize(
-                    image,
-                    (target_width, target_height),
-                    interpolation=cv2.INTER_AREA,
-                )
-                resized_mask = cv2.resize(
-                    binary_mask.astype(np.uint8),
-                    (target_width, target_height),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                _write_png(image_out_dir / f"{frame_name}.png", resized_image)
-                _write_png(mask_out_dir / f"{frame_name}.png", resized_mask * 255)
+                if native_resolution:
+                    if image_path.suffix.lower() != ".png":
+                        raise ValueError(
+                            "Native-resolution RGB inputs must be PNG files so their "
+                            f"pixels can be copied without re-encoding: {image_path}"
+                        )
+                    image = _read_image(
+                        image_path,
+                        cv2.IMREAD_UNCHANGED,
+                        "native-resolution RGB image",
+                    )
+                    if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+                        raise ValueError(
+                            "Native-resolution RGB inputs must be three-channel uint8 "
+                            f"PNG files, got dtype={image.dtype}, shape={image.shape}: "
+                            f"{image_path}"
+                        )
+                    shutil.copy2(image_path, image_out_dir / f"{frame_name}.png")
+                    _write_png(
+                        mask_out_dir / f"{frame_name}.png",
+                        binary_mask.astype(np.uint8) * 255,
+                    )
+                else:
+                    image = _read_image(image_path, cv2.IMREAD_COLOR, "RGB image")
+                    resized_image = cv2.resize(
+                        image,
+                        (output_width, output_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    resized_mask = cv2.resize(
+                        binary_mask.astype(np.uint8),
+                        (output_width, output_height),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    _write_png(image_out_dir / f"{frame_name}.png", resized_image)
+                    _write_png(mask_out_dir / f"{frame_name}.png", resized_mask * 255)
                 frame_records.append(
                     {
                         "frame_name": frame_name,
@@ -426,8 +493,13 @@ def prepare_modal_dynamic_dataset(
                 "view_count": len(validated_views),
                 "frame_count": len(frame_records),
                 "target_resolution": {
-                    "width": target_width,
-                    "height": target_height,
+                    "width": output_width,
+                    "height": output_height,
+                },
+                "spatial_processing": {
+                    "mode": "native_resolution" if native_resolution else "target_width",
+                    "image_resize": "none" if native_resolution else "area",
+                    "mask_resize": "none" if native_resolution else "nearest",
                 },
                 "views": metadata_views,
             },
@@ -451,14 +523,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_view_spec,
         help="VIEW_ID=IMAGE_DIR=MASK_DIR=FRAME_NAMES_JSON=FPS; repeat per view.",
     )
-    parser.add_argument("--target-width", type=int, required=True)
+    resolution_group = parser.add_mutually_exclusive_group(required=True)
+    resolution_group.add_argument("--target-width", type=int)
+    resolution_group.add_argument("--native-resolution", action="store_true")
     parser.add_argument("--out-dir", type=Path, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    output = prepare_modal_dynamic_dataset(args.view, args.target_width, args.out_dir)
+    if args.native_resolution:
+        output = prepare_modal_dynamic_dataset_native(args.view, args.out_dir)
+    else:
+        output = prepare_modal_dynamic_dataset(args.view, args.target_width, args.out_dir)
     print(f"Saved modal dynamic dataset -> {output}")
 
 

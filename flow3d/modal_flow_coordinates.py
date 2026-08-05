@@ -887,12 +887,6 @@ def _load_and_validate_caches(
         if cache.mask is None:
             raise ValueError(f"Flow cache for {view_id!r} must contain a foreground mask")
         reference_index = int(cache.metadata["analysis"]["reference_frame_index"])
-        expected_reference_index = cache.flow_u.shape[0] // 2
-        if reference_index != expected_reference_index:
-            raise ValueError(
-                f"Flow cache reference index for {view_id!r} is {reference_index}, "
-                f"expected middle frame {expected_reference_index}"
-            )
         expected_reference_time = reference_index / expected_fps
         if abs(cache.t_ref_s - expected_reference_time) > 1e-9:
             raise ValueError(
@@ -972,12 +966,6 @@ def _load_and_validate_rendered_caches(
         if cache.mask is None:
             raise ValueError(f"Flow cache for {view_id!r} must contain a foreground mask")
         reference_index = int(cache.metadata["analysis"]["reference_frame_index"])
-        expected_reference_index = cache.flow_u.shape[0] // 2
-        if reference_index != expected_reference_index:
-            raise ValueError(
-                f"Flow cache reference index for {view_id!r} is {reference_index}, "
-                f"expected middle frame {expected_reference_index}"
-            )
         expected_reference_time = reference_index / expected_fps
         if abs(cache.t_ref_s - expected_reference_time) > 1e-9:
             raise ValueError(

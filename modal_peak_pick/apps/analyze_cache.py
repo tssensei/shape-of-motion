@@ -8,17 +8,41 @@ from typing import Any
 import numpy as np
 
 from modal_peak_pick.core.cache import write_analysis_cache
+from modal_peak_pick.core.background_compensation import load_frame_names
 from modal_peak_pick.core.flow import compute_dense_flow_to_reference, contrast_weighted_smooth
 from modal_peak_pick.core.pipeline import load_mask
 from modal_peak_pick.core.spectrum import fft_over_time, global_power_spectrum
-from modal_peak_pick.core.video_io import load_video_clip
+from modal_peak_pick.core.video_io import load_ordered_image_sequence, load_video_clip
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--video", required=True, help="Input video path.")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--video", help="Input video path.")
+    source.add_argument("--image-dir", help="Ordered image-sequence directory.")
+    parser.add_argument(
+        "--frame-names-json",
+        default=None,
+        help="Ordered JSON list of image filename stems; required with --image-dir.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Image-sequence FPS; required with --image-dir.",
+    )
+    parser.add_argument(
+        "--reference-frame",
+        default=None,
+        help="Explicit reference-frame stem; required with --image-dir.",
+    )
+    parser.add_argument(
+        "--source-identity",
+        default=None,
+        help="Optional immutable source identity recorded for ordered image input.",
+    )
     parser.add_argument("--cache-dir", required=True, help="New immutable modal-analysis cache directory.")
     parser.add_argument("--mask", default=None, help="Optional binary ROI mask path (.npy or image).")
-    parser.add_argument("--t0", type=float, default=0.0, help="Clip start time in seconds.")
+    parser.add_argument("--t0", type=float, default=None, help="Clip start time in seconds; video input only.")
     parser.add_argument("--t1", type=float, default=None, help="Clip end time in seconds.")
     parser.add_argument("--resize", type=int, default=None, help="Resize max(H,W) before analysis.")
     parser.add_argument("--max-frames", type=int, default=None, help="Optional maximum decoded frames.")
@@ -75,16 +99,97 @@ def run(args: argparse.Namespace) -> None:
     if cache_dir.exists() or cache_dir.is_symlink():
         raise FileExistsError(f"Modal analysis cache target already exists: {cache_dir}")
 
+    image_mode = args.image_dir is not None
+    if image_mode:
+        missing = [
+            option
+            for option, value in (
+                ("--frame-names-json", args.frame_names_json),
+                ("--fps", args.fps),
+                ("--reference-frame", args.reference_frame),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "--image-dir requires " + ", ".join(missing)
+            )
+        forbidden = [
+            option
+            for option, value in (
+                ("--resize", args.resize),
+                ("--t0", args.t0),
+                ("--t1", args.t1),
+                ("--max-frames", args.max_frames),
+            )
+            if value is not None
+        ]
+        if forbidden:
+            raise ValueError(
+                "Image-sequence analysis does not allow " + ", ".join(forbidden)
+            )
+        fps = float(args.fps)
+        if not np.isfinite(fps) or fps <= 0.0:
+            raise ValueError("--fps must be finite and positive")
+    else:
+        image_only = [
+            option
+            for option, value in (
+                ("--frame-names-json", args.frame_names_json),
+                ("--fps", args.fps),
+                ("--reference-frame", args.reference_frame),
+                ("--source-identity", args.source_identity),
+            )
+            if value is not None
+        ]
+        if image_only:
+            raise ValueError(
+                "Video analysis does not allow image-sequence options: "
+                + ", ".join(image_only)
+            )
+
     total_start = time.perf_counter()
     stage_start = time.perf_counter()
-    frames_gray, fps = load_video_clip(
-        args.video,
-        t0=args.t0,
-        t1=args.t1,
-        resize=args.resize,
-        grayscale=True,
-        max_frames=args.max_frames,
-    )
+    frame_names: tuple[str, ...] | None = None
+    reference_frame_name: str | None = None
+    if image_mode:
+        frame_names = load_frame_names(args.frame_names_json)
+        reference_frame_name = str(args.reference_frame)
+        if reference_frame_name not in frame_names:
+            raise ValueError(
+                f"Reference frame {reference_frame_name!r} is not present in "
+                f"{args.frame_names_json}"
+            )
+        frames_gray = load_ordered_image_sequence(
+            args.image_dir,
+            frame_names,
+            resize=None,
+            grayscale=True,
+        )
+        reference_frame_index = frame_names.index(reference_frame_name)
+        frame_range = {
+            "t0_s": 0.0,
+            "t1_s": None,
+            "max_frames": None,
+            "decoded_frame_count": int(frames_gray.shape[0]),
+        }
+    else:
+        t0 = 0.0 if args.t0 is None else float(args.t0)
+        frames_gray, fps = load_video_clip(
+            args.video,
+            t0=t0,
+            t1=args.t1,
+            resize=args.resize,
+            grayscale=True,
+            max_frames=args.max_frames,
+        )
+        reference_frame_index = int(frames_gray.shape[0] // 2)
+        frame_range = {
+            "t0_s": t0,
+            "t1_s": None if args.t1 is None else float(args.t1),
+            "max_frames": None if args.max_frames is None else int(args.max_frames),
+            "decoded_frame_count": int(frames_gray.shape[0]),
+        }
     height, width = int(frames_gray.shape[1]), int(frames_gray.shape[2])
     mask = load_mask(
         args.mask,
@@ -94,10 +199,13 @@ def run(args: argparse.Namespace) -> None:
     )
     decode_seconds = time.perf_counter() - stage_start
 
-    reference_frame_index = int(frames_gray.shape[0] // 2)
     reference_frame = frames_gray[reference_frame_index]
     stage_start = time.perf_counter()
-    flow_u, flow_v = compute_dense_flow_to_reference(frames_gray, method=args.flow_method)
+    flow_u, flow_v = compute_dense_flow_to_reference(
+        frames_gray,
+        method=args.flow_method,
+        reference_frame_index=reference_frame_index,
+    )
     flow_seconds = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
@@ -128,20 +236,38 @@ def run(args: argparse.Namespace) -> None:
     analysis_total = time.perf_counter() - total_start
 
     source_mask = None if args.mask is None else _source_metadata(args.mask)
+    primary_source = _source_metadata(
+        args.image_dir if image_mode else args.video
+    )
+    sources: dict[str, Any] = {
+        "video": primary_source,
+        "mask": source_mask,
+    }
+    if image_mode:
+        assert frame_names is not None
+        assert reference_frame_name is not None
+        sources.update(
+            {
+                "input_type": "image_sequence",
+                "image_sequence": {
+                    "image_dir": primary_source,
+                    "frame_names_json": _source_metadata(args.frame_names_json),
+                    "ordered_frame_names": list(frame_names),
+                    "reference_frame": reference_frame_name,
+                    **(
+                        {"source_identity": str(args.source_identity)}
+                        if args.source_identity is not None
+                        else {}
+                    ),
+                },
+            }
+        )
     metadata = {
-        "sources": {
-            "video": _source_metadata(args.video),
-            "mask": source_mask,
-        },
+        "sources": sources,
         "video": {
             "fps": float(fps),
-            "frame_range": {
-                "t0_s": float(args.t0),
-                "t1_s": None if args.t1 is None else float(args.t1),
-                "max_frames": None if args.max_frames is None else int(args.max_frames),
-                "decoded_frame_count": int(frames_gray.shape[0]),
-            },
-            "resize_max_side": None if args.resize is None else int(args.resize),
+            "frame_range": frame_range,
+            "resize_max_side": None if image_mode or args.resize is None else int(args.resize),
         },
         "analysis": {
             "flow_method": str(args.flow_method),
@@ -162,7 +288,12 @@ def run(args: argparse.Namespace) -> None:
                 "method": "mean_image_plane_amplitude",
             },
             "reference_frame_index": reference_frame_index,
-            "reference_time_s": float(args.t0 + reference_frame_index / fps),
+            "reference_time_s": float(frame_range["t0_s"] + reference_frame_index / fps),
+            **(
+                {"reference_frame_name": reference_frame_name}
+                if reference_frame_name is not None
+                else {}
+            ),
         },
         "timings_seconds": {
             "decode": float(decode_seconds),

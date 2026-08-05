@@ -138,8 +138,7 @@ def main(cfg: TrainConfig):
 
     # save config
     os.makedirs(cfg.work_dir, exist_ok=True)
-    with open(f"{cfg.work_dir}/cfg.yaml", "w") as f:
-        yaml.dump(asdict(cfg), f, default_flow_style=False)
+    _write_training_config(cfg)
 
     initialize_and_checkpoint_model(
         cfg,
@@ -425,9 +424,42 @@ def initialize_and_checkpoint_model(
         _save_new_initial_checkpoints(checkpoint, ckpt_path)
     else:
         guru.info(f"Saving initialization to {ckpt_path}")
-        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-        torch.save(checkpoint, ckpt_path)
+        _save_checkpoint_atomic(checkpoint, ckpt_path)
     return
+
+
+def _write_training_config(cfg: TrainConfig) -> None:
+    target = Path(cfg.work_dir) / "cfg.yaml"
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    os.close(descriptor)
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            yaml.dump(asdict(cfg), handle, default_flow_style=False)
+        os.replace(temporary_path, target)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def _save_checkpoint_atomic(checkpoint: dict[str, Any], ckpt_path: str) -> None:
+    checkpoint_dir = Path(ckpt_path).parent
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{Path(ckpt_path).name}.",
+        suffix=".tmp",
+        dir=checkpoint_dir,
+    )
+    os.close(descriptor)
+    try:
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, ckpt_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 def _save_new_initial_checkpoints(
