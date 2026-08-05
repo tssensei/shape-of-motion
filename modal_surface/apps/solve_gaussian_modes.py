@@ -39,9 +39,11 @@ from modal_surface.gaussian_motion_fill import (
     RIGID_SEQUENTIAL_MOTION_FILL_METHOD,
     RIGID_SINGLE_VIEW_PARTIAL_FILL_METHOD,
     RIGID_SINGLE_VIEW_PARTIAL_FILL_POLICY,
+    SOFT_ELASTIC_SEED_MOTION_FILL_METHOD,
     GaussianMotionFillResult,
     RigidSeedMotionFillResult,
     apply_gaussian_motion_fill,
+    apply_soft_elastic_seed_motion_fill,
     apply_sequential_rigid_motion_fill,
     apply_single_view_component_partial_fill,
     load_motion_fill_graph,
@@ -1454,6 +1456,30 @@ def _load_resumed_soft_elastic_mode(
         _scalar_value(diagnostics, "soft_elastic_graph_path", diagnostics_path)
     ) != str(soft_graph_path):
         raise ValueError(f"Cannot resume {latent_path}: observed graph differs.")
+    has_motion_fill = "motion_fill_method" in diagnostics
+    if has_motion_fill != bool(args.motion_fill):
+        raise ValueError(
+            f"Cannot resume {latent_path}: motion-fill setting differs."
+        )
+    if has_motion_fill:
+        method = str(
+            _scalar_value(diagnostics, "motion_fill_method", diagnostics_path)
+        )
+        if method != SOFT_ELASTIC_SEED_MOTION_FILL_METHOD:
+            raise ValueError(
+                f"Cannot resume {latent_path}: motion-fill method differs."
+            )
+        max_anchor_hops = int(
+            _scalar_value(
+                diagnostics,
+                "motion_fill_max_anchor_hops",
+                diagnostics_path,
+            )
+        )
+        if max_anchor_hops != int(args.motion_fill_max_anchor_hops):
+            raise ValueError(
+                f"Cannot resume {latent_path}: motion-fill max anchor hops differs."
+            )
     if int(_scalar_value(latent, "mode_index", latent_path)) != mode_index:
         raise ValueError(f"Cannot resume {latent_path}: mode index differs.")
     if str(_scalar_value(latent, "source_checkpoint", latent_path)) != str(
@@ -1607,7 +1633,7 @@ def _gaussian_latent_stats(
         partial = observable.partial_mask.astype(bool)
         unobserved = observable.unobserved_mask.astype(bool)
         staged_solver_method = "staged_overlap_observable"
-        motion_fill_method = MOTION_FILL_METHOD
+        motion_fill_method = str(motion_fill.diagnostics["method"])
         stats.update(
             {
                 "staged_solver_method": staged_solver_method,
@@ -1879,7 +1905,8 @@ def _soft_elastic_latent_stats(
     if motion_fill is not None:
         stats["staged_solver_method"] = "soft_elastic_displacement_v1"
         stats["effective_field_method"] = (
-            f"soft_elastic_displacement_v1+{MOTION_FILL_METHOD}"
+            "soft_elastic_displacement_v1+"
+            f"{motion_fill.diagnostics['method']}"
         )
     return stats
 
@@ -2624,13 +2651,19 @@ def _write_solver_diagnostics(
                 "active_component_anchor_count": motion.connectivity.component_anchor_count.astype(
                     np.int32
                 ),
-                "motion_fill_method": np.array(MOTION_FILL_METHOD),
+                "motion_fill_method": np.array(diagnostics["method"]),
                 "motion_fill_version": np.array(MOTION_FILL_VERSION, dtype=np.int32),
                 "motion_fill_numerical_rank_policy": np.array(
-                    MOTION_FILL_NUMERICAL_RANK_POLICY
+                    diagnostics.get(
+                        "numerical_rank_policy",
+                        MOTION_FILL_NUMERICAL_RANK_POLICY,
+                    )
                 ),
                 "motion_fill_excluded_policy": np.array(
-                    "retain_observable_exclude_from_graph"
+                    diagnostics.get(
+                        "excluded_policy",
+                        "retain_observable_exclude_from_graph",
+                    )
                 ),
                 "motion_fill_graph_path": np.array(graph_path),
                 "motion_fill_graph_k": np.array(graph.k, dtype=np.int32),
@@ -2639,19 +2672,6 @@ def _write_solver_diagnostics(
                 ),
                 "motion_fill_graph_epsilon": np.array(
                     graph.epsilon, dtype=np.float64
-                ),
-                "motion_fill_nullspace_operator_max_relative_error": np.array(
-                    diagnostics["nullspace_operator_max_relative_error"],
-                    dtype=np.float64,
-                ),
-                "motion_fill_nullspace_operator_rtol": np.array(
-                    MOTION_FILL_NULLSPACE_RTOL, dtype=np.float64
-                ),
-                "motion_fill_observation_drift_max_relative": np.array(
-                    diagnostics["observation_drift_max_relative"], dtype=np.float64
-                ),
-                "motion_fill_observation_drift_rtol": np.array(
-                    MOTION_FILL_OBSERVATION_DRIFT_RTOL, dtype=np.float64
                 ),
                 "motion_fill_relative_denominator_epsilon": np.array(
                     MOTION_FILL_EPSILON, dtype=np.float64
@@ -2690,6 +2710,30 @@ def _write_solver_diagnostics(
                 ),
             }
         )
+        if "nullspace_operator_max_relative_error" in diagnostics:
+            arrays.update(
+                {
+                    "motion_fill_nullspace_operator_max_relative_error": np.array(
+                        diagnostics["nullspace_operator_max_relative_error"],
+                        dtype=np.float64,
+                    ),
+                    "motion_fill_nullspace_operator_rtol": np.array(
+                        MOTION_FILL_NULLSPACE_RTOL, dtype=np.float64
+                    ),
+                    "motion_fill_observation_drift_max_relative": np.array(
+                        diagnostics["observation_drift_max_relative"],
+                        dtype=np.float64,
+                    ),
+                    "motion_fill_observation_drift_rtol": np.array(
+                        MOTION_FILL_OBSERVATION_DRIFT_RTOL, dtype=np.float64
+                    ),
+                }
+            )
+        if "max_anchor_hops" in diagnostics:
+            arrays["motion_fill_max_anchor_hops"] = np.array(
+                int(diagnostics["max_anchor_hops"]),
+                dtype=np.int32,
+            )
     return save_npz_compressed_atomic(out_path, arrays)
 
 
@@ -4000,10 +4044,13 @@ def run(args: argparse.Namespace) -> None:
                 assert motion_fill_graph_path is not None
                 assert graph_relative_path is not None
                 try:
-                    motion_fill_result = apply_gaussian_motion_fill(
+                    motion_fill_result = apply_soft_elastic_seed_motion_fill(
                         soft_staged,
+                        soft.phi,
+                        soft.node_gaussian_indices,
                         motion_fill_graph,
                         graph_relative_path,
+                        max_anchor_hops=int(args.motion_fill_max_anchor_hops),
                     )
                 except Exception:
                     _write_solver_diagnostics(
@@ -4350,6 +4397,8 @@ def run(args: argparse.Namespace) -> None:
             and args.rigid_motion_fill_stage == "single-view-components"
             else RIGID_SEQUENTIAL_MOTION_FILL_METHOD
             if args.solve_method == "rigid-components"
+            else SOFT_ELASTIC_SEED_MOTION_FILL_METHOD
+            if args.solve_method == "soft-elastic"
             else MOTION_FILL_METHOD
         )
         manifest_parameters.update(
@@ -4368,11 +4417,19 @@ def run(args: argparse.Namespace) -> None:
                         "gaussians_free"
                     )
                     if args.solve_method == "rigid-components"
-                    else "retain_observable_exclude_from_graph"
+                    else (
+                        "soft_elastic_graph_nodes_fixed_unobserved_gaussians_free"
+                        if args.solve_method == "soft-elastic"
+                        else "retain_observable_exclude_from_graph"
+                    )
                 ),
             }
         )
-        if args.solve_method in {"staged", "soft-elastic"}:
+        if args.solve_method == "soft-elastic":
+            manifest_parameters["motion_fill_max_anchor_hops"] = int(
+                args.motion_fill_max_anchor_hops
+            )
+        if args.solve_method == "staged":
             manifest_parameters.update(
                 {
                     "motion_fill_nullspace_operator_rtol": MOTION_FILL_NULLSPACE_RTOL,
@@ -4403,8 +4460,11 @@ def run(args: argparse.Namespace) -> None:
                                 args.motion_fill_max_anchor_hops
                             )
                         }
-                        if args.solve_method == "rigid-components"
-                        and args.rigid_motion_fill_stage == "sequential"
+                        if (
+                            args.solve_method == "soft-elastic"
+                            or args.solve_method == "rigid-components"
+                            and args.rigid_motion_fill_stage == "sequential"
+                        )
                         else {}
                     ),
                 },

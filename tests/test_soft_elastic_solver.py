@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
+from modal_surface.gaussian_motion_fill import (
+    MOTION_FILL_ROLE_FIXED_ANCHOR,
+    MOTION_FILL_ROLE_FREE_VARIABLE,
+    SOFT_ELASTIC_SEED_MOTION_FILL_METHOD,
+    apply_soft_elastic_seed_motion_fill,
+)
+from modal_surface.motion_fill import KnnGraph
 from modal_surface.observed_structure_graph import (
     LoadedObservedStructureGraph,
     ObservedStructureGraph,
@@ -147,6 +155,55 @@ def _prepared(points: np.ndarray, phi: np.ndarray):
     )
 
 
+def _single_view_prepared(points: np.ndarray, phi: np.ndarray):
+    point_index = np.arange(3, dtype=np.int32)
+    view_index = np.zeros((3,), dtype=np.int32)
+    jacobian = np.broadcast_to(
+        np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        (3, 2, 3),
+    ).copy()
+    observation = np.einsum(
+        "oij,oj->oi", jacobian, phi[point_index]
+    ).astype(np.complex64)
+    return prepare_observations(
+        {
+            "points_world": points.astype(np.float32),
+            "obs_point_index": point_index,
+            "obs_view_index": view_index,
+            "obs_pixels_xy": np.zeros((3, 2), dtype=np.float32),
+            "obs_y": observation,
+            "obs_J": jacobian,
+            "obs_contribution_weight": np.ones((3,), dtype=np.float32),
+            "obs_count_per_point": np.asarray([1, 1, 1, 0], dtype=np.int32),
+            "obs_sample_count_per_point": np.asarray(
+                [1, 1, 1, 0], dtype=np.int32
+            ),
+            "view_ids": np.asarray(["view1", "view2"]),
+            "freq_hz": np.array(1.0, dtype=np.float32),
+            "mode_index": np.array(0, dtype=np.int32),
+        }
+    )
+
+
+def _motion_fill_graph() -> KnnGraph:
+    return KnnGraph(
+        edge_index=np.asarray([[0, 1], [1, 2], [2, 3]], dtype=np.int64),
+        edge_distance=np.asarray([1.0, 1.0, 6.0], dtype=np.float64),
+        edge_weight=np.asarray([1.0, 1.0, 1.0 / 6.0], dtype=np.float64),
+        degree=np.asarray([1, 2, 2, 1], dtype=np.int32),
+        component_index=np.zeros((4,), dtype=np.int32),
+        component_sizes=np.asarray([4], dtype=np.int32),
+        isolated_mask=np.zeros((4,), dtype=bool),
+        num_points=4,
+        k=2,
+        max_distance=10.0,
+        epsilon=1.0e-8,
+        candidate_directed_count=8,
+        retained_directed_count=6,
+        pruned_directed_count=2,
+    )
+
+
 class SoftElasticSolverTest(unittest.TestCase):
     def setUp(self) -> None:
         self.points = np.asarray(
@@ -204,6 +261,61 @@ class SoftElasticSolverTest(unittest.TestCase):
         )
 
         self.assertTrue(np.all(result.edge_relative_axial_real > 0.09))
+
+    def test_motion_fill_preserves_full_3d_soft_seeds(self) -> None:
+        phi = np.zeros((4, 3), dtype=np.complex64)
+        phi[:3] = np.asarray(
+            [
+                [0.1 + 0.2j, -0.3 + 0.1j, 0.7 - 0.4j],
+                [0.2 + 0.1j, -0.2 + 0.2j, 0.8 - 0.3j],
+                [0.3 + 0.0j, -0.1 + 0.3j, 0.9 - 0.2j],
+            ],
+            dtype=np.complex64,
+        )
+        prepared = _single_view_prepared(self.points, phi)
+        staged = SimpleNamespace(
+            prepared=prepared,
+            alpha=_alpha(),
+            observable=SimpleNamespace(
+                point_status=np.zeros((4,), dtype=np.int8)
+            ),
+        )
+
+        result = apply_soft_elastic_seed_motion_fill(
+            staged,
+            phi,
+            np.asarray([0, 1, 2], dtype=np.int32),
+            _motion_fill_graph(),
+            "synthetic_motion_fill_graph.npz",
+            max_anchor_hops=8,
+        )
+
+        np.testing.assert_array_equal(result.motion.phi[:3], phi[:3])
+        np.testing.assert_array_equal(
+            result.motion.phi_nullspace_correction[:3],
+            np.zeros((3, 3), dtype=np.complex64),
+        )
+        np.testing.assert_allclose(result.motion.phi[3], phi[2], atol=1.0e-6)
+        np.testing.assert_array_equal(
+            result.roles.role,
+            np.asarray(
+                [
+                    MOTION_FILL_ROLE_FIXED_ANCHOR,
+                    MOTION_FILL_ROLE_FIXED_ANCHOR,
+                    MOTION_FILL_ROLE_FIXED_ANCHOR,
+                    MOTION_FILL_ROLE_FREE_VARIABLE,
+                ],
+                dtype=np.int8,
+            ),
+        )
+        self.assertEqual(
+            result.diagnostics["method"],
+            SOFT_ELASTIC_SEED_MOTION_FILL_METHOD,
+        )
+        self.assertEqual(
+            result.diagnostics["completion"]["completed_unobserved_count"],
+            1,
+        )
 
     def test_config_rejects_zero_regularization(self) -> None:
         with self.assertRaisesRegex(ValueError, "cannot both be zero"):

@@ -1092,3 +1092,21 @@ Date: 2026-08-05
   controller validation bug, not a graph-construction failure. The temporary
   attempt is expected to be removed by failure cleanup, and the same pipeline
   command should rebuild and publish the candidate after pulling the fix.
+
+### Low-frequency soft-elastic K5 motion-fill failure and fix
+
+- The first low-frequency comparison attempted the selected 0.025 Hz mode in
+  `/home/zs292/data_formal/curtain3_2view_v1/modal_fields/greedy_0p025_4p0_step0p025_k20prefix_dense_10fps_v1/soft_elastic_greedy5_from_k20_lowfreq_v1`.
+  The soft-elastic solve itself completed for 30,387 observed-graph nodes, but
+  the following legacy staged motion-fill adapter failed at Gaussian 3 with
+  `phi_observable is not orthogonal to the nullspace`; 21,333 of 51,720
+  foreground Gaussians had no direct observations.
+- This was an adapter error rather than a bad low-frequency mode. Soft-elastic
+  supplies a complete regularized 3-D displacement on every graph node, so its
+  legitimate single-view depth/nullspace component must not be projected away
+  or completed a second time. The replacement fixes those graph nodes as exact
+  seeds and applies the existing KNN+LSMR fill only to graph-external,
+  unobserved Gaussians, honoring the configured maximum anchor-hop distance.
+- The interrupted directory has no accepted completed mode and may be resumed
+  with the same command plus `--resume` after pulling the fix. Cluster rerun and
+  visual evaluation remain pending.

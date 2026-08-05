@@ -69,6 +69,9 @@ MOTION_FILL_LSMR_BTOL = 1e-6
 MOTION_FILL_LSMR_CONLIM = 1e8
 MOTION_FILL_NULLSPACE_RTOL = 1e-4
 MOTION_FILL_OBSERVATION_DRIFT_RTOL = 1e-4
+SOFT_ELASTIC_SEED_MOTION_FILL_METHOD = (
+    "soft_elastic_seed_independent_gaussian_knn_lsmr"
+)
 RIGID_SEQUENTIAL_MOTION_FILL_METHOD = (
     "rigid_seed_partial_component_then_independent_gaussian_knn_lsmr"
 )
@@ -710,6 +713,182 @@ def apply_gaussian_motion_fill(
         roles=roles,
         numerical_nullity=subspaces.nullity,
         staged_nullity_refined_mask=refined_partial_mask,
+        point_solution_status=point_status,
+        obs_pred_y=pred,
+        obs_residual=obs_residual,
+        obs_residual_valid_mask=obs_residual_valid,
+        point_residual=point_residual,
+        point_residual_valid_mask=point_residual_valid,
+        diagnostics=diagnostics,
+    )
+
+
+def apply_soft_elastic_seed_motion_fill(
+    staged: StagedSolveResult,
+    soft_phi: np.ndarray,
+    seed_gaussian_indices: np.ndarray,
+    graph: KnnGraph,
+    graph_path: str,
+    *,
+    max_anchor_hops: int,
+) -> GaussianMotionFillResult:
+    """Fill graph-external Gaussians while preserving complete soft-elastic seeds."""
+
+    if not graph_path:
+        raise ValueError("graph_path must be non-empty.")
+    prepared = staged.prepared
+    points = np.asarray(prepared.points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points_world must have shape (N,3), got {points.shape}.")
+    num_points = int(points.shape[0])
+    if graph.num_points != num_points:
+        raise ValueError(
+            f"Motion-fill graph has {graph.num_points} points, expected {num_points}."
+        )
+
+    values = np.asarray(soft_phi)
+    if values.shape != (num_points, 3) or not np.iscomplexobj(values):
+        raise ValueError(
+            f"soft_phi must be a complex ({num_points},3) array, got {values.shape}."
+        )
+    if not np.all(np.isfinite(values.real)) or not np.all(np.isfinite(values.imag)):
+        raise ValueError("soft_phi contains non-finite values.")
+    indices = np.asarray(seed_gaussian_indices)
+    if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+        raise ValueError("seed_gaussian_indices must be a one-dimensional integer array.")
+    indices = indices.astype(np.int64, copy=False)
+    if indices.size == 0:
+        raise ValueError("soft-elastic motion fill requires at least one seed Gaussian.")
+    if np.any(indices < 0) or np.any(indices >= num_points):
+        raise ValueError("seed_gaussian_indices contains an out-of-range index.")
+    if np.unique(indices).size != indices.size:
+        raise ValueError("seed_gaussian_indices must not contain duplicates.")
+
+    seed_mask = np.zeros((num_points,), dtype=bool)
+    seed_mask[indices] = True
+    observed_mask = np.asarray(prepared.obs_count_per_point) > 0
+    if not np.array_equal(seed_mask, observed_mask):
+        missing = int(np.count_nonzero(observed_mask & ~seed_mask))
+        extra = int(np.count_nonzero(seed_mask & ~observed_mask))
+        raise ValueError(
+            "Soft-elastic seed Gaussians must exactly match points with positive "
+            f"observation rows; missing={missing}, extra={extra}."
+        )
+    target_mask = ~seed_mask
+    if np.any(values[target_mask] != 0):
+        raise ValueError(
+            "Graph-external soft_phi values must be zero before motion fill."
+        )
+
+    empty_mask = np.zeros((num_points,), dtype=bool)
+    basis = np.broadcast_to(
+        np.eye(3, dtype=np.float64),
+        (num_points, 3, 3),
+    ).copy()
+    nullity = np.where(seed_mask, 0, 3).astype(np.int8)
+    role = np.full(
+        (num_points,),
+        MOTION_FILL_ROLE_FREE_VARIABLE,
+        dtype=np.int8,
+    )
+    role[seed_mask] = MOTION_FILL_ROLE_FIXED_ANCHOR
+    roles = GaussianMotionFillRoles(
+        role=role,
+        excluded_reason=np.full(
+            (num_points,),
+            MOTION_FILL_EXCLUDED_NONE,
+            dtype=np.int8,
+        ),
+        fixed_anchor_mask=seed_mask,
+        constrained_variable_mask=empty_mask,
+        free_variable_mask=target_mask,
+        excluded_mask=empty_mask.copy(),
+    )
+    motion = fill_nullspace_motion(
+        graph,
+        values,
+        basis,
+        nullity,
+        seed_mask,
+        empty_mask,
+        target_mask,
+        excluded_mask=empty_mask,
+        lsmr_atol=MOTION_FILL_LSMR_ATOL,
+        lsmr_btol=MOTION_FILL_LSMR_BTOL,
+        lsmr_conlim=MOTION_FILL_LSMR_CONLIM,
+        max_anchor_hops=max_anchor_hops,
+    )
+    if not np.array_equal(motion.phi[seed_mask], values[seed_mask]):
+        raise RuntimeError("Soft-elastic motion fill changed a fixed seed Gaussian.")
+    if np.any(motion.phi_nullspace_correction[seed_mask] != 0):
+        raise RuntimeError(
+            "Soft-elastic motion fill assigned a correction to a fixed seed Gaussian."
+        )
+    if np.any(motion.phi_nullspace_correction[observed_mask] != 0):
+        raise RuntimeError("Soft-elastic motion fill changed an observed Gaussian.")
+
+    pred, obs_residual, obs_residual_valid, point_residual, point_residual_valid = (
+        compute_prediction_and_residuals(prepared, staged.alpha, motion.phi)
+    )
+    point_status = np.asarray(staged.observable.point_status, dtype=np.int8).copy()
+    point_status[target_mask & motion.completion_mask] = (
+        POINT_STATUS_COMPLETED_UNOBSERVED
+    )
+    role_counts = {
+        name: int(np.count_nonzero(roles.role == index))
+        for index, name in enumerate(MOTION_FILL_ROLE_NAMES)
+    }
+    hop_limited_mask = (
+        motion.completion_connected_to_anchor
+        & ~motion.completion_mask
+        & target_mask
+    )
+    diagnostics = {
+        "method": SOFT_ELASTIC_SEED_MOTION_FILL_METHOD,
+        "version": MOTION_FILL_VERSION,
+        "graph_path": graph_path,
+        "pipeline": "soft_elastic_observed_seeds_then_independent_3d_gaussians",
+        "max_anchor_hops": int(max_anchor_hops),
+        "role_counts": role_counts,
+        "excluded_reason_counts": {},
+        "numerical_rank_policy": "soft_elastic_seeds_fixed_identity_3d_targets",
+        "excluded_policy": (
+            "soft_elastic_graph_nodes_fixed_unobserved_gaussians_free"
+        ),
+        "completion_count": int(np.count_nonzero(motion.completion_mask)),
+        "anchor_connected_point_count": int(
+            np.count_nonzero(motion.completion_connected_to_anchor)
+        ),
+        "active_component_count": int(motion.connectivity.component_sizes.size),
+        "anchor_connected_component_count": int(
+            np.count_nonzero(motion.connectivity.component_has_anchor)
+        ),
+        "completion": {
+            "seed_count": int(np.count_nonzero(seed_mask)),
+            "target_count": int(np.count_nonzero(target_mask)),
+            "completed_observed_count": 0,
+            "completed_unobserved_count": int(
+                np.count_nonzero(target_mask & motion.completion_mask)
+            ),
+            "unresolved_target_count": int(
+                np.count_nonzero(target_mask & ~motion.completion_mask)
+            ),
+            "hop_limited_target_count": int(np.count_nonzero(hop_limited_mask)),
+        },
+        "system": {
+            "row_count": int(motion.system_row_count),
+            "column_count": int(motion.system_column_count),
+            "active_edge_count": int(motion.active_edge_count),
+            "eligible_edge_count": int(graph.edge_index.shape[0]),
+        },
+        "lsmr_real": _solver_diagnostics(motion.real_solver),
+        "lsmr_imaginary": _solver_diagnostics(motion.imag_solver),
+    }
+    return GaussianMotionFillResult(
+        motion=motion,
+        roles=roles,
+        numerical_nullity=nullity,
+        staged_nullity_refined_mask=empty_mask.copy(),
         point_solution_status=point_status,
         obs_pred_y=pred,
         obs_residual=obs_residual,
