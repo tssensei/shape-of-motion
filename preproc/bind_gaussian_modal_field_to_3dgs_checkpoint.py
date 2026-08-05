@@ -183,6 +183,9 @@ def main() -> None:
     state["modal_phi_real"] = torch.from_numpy(np.stack(phi_real, axis=0)).float()
     state["modal_phi_imag"] = torch.from_numpy(np.stack(phi_imag, axis=0)).float()
     state["modal_freqs_hz"] = torch.tensor(freqs_hz, dtype=torch.float32)
+    state["modal_phi_trainable_mask"] = torch.zeros(
+        (len(phi_real), num_fg), dtype=torch.bool
+    )
     if obs_counts:
         if missing_obs_count_modes:
             raise ValueError(
