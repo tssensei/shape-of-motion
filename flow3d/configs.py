@@ -52,7 +52,7 @@ class LossesConfig:
     w_depth_const: float = 0.0
     w_depth_grad: float = 1.0
     w_track: float = 0.0
-    w_mask: float = 1.0
+    w_mask: float = 0.0
     w_smooth_bases: float = 0.1
     w_smooth_tracks: float = 2.0
     w_scale_var: float = 0.01
