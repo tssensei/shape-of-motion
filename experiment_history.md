@@ -988,3 +988,13 @@ Date: 2026-08-05
 - Because `num_bg` participates in the immutable pipeline config identity,
   the replacement run starts with a clean controller directory and retrains
   the static candidate from scratch.
+
+### Static extension controller fix
+
+- After the replacement 100-epoch foreground/background model completed,
+  extending it to 200 epochs initially stopped before training because the
+  frozen resolved payload stored `frequency_selection.mode_counts` as a JSON
+  list while the recomputed in-memory payload retained a Python tuple.
+- This was a controller serialization comparison bug rather than scientific
+  config drift. The existing checkpoint remains valid and resumable after
+  canonicalizing the recomputed field to the same JSON-list representation.

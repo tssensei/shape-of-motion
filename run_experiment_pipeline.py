@@ -1324,7 +1324,10 @@ def _resolved_config_payload(
             "modal_inputs": asdict(config.modal_inputs),
             "view_configs": asdict(config.view_configs),
             "topology": asdict(config.topology),
-            "frequency_selection": asdict(config.frequency),
+            "frequency_selection": {
+                **asdict(config.frequency),
+                "mode_counts": list(config.frequency.mode_counts),
+            },
             "solver": asdict(config.solver),
             "rigid_graph": asdict(config.rigid_graph),
             "motion_fill": asdict(config.motion_fill),

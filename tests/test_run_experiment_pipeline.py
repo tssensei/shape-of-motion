@@ -13,12 +13,16 @@ from pathlib import Path
 import yaml
 
 from run_experiment_pipeline import (
+    PrestaticInputs,
     REPO_ROOT,
+    SourceView,
     _candidate_parameters_from_args,
     _initial_state,
     _parse_source_view,
     _pipeline_paths,
+    _prepare_controller,
     _python_argv,
+    _resolved_config_payload,
     _run_argv,
     _set_gate,
     _status_payload,
@@ -230,6 +234,48 @@ class ExperimentPipelineTest(unittest.TestCase):
             _set_gate(paths, state, None)
             saved = json.loads(paths.state_path.read_text(encoding="utf-8"))
             self.assertIsNone(saved["gate"])
+
+    def test_resolved_config_survives_json_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, config_path = _write_test_config(root)
+            config = load_config(config_path)
+            paths = _pipeline_paths(config)
+            inputs = PrestaticInputs(
+                ready_path=root / "ready.json",
+                static_dataset=root / "static_dataset",
+                source_manifest=root / "source_manifest.json",
+                reference_cameras=root / "reference_cameras.json",
+                reference_selection=root / "reference_selection.json",
+                views=(
+                    SourceView(
+                        view_id="view1",
+                        image_dir=root / "images" / "view1",
+                        mask_dir=root / "masks" / "view1",
+                        fps_hz=30.0,
+                        width=960,
+                        height=540,
+                        frame_names=("000000.png",),
+                        source_identity="source_identity",
+                        reference_frame_name="000000.png",
+                        reference_frame_stem="000000",
+                        reference_local_index=0,
+                    ),
+                ),
+            )
+
+            first_state = _prepare_controller(config, inputs, paths)
+            second_state = _prepare_controller(config, inputs, paths)
+            resolved = json.loads(
+                paths.resolved_config_path.read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(second_state, first_state)
+            self.assertEqual(
+                resolved["scientific_config"]["frequency_selection"]["mode_counts"],
+                [20, 40, 60],
+            )
+            self.assertEqual(resolved, _resolved_config_payload(config, inputs, paths))
 
     def test_viewer_and_python_commands_use_derived_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
