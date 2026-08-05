@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -96,11 +97,24 @@ from modal_surface.solver_cli import (
     RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT,
     STAGED_ANCHOR_RESIDUAL_MAX_DEFAULT,
     STAGED_ANCHOR_SVD_RATIO_DEFAULT,
+    SOFT_ELASTIC_LAPLACIAN_RELATIVE_DEFAULT,
+    SOFT_ELASTIC_LSMR_ATOL_DEFAULT,
+    SOFT_ELASTIC_LSMR_BTOL_DEFAULT,
+    SOFT_ELASTIC_LSMR_CONLIM_DEFAULT,
+    SOFT_ELASTIC_LSMR_MAXITER_DEFAULT,
+    SOFT_ELASTIC_STRETCH_RELATIVE_DEFAULT,
     add_solve_method_arguments,
+    add_soft_elastic_solver_arguments,
     add_staged_solver_arguments,
     rigid_component_manifest_parameters,
+    soft_elastic_manifest_parameters,
+    soft_elastic_solver_config,
     staged_solver_config,
     staged_solver_manifest_parameters,
+)
+from modal_surface.soft_elastic_solver import (
+    SoftElasticSolveResult,
+    solve_soft_elastic,
 )
 
 
@@ -289,9 +303,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--resume",
         action="store_true",
         help=(
-            "Reuse completed rigid-component modes in an interrupted output "
-            "directory. A mode is complete only when its compact latent and "
-            "successful diagnostics are both present and compatible."
+            "Reuse completed rigid-component or soft-elastic modes in an "
+            "interrupted output directory. A mode is complete only when its "
+            "compact latent and successful diagnostics are both present and "
+            "compatible."
         ),
     )
     parser.add_argument("--mode-indices", default="all", help="Comma-separated zero-based mode indices, or 'all'.")
@@ -316,8 +331,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--motion-fill",
         action="store_true",
         help=(
-            "Run the existing staged nullspace fill, or propagate rigid-component "
-            "seeds to every non-seed Gaussian in rigid-components mode."
+            "Run observation-preserving Gaussian motion fill after staged or "
+            "soft-elastic solving, or propagate rigid-component seeds to every "
+            "non-seed Gaussian in rigid-components mode."
         ),
     )
     parser.add_argument(
@@ -350,6 +366,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     add_solve_method_arguments(parser)
+    add_soft_elastic_solver_arguments(parser)
     add_staged_solver_arguments(parser)
 
 
@@ -359,14 +376,17 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     observation_measurement_paths = list(
         args.rigid_component_observation_measurement
     )
-    if args.solve_method == "rigid-components" and args.base_manifest is not None:
+    soft_graph_path = args.soft_elastic_graph
+    soft_topology_path = args.soft_elastic_observation_topology
+    soft_measurement_paths = list(args.soft_elastic_observation_measurement)
+    if args.solve_method != "staged" and args.base_manifest is not None:
         raise ValueError(
             "--base-manifest is currently supported only with --solve-method=staged."
         )
-    if args.resume and args.solve_method != "rigid-components":
+    if args.resume and args.solve_method not in {"rigid-components", "soft-elastic"}:
         raise ValueError(
-            "--resume is currently supported only with "
-            "--solve-method=rigid-components."
+            "--resume is supported only with --solve-method=rigid-components "
+            "or --solve-method=soft-elastic."
         )
     rcond = float(args.rigid_component_rcond)
     min_valid_views = int(args.rigid_seed_min_valid_views)
@@ -420,7 +440,61 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         raise ValueError(
             "--rigid-motion-fill-stage=single-view-components requires --motion-fill."
         )
-    if args.solve_method == "staged":
+    rigid_paths_supplied = (
+        graph_path is not None
+        or observation_topology_path is not None
+        or bool(observation_measurement_paths)
+    )
+    soft_paths_supplied = (
+        soft_graph_path is not None
+        or soft_topology_path is not None
+        or bool(soft_measurement_paths)
+    )
+    soft_values = {
+        "--soft-elastic-stretch-relative": (
+            float(args.soft_elastic_stretch_relative),
+            SOFT_ELASTIC_STRETCH_RELATIVE_DEFAULT,
+        ),
+        "--soft-elastic-laplacian-relative": (
+            float(args.soft_elastic_laplacian_relative),
+            SOFT_ELASTIC_LAPLACIAN_RELATIVE_DEFAULT,
+        ),
+        "--soft-elastic-lsmr-atol": (
+            float(args.soft_elastic_lsmr_atol),
+            SOFT_ELASTIC_LSMR_ATOL_DEFAULT,
+        ),
+        "--soft-elastic-lsmr-btol": (
+            float(args.soft_elastic_lsmr_btol),
+            SOFT_ELASTIC_LSMR_BTOL_DEFAULT,
+        ),
+        "--soft-elastic-lsmr-conlim": (
+            float(args.soft_elastic_lsmr_conlim),
+            SOFT_ELASTIC_LSMR_CONLIM_DEFAULT,
+        ),
+        "--soft-elastic-lsmr-maxiter": (
+            int(args.soft_elastic_lsmr_maxiter),
+            SOFT_ELASTIC_LSMR_MAXITER_DEFAULT,
+        ),
+    }
+    soft_custom = [
+        name for name, (value, default) in soft_values.items() if value != default
+    ]
+    if args.solve_method != "rigid-components" and rigid_paths_supplied:
+        raise ValueError(
+            "Rigid-component graph/topology/measurement arguments require "
+            "--solve-method=rigid-components."
+        )
+    if args.solve_method != "soft-elastic" and soft_paths_supplied:
+        raise ValueError(
+            "Soft-elastic graph/topology/measurement arguments require "
+            "--solve-method=soft-elastic."
+        )
+    if args.solve_method != "soft-elastic" and soft_custom:
+        raise ValueError(
+            f"Custom soft-elastic parameters require --solve-method=soft-elastic: {soft_custom}"
+        )
+
+    if args.solve_method in {"staged", "soft-elastic"}:
         if graph_path is not None:
             raise ValueError(
                 "--rigid-component-graph requires --solve-method=rigid-components."
@@ -481,6 +555,22 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
                 "A custom --rigid-single-view-ray-direction-min-fraction requires "
                 "--solve-method=rigid-components."
             )
+        if args.solve_method == "soft-elastic":
+            if soft_graph_path is None:
+                raise ValueError(
+                    "--solve-method=soft-elastic requires --soft-elastic-graph."
+                )
+            if soft_topology_path is None:
+                raise ValueError(
+                    "--solve-method=soft-elastic requires "
+                    "--soft-elastic-observation-topology."
+                )
+            if not soft_measurement_paths:
+                raise ValueError(
+                    "--solve-method=soft-elastic requires "
+                    "--soft-elastic-observation-measurement."
+                )
+            soft_elastic_solver_config(args).validate()
         return
     if graph_path is None:
         raise ValueError(
@@ -530,6 +620,14 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> Path:
     return path
 
 
+def _read_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain a JSON object.")
+    return payload
+
+
 def _load_npz_arrays(path: Path) -> dict[str, np.ndarray]:
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -550,9 +648,10 @@ def _scalar_value(
     return value.item()
 
 
-def _load_rigid_component_measurements(
+def _load_shared_observation_measurements(
     measurement_paths: list[str],
     mode_indices: list[int],
+    solver_label: str,
 ) -> dict[int, Path]:
     loaded_by_mode: dict[int, Path] = {}
     for raw_path in measurement_paths:
@@ -583,7 +682,7 @@ def _load_rigid_component_measurements(
         if mode_index in loaded_by_mode:
             previous = loaded_by_mode[mode_index]
             raise ValueError(
-                "Duplicate rigid component observation measurement for mode "
+                f"Duplicate {solver_label} observation measurement for mode "
                 f"{mode_index}: {previous} and {path}."
             )
         loaded_by_mode[mode_index] = path
@@ -593,13 +692,13 @@ def _load_rigid_component_measurements(
     extra = sorted(supplied - requested)
     if missing or extra:
         raise ValueError(
-            "Rigid component observation measurements must match requested modes exactly: "
+            f"{solver_label} observation measurements must match requested modes exactly: "
             f"missing={missing}, extra={extra}."
         )
     return loaded_by_mode
 
 
-def _validate_rigid_source_observations(
+def _validate_shared_source_observations(
     loaded_graph: LoadedObservedStructureGraph,
     observations: Mapping[str, np.ndarray],
     *,
@@ -647,7 +746,7 @@ def _validate_rigid_source_observations(
     }
     missing = sorted(required - set(observations))
     if missing:
-        raise ValueError(f"{source_path} missing rigid-solve fields: {missing}.")
+        raise ValueError(f"{source_path} missing shared-solve fields: {missing}.")
     if str(_scalar_value(observations, "point_type", source_path)) != (
         "foreground_gaussian_center"
     ):
@@ -1073,6 +1172,153 @@ def _load_resumed_rigid_mode(
     return mode_entry, motion_fill_diagnostics
 
 
+def _soft_elastic_resume_summary_path(diagnostics_path: Path) -> Path:
+    return diagnostics_path.with_suffix(".json")
+
+
+def _write_soft_elastic_resume_summary(
+    path: Path,
+    *,
+    args: argparse.Namespace,
+    mode_index: int,
+    reference_freq: float,
+    source_measurement_path: Path,
+    soft_graph_path: Path,
+    motion_fill_graph_path: Path | None,
+    mode_entry: Mapping[str, Any],
+    motion_fill_diagnostics: Mapping[str, Any] | None,
+) -> Path:
+    return _write_json_atomic(
+        path,
+        {
+            "format": "soft_elastic_mode_completion",
+            "version": 1,
+            "mode_index": int(mode_index),
+            "freq_hz": float(reference_freq),
+            "source_checkpoint": str(args.input_ckpt),
+            "source_observation_measurement": str(source_measurement_path),
+            "source_observed_graph": str(soft_graph_path),
+            "source_motion_fill_graph": (
+                str(motion_fill_graph_path)
+                if motion_fill_graph_path is not None
+                else None
+            ),
+            "solver_parameters": soft_elastic_manifest_parameters(args),
+            "mode_entry": dict(mode_entry),
+            "motion_fill_diagnostics": (
+                dict(motion_fill_diagnostics)
+                if motion_fill_diagnostics is not None
+                else None
+            ),
+        },
+    )
+
+
+def _load_resumed_soft_elastic_mode(
+    *,
+    args: argparse.Namespace,
+    prepared: PreparedObservations,
+    reference_freq: float,
+    mode_index: int,
+    source_measurement_path: Path,
+    latent_path: Path,
+    diagnostics_path: Path,
+    soft_graph_path: Path,
+    motion_fill_graph_path: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    summary_path = _soft_elastic_resume_summary_path(diagnostics_path)
+    if not diagnostics_path.is_file() or not summary_path.is_file():
+        raise ValueError(
+            f"Cannot resume {latent_path}: soft-elastic diagnostics or completion "
+            "summary are missing."
+        )
+    latent = _load_npz_arrays(latent_path)
+    diagnostics = _load_npz_arrays(diagnostics_path)
+    summary = _read_json(summary_path)
+    if summary.get("format") != "soft_elastic_mode_completion" or summary.get(
+        "version"
+    ) != 1:
+        raise ValueError(f"Cannot resume {latent_path}: completion format differs.")
+    expected_summary = {
+        "mode_index": int(mode_index),
+        "source_checkpoint": str(args.input_ckpt),
+        "source_observation_measurement": str(source_measurement_path),
+        "source_observed_graph": str(soft_graph_path),
+        "source_motion_fill_graph": (
+            str(motion_fill_graph_path)
+            if motion_fill_graph_path is not None
+            else None
+        ),
+        "solver_parameters": soft_elastic_manifest_parameters(args),
+    }
+    mismatches = {
+        key: (summary.get(key), expected)
+        for key, expected in expected_summary.items()
+        if summary.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(
+            f"Cannot resume {latent_path}: completion metadata differs: {mismatches}"
+        )
+    if not np.isclose(
+        float(summary.get("freq_hz", np.nan)),
+        reference_freq,
+        rtol=0.0,
+        atol=float(args.freq_tolerance_hz),
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: frequency differs.")
+    if str(
+        _scalar_value(diagnostics, "solver_method", diagnostics_path)
+    ) != "soft_elastic" or str(
+        _scalar_value(diagnostics, "solver_diagnostics_type", diagnostics_path)
+    ) != "soft_elastic_displacement_v1":
+        raise ValueError(
+            f"Cannot resume {latent_path}: diagnostics are not a completed "
+            "soft-elastic solve."
+        )
+    if str(
+        _scalar_value(diagnostics, "soft_elastic_graph_path", diagnostics_path)
+    ) != str(soft_graph_path):
+        raise ValueError(f"Cannot resume {latent_path}: observed graph differs.")
+    if int(_scalar_value(latent, "mode_index", latent_path)) != mode_index:
+        raise ValueError(f"Cannot resume {latent_path}: mode index differs.")
+    if str(_scalar_value(latent, "source_checkpoint", latent_path)) != str(
+        args.input_ckpt
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: checkpoint differs.")
+    expected_indices = np.arange(prepared.points.shape[0], dtype=np.int32)
+    if not np.array_equal(latent.get("gaussian_indices"), expected_indices):
+        raise ValueError(f"Cannot resume {latent_path}: Gaussian indices differ.")
+    if not np.array_equal(
+        np.asarray(latent.get("points_world"), dtype=np.float32),
+        prepared.points.astype(np.float32),
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: Gaussian centers differ.")
+    phi = np.asarray(latent.get("phi"))
+    if (
+        phi.shape != prepared.points.shape
+        or not np.iscomplexobj(phi)
+        or not np.all(np.isfinite(phi.real))
+        or not np.all(np.isfinite(phi.imag))
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: final phi is invalid.")
+    mode_entry = summary.get("mode_entry")
+    if not isinstance(mode_entry, dict):
+        raise ValueError(f"Cannot resume {latent_path}: mode entry is missing.")
+    motion_fill_diagnostics = summary.get("motion_fill_diagnostics")
+    if motion_fill_diagnostics is not None and not isinstance(
+        motion_fill_diagnostics, dict
+    ):
+        raise ValueError(
+            f"Cannot resume {latent_path}: motion-fill diagnostics are malformed."
+        )
+    return dict(mode_entry), (
+        dict(motion_fill_diagnostics)
+        if motion_fill_diagnostics is not None
+        else None
+    )
+
+
 def _validate_motion_fill_arguments(
     args: argparse.Namespace,
     num_points: int | None = None,
@@ -1395,6 +1641,71 @@ def _rigid_gaussian_latent_stats(
                 ),
                 "motion_fill": motion_fill.diagnostics,
             }
+        )
+    return stats
+
+
+def _staged_with_soft_elastic_phi(
+    staged: StagedSolveResult,
+    phi: np.ndarray,
+) -> StagedSolveResult:
+    values = np.asarray(phi, dtype=np.complex64)
+    if values.shape != staged.observable.phi.shape:
+        raise ValueError(
+            "Soft-elastic phi shape does not match staged observable field: "
+            f"{values.shape} != {staged.observable.phi.shape}"
+        )
+    prediction, obs_residual, obs_valid, point_residual, point_valid = (
+        compute_prediction_and_residuals(staged.prepared, staged.alpha, values)
+    )
+    observable = replace(
+        staged.observable,
+        phi=values.copy(),
+        phi_observable=values.copy(),
+    )
+    return replace(
+        staged,
+        observable=observable,
+        obs_pred_y=prediction,
+        obs_residual=obs_residual,
+        obs_residual_valid_mask=obs_valid,
+        point_residual=point_residual,
+        point_residual_valid_mask=point_valid,
+    )
+
+
+def _soft_elastic_latent_stats(
+    staged: StagedSolveResult,
+    soft: SoftElasticSolveResult,
+    motion_fill: GaussianMotionFillResult | None,
+    observations: Mapping[str, np.ndarray],
+    num_fg: int,
+) -> dict[str, Any]:
+    stats = _gaussian_latent_stats(staged, motion_fill, observations, num_fg)
+    stats["solver_method"] = "soft_elastic_displacement_v1"
+    stats["soft_elastic_observed_node_count"] = int(
+        soft.node_gaussian_indices.size
+    )
+    stats["soft_elastic_stretch_edge_count"] = int(soft.stretch_edge_count)
+    stats["soft_elastic_zero_length_edge_count"] = int(
+        soft.zero_length_edge_count
+    )
+    stats["soft_elastic_laplacian_node_count"] = int(
+        soft.laplacian_node_count
+    )
+    stats["soft_elastic_system_row_count"] = int(soft.system_row_count)
+    stats["soft_elastic_system_column_count"] = int(soft.system_column_count)
+    stats["soft_elastic_data_scale"] = float(soft.data_scale)
+    stats["soft_elastic_lsmr_real_iterations"] = int(
+        soft.real_solver.iterations
+    )
+    stats["soft_elastic_lsmr_imaginary_iterations"] = int(
+        soft.imaginary_solver.iterations
+    )
+    if motion_fill is not None:
+        stats["staged_solver_method"] = "soft_elastic_displacement_v1"
+        stats["effective_field_method"] = (
+            f"soft_elastic_displacement_v1+{MOTION_FILL_METHOD}"
         )
     return stats
 
@@ -1891,6 +2202,101 @@ def _motion_fill_solver_arrays(prefix: str, metadata: Any) -> dict[str, np.ndarr
     }
 
 
+def _soft_elastic_diagnostic_arrays(
+    soft: SoftElasticSolveResult,
+    graph_path: str,
+) -> dict[str, np.ndarray]:
+    axial = np.sqrt(
+        soft.edge_axial_real.astype(np.float64) ** 2
+        + soft.edge_axial_imaginary.astype(np.float64) ** 2
+    )
+    relative_axial = np.sqrt(
+        soft.edge_relative_axial_real.astype(np.float64) ** 2
+        + soft.edge_relative_axial_imaginary.astype(np.float64) ** 2
+    )
+    laplacian = np.sqrt(
+        np.sum(soft.laplacian_real.astype(np.float64) ** 2, axis=1)
+        + np.sum(soft.laplacian_imaginary.astype(np.float64) ** 2, axis=1)
+    )
+
+    def percentiles(prefix: str, values: np.ndarray) -> dict[str, np.ndarray]:
+        finite = np.asarray(values)[np.isfinite(values)]
+        if finite.size == 0:
+            summary = np.full((4,), np.nan, dtype=np.float64)
+        else:
+            summary = np.asarray(
+                [
+                    np.percentile(finite, 50),
+                    np.percentile(finite, 90),
+                    np.percentile(finite, 99),
+                    np.max(finite),
+                ],
+                dtype=np.float64,
+            )
+        return {
+            f"{prefix}_p50": np.array(summary[0], dtype=np.float64),
+            f"{prefix}_p90": np.array(summary[1], dtype=np.float64),
+            f"{prefix}_p99": np.array(summary[2], dtype=np.float64),
+            f"{prefix}_max": np.array(summary[3], dtype=np.float64),
+        }
+
+    return {
+        "solver_method": np.array("soft_elastic"),
+        "solver_diagnostics_type": np.array("soft_elastic_displacement_v1"),
+        "soft_elastic_graph_path": np.array(graph_path),
+        "soft_elastic_stretch_relative": np.array(
+            soft.config.stretch_relative, dtype=np.float64
+        ),
+        "soft_elastic_laplacian_relative": np.array(
+            soft.config.laplacian_relative, dtype=np.float64
+        ),
+        "soft_elastic_lsmr_atol": np.array(
+            soft.config.lsmr_atol, dtype=np.float64
+        ),
+        "soft_elastic_lsmr_btol": np.array(
+            soft.config.lsmr_btol, dtype=np.float64
+        ),
+        "soft_elastic_lsmr_conlim": np.array(
+            soft.config.lsmr_conlim, dtype=np.float64
+        ),
+        "soft_elastic_lsmr_maxiter": np.array(
+            soft.config.lsmr_maxiter, dtype=np.int32
+        ),
+        "soft_elastic_data_scale": np.array(soft.data_scale, dtype=np.float64),
+        "soft_elastic_system_row_count": np.array(
+            soft.system_row_count, dtype=np.int64
+        ),
+        "soft_elastic_system_column_count": np.array(
+            soft.system_column_count, dtype=np.int64
+        ),
+        "soft_elastic_supported_column_count": np.array(
+            soft.supported_column_count, dtype=np.int64
+        ),
+        "soft_elastic_observed_node_count": np.array(
+            soft.node_gaussian_indices.size, dtype=np.int64
+        ),
+        "soft_elastic_stretch_edge_count": np.array(
+            soft.stretch_edge_count, dtype=np.int64
+        ),
+        "soft_elastic_zero_length_edge_count": np.array(
+            soft.zero_length_edge_count, dtype=np.int64
+        ),
+        "soft_elastic_laplacian_node_count": np.array(
+            soft.laplacian_node_count, dtype=np.int64
+        ),
+        "soft_elastic_valid_observation_count": np.array(
+            np.count_nonzero(soft.valid_observation_mask), dtype=np.int64
+        ),
+        **percentiles("soft_elastic_axial", axial),
+        **percentiles("soft_elastic_relative_axial", relative_axial),
+        **percentiles("soft_elastic_laplacian", laplacian),
+        **_motion_fill_solver_arrays("soft_elastic_lsmr_real", soft.real_solver),
+        **_motion_fill_solver_arrays(
+            "soft_elastic_lsmr_imaginary", soft.imaginary_solver
+        ),
+    }
+
+
 def _alpha_diagnostic_arrays(
     prepared: PreparedObservations,
     alpha: AlphaSyncResult,
@@ -1938,6 +2344,8 @@ def _write_solver_diagnostics(
     motion_fill: GaussianMotionFillResult | None,
     graph: KnnGraph | None = None,
     graph_path: str | None = None,
+    soft_elastic: SoftElasticSolveResult | None = None,
+    soft_elastic_graph_path: str | None = None,
 ) -> Path:
     alpha = staged.alpha
     observable = staged.observable
@@ -1993,6 +2401,15 @@ def _write_solver_diagnostics(
         ),
         "anchor_condition_max": np.array(ANCHOR_CONDITION_MAX, dtype=np.float32),
     }
+    if soft_elastic is not None:
+        if soft_elastic_graph_path is None:
+            raise ValueError("Soft-elastic diagnostics require a graph path")
+        arrays.update(
+            _soft_elastic_diagnostic_arrays(
+                soft_elastic,
+                soft_elastic_graph_path,
+            )
+        )
     if motion_fill is not None:
         if graph is None or graph_path is None:
             raise ValueError("Motion-fill diagnostics require graph metadata.")
@@ -2087,7 +2504,9 @@ def _write_solver_diagnostics(
                     MOTION_FILL_LSMR_CONLIM, dtype=np.float64
                 ),
                 "motion_fill_source_solver_method": np.array(
-                    "staged_overlap_observable"
+                    "soft_elastic_displacement_v1"
+                    if soft_elastic is not None
+                    else "staged_overlap_observable"
                 ),
                 **_motion_fill_solver_arrays(
                     "motion_fill_lsmr_real", motion.real_solver
@@ -2702,7 +3121,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
     stage_started = perf_counter()
-    if args.solve_method == "rigid-components":
+    if args.solve_method in {"rigid-components", "soft-elastic"}:
         fg_means = load_fg_means_from_checkpoint(args.input_ckpt)
         fg_scales = None
         fg_quats = None
@@ -2767,11 +3186,36 @@ def run(args: argparse.Namespace) -> None:
         else None
     )
     rigid_observation_measurements = (
-        _load_rigid_component_measurements(
+        _load_shared_observation_measurements(
             list(args.rigid_component_observation_measurement),
             mode_indices,
+            "rigid-component",
         )
         if args.solve_method == "rigid-components"
+        else {}
+    )
+    soft_graph = (
+        load_observed_structure_graph(args.soft_elastic_graph)
+        if args.solve_method == "soft-elastic"
+        else None
+    )
+    soft_observation_topology_path = (
+        Path(args.soft_elastic_observation_topology).expanduser().resolve()
+        if args.solve_method == "soft-elastic"
+        else None
+    )
+    soft_observation_topology = (
+        load_gaussian_observation_topology(soft_observation_topology_path)
+        if soft_observation_topology_path is not None
+        else None
+    )
+    soft_observation_measurements = (
+        _load_shared_observation_measurements(
+            list(args.soft_elastic_observation_measurement),
+            mode_indices,
+            "soft-elastic",
+        )
+        if args.solve_method == "soft-elastic"
         else {}
     )
     setup_timings["frequency_and_rigid_graph_loading_seconds"] = float(
@@ -2914,7 +3358,7 @@ def run(args: argparse.Namespace) -> None:
                 rigid_observation_topology,
                 measurement,
             )
-            prepared = _validate_rigid_source_observations(
+            prepared = _validate_shared_source_observations(
                 rigid_graph,
                 observations,
                 source_path=source_measurement_path,
@@ -3272,6 +3716,187 @@ def run(args: argparse.Namespace) -> None:
             )
             mode_time_profiles[mode_name] = mode_profile
             continue
+        if args.solve_method == "soft-elastic":
+            assert soft_graph is not None
+            assert soft_observation_topology is not None
+            assert soft_observation_topology_path is not None
+            source_measurement_path = soft_observation_measurements[mode_index]
+            measurement = load_gaussian_observation_measurement(
+                source_measurement_path
+            )
+            observations = compose_gaussian_observations(
+                soft_observation_topology,
+                measurement,
+            )
+            prepared = _validate_shared_source_observations(
+                soft_graph,
+                observations,
+                source_path=source_measurement_path,
+                args=args,
+                view_config_paths=view_configs_paths,
+                modal_npz_paths=modal_npzs_paths,
+                freqs_per_view=freqs_per_view,
+                mode_index=mode_index,
+                reference_freq=reference_freq,
+                foreground_points=fg_means,
+            )
+            _print_observation_sanity(observations, fg_means.shape[0])
+            if args.resume and latent_path.is_file():
+                mode_entry, resumed_motion_fill_diagnostics = (
+                    _load_resumed_soft_elastic_mode(
+                        args=args,
+                        prepared=prepared,
+                        reference_freq=reference_freq,
+                        mode_index=mode_index,
+                        source_measurement_path=source_measurement_path,
+                        latent_path=latent_path,
+                        diagnostics_path=diagnostics_path,
+                        soft_graph_path=soft_graph.graph_path,
+                        motion_fill_graph_path=motion_fill_graph_path,
+                    )
+                )
+                modes.append(mode_entry)
+                if resumed_motion_fill_diagnostics is not None:
+                    motion_fill_mode_diagnostics[mode_name] = (
+                        resumed_motion_fill_diagnostics
+                    )
+                print(f"Resumed completed Gaussian mode {mode_name}", flush=True)
+                continue
+
+            latent_path.unlink(missing_ok=True)
+            diagnostics_path.unlink(missing_ok=True)
+            _soft_elastic_resume_summary_path(diagnostics_path).unlink(
+                missing_ok=True
+            )
+            staged = optimize_multi_view_staged(
+                observations=observations,
+                config=staged_solver_config(args),
+            )
+            if (
+                staged.config.alpha_failure == "error"
+                and staged.unidentifiable_observed_view_indices.size
+            ):
+                _write_solver_diagnostics(diagnostics_path, staged, None)
+                enforce_alpha_failure(staged, diagnostics_path)
+
+            try:
+                soft = solve_soft_elastic(
+                    staged.prepared,
+                    staged.alpha,
+                    soft_graph,
+                    soft_elastic_solver_config(args),
+                )
+            except Exception:
+                _write_solver_diagnostics(diagnostics_path, staged, None)
+                raise
+            soft_staged = _staged_with_soft_elastic_phi(staged, soft.phi)
+
+            motion_fill_result = None
+            graph_relative_path = (
+                relative_path(motion_fill_graph_path, out_dir)
+                if motion_fill_graph_path is not None
+                else None
+            )
+            if motion_fill_graph is not None:
+                assert motion_fill_graph_path is not None
+                assert graph_relative_path is not None
+                try:
+                    motion_fill_result = apply_gaussian_motion_fill(
+                        soft_staged,
+                        motion_fill_graph,
+                        graph_relative_path,
+                    )
+                except Exception:
+                    _write_solver_diagnostics(
+                        diagnostics_path,
+                        soft_staged,
+                        None,
+                        soft_elastic=soft,
+                        soft_elastic_graph_path=str(soft_graph.graph_path),
+                    )
+                    raise
+                motion_fill_mode_diagnostics[mode_name] = (
+                    motion_fill_result.diagnostics
+                )
+
+            if motion_fill_result is None:
+                final_phi = soft_staged.observable.phi
+                final_prediction = soft_staged.obs_pred_y
+                final_residual_valid = soft_staged.obs_residual_valid_mask
+            else:
+                final_phi = motion_fill_result.motion.phi
+                final_prediction = motion_fill_result.obs_pred_y
+                final_residual_valid = motion_fill_result.obs_residual_valid_mask
+            write_solve_visualizations(
+                soft_staged,
+                final_phi,
+                final_prediction,
+                final_residual_valid,
+                mode_vis_dir,
+            )
+            _write_solver_diagnostics(
+                diagnostics_path,
+                soft_staged,
+                motion_fill_result,
+                motion_fill_graph,
+                graph_relative_path,
+                soft_elastic=soft,
+                soft_elastic_graph_path=str(soft_graph.graph_path),
+            )
+            _write_compact_gaussian_latent(
+                latent_path,
+                soft_staged,
+                motion_fill_result,
+            )
+            mode_stats = _soft_elastic_latent_stats(
+                soft_staged,
+                soft,
+                motion_fill_result,
+                observations,
+                fg_means.shape[0],
+            )
+            freqs_by_view = [
+                float(freqs[mode_index]) for freqs in freqs_per_view
+            ]
+            mode_entry = {
+                "mode_index": int(mode_index),
+                "freq_hz": reference_freq,
+                "freqs_hz_by_view": freqs_by_view,
+                "label": f"{mode_index}: {reference_freq:.6f} Hz",
+                "observation_measurement_path": relative_path(
+                    source_measurement_path, out_dir
+                ),
+                "source_observation_measurement_path": str(
+                    source_measurement_path
+                ),
+                "latent_path": relative_path(latent_path, out_dir),
+                "diagnostics_path": relative_path(diagnostics_path, out_dir),
+                "soft_elastic_graph_path": relative_path(
+                    soft_graph.graph_path, out_dir
+                ),
+                "soft_elastic_graph_source_path": str(soft_graph.graph_path),
+                "vis_dir": relative_path(mode_vis_dir, out_dir),
+                "alpha_by_view": alpha_by_view_diagnostics(soft_staged),
+                "stats": mode_stats,
+            }
+            modes.append(mode_entry)
+            _write_soft_elastic_resume_summary(
+                _soft_elastic_resume_summary_path(diagnostics_path),
+                args=args,
+                mode_index=mode_index,
+                reference_freq=reference_freq,
+                source_measurement_path=source_measurement_path,
+                soft_graph_path=soft_graph.graph_path,
+                motion_fill_graph_path=motion_fill_graph_path,
+                mode_entry=mode_entry,
+                motion_fill_diagnostics=(
+                    motion_fill_result.diagnostics
+                    if motion_fill_result is not None
+                    else None
+                ),
+            )
+            print(f"Solved soft-elastic Gaussian mode {mode_name}", flush=True)
+            continue
         build_gaussian_observation_graph(
             # Staged mode loaded the static render inputs and Gaussian tree above.
             points_world=fg_means,
@@ -3382,11 +4007,12 @@ def run(args: argparse.Namespace) -> None:
         modes.append(mode_entry)
 
     global_output_started = perf_counter()
-    solver_manifest_parameters = (
-        rigid_component_manifest_parameters(args)
-        if args.solve_method == "rigid-components"
-        else staged_solver_manifest_parameters(args)
-    )
+    if args.solve_method == "rigid-components":
+        solver_manifest_parameters = rigid_component_manifest_parameters(args)
+    elif args.solve_method == "soft-elastic":
+        solver_manifest_parameters = soft_elastic_manifest_parameters(args)
+    else:
+        solver_manifest_parameters = staged_solver_manifest_parameters(args)
     manifest_parameters = {
         "mask_erode_iters": int(args.mask_erode_iters),
         "pixel_sample_stride": int(args.pixel_sample_stride),
@@ -3411,6 +4037,26 @@ def run(args: argparse.Namespace) -> None:
                 "observation_storage_policy": (
                     "shared_topology_sample_measurements_v1"
                 ),
+            }
+        )
+    elif args.solve_method == "soft-elastic":
+        assert soft_graph is not None
+        manifest_parameters.update(
+            {
+                "soft_elastic_graph_count": 1,
+                "soft_elastic_graph_policy": (
+                    "shared_observed_adjacency_not_rigid_components"
+                ),
+                "soft_elastic_observation_policy": (
+                    "shared_topology_sample_measurements_v1"
+                ),
+                "observation_storage_policy": (
+                    "shared_topology_sample_measurements_v1"
+                ),
+                "soft_elastic_graph_path": relative_path(
+                    soft_graph.graph_path, out_dir
+                ),
+                "soft_elastic_graph_source_path": str(soft_graph.graph_path),
             }
         )
     if motion_fill_graph is not None:
@@ -3443,7 +4089,7 @@ def run(args: argparse.Namespace) -> None:
                 ),
             }
         )
-        if args.solve_method == "staged":
+        if args.solve_method in {"staged", "soft-elastic"}:
             manifest_parameters.update(
                 {
                     "motion_fill_nullspace_operator_rtol": MOTION_FILL_NULLSPACE_RTOL,
@@ -3501,13 +4147,18 @@ def run(args: argparse.Namespace) -> None:
         "parameters": manifest_parameters,
         "modes": combined_modes,
     }
-    if rigid_observation_topology_path is not None:
+    observation_topology_path = (
+        rigid_observation_topology_path
+        if rigid_observation_topology_path is not None
+        else soft_observation_topology_path
+    )
+    if observation_topology_path is not None:
         manifest["observation_topology_path"] = relative_path(
-            rigid_observation_topology_path,
+            observation_topology_path,
             out_dir,
         )
         manifest["source_observation_topology_path"] = str(
-            rigid_observation_topology_path
+            observation_topology_path
         )
     if incremental_base is not None:
         manifest["incremental_extension"] = {

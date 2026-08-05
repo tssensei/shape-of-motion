@@ -106,6 +106,16 @@ class SolverConfig:
 
 
 @dataclass(frozen=True)
+class SoftElasticConfig:
+    stretch_relative: float
+    laplacian_relative: float
+    lsmr_atol: float
+    lsmr_btol: float
+    lsmr_conlim: float
+    lsmr_maxiter: int
+
+
+@dataclass(frozen=True)
 class RigidGraphConfig:
     default_candidate_id: str
     max_distance: float
@@ -175,6 +185,7 @@ class PipelineConfig:
     topology: TopologyConfig
     frequency: FrequencyConfig
     solver: SolverConfig
+    soft_elastic: SoftElasticConfig | None
     rigid_graph: RigidGraphConfig
     motion_fill: MotionFillConfig
     rendered_design: RenderedDesignConfig
@@ -269,10 +280,11 @@ def _validate_keys(
     *,
     required: set[str],
     label: str,
+    optional: set[str] | None = None,
 ) -> None:
     actual = set(value)
     missing = sorted(required - actual)
-    extra = sorted(actual - required)
+    extra = sorted(actual - (required | (optional or set())))
     if missing or extra:
         raise ValueError(
             f"{label} fields do not match the strict schema: "
@@ -360,7 +372,12 @@ def load_config(path_value: str | Path) -> PipelineConfig:
         "physics",
         "checkpoints",
     }
-    _validate_keys(payload, required=root_fields, label="config")
+    _validate_keys(
+        payload,
+        required=root_fields,
+        optional={"soft_elastic"},
+        label="config",
+    )
     if payload["format"] != CONFIG_FORMAT or payload["version"] != CONFIG_VERSION:
         raise ValueError(
             f"Config must use format={CONFIG_FORMAT!r}, version={CONFIG_VERSION}"
@@ -565,8 +582,10 @@ def load_config(path_value: str | Path) -> PipelineConfig:
         },
     )
     method = solver_value["method"]
-    if method not in {"staged", "rigid-components"}:
-        raise ValueError("solver.method must be 'staged' or 'rigid-components'")
+    if method not in {"staged", "rigid-components", "soft-elastic"}:
+        raise ValueError(
+            "solver.method must be 'staged', 'rigid-components', or 'soft-elastic'"
+        )
     alpha_model = solver_value["alpha_model"]
     if alpha_model not in {"phase", "bounded-complex"}:
         raise ValueError("solver.alpha_model must be 'phase' or 'bounded-complex'")
@@ -659,6 +678,66 @@ def load_config(path_value: str | Path) -> PipelineConfig:
     )
     if solver.alpha_gain_max < solver.alpha_gain_min:
         raise ValueError("solver.alpha_gain_max must be >= alpha_gain_min")
+
+    soft_elastic: SoftElasticConfig | None = None
+    if "soft_elastic" in payload:
+        soft_value = _section(
+            payload,
+            "soft_elastic",
+            {
+                "stretch_relative",
+                "laplacian_relative",
+                "lsmr_atol",
+                "lsmr_btol",
+                "lsmr_conlim",
+                "lsmr_maxiter",
+            },
+        )
+        soft_elastic = SoftElasticConfig(
+            stretch_relative=_parse_float(
+                soft_value["stretch_relative"],
+                "soft_elastic.stretch_relative",
+                minimum=0.0,
+            ),
+            laplacian_relative=_parse_float(
+                soft_value["laplacian_relative"],
+                "soft_elastic.laplacian_relative",
+                minimum=0.0,
+            ),
+            lsmr_atol=_parse_float(
+                soft_value["lsmr_atol"],
+                "soft_elastic.lsmr_atol",
+                minimum=0.0,
+                minimum_inclusive=False,
+            ),
+            lsmr_btol=_parse_float(
+                soft_value["lsmr_btol"],
+                "soft_elastic.lsmr_btol",
+                minimum=0.0,
+                minimum_inclusive=False,
+            ),
+            lsmr_conlim=_parse_float(
+                soft_value["lsmr_conlim"],
+                "soft_elastic.lsmr_conlim",
+                minimum=0.0,
+                minimum_inclusive=False,
+            ),
+            lsmr_maxiter=_parse_int(
+                soft_value["lsmr_maxiter"],
+                "soft_elastic.lsmr_maxiter",
+            ),
+        )
+        if (
+            soft_elastic.stretch_relative == 0.0
+            and soft_elastic.laplacian_relative == 0.0
+        ):
+            raise ValueError(
+                "soft_elastic stretch_relative and laplacian_relative cannot both be zero"
+            )
+    if method == "soft-elastic" and soft_elastic is None:
+        raise ValueError(
+            "solver.method=soft-elastic requires a soft_elastic config section"
+        )
 
     graph_value = _section(
         payload,
@@ -872,6 +951,7 @@ def load_config(path_value: str | Path) -> PipelineConfig:
         topology=topology,
         frequency=frequency,
         solver=solver,
+        soft_elastic=soft_elastic,
         rigid_graph=rigid_graph,
         motion_fill=motion_fill,
         rendered_design=rendered_design,
@@ -1329,6 +1409,11 @@ def _resolved_config_payload(
                 "mode_counts": list(config.frequency.mode_counts),
             },
             "solver": asdict(config.solver),
+            **(
+                {"soft_elastic": asdict(config.soft_elastic)}
+                if config.soft_elastic is not None
+                else {}
+            ),
             "rigid_graph": asdict(config.rigid_graph),
             "motion_fill": asdict(config.motion_fill),
             "rendered_design": asdict(config.rendered_design),
@@ -3327,7 +3412,7 @@ def _modal_solver_argv(
                 f"{config.solver.anchor_residual_max:.17g}",
             ]
         )
-    else:
+    elif config.solver.method == "rigid-components":
         if rigid_graph is None:
             raise ValueError("Rigid-component solver requires an approved graph")
         argv.extend(
@@ -3360,6 +3445,41 @@ def _modal_solver_argv(
             )
         if resume:
             argv.append("--resume")
+    else:
+        if config.soft_elastic is None:
+            raise ValueError("Soft-elastic solver config is missing")
+        if rigid_graph is None:
+            raise ValueError("Soft-elastic solver requires an approved graph")
+        argv.extend(
+            [
+                "--anchor-svd-ratio-min",
+                f"{config.solver.anchor_svd_ratio_min:.17g}",
+                "--anchor-residual-max",
+                f"{config.solver.anchor_residual_max:.17g}",
+                "--soft-elastic-graph",
+                str(rigid_graph),
+                "--soft-elastic-observation-topology",
+                str(paths.topology_path),
+                "--soft-elastic-stretch-relative",
+                f"{config.soft_elastic.stretch_relative:.17g}",
+                "--soft-elastic-laplacian-relative",
+                f"{config.soft_elastic.laplacian_relative:.17g}",
+                "--soft-elastic-lsmr-atol",
+                f"{config.soft_elastic.lsmr_atol:.17g}",
+                "--soft-elastic-lsmr-btol",
+                f"{config.soft_elastic.lsmr_btol:.17g}",
+                "--soft-elastic-lsmr-conlim",
+                f"{config.soft_elastic.lsmr_conlim:.17g}",
+                "--soft-elastic-lsmr-maxiter",
+                str(config.soft_elastic.lsmr_maxiter),
+            ]
+        )
+        for measurement in _measurement_paths(config, paths):
+            argv.extend(
+                ["--soft-elastic-observation-measurement", str(measurement)]
+            )
+        if resume:
+            argv.append("--resume")
     return argv
 
 
@@ -3387,7 +3507,7 @@ def _prepare_modal_fields(
         print(f"[{stage}] validated existing output")
         return
     existing = paths.modal_fields_dir.exists()
-    if existing and config.solver.method != "rigid-components":
+    if existing and config.solver.method not in {"rigid-components", "soft-elastic"}:
         raise FileExistsError(
             f"Staged modal output exists without receipt: {paths.modal_fields_dir}"
         )
@@ -3944,7 +4064,11 @@ def _write_final_ready(
         ),
         "original_video_reconstruction_included": False,
         "viewer_targets": ["static"]
-        + (["rigid-graph"] if config.solver.method == "rigid-components" else [])
+        + (
+            ["rigid-graph"]
+            if config.solver.method in {"rigid-components", "soft-elastic"}
+            else []
+        )
         + ["direct"]
         + (["physics"] if config.physics.enabled else []),
         "completed_at": _utc_now(),
@@ -3990,7 +4114,12 @@ def _print_graph_gate(
     paths: PipelinePaths,
     candidate_id: str,
 ) -> None:
-    print("\nPaused for manual rigid-component graph inspection.")
+    graph_role = (
+        "rigid-component topology"
+        if config.solver.method == "rigid-components"
+        else "soft-elastic adjacency"
+    )
+    print(f"\nPaused for manual observed structure graph inspection ({graph_role}).")
     print(
         "Viewer: "
         + _viewer_command_text(config, paths, "rigid-graph", candidate_id, 8890)
@@ -4053,7 +4182,7 @@ def _run_pipeline(config: PipelineConfig, *, dry_run: bool) -> None:
     )
 
     rigid_graph: Path | None = None
-    if config.solver.method == "rigid-components":
+    if config.solver.method in {"rigid-components", "soft-elastic"}:
         graph_approval = _load_graph_approval(
             config, inputs, paths, accepted_checkpoint
         )
@@ -4186,10 +4315,10 @@ def _viewer_command_text(
         argv = ["python", "-u", "run_rendering.py", "--work-dir", str(work_dir), "--port", str(port)]
         return "CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. " + " ".join(argv)
     if target == "rigid-graph":
-        if config.solver.method != "rigid-components":
+        if config.solver.method not in {"rigid-components", "soft-elastic"}:
             raise ValueError(
-                "The rigid-graph viewer is only available for solver.method="
-                "rigid-components"
+                "The observed-graph viewer is available only for "
+                "solver.method=rigid-components or soft-elastic"
             )
         if candidate_id is None:
             approval_path = _graph_approval_path(paths)
@@ -4412,8 +4541,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.command == "build-graph-candidate":
-        if config.solver.method != "rigid-components":
-            raise ValueError("Graph candidates are only used by solver.method=rigid-components")
+        if config.solver.method not in {"rigid-components", "soft-elastic"}:
+            raise ValueError(
+                "Graph candidates are used only by solver.method=rigid-components "
+                "or soft-elastic"
+            )
         inputs, paths, _state, accepted_checkpoint = _require_pipeline_prerequisites(
             config, read_only=bool(args.dry_run)
         )
@@ -4439,8 +4571,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.command == "approve-graph":
-        if config.solver.method != "rigid-components":
-            raise ValueError("Graph approval is only used by rigid-components")
+        if config.solver.method not in {"rigid-components", "soft-elastic"}:
+            raise ValueError(
+                "Graph approval is used only by rigid-components or soft-elastic"
+            )
         inputs, paths, state, accepted_checkpoint = _require_pipeline_prerequisites(config)
         candidate_id = _parse_id(args.candidate_id, "--candidate-id")
         _approve_graph(

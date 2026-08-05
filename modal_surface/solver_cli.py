@@ -6,6 +6,7 @@ import argparse
 from typing import Any
 
 from modal_surface.optimization_staged import StagedSolverConfig
+from modal_surface.soft_elastic_solver import SoftElasticSolverConfig
 
 
 STAGED_ANCHOR_SVD_RATIO_DEFAULT = 1e-2
@@ -18,16 +19,23 @@ RIGID_SEED_MAX_FINITE_DRIFT_DEFAULT = 2.0
 RIGID_MOTION_FILL_STAGE_DEFAULT = "sequential"
 RIGID_SINGLE_VIEW_OBSERVABLE_RATIO_DEFAULT = 1.0e-2
 RIGID_SINGLE_VIEW_RAY_DIRECTION_MIN_FRACTION_DEFAULT = 0.8
+SOFT_ELASTIC_STRETCH_RELATIVE_DEFAULT = 1.0e-2
+SOFT_ELASTIC_LAPLACIAN_RELATIVE_DEFAULT = 1.0e-4
+SOFT_ELASTIC_LSMR_ATOL_DEFAULT = 1.0e-6
+SOFT_ELASTIC_LSMR_BTOL_DEFAULT = 1.0e-6
+SOFT_ELASTIC_LSMR_CONLIM_DEFAULT = 1.0e8
+SOFT_ELASTIC_LSMR_MAXITER_DEFAULT = 2000
 
 
 def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--solve-method",
-        choices=["staged", "rigid-components"],
+        choices=["staged", "rigid-components", "soft-elastic"],
         default="staged",
         help=(
-            "Run the existing staged per-Gaussian solve, or consume one prebuilt "
-            "shared observed structure graph and solve one rigid twist per component."
+            "Run the existing staged per-Gaussian solve, solve one rigid twist "
+            "per observed-graph component, or solve one softly regularized "
+            "complex displacement per observed Gaussian."
         ),
     )
     parser.add_argument(
@@ -131,6 +139,63 @@ def add_solve_method_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_soft_elastic_solver_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--soft-elastic-graph",
+        type=str,
+        help=(
+            "One approved version-3 observed Gaussian structure graph whose "
+            "edges define soft elastic adjacency."
+        ),
+    )
+    parser.add_argument(
+        "--soft-elastic-observation-topology",
+        type=str,
+        help="Shared Gaussian observation topology for soft-elastic modes.",
+    )
+    parser.add_argument(
+        "--soft-elastic-observation-measurement",
+        action="append",
+        default=[],
+        help=(
+            "Lightweight Gaussian observation measurement for one requested "
+            "soft-elastic mode. Repeat once per mode."
+        ),
+    )
+    parser.add_argument(
+        "--soft-elastic-stretch-relative",
+        type=float,
+        default=SOFT_ELASTIC_STRETCH_RELATIVE_DEFAULT,
+        help="Axial-stretch weight relative to the median data normal scale.",
+    )
+    parser.add_argument(
+        "--soft-elastic-laplacian-relative",
+        type=float,
+        default=SOFT_ELASTIC_LAPLACIAN_RELATIVE_DEFAULT,
+        help="Graph-Laplacian weight relative to the median data normal scale.",
+    )
+    parser.add_argument(
+        "--soft-elastic-lsmr-atol",
+        type=float,
+        default=SOFT_ELASTIC_LSMR_ATOL_DEFAULT,
+    )
+    parser.add_argument(
+        "--soft-elastic-lsmr-btol",
+        type=float,
+        default=SOFT_ELASTIC_LSMR_BTOL_DEFAULT,
+    )
+    parser.add_argument(
+        "--soft-elastic-lsmr-conlim",
+        type=float,
+        default=SOFT_ELASTIC_LSMR_CONLIM_DEFAULT,
+    )
+    parser.add_argument(
+        "--soft-elastic-lsmr-maxiter",
+        type=int,
+        default=SOFT_ELASTIC_LSMR_MAXITER_DEFAULT,
+    )
+
+
 def add_staged_solver_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--alpha-model",
@@ -195,6 +260,47 @@ def staged_solver_config(args: argparse.Namespace) -> StagedSolverConfig:
 def staged_solver_manifest_parameters(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "solver": "staged",
+        "alpha_solver_model": str(args.alpha_model),
+        "alpha_gain_min": float(args.alpha_gain_min),
+        "alpha_gain_max": float(args.alpha_gain_max),
+        "alpha_min_shared_points": int(args.alpha_min_shared_points),
+        "alpha_rank_ratio_min": float(args.alpha_rank_ratio_min),
+        "alpha_info_ratio_min": float(args.alpha_info_ratio_min),
+        "alpha_failure": str(args.alpha_failure),
+        "anchor_svd_ratio_min": float(args.anchor_svd_ratio_min),
+        "anchor_residual_max": float(args.anchor_residual_max),
+    }
+
+
+def soft_elastic_solver_config(args: argparse.Namespace) -> SoftElasticSolverConfig:
+    return SoftElasticSolverConfig(
+        stretch_relative=float(args.soft_elastic_stretch_relative),
+        laplacian_relative=float(args.soft_elastic_laplacian_relative),
+        lsmr_atol=float(args.soft_elastic_lsmr_atol),
+        lsmr_btol=float(args.soft_elastic_lsmr_btol),
+        lsmr_conlim=float(args.soft_elastic_lsmr_conlim),
+        lsmr_maxiter=int(args.soft_elastic_lsmr_maxiter),
+    )
+
+
+def soft_elastic_manifest_parameters(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "solver": "soft_elastic",
+        "solver_method": "soft_elastic_displacement_v1",
+        "soft_elastic_data_normalization": "median_positive_point_information",
+        "soft_elastic_stretch_model": "first_order_edge_axial_displacement",
+        "soft_elastic_laplacian_model": "weighted_random_walk_vector_laplacian",
+        "soft_elastic_stretch_relative": float(
+            args.soft_elastic_stretch_relative
+        ),
+        "soft_elastic_laplacian_relative": float(
+            args.soft_elastic_laplacian_relative
+        ),
+        "soft_elastic_lsmr_atol": float(args.soft_elastic_lsmr_atol),
+        "soft_elastic_lsmr_btol": float(args.soft_elastic_lsmr_btol),
+        "soft_elastic_lsmr_conlim": float(args.soft_elastic_lsmr_conlim),
+        "soft_elastic_lsmr_maxiter": int(args.soft_elastic_lsmr_maxiter),
+        "soft_elastic_graph_role": "observed_adjacency_not_rigid_components",
         "alpha_solver_model": str(args.alpha_model),
         "alpha_gain_min": float(args.alpha_gain_min),
         "alpha_gain_max": float(args.alpha_gain_max),

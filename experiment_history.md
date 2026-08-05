@@ -1029,3 +1029,34 @@ Date: 2026-08-05
   and its achieved registration ratio are pending; the existing sparse-sweep
   static checkpoint remains available for comparison, while this dataset must
   start a new static artifact rather than resume that checkpoint.
+
+### Completed registration and static model
+
+- The 10 fps registration run subsequently completed successfully and its
+  packaged dataset was used for a new static foreground/background model at
+  `/home/zs292/data_formal/curtain3_2view_v1/static_3dgs/sweep_rgbmask_10fps_v1`.
+- Viser inspection found the denser-pose model substantially better. It was
+  extended by another 60 epochs to a total target of 120 epochs.
+- The dense-pixel modal controller config is
+  `/home/zs292/data_formal/curtain3_2view_v1/shared/inputs/modal_pipeline_k20_10fps_dense_v1.yaml`;
+  it uses `pixel_sample_stride=1` and is awaiting or passing the manual static
+  checkpoint approval before topology and observed-graph construction.
+
+## `curtain3_soft_elastic_experimental_solver`
+
+Date: 2026-08-05
+
+### Intended comparison
+
+- A third `soft-elastic` solver is now available for the curtain experiment.
+  It uses the same approved color/depth observed structure graph and modal
+  measurements as rigid-components, but graph connectivity supplies soft
+  axial-stretch and weak vector-Laplacian penalties instead of assigning one
+  shared SE(3) transform to each connected component.
+- The initial comparison settings are `stretch_relative=0.01`,
+  `laplacian_relative=0.0001`, LSMR tolerances `1e-6`, condition limit `1e8`,
+  and at most 2,000 iterations. Existing full-Gaussian motion fill remains
+  enabled after the observed-node solve.
+- No soft-elastic cluster artifact has been produced yet. The run must use a
+  new pipeline and solver artifact ID so the completed rigid/staged outputs
+  remain immutable and directly comparable.

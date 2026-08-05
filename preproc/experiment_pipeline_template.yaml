@@ -48,6 +48,7 @@ frequency_selection:
 
 solver:
   artifact_id: rigid_rgbdepth_v3_sequential_k60_bounded_complex_v1
+  # Choices: staged, rigid-components, soft-elastic.
   method: rigid-components
   freq_tolerance_hz: 0.1
   alpha_model: bounded-complex
@@ -66,6 +67,15 @@ solver:
   rigid_seed_max_finite_drift: 2.0
   rigid_single_view_observable_ratio: 0.01
   rigid_single_view_ray_direction_min_fraction: 0.8
+
+soft_elastic:
+  # Used only when solver.method is soft-elastic.
+  stretch_relative: 0.01
+  laplacian_relative: 0.0001
+  lsmr_atol: 1.0e-6
+  lsmr_btol: 1.0e-6
+  lsmr_conlim: 1.0e8
+  lsmr_maxiter: 2000
 
 rigid_graph:
   default_candidate_id: knn8_maxdist0p008_v1

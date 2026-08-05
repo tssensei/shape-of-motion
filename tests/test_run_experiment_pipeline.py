@@ -18,6 +18,7 @@ from run_experiment_pipeline import (
     SourceView,
     _candidate_parameters_from_args,
     _initial_state,
+    _modal_solver_argv,
     _parse_source_view,
     _pipeline_paths,
     _prepare_controller,
@@ -97,6 +98,89 @@ class ExperimentPipelineTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "strict schema"):
                 load_config(config_path)
+
+    def test_soft_elastic_is_a_third_solver_with_explicit_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload, config_path = _write_test_config(root)
+            solver = payload["solver"]
+            assert isinstance(solver, dict)
+            solver["method"] = "soft-elastic"
+            solver["artifact_id"] = "soft_elastic_k60_v1"
+            config_path.write_text(
+                yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.solver.method, "soft-elastic")
+            self.assertIsNotNone(config.soft_elastic)
+            assert config.soft_elastic is not None
+            self.assertEqual(config.soft_elastic.stretch_relative, 0.01)
+            self.assertEqual(config.soft_elastic.laplacian_relative, 0.0001)
+
+    def test_legacy_config_without_soft_elastic_section_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload, config_path = _write_test_config(root)
+            payload.pop("soft_elastic")
+            config_path.write_text(
+                yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+            )
+
+            config = load_config(config_path)
+
+            self.assertIsNone(config.soft_elastic)
+
+    def test_soft_elastic_modal_command_uses_shared_graph_and_measurements(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload, config_path = _write_test_config(root)
+            solver = payload["solver"]
+            assert isinstance(solver, dict)
+            solver["method"] = "soft-elastic"
+            config_path.write_text(
+                yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+            )
+            config = load_config(config_path)
+            paths = _pipeline_paths(config)
+            view = SourceView(
+                view_id="view1",
+                image_dir=root / "images" / "view1",
+                mask_dir=root / "masks" / "view1",
+                fps_hz=30.0,
+                width=960,
+                height=540,
+                frame_names=("000000.png",),
+                source_identity="source_identity",
+                reference_frame_name="000000.png",
+                reference_frame_stem="000000",
+                reference_local_index=0,
+            )
+            inputs = PrestaticInputs(
+                ready_path=root / "ready.json",
+                static_dataset=root / "static_dataset",
+                source_manifest=root / "source_manifest.json",
+                reference_cameras=root / "reference_cameras.json",
+                reference_selection=root / "reference_selection.json",
+                views=(view,),
+            )
+            graph = root / "observed_structure_graph.npz"
+            argv = _modal_solver_argv(
+                config,
+                inputs,
+                paths,
+                root / "last.ckpt",
+                graph,
+                resume=True,
+            )
+
+            self.assertIn("--soft-elastic-graph", argv)
+            self.assertEqual(argv[argv.index("--soft-elastic-graph") + 1], str(graph))
+            self.assertIn("--soft-elastic-observation-measurement", argv)
+            self.assertIn("--soft-elastic-stretch-relative", argv)
+            self.assertIn("--resume", argv)
+            self.assertNotIn("--rigid-component-graph", argv)
 
     def test_reference_view_accepts_an_explicit_non_middle_frame(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
