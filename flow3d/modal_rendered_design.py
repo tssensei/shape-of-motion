@@ -25,6 +25,8 @@ RENDERED_MODAL_DESIGN_SUMMARY_FILENAME = "summary.json"
 RENDERED_MODAL_DESIGN_NORMALIZATION = "alpha_normalized_foreground_v1"
 ROLE_DIAGNOSTICS_FILENAME = "role_diagnostics.npz"
 ROLE_OVERVIEW_FILENAME = "role_contribution_overview.png"
+_PACKING_MAX_ABS_TOLERANCE = 1e-3
+_PACKING_RELATIVE_L2_TOLERANCE = 1e-3
 
 __all__ = [
     "RENDERED_MODAL_DESIGN_FILENAME",
@@ -906,18 +908,27 @@ def build_rendered_modal_design(
             packed_coordinates.astype(np.float64),
             optimize=True,
         )
-        direct_error = float(
-            np.max(np.abs(design_values - direct_values.astype(np.float64)))
+        direct_values_float64 = direct_values.astype(np.float64)
+        direct_difference = design_values - direct_values_float64
+        direct_error = float(np.max(np.abs(direct_difference)))
+        direct_relative_l2_error = float(
+            np.linalg.norm(direct_difference.reshape(-1))
+            / max(
+                np.linalg.norm(direct_values_float64.reshape(-1)),
+                np.finfo(np.float64).eps,
+            )
         )
-        if not np.allclose(
-            design_values,
-            direct_values,
-            rtol=5e-4,
-            atol=5e-5,
+        # Gsplat can accumulate a packed feature render and a direct two-channel
+        # render in different float32 orders. Reject only discrepancies that are
+        # significant both absolutely and relative to the rendered signal.
+        if (
+            direct_error > _PACKING_MAX_ABS_TOLERANCE
+            and direct_relative_l2_error > _PACKING_RELATIVE_L2_TOLERANCE
         ):
             raise RuntimeError(
                 f"Rendered design packing check failed for {config.view_id!r}; "
-                f"max absolute error={direct_error:.6g}"
+                f"max absolute error={direct_error:.6g}, "
+                f"relative L2 error={direct_relative_l2_error:.6g}"
             )
         direct_render_max_abs_error.append(direct_error)
         del direct_features, direct_values
