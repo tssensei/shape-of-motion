@@ -1,0 +1,21 @@
+# Copy this file to:
+# /home/zs292/data_formal/<scene_id>/shared/inputs/prestatic_registration_v1.yaml
+#
+# The registration controller derives a denser sweep training dataset from an
+# immutable completed pre-static run. It does not modify the base COLMAP model,
+# database, packaged dataset, or source image/mask sequences.
+format: som_prestatic_registration
+version: 1
+
+scene_id: example_3view_v1
+scene_root: /home/zs292/data_formal/example_3view_v1
+run_id: joint_colmap_frames_10fps_v1
+base_prestatic_run_id: joint_colmap_frames_v1
+
+target_sweep_fps_hz: 10
+min_target_registration_ratio: 0.95
+seed_neighbors_per_side: 2
+target_neighbor_radius: 2
+
+# An absolute executable path is allowed when COLMAP is in another conda env.
+colmap_command: colmap

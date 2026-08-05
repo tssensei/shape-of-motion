@@ -998,3 +998,34 @@ Date: 2026-08-05
 - This was a controller serialization comparison bug rather than scientific
   config drift. The existing checkpoint remains valid and resumable after
   canonicalizing the recomputed field to the same JSON-list representation.
+
+## `curtain3_joint_colmap_frames_10fps_v1`
+
+Date: 2026-08-05
+
+### Inputs and derived output
+
+- Immutable seed pre-static run:
+  `/home/zs292/data_formal/curtain3_2view_v1/shared/preprocessing/joint_colmap_frames_v1`.
+- Canonical curtain sweep contains 1,467 frames at 30 fps. The strict 10 fps
+  target grid contains 489 frames; 49 target frames reuse the exact 3 fps seed
+  image/database identities and 440 frames require new feature extraction.
+- Intended derived run:
+  `/home/zs292/data_formal/curtain3_2view_v1/shared/preprocessing/joint_colmap_frames_10fps_v1`.
+
+### Registration change
+
+- The denser run snapshots the seed SQLite database and sparse model without
+  modifying the completed 3 fps run. New frames use the existing sweep camera
+  ID and explicit temporal matches to successfully registered seed neighbours,
+  followed by image registration, point triangulation, and intrinsics-frozen
+  bundle adjustment.
+- Only successfully registered frames from the strict 10 fps target grid enter
+  the static training image/mask package. Extra 3 fps seed images may remain in
+  the sparse model to support geometry but are excluded from training-frame
+  counts and from the camera subset used to recompute scene normalization.
+- The derived output retains the existing version-1 READY, source-manifest,
+  fixed-reference-camera, and static COLMAP dataset contracts. The cluster run
+  and its achieved registration ratio are pending; the existing sparse-sweep
+  static checkpoint remains available for comparison, while this dataset must
+  start a new static artifact rather than resume that checkpoint.
