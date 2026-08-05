@@ -392,6 +392,7 @@ class _ViewState:
     raw_power: np.ndarray
     reconstructed_modes: np.ndarray
     reconstructed_power: np.ndarray
+    alphas: np.ndarray | None
     alpha_identifiable: np.ndarray | None
     frequency_limits: tuple[float, float]
 
@@ -707,6 +708,7 @@ class SpectrumComparisonController:
         self.raw_power = state.raw_power
         self.reconstructed_modes = state.reconstructed_modes
         self.reconstructed_power = state.reconstructed_power
+        self.alphas = state.alphas
         self.alpha_identifiable = state.alpha_identifiable
         self.frequency_limits = state.frequency_limits
         self.raw_mode = np.empty((self.pixels.shape[0], 2), dtype=np.complex64)
@@ -884,6 +886,7 @@ class SpectrumComparisonController:
             raw_power=raw_power,
             reconstructed_modes=reconstructed_modes,
             reconstructed_power=reconstructed_power,
+            alphas=alphas,
             alpha_identifiable=alpha_identifiable,
             frequency_limits=frequency_limits,
         )
@@ -1147,6 +1150,7 @@ class SpectrumComparisonController:
                 "Unknown modal image amplitude normalization: "
                 f"{self.amplitude_normalization!r}"
             )
+        self.modal_image_magnitude_hi = float(magnitude_hi)
         self.raw_modal_image = self._render_modal_image(
             raw_values,
             magnitude_hi,
@@ -1248,6 +1252,38 @@ class SpectrumComparisonController:
         self.component_index = 0 if component == "U" else 1
         self._render_all()
         return self.outputs()
+
+    def current_modal_phase_display_context(
+        self,
+        mode_index: int,
+        component_index: int,
+        amplitude_normalization: str,
+    ) -> tuple[str, complex, bool, float]:
+        if int(mode_index) != int(self.reconstructed_index):
+            raise ValueError(
+                "Main Viewer modal mode is not synchronized with the spectrum panel"
+            )
+        if int(component_index) != int(self.component_index):
+            raise ValueError(
+                "Main Viewer modal component is not synchronized with the spectrum panel"
+            )
+        if str(amplitude_normalization) != self.amplitude_normalization:
+            raise ValueError(
+                "Main Viewer amplitude normalization is not synchronized with the "
+                "spectrum panel"
+            )
+        if self.alphas is None or self.alpha_identifiable is None:
+            raise ValueError(
+                "Gaussian phase display alignment requires manifest view alphas"
+            )
+        alpha = complex(self.alphas[self.reconstructed_index])
+        identifiable = bool(self.alpha_identifiable[self.reconstructed_index])
+        magnitude_hi = float(self.modal_image_magnitude_hi)
+        if not np.isfinite(alpha.real) or not np.isfinite(alpha.imag):
+            raise ValueError("Selected modal view alpha is non-finite")
+        if not np.isfinite(magnitude_hi) or magnitude_hi <= 0.0:
+            raise ValueError("Selected modal image magnitude scale must be positive")
+        return self.view_id, alpha, identifiable, magnitude_hi
 
     def select_amplitude_normalization(self, normalization: str):
         if normalization not in ("per mode", "entire spectrum"):

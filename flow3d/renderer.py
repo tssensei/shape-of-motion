@@ -131,6 +131,40 @@ class Renderer:
                         "Modal spectrum manifest frequencies do not match the "
                         "checkpoint modal frequencies"
                     )
+                spectrum_view_ids = tuple(
+                    str(view_id) for view_id in modal_spectrum_controller.available_view_ids
+                )
+                for view_id in spectrum_view_ids:
+                    matching_cameras = tuple(
+                        camera for camera in viewer_cameras if camera.label == view_id
+                    )
+                    if len(matching_cameras) != 1:
+                        raise ValueError(
+                            f"Modal spectrum view {view_id!r} must match exactly one "
+                            f"Viewer camera; found {len(matching_cameras)}"
+                        )
+                    view_index = list(
+                        modal_spectrum_controller.manifest.topology.view_ids
+                    ).index(view_id)
+                    expected_size = (
+                        int(
+                            modal_spectrum_controller.manifest.topology.view_image_width[
+                                view_index
+                            ]
+                        ),
+                        int(
+                            modal_spectrum_controller.manifest.topology.view_image_height[
+                                view_index
+                            ]
+                        ),
+                    )
+                    camera = matching_cameras[0]
+                    if (camera.image_width, camera.image_height) != expected_size:
+                        raise ValueError(
+                            f"Modal spectrum view {view_id!r} size {expected_size} does "
+                            "not match its Viewer camera size "
+                            f"{(camera.image_width, camera.image_height)}"
+                        )
             server = get_server(port=port)
             self.viewer = DynamicViewer(
                 server,
@@ -373,6 +407,10 @@ class Renderer:
                     c2w=c2w.astype(np.float64),
                     fov=fov,
                     aspect=aspect,
+                    K=view_cfg.K.astype(np.float64),
+                    world_to_camera=view_cfg.world_to_camera.astype(np.float64),
+                    image_width=int(view_cfg.image_width),
+                    image_height=int(view_cfg.image_height),
                 )
             )
         return tuple(viewer_cameras)
@@ -501,6 +539,9 @@ class Renderer:
         amplitude_normalization: str,
         w2c: torch.Tensor,
         K: torch.Tensor,
+        display_alpha: complex = 1.0 + 0.0j,
+        display_identifiable: bool = True,
+        display_magnitude_hi: float | None = None,
     ) -> torch.Tensor:
         if component_index not in (0, 1):
             raise ValueError(
@@ -512,6 +553,18 @@ class Renderer:
                 f"'entire spectrum', got {amplitude_normalization!r}"
             )
         means = self.model.fg.params["means"]
+        if not display_identifiable:
+            return torch.zeros(
+                (means.shape[0], 3),
+                device=means.device,
+                dtype=means.dtype,
+            )
+        if not np.isfinite(display_alpha.real) or not np.isfinite(display_alpha.imag):
+            raise ValueError("Modal phase display alpha must be finite")
+        if display_magnitude_hi is not None and (
+            not np.isfinite(display_magnitude_hi) or display_magnitude_hi <= 0.0
+        ):
+            raise ValueError("Modal phase display magnitude scale must be positive")
         R = w2c[:3, :3]
         t = w2c[:3, 3]
         points_cam = means @ R.T + t[None]
@@ -543,15 +596,37 @@ class Renderer:
         projected_imag = torch.einsum("nij,nj->ni", J, phi_imag)
         real = projected_real[:, component_index]
         imag = projected_imag[:, component_index]
+        alpha_real = torch.as_tensor(
+            display_alpha.real,
+            device=real.device,
+            dtype=real.dtype,
+        )
+        alpha_imag = torch.as_tensor(
+            display_alpha.imag,
+            device=real.device,
+            dtype=real.dtype,
+        )
+        scaled_real = alpha_real * real - alpha_imag * imag
+        scaled_imag = alpha_imag * real + alpha_real * imag
+        real = scaled_real
+        imag = scaled_imag
         amp = torch.sqrt(real.square() + imag.square())
         phase = torch.atan2(imag, real)
         finite = torch.isfinite(amp) & torch.isfinite(phase)
-        hi = None
-        if amplitude_normalization == "per mode":
+        hi = (
+            None
+            if display_magnitude_hi is None
+            else torch.as_tensor(
+                display_magnitude_hi,
+                device=amp.device,
+                dtype=amp.dtype,
+            )
+        )
+        if hi is None and amplitude_normalization == "per mode":
             finite_amp = amp[finite]
             if finite_amp.numel() > 0:
                 hi = torch.quantile(finite_amp, 0.95).clamp_min(1.0e-8)
-        else:
+        elif hi is None:
             J_component = J[:, component_index]
             for spectrum_mode_index in range(effective_real.shape[0]):
                 if spectrum_mode_index == mode_index:
@@ -635,12 +710,41 @@ class Renderer:
                     f"Gaussian phase mode index {phase_mode_index} is outside "
                     f"[0, {self.model.modal_phi_real.shape[0]})"
                 )
+            display_context = self.viewer.current_gaussian_phase_display_context(
+                phase_mode_index,
+                component_index,
+                amplitude_normalization,
+            )
+            display_alpha = 1.0 + 0.0j
+            display_identifiable = True
+            display_magnitude_hi = None
+            if display_context is not None:
+                (
+                    display_w2c,
+                    display_K,
+                    display_alpha,
+                    display_identifiable,
+                    display_magnitude_hi,
+                ) = display_context
+                w2c = torch.as_tensor(
+                    display_w2c,
+                    device=w2c.device,
+                    dtype=w2c.dtype,
+                )
+                K = torch.as_tensor(
+                    display_K,
+                    device=K.device,
+                    dtype=K.dtype,
+                )
             fg_colors = self._modal_phase_colors(
                 phase_mode_index,
                 component_index,
                 amplitude_normalization,
                 w2c,
                 K,
+                display_alpha=display_alpha,
+                display_identifiable=display_identifiable,
+                display_magnitude_hi=display_magnitude_hi,
             )
         elif color_mode == "obs count":
             if not self.model.has_modal_obs_count:

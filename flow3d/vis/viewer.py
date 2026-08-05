@@ -28,6 +28,10 @@ class ViewerCamera:
     c2w: np.ndarray
     fov: float
     aspect: float
+    K: np.ndarray
+    world_to_camera: np.ndarray
+    image_width: int
+    image_height: int
 
 
 @dataclass(frozen=True)
@@ -273,6 +277,7 @@ class DynamicViewer(Viewer):
                 self._modal_spectrum_panel = ModalSpectrumPanel(
                     server,
                     self.modal_spectrum_controller,
+                    on_view_selected=self._on_modal_spectrum_view_selected,
                     on_mode_selected=self._set_selected_modal_mode,
                     on_component_selected=self._set_selected_modal_component,
                     on_normalization_selected=(
@@ -287,6 +292,12 @@ class DynamicViewer(Viewer):
                 width=720.0,
                 height=800.0,
             )
+
+    def _on_modal_spectrum_view_selected(self, view_id: str) -> None:
+        controller = self.modal_spectrum_controller
+        if controller is None or controller.view_id != str(view_id):
+            raise ValueError("Spectrum panel view selection did not update its controller")
+        self.rerender(None)
 
     def _active_playback_group(self) -> ViewerPlaybackGroup | None:
         if self._active_playback_group_label is None:
@@ -722,6 +733,46 @@ class DynamicViewer(Viewer):
                 f"Unknown Gaussian phase amplitude normalization: {normalization}"
             )
         return normalization
+
+    def current_gaussian_phase_display_context(
+        self,
+        mode_index: int,
+        component_index: int,
+        amplitude_normalization: str,
+    ) -> tuple[np.ndarray, np.ndarray, complex, bool, float] | None:
+        controller = self.modal_spectrum_controller
+        if controller is None:
+            return None
+        view_id, alpha, identifiable, magnitude_hi = (
+            controller.current_modal_phase_display_context(
+                mode_index,
+                component_index,
+                amplitude_normalization,
+            )
+        )
+        matching_cameras = tuple(
+            camera for camera in self.viewer_cameras if camera.label == view_id
+        )
+        if len(matching_cameras) != 1:
+            raise ValueError(
+                f"Spectrum view {view_id!r} must match exactly one Viewer camera; "
+                f"found {len(matching_cameras)}"
+            )
+        camera = matching_cameras[0]
+        cache_height, cache_width = controller.cache.reference_frame.shape[:2]
+        if (camera.image_width, camera.image_height) != (cache_width, cache_height):
+            raise ValueError(
+                f"Spectrum view {view_id!r} image size {(cache_width, cache_height)} "
+                "does not match its calibrated Viewer camera size "
+                f"{(camera.image_width, camera.image_height)}"
+            )
+        return (
+            camera.world_to_camera,
+            camera.K,
+            alpha,
+            identifiable,
+            magnitude_hi,
+        )
 
     def update_modal_anchors(self, points: np.ndarray, update_key) -> None:
         if not self.wants_modal_anchors():

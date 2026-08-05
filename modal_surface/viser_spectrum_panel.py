@@ -56,6 +56,7 @@ class ModalSpectrumPanel:
         self,
         server: viser.ViserServer,
         controller: SpectrumComparisonController,
+        on_view_selected: Callable[[str], None],
         on_mode_selected: Callable[[int], None],
         on_component_selected: Callable[[str], None],
         on_normalization_selected: Callable[[str], None],
@@ -64,6 +65,7 @@ class ModalSpectrumPanel:
     ) -> None:
         self.server = server
         self.controller = controller
+        self._on_view_selected = on_view_selected
         self._on_mode_selected = on_mode_selected
         self._on_component_selected = on_component_selected
         self._on_normalization_selected = on_normalization_selected
@@ -170,6 +172,7 @@ class ModalSpectrumPanel:
             try:
                 self.controller.select_view(str(self.view.value))
                 self._refresh()
+                self._on_view_selected(str(self.view.value))
             finally:
                 self._updating = False
 
