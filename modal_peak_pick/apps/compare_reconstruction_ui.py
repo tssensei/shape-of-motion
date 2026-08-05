@@ -67,7 +67,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--port", type=int, default=8894, help="Gradio server port.")
 
 
-def _view_alphas(manifest_path: Path, manifest: Any, view_index: int) -> np.ndarray:
+def _view_alphas(
+    manifest_path: Path,
+    manifest: Any,
+    view_index: int,
+) -> tuple[np.ndarray, np.ndarray]:
     with manifest_path.open("r", encoding="utf-8") as file:
         payload = json.load(file)
     modes = payload.get("modes")
@@ -76,6 +80,7 @@ def _view_alphas(manifest_path: Path, manifest: Any, view_index: int) -> np.ndar
 
     view_id = manifest.topology.view_ids[view_index]
     alphas = np.empty((len(modes),), dtype=np.complex64)
+    identifiable = np.empty((len(modes),), dtype=bool)
     for slot, mode in enumerate(modes):
         if not isinstance(mode, dict):
             raise ValueError(f"{manifest_path} mode entries must be objects")
@@ -91,15 +96,18 @@ def _view_alphas(manifest_path: Path, manifest: Any, view_index: int) -> np.ndar
             raise ValueError(
                 f"{manifest_path} mode {slot} alpha order does not match view {view_id!r}"
             )
-        if entry.get("identifiable") is not True:
+        identifiable_value = entry.get("identifiable")
+        if not isinstance(identifiable_value, bool):
             raise ValueError(
-                f"{manifest_path} mode {slot} is not alpha-identifiable in view {view_id!r}"
+                f"{manifest_path} mode {slot} has invalid alpha-identifiable state "
+                f"in view {view_id!r}"
             )
         alpha = complex(float(entry.get("real", np.nan)), float(entry.get("imag", np.nan)))
         if not np.isfinite(alpha.real) or not np.isfinite(alpha.imag):
             raise ValueError(f"{manifest_path} mode {slot} has a non-finite view alpha")
         alphas[slot] = alpha
-    return alphas
+        identifiable[slot] = identifiable_value
+    return alphas, identifiable
 
 
 def _candidate_power_spectrum(
@@ -177,12 +185,19 @@ def _project_reconstructed_modes(
     starts: np.ndarray,
     sorted_weights: np.ndarray,
     alphas: np.ndarray,
+    alpha_identifiable: np.ndarray,
 ) -> np.ndarray:
     topology = manifest.topology
+    identifiable = np.asarray(alpha_identifiable)
+    if identifiable.dtype != np.bool_ or identifiable.shape != alphas.shape:
+        raise ValueError("Alpha-identifiable mask must be boolean and match alphas")
     point_indices = topology.obs_point_index[sorted_rows]
     jacobians = topology.obs_J[sorted_rows]
     modes = np.empty((manifest.frequencies_hz.size, starts.size, 2), dtype=np.complex64)
     for slot in range(manifest.frequencies_hz.size):
+        if not bool(identifiable[slot]):
+            modes[slot] = 0.0
+            continue
         point_phi = manifest.phi[slot, point_indices].astype(np.complex128)
         projected = np.einsum("oij,oj->oi", jacobians, point_phi, optimize=True)
         projected *= sorted_weights[:, None]
@@ -334,14 +349,19 @@ def _view_source_identity(
     view_id: str,
     view_index: int,
     alphas: np.ndarray | None,
+    alpha_identifiable: np.ndarray | None,
 ) -> str:
     hasher = hashlib.sha256()
     hasher.update(projection_identity.encode("ascii"))
     hasher.update(_flow_cache_identity(cache).encode("ascii"))
     hasher.update(view_id.encode("utf-8"))
     hasher.update(str(view_index).encode("ascii"))
+    if (alphas is None) != (alpha_identifiable is None):
+        raise ValueError("View alpha values and identifiability must be provided together")
     if alphas is not None:
         _hash_array(hasher, "alphas", alphas)
+        assert alpha_identifiable is not None
+        _hash_array(hasher, "alpha_identifiable", alpha_identifiable)
     return hasher.hexdigest()
 
 
@@ -372,6 +392,7 @@ class _ViewState:
     raw_power: np.ndarray
     reconstructed_modes: np.ndarray
     reconstructed_power: np.ndarray
+    alpha_identifiable: np.ndarray | None
     frequency_limits: tuple[float, float]
 
 
@@ -686,6 +707,7 @@ class SpectrumComparisonController:
         self.raw_power = state.raw_power
         self.reconstructed_modes = state.reconstructed_modes
         self.reconstructed_power = state.reconstructed_power
+        self.alpha_identifiable = state.alpha_identifiable
         self.frequency_limits = state.frequency_limits
         self.raw_mode = np.empty((self.pixels.shape[0], 2), dtype=np.complex64)
         self._set_frequencies(self.raw_frequency_hz, self.reconstructed_index)
@@ -708,7 +730,7 @@ class SpectrumComparisonController:
                 int(self.manifest.topology.view_image_height[view_index]),
                 int(self.manifest.topology.view_image_width[view_index]),
             )
-            alphas = _view_alphas(
+            alphas, alpha_identifiable = _view_alphas(
                 self.manifest.path,
                 self.manifest,
                 view_index,
@@ -720,6 +742,7 @@ class SpectrumComparisonController:
                 int(self.rendered_design.view_image_width[view_index]),
             )
             alphas = None
+            alpha_identifiable = None
         if cache.flow_u.shape[1:] != expected_shape:
             raise ValueError(
                 f"Cache shape {cache.flow_u.shape[1:]} does not match "
@@ -741,6 +764,7 @@ class SpectrumComparisonController:
                 view_id,
                 view_index,
                 alphas,
+                alpha_identifiable,
             )
             view_digest = hashlib.sha256(view_id.encode("utf-8")).hexdigest()[:12]
             disk_directory = (
@@ -779,12 +803,14 @@ class SpectrumComparisonController:
                 ) = _view_pixel_groups(self.manifest.topology, view_index, cache)
                 pixels = np.asarray(pixels, dtype=np.int64)
                 assert alphas is not None
+                assert alpha_identifiable is not None
                 reconstructed_modes = _project_reconstructed_modes(
                     self.manifest,
                     sorted_rows,
                     starts,
                     sorted_weights,
                     alphas,
+                    alpha_identifiable,
                 )
             else:
                 assert self.rendered_design is not None
@@ -858,6 +884,7 @@ class SpectrumComparisonController:
             raw_power=raw_power,
             reconstructed_modes=reconstructed_modes,
             reconstructed_power=reconstructed_power,
+            alpha_identifiable=alpha_identifiable,
             frequency_limits=frequency_limits,
         )
 
@@ -1052,6 +1079,10 @@ class SpectrumComparisonController:
         reconstructed_frequency = float(
             self.frequencies_hz[self.reconstructed_index]
         )
+        reconstructed_identifiable = (
+            self.alpha_identifiable is None
+            or bool(self.alpha_identifiable[self.reconstructed_index])
+        )
         reconstructed_power = float(self.reconstructed_power[self.reconstructed_index])
         raw_visible = (
             (self.cache.freqs_hz >= self.frequency_limits[0])
@@ -1124,7 +1155,20 @@ class SpectrumComparisonController:
         self.reconstructed_modal_image = self._render_modal_image(
             reconstructed_values,
             magnitude_hi,
-            f"Reconstructed {component_label} phase - {reconstructed_frequency:.5f} Hz",
+            (
+                f"Reconstructed {component_label} phase - "
+                f"{reconstructed_frequency:.5f} Hz"
+                + ("" if reconstructed_identifiable else " (alpha unavailable)")
+            ),
+        )
+        availability_status = (
+            ""
+            if reconstructed_identifiable
+            else (
+                "  \n**Reconstruction availability:** this mode is not "
+                "alpha-identifiable in the selected view; reconstructed "
+                "power and image are shown as unavailable (zero)."
+            )
         )
         self.status = (
             f"**View:** `{self.view_id}` &nbsp; **candidate pixels:** {self.pixels.shape[0]}  \n"
@@ -1132,6 +1176,7 @@ class SpectrumComparisonController:
             f"**Reconstructed:** {reconstructed_frequency:.6f} Hz, "
             f"power={reconstructed_power:.6g} &nbsp; **component:** {component_label}  \n"
             f"**Amplitude normalization:** `{self.amplitude_normalization}`"
+            f"{availability_status}"
         )
 
     def outputs(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
