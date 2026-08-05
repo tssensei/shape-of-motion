@@ -3288,6 +3288,27 @@ def _graph_candidate_payload(
     }
 
 
+def _stored_graph_scalar_matches_expected(
+    stored: Any,
+    expected: int | float,
+) -> bool:
+    import numpy as np
+
+    value = np.asarray(stored)
+    if value.shape != ():
+        return False
+    actual = value.item()
+    if isinstance(expected, int):
+        return (
+            bool(np.issubdtype(value.dtype, np.integer))
+            and int(actual) == expected
+        )
+    if not np.issubdtype(value.dtype, np.floating):
+        return False
+    expected_at_storage_precision = np.asarray(expected, dtype=value.dtype).item()
+    return float(actual) == float(expected_at_storage_precision)
+
+
 def _validate_graph_candidate(
     config: PipelineConfig,
     inputs: PrestaticInputs,
@@ -3330,12 +3351,10 @@ def _validate_graph_candidate(
             "min_component_edges": parameters.min_component_edges,
         }
         for name, expected in expected_scalars.items():
-            actual = np.asarray(archive[name]).item()
-            if isinstance(expected, int):
-                valid = int(actual) == expected
-            else:
-                valid = math.isclose(float(actual), expected, rel_tol=0.0, abs_tol=1e-12)
-            if not valid:
+            if not _stored_graph_scalar_matches_expected(
+                archive[name],
+                expected,
+            ):
                 raise ValueError(f"Rigid graph candidate {name} changed")
     counts = loaded.graph.counts
     summary = {

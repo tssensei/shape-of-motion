@@ -31,6 +31,7 @@ from run_experiment_pipeline import (
     _run_argv,
     _set_gate,
     _status_payload,
+    _stored_graph_scalar_matches_expected,
     _viewer_command_text,
     build_parser,
     load_comparison_config,
@@ -71,6 +72,34 @@ def _write_comparison_config(
 
 
 class ExperimentPipelineTest(unittest.TestCase):
+    def test_graph_scalar_validation_uses_artifact_storage_precision(self) -> None:
+        import numpy as np
+
+        self.assertTrue(
+            _stored_graph_scalar_matches_expected(
+                np.array(0.008, dtype=np.float32),
+                0.008,
+            )
+        )
+        self.assertFalse(
+            _stored_graph_scalar_matches_expected(
+                np.array(0.009, dtype=np.float32),
+                0.008,
+            )
+        )
+        self.assertTrue(
+            _stored_graph_scalar_matches_expected(
+                np.array(8, dtype=np.int32),
+                8,
+            )
+        )
+        self.assertFalse(
+            _stored_graph_scalar_matches_expected(
+                np.array(7, dtype=np.int32),
+                8,
+            )
+        )
+
     def test_comparison_config_reuses_shared_paths_and_isolates_variants(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

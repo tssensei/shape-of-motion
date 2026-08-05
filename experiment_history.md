@@ -1080,3 +1080,15 @@ Date: 2026-08-05
   `modal_checkpoints`. No curtain comparison run directory or cluster result
   has been created yet; `shared_run_id` and all variant artifact IDs must be
   chosen in the cluster comparison YAML before the first run.
+
+### Dense observed-graph validation retry
+
+- Building candidate `knn8_maxdist0p008_v1` from the dense curtain topology
+  produced 30,387 observed nodes and 76,305 edges, with 2,541 isolated nodes;
+  127 small components (291 nodes and 179 edges) were pruned.
+- The builder completed, but atomic publication stopped because the controller
+  compared the configured Python `float64` value `0.008` against its persisted
+  NPZ `float32` representation using an invalid `1e-12` tolerance. This was a
+  controller validation bug, not a graph-construction failure. The temporary
+  attempt is expected to be removed by failure cleanup, and the same pipeline
+  command should rebuild and publish the candidate after pulling the fix.
