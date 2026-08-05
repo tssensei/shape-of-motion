@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -21,6 +21,8 @@ import yaml
 
 CONFIG_FORMAT = "som_modal_experiment_pipeline"
 CONFIG_VERSION = 1
+COMPARISON_CONFIG_FORMAT = "som_modal_solver_comparison_pipeline"
+COMPARISON_CONFIG_VERSION = 2
 STATE_FORMAT = "som_modal_experiment_pipeline_state"
 STATE_VERSION = 1
 RECEIPT_FORMAT = "som_modal_experiment_stage_receipt"
@@ -192,6 +194,22 @@ class PipelineConfig:
     flow_coordinates: FlowCoordinatesConfig
     physics: PhysicsConfig
     checkpoints: CheckpointsConfig
+
+
+@dataclass(frozen=True)
+class ComparisonVariantConfig:
+    variant_id: str
+    config: PipelineConfig
+
+
+@dataclass(frozen=True)
+class ComparisonPipelineConfig:
+    config_path: Path
+    config_identity: str
+    shared_run_id: str
+    base_config: PipelineConfig
+    shared_config: PipelineConfig
+    variants: tuple[ComparisonVariantConfig, ...]
 
 
 @dataclass(frozen=True)
@@ -961,6 +979,200 @@ def load_config(path_value: str | Path) -> PipelineConfig:
     )
 
 
+def load_comparison_config(path_value: str | Path) -> ComparisonPipelineConfig:
+    path = Path(path_value).expanduser().resolve(strict=True)
+    with path.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    payload = _require_mapping(loaded, "comparison config")
+    _validate_keys(
+        payload,
+        required={
+            "format",
+            "version",
+            "base_config",
+            "shared_run_id",
+            "variants",
+        },
+        label="comparison config",
+    )
+    if (
+        payload["format"] != COMPARISON_CONFIG_FORMAT
+        or payload["version"] != COMPARISON_CONFIG_VERSION
+    ):
+        raise ValueError(
+            "Comparison config must use "
+            f"format={COMPARISON_CONFIG_FORMAT!r}, "
+            f"version={COMPARISON_CONFIG_VERSION}"
+        )
+    base_value = payload["base_config"]
+    if not isinstance(base_value, str) or not base_value:
+        raise ValueError("base_config must be a non-empty path")
+    base_path = Path(base_value).expanduser()
+    if not base_path.is_absolute():
+        base_path = path.parent / base_path
+    base = load_config(base_path)
+    shared_run_id = _parse_id(payload["shared_run_id"], "shared_run_id")
+    shared_identity = _config_hash(
+        {
+            "format": COMPARISON_CONFIG_FORMAT,
+            "version": COMPARISON_CONFIG_VERSION,
+            "base_config_identity": base.config_identity,
+            "shared_run_id": shared_run_id,
+        }
+    )
+    shared_config = replace(
+        base,
+        config_path=path,
+        config_identity=shared_identity,
+        pipeline_id=shared_run_id,
+        solver=replace(base.solver, method="rigid-components"),
+    )
+
+    variant_values = payload["variants"]
+    if not isinstance(variant_values, list) or not variant_values:
+        raise ValueError("variants must be a non-empty list")
+    variant_fields = {
+        "variant_id",
+        "method",
+        "solver_artifact_id",
+        "rendered_design_artifact_id",
+        "flow_coordinates_artifact_id",
+        "physics_artifact_id",
+        "direct_checkpoint_artifact_id",
+        "physics_checkpoint_artifact_id",
+    }
+    variants: list[ComparisonVariantConfig] = []
+    seen_variant_ids: set[str] = set()
+    seen_methods: set[str] = set()
+    seen_solver_artifacts: set[str] = set()
+    for index, raw_variant in enumerate(variant_values):
+        variant = _require_mapping(raw_variant, f"variants[{index}]")
+        _validate_keys(
+            variant,
+            required=variant_fields,
+            label=f"variants[{index}]",
+        )
+        variant_id = _parse_id(
+            variant["variant_id"], f"variants[{index}].variant_id"
+        )
+        if variant_id in seen_variant_ids:
+            raise ValueError(f"Duplicate variant_id: {variant_id}")
+        seen_variant_ids.add(variant_id)
+        method = str(variant["method"])
+        if method not in {"staged", "rigid-components", "soft-elastic"}:
+            raise ValueError(
+                f"variants[{index}].method must be staged, rigid-components, "
+                "or soft-elastic"
+            )
+        if method in seen_methods:
+            raise ValueError(f"Duplicate comparison solver method: {method}")
+        seen_methods.add(method)
+        if method == "soft-elastic" and base.soft_elastic is None:
+            raise ValueError(
+                "The base config must define soft_elastic parameters for the "
+                "soft-elastic comparison variant"
+            )
+        solver_artifact_id = _parse_id(
+            variant["solver_artifact_id"],
+            f"variants[{index}].solver_artifact_id",
+        )
+        if solver_artifact_id in seen_solver_artifacts:
+            raise ValueError(
+                f"Duplicate solver_artifact_id: {solver_artifact_id}"
+            )
+        seen_solver_artifacts.add(solver_artifact_id)
+        rendered_artifact_id = _parse_id(
+            variant["rendered_design_artifact_id"],
+            f"variants[{index}].rendered_design_artifact_id",
+        )
+        flow_artifact_id = _parse_id(
+            variant["flow_coordinates_artifact_id"],
+            f"variants[{index}].flow_coordinates_artifact_id",
+        )
+        physics_artifact_id = _parse_id(
+            variant["physics_artifact_id"],
+            f"variants[{index}].physics_artifact_id",
+        )
+        direct_artifact_id = _parse_id(
+            variant["direct_checkpoint_artifact_id"],
+            f"variants[{index}].direct_checkpoint_artifact_id",
+        )
+        physics_checkpoint_artifact_id = _parse_id(
+            variant["physics_checkpoint_artifact_id"],
+            f"variants[{index}].physics_checkpoint_artifact_id",
+        )
+        if base.physics.enabled and (
+            direct_artifact_id == physics_checkpoint_artifact_id
+        ):
+            raise ValueError(
+                f"variants[{index}] direct and physics checkpoint artifact IDs "
+                "must differ"
+            )
+        variant_identity = _config_hash(
+            {
+                "base_config_identity": base.config_identity,
+                "shared_run_id": shared_run_id,
+                "variant": dict(variant),
+            }
+        )
+        variant_config = replace(
+            base,
+            config_path=path,
+            config_identity=variant_identity,
+            pipeline_id=f"{shared_run_id}__{variant_id}",
+            solver=replace(
+                base.solver,
+                method=method,
+                artifact_id=solver_artifact_id,
+            ),
+            rendered_design=replace(
+                base.rendered_design,
+                artifact_id=rendered_artifact_id,
+            ),
+            flow_coordinates=replace(
+                base.flow_coordinates,
+                artifact_id=flow_artifact_id,
+            ),
+            physics=replace(base.physics, artifact_id=physics_artifact_id),
+            checkpoints=CheckpointsConfig(
+                direct_artifact_id=direct_artifact_id,
+                physics_artifact_id=physics_checkpoint_artifact_id,
+            ),
+        )
+        variants.append(
+            ComparisonVariantConfig(
+                variant_id=variant_id,
+                config=variant_config,
+            )
+        )
+    required_methods = {"staged", "rigid-components", "soft-elastic"}
+    if seen_methods != required_methods:
+        raise ValueError(
+            "Comparison config must define exactly one staged, one "
+            "rigid-components, and one soft-elastic variant"
+        )
+    return ComparisonPipelineConfig(
+        config_path=path,
+        config_identity=_config_hash(payload),
+        shared_run_id=shared_run_id,
+        base_config=base,
+        shared_config=shared_config,
+        variants=tuple(variants),
+    )
+
+
+def load_pipeline_configuration(
+    path_value: str | Path,
+) -> PipelineConfig | ComparisonPipelineConfig:
+    path = Path(path_value).expanduser().resolve(strict=True)
+    with path.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    payload = _require_mapping(loaded, "config")
+    if payload.get("format") == COMPARISON_CONFIG_FORMAT:
+        return load_comparison_config(path)
+    return load_config(path)
+
+
 def _read_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -1172,6 +1384,175 @@ def _pipeline_paths(config: PipelineConfig) -> PipelinePaths:
             / config.checkpoints.physics_artifact_id
         ),
     )
+
+
+def _comparison_control_paths(config: ComparisonPipelineConfig) -> PipelinePaths:
+    control = _pipeline_paths(config.shared_config)
+    shared = _pipeline_paths(config.base_config)
+    return replace(
+        control,
+        static_work_dir=shared.static_work_dir,
+        accepted_static_root=shared.accepted_static_root,
+        modal_inputs_root=shared.modal_inputs_root,
+        dynamic_dataset=shared.dynamic_dataset,
+        frame_names_dir=shared.frame_names_dir,
+        roi_union_dir=shared.roi_union_dir,
+        flow_root=shared.flow_root,
+        view_configs_dir=shared.view_configs_dir,
+        topology_path=shared.topology_path,
+        frequency_dir=shared.frequency_dir,
+        modal_analysis_dir=shared.modal_analysis_dir,
+        observations_dir=shared.observations_dir,
+        motion_fill_graph_path=shared.motion_fill_graph_path,
+        gaussian_sidecar_path=shared.gaussian_sidecar_path,
+    )
+
+
+def _comparison_variant_paths(
+    comparison: ComparisonPipelineConfig,
+    variant: ComparisonVariantConfig,
+) -> PipelinePaths:
+    shared = _comparison_control_paths(comparison)
+    config = variant.config
+    pipeline_dir = shared.pipeline_dir / "variants" / variant.variant_id
+    reports = pipeline_dir / "reports"
+    solver_root = config.solver.artifact_id
+    basis = config.frequency.basis_id
+    scene = config.scene_root
+    return replace(
+        shared,
+        pipeline_dir=pipeline_dir,
+        reports_dir=reports,
+        stages_dir=reports / "stages",
+        approvals_dir=reports / "approvals",
+        state_path=reports / "pipeline_state.json",
+        resolved_config_path=reports / "resolved_config.json",
+        events_path=reports / "events.jsonl",
+        final_ready_path=reports / "FINAL_VISUALIZATION_READY.json",
+        modal_fields_dir=scene / "modal_fields" / basis / solver_root,
+        rendered_design_dir=(
+            scene
+            / "shared"
+            / "preprocessing"
+            / "rendered_modal_designs"
+            / basis
+            / solver_root
+            / config.rendered_design.artifact_id
+        ),
+        flow_coordinates_dir=(
+            scene
+            / "flow_coordinates"
+            / basis
+            / solver_root
+            / config.flow_coordinates.artifact_id
+        ),
+        physics_coordinates_dir=(
+            scene
+            / "physics_coordinates"
+            / basis
+            / solver_root
+            / config.physics.artifact_id
+        ),
+        direct_checkpoint_dir=(
+            scene
+            / "modal_checkpoints"
+            / basis
+            / solver_root
+            / config.checkpoints.direct_artifact_id
+        ),
+        physics_checkpoint_dir=(
+            scene
+            / "modal_checkpoints"
+            / basis
+            / solver_root
+            / config.checkpoints.physics_artifact_id
+        ),
+    )
+
+
+def _comparison_stage_config(
+    comparison: ComparisonPipelineConfig,
+    variant: ComparisonVariantConfig,
+    stage: str,
+    approved_graph_identity: str | None = None,
+) -> PipelineConfig:
+    config = variant.config
+    if (
+        config.solver.method in {"rigid-components", "soft-elastic"}
+        and approved_graph_identity is None
+    ):
+        raise ValueError(
+            f"Comparison stage {stage} for {config.solver.method} requires the "
+            "approved graph identity"
+        )
+    shared_scientific_identity = _config_hash(
+        {
+            "scene_id": comparison.base_config.scene_id,
+            "prestatic_run_id": comparison.base_config.prestatic_run_id,
+            "static": asdict(config.static),
+            "modal_inputs": asdict(config.modal_inputs),
+            "view_configs": asdict(config.view_configs),
+            "topology": asdict(config.topology),
+            "frequency": asdict(config.frequency),
+            "motion_fill": asdict(config.motion_fill),
+        }
+    )
+    modal_payload: dict[str, Any] = {
+        "shared_scientific_identity": shared_scientific_identity,
+        "solver": asdict(config.solver),
+        "approved_graph_identity": (
+            approved_graph_identity
+            if config.solver.method in {"rigid-components", "soft-elastic"}
+            else None
+        ),
+        "soft_elastic": (
+            asdict(config.soft_elastic)
+            if config.solver.method == "soft-elastic"
+            and config.soft_elastic is not None
+            else None
+        ),
+        "topology": asdict(config.topology),
+        "frequency": asdict(config.frequency),
+        "motion_fill": asdict(config.motion_fill),
+    }
+    if stage == "gaussian_modal_fields":
+        payload = modal_payload
+    elif stage == "rendered_modal_design":
+        payload = {
+            "modal": modal_payload,
+            "rendered_design": asdict(config.rendered_design),
+        }
+    elif stage == "modal_flow_coordinates":
+        payload = {
+            "modal": modal_payload,
+            "rendered_design": asdict(config.rendered_design),
+            "flow_coordinates": asdict(config.flow_coordinates),
+        }
+    elif stage == "modal_physics_coordinates":
+        payload = {
+            "modal": modal_payload,
+            "rendered_design": asdict(config.rendered_design),
+            "flow_coordinates": asdict(config.flow_coordinates),
+            "physics": asdict(config.physics),
+        }
+    elif stage == "materialize_direct_checkpoint":
+        payload = {
+            "modal": modal_payload,
+            "rendered_design": asdict(config.rendered_design),
+            "flow_coordinates": asdict(config.flow_coordinates),
+            "checkpoint": config.checkpoints.direct_artifact_id,
+        }
+    elif stage == "materialize_physics_checkpoint":
+        payload = {
+            "modal": modal_payload,
+            "rendered_design": asdict(config.rendered_design),
+            "flow_coordinates": asdict(config.flow_coordinates),
+            "physics": asdict(config.physics),
+            "checkpoint": config.checkpoints.physics_artifact_id,
+        }
+    else:
+        raise ValueError(f"Unsupported comparison stage identity: {stage}")
+    return replace(config, config_identity=_config_hash(payload))
 
 
 def _parse_source_view(
@@ -3410,8 +3791,16 @@ def _modal_solver_argv(
                 f"{config.solver.anchor_svd_ratio_min:.17g}",
                 "--anchor-residual-max",
                 f"{config.solver.anchor_residual_max:.17g}",
+                "--staged-observation-topology",
+                str(paths.topology_path),
             ]
         )
+        for measurement in _measurement_paths(config, paths):
+            argv.extend(
+                ["--staged-observation-measurement", str(measurement)]
+            )
+        if resume:
+            argv.append("--resume")
     elif config.solver.method == "rigid-components":
         if rigid_graph is None:
             raise ValueError("Rigid-component solver requires an approved graph")
@@ -3507,10 +3896,29 @@ def _prepare_modal_fields(
         print(f"[{stage}] validated existing output")
         return
     existing = paths.modal_fields_dir.exists()
-    if existing and config.solver.method not in {"rigid-components", "soft-elastic"}:
-        raise FileExistsError(
-            f"Staged modal output exists without receipt: {paths.modal_fields_dir}"
-        )
+    if existing and (paths.modal_fields_dir / "modal_modes_manifest.json").is_file():
+        if dry_run:
+            print(f"[{stage}] would validate and adopt existing output")
+            return
+        try:
+            summary = _validate_modal_fields(
+                config,
+                accepted_checkpoint,
+                paths,
+            )
+        except (FileNotFoundError, ValueError, KeyError, TypeError):
+            pass
+        else:
+            _write_receipt(
+                config,
+                paths,
+                stage,
+                None,
+                [paths.modal_fields_dir],
+                summary,
+            )
+            print(f"[{stage}] adopted validated output and wrote a receipt")
+            return
     argv = _modal_solver_argv(
         config,
         inputs,
@@ -4174,6 +4582,7 @@ def _run_pipeline(config: PipelineConfig, *, dry_run: bool) -> None:
     _prepare_topology(config, inputs, paths, accepted_checkpoint, dry_run=dry_run)
     _prepare_frequency_selection(config, inputs, paths, dry_run=dry_run)
     _prepare_modal_exports(config, inputs, paths, dry_run=dry_run)
+    _prepare_observations(config, inputs, paths, dry_run=dry_run)
     _prepare_motion_fill_graph(
         config, paths, accepted_checkpoint, dry_run=dry_run
     )
@@ -4212,7 +4621,6 @@ def _run_pipeline(config: PipelineConfig, *, dry_run: bool) -> None:
             _print_graph_gate(config, paths, candidate.candidate_id)
             return
         rigid_graph, _approved_parameters = graph_approval
-        _prepare_observations(config, inputs, paths, dry_run=dry_run)
 
     _prepare_modal_fields(
         config,
@@ -4258,6 +4666,352 @@ def _run_pipeline(config: PipelineConfig, *, dry_run: bool) -> None:
     print("Direct viewer: " + _viewer_command_text(config, paths, "direct", None, 8890))
     if config.physics.enabled:
         print("Physics viewer: " + _viewer_command_text(config, paths, "physics", None, 8891))
+
+
+def _print_comparison_static_gate(
+    comparison: ComparisonPipelineConfig,
+    paths: PipelinePaths,
+) -> None:
+    print("\nPaused for manual static-3DGS quality inspection.")
+    print(
+        "Viewer: "
+        + _viewer_command_text(
+            comparison.base_config,
+            paths,
+            "static",
+            None,
+            8890,
+        )
+    )
+    print(
+        "Approve: "
+        f"python -u {REPO_ROOT / 'run_experiment_pipeline.py'} approve-static "
+        f"--config {comparison.config_path}"
+    )
+    print(
+        "Extend: "
+        f"python -u {REPO_ROOT / 'run_experiment_pipeline.py'} extend-static "
+        f"--config {comparison.config_path} --target-epochs <TOTAL_EPOCHS>"
+    )
+
+
+def _run_comparison_pipeline(
+    comparison: ComparisonPipelineConfig,
+    *,
+    dry_run: bool,
+    variant_id: str | None = None,
+) -> None:
+    base = comparison.base_config
+    inputs = load_prestatic_inputs(base)
+    base_paths = _pipeline_paths(base)
+    control_paths = _comparison_control_paths(comparison)
+    if dry_run:
+        state = (
+            dict(
+                _require_mapping(
+                    _read_json(control_paths.state_path),
+                    "comparison pipeline state",
+                )
+            )
+            if control_paths.state_path.is_file()
+            else _initial_state(comparison.shared_config)
+        )
+    else:
+        state = _prepare_controller(
+            comparison.shared_config,
+            inputs,
+            control_paths,
+        )
+
+    static_approval = _load_static_approval(base, inputs, base_paths)
+    if static_approval is None:
+        if dry_run:
+            base_state = (
+                dict(
+                    _require_mapping(
+                        _read_json(base_paths.state_path),
+                        "base pipeline state",
+                    )
+                )
+                if base_paths.state_path.is_file()
+                else _initial_state(base)
+            )
+        else:
+            base_state = _prepare_controller(base, inputs, base_paths)
+        _run_static_candidate(
+            base,
+            inputs,
+            base_paths,
+            base_state,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            _set_gate(
+                control_paths,
+                state,
+                {
+                    "name": "static_quality",
+                    "status": "waiting_for_approval",
+                    "base_pipeline_id": base.pipeline_id,
+                    "candidate_work_dir": str(base_paths.static_work_dir),
+                    "target_epochs": int(base_state["static_target_epochs"]),
+                },
+            )
+        _print_comparison_static_gate(comparison, base_paths)
+        return
+    accepted_checkpoint, _accepted_cfg = static_approval
+
+    _prepare_native_inputs(base, inputs, base_paths, dry_run=dry_run)
+    _prepare_flow_caches(base, inputs, base_paths, dry_run=dry_run)
+    _prepare_view_configs(
+        base,
+        inputs,
+        base_paths,
+        accepted_checkpoint,
+        dry_run=dry_run,
+    )
+    _prepare_topology(
+        base,
+        inputs,
+        base_paths,
+        accepted_checkpoint,
+        dry_run=dry_run,
+    )
+    _prepare_frequency_selection(base, inputs, base_paths, dry_run=dry_run)
+    _prepare_modal_exports(base, inputs, base_paths, dry_run=dry_run)
+    _prepare_observations(base, inputs, base_paths, dry_run=dry_run)
+    _prepare_motion_fill_graph(
+        base,
+        base_paths,
+        accepted_checkpoint,
+        dry_run=dry_run,
+    )
+    _prepare_gaussian_sidecar(
+        base,
+        base_paths,
+        accepted_checkpoint,
+        dry_run=dry_run,
+    )
+
+    graph_approval = _load_graph_approval(
+        comparison.shared_config,
+        inputs,
+        control_paths,
+        accepted_checkpoint,
+    )
+    if graph_approval is None and _graph_approval_path(base_paths).is_file():
+        graph_approval = _load_graph_approval(
+            base,
+            inputs,
+            base_paths,
+            accepted_checkpoint,
+        )
+        if graph_approval is not None:
+            print(
+                "Reusing approved observed structure graph from base pipeline: "
+                f"{graph_approval[0]}"
+            )
+    if graph_approval is None:
+        candidate = _default_graph_candidate(comparison.shared_config)
+        _build_graph_candidate(
+            comparison.shared_config,
+            inputs,
+            control_paths,
+            accepted_checkpoint,
+            candidate,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            _set_gate(
+                control_paths,
+                state,
+                {
+                    "name": "rigid_graph_quality",
+                    "status": "waiting_for_approval",
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_dir": str(
+                        _graph_candidate_dir(
+                            control_paths,
+                            candidate.candidate_id,
+                        )
+                    ),
+                },
+            )
+        _print_graph_gate(
+            comparison.shared_config,
+            control_paths,
+            candidate.candidate_id,
+        )
+        return
+    approved_graph, _approved_parameters = graph_approval
+    approved_graph_identity = _sha256_file(approved_graph)
+
+    selected_variants = (
+        comparison.variants
+        if variant_id is None
+        else (_comparison_variant_by_id(comparison, variant_id),)
+    )
+    for variant in selected_variants:
+        config = variant.config
+        paths = _comparison_variant_paths(comparison, variant)
+        if not dry_run:
+            variant_state = _prepare_controller(config, inputs, paths)
+        else:
+            variant_state = _initial_state(config)
+
+        def stage_config(stage_name: str) -> PipelineConfig:
+            return _comparison_stage_config(
+                comparison,
+                variant,
+                stage_name,
+                approved_graph_identity,
+            )
+
+        modal_config = stage_config("gaussian_modal_fields")
+        _prepare_modal_fields(
+            modal_config,
+            inputs,
+            paths,
+            accepted_checkpoint,
+            (
+                approved_graph
+                if config.solver.method in {"rigid-components", "soft-elastic"}
+                else None
+            ),
+            dry_run=dry_run,
+        )
+        _prepare_rendered_design(
+            stage_config("rendered_modal_design"),
+            inputs,
+            paths,
+            accepted_checkpoint,
+            dry_run=dry_run,
+        )
+        _prepare_flow_coordinates(
+            stage_config("modal_flow_coordinates"),
+            inputs,
+            paths,
+            dry_run=dry_run,
+        )
+        if config.physics.enabled:
+            _prepare_physics_coordinates(
+                stage_config("modal_physics_coordinates"),
+                inputs,
+                paths,
+                dry_run=dry_run,
+            )
+        _prepare_materialized_checkpoint(
+            stage_config("materialize_direct_checkpoint"),
+            inputs,
+            paths,
+            accepted_checkpoint,
+            paths.flow_coordinates_dir,
+            paths.direct_checkpoint_dir,
+            "materialize_direct_checkpoint",
+            dry_run=dry_run,
+        )
+        if config.physics.enabled:
+            _prepare_materialized_checkpoint(
+                stage_config("materialize_physics_checkpoint"),
+                inputs,
+                paths,
+                accepted_checkpoint,
+                paths.physics_coordinates_dir,
+                paths.physics_checkpoint_dir,
+                "materialize_physics_checkpoint",
+                dry_run=dry_run,
+            )
+        if dry_run:
+            print(
+                f"[{variant.variant_id}] would write "
+                "FINAL_VISUALIZATION_READY.json"
+            )
+            continue
+        _set_gate(paths, variant_state, None)
+        _write_final_ready(config, inputs, paths)
+        print(f"Completed comparison variant {variant.variant_id} -> {paths.final_ready_path}")
+
+    if dry_run:
+        print("[comparison_final] would write comparison READY report")
+        return
+    incomplete_variants = [
+        variant.variant_id
+        for variant in comparison.variants
+        if not _comparison_variant_paths(
+            comparison,
+            variant,
+        ).final_ready_path.is_file()
+    ]
+    if incomplete_variants:
+        print(
+            "Selected comparison variant(s) completed; overall comparison is "
+            f"waiting for {incomplete_variants}."
+        )
+        return
+    _set_gate(control_paths, state, None)
+    comparison_ready = control_paths.reports_dir / "FINAL_COMPARISON_READY.json"
+    payload = {
+        "format": "som_modal_solver_comparison_ready",
+        "version": 1,
+        "config_identity": comparison.config_identity,
+        "base_config": str(base.config_path),
+        "shared_run_id": comparison.shared_run_id,
+        "approved_graph": str(approved_graph),
+        "variants": [
+            {
+                "variant_id": variant.variant_id,
+                "method": variant.config.solver.method,
+                "ready_path": str(
+                    _comparison_variant_paths(
+                        comparison,
+                        variant,
+                    ).final_ready_path
+                ),
+            }
+            for variant in comparison.variants
+        ],
+        "completed_at": _utc_now(),
+    }
+    if comparison_ready.is_file():
+        existing = dict(
+            _require_mapping(
+                _read_json(comparison_ready),
+                "comparison ready report",
+            )
+        )
+        existing.pop("completed_at", None)
+        current = dict(payload)
+        current.pop("completed_at", None)
+        if existing != current:
+            raise ValueError(
+                f"Existing comparison READY report differs: {comparison_ready}"
+            )
+    else:
+        _write_json_atomic(comparison_ready, payload)
+    print(f"Comparison pipeline completed -> {comparison_ready}")
+    for index, variant in enumerate(comparison.variants):
+        paths = _comparison_variant_paths(comparison, variant)
+        print(
+            f"{variant.variant_id} direct viewer: "
+            + _viewer_command_text(
+                variant.config,
+                paths,
+                "direct",
+                None,
+                8890 + index * 2,
+            )
+        )
+        if variant.config.physics.enabled:
+            print(
+                f"{variant.variant_id} physics viewer: "
+                + _viewer_command_text(
+                    variant.config,
+                    paths,
+                    "physics",
+                    None,
+                    8891 + index * 2,
+                )
+            )
 
 
 def _candidate_parameters_from_args(
@@ -4384,6 +5138,64 @@ def _status_payload(config: PipelineConfig) -> dict[str, Any]:
     }
 
 
+def _comparison_status_payload(
+    comparison: ComparisonPipelineConfig,
+) -> dict[str, Any]:
+    control_paths = _comparison_control_paths(comparison)
+    state = (
+        _read_json(control_paths.state_path)
+        if control_paths.state_path.is_file()
+        else None
+    )
+    return {
+        "format": "som_modal_solver_comparison_pipeline_status",
+        "version": 1,
+        "scene_id": comparison.base_config.scene_id,
+        "shared_run_id": comparison.shared_run_id,
+        "base_pipeline_id": comparison.base_config.pipeline_id,
+        "started": state is not None,
+        "gate": state.get("gate") if isinstance(state, Mapping) else None,
+        "static_approved": _static_approval_path(
+            _pipeline_paths(comparison.base_config)
+        ).is_file(),
+        "graph_approved": (
+            _graph_approval_path(control_paths).is_file()
+            or _graph_approval_path(
+                _pipeline_paths(comparison.base_config)
+            ).is_file()
+        ),
+        "variants": {
+            variant.variant_id: _status_payload_for_paths(
+                variant.config,
+                _comparison_variant_paths(comparison, variant),
+            )
+            for variant in comparison.variants
+        },
+        "final_comparison_ready": (
+            control_paths.reports_dir / "FINAL_COMPARISON_READY.json"
+        ).is_file(),
+    }
+
+
+def _status_payload_for_paths(
+    config: PipelineConfig,
+    paths: PipelinePaths,
+) -> dict[str, Any]:
+    state = _read_json(paths.state_path) if paths.state_path.is_file() else None
+    stage_receipts = (
+        sorted(path.stem for path in paths.stages_dir.glob("*.json"))
+        if paths.stages_dir.is_dir()
+        else []
+    )
+    return {
+        "method": config.solver.method,
+        "started": state is not None,
+        "completed_stages": stage_receipts,
+        "final_visualization_ready": paths.final_ready_path.is_file(),
+        "final_ready_path": str(paths.final_ready_path),
+    }
+
+
 def _add_config_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", required=True, type=Path)
 
@@ -4400,6 +5212,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run until the next manual gate or completion")
     _add_config_argument(run_parser)
     run_parser.add_argument("--dry-run", action="store_true")
+    run_parser.add_argument(
+        "--variant",
+        default=None,
+        help="Run only one solver variant from a comparison config",
+    )
 
     status_parser = subparsers.add_parser("status", help="Print persistent pipeline status")
     _add_config_argument(status_parser)
@@ -4446,6 +5263,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--target", choices=["static", "rigid-graph", "direct", "physics"], required=True
     )
     viewer_parser.add_argument("--candidate-id", default=None)
+    viewer_parser.add_argument(
+        "--variant",
+        default=None,
+        help="Comparison variant ID for direct or physics viewers",
+    )
     viewer_parser.add_argument("--port", type=int, default=8890)
     return parser
 
@@ -4482,10 +5304,244 @@ def _require_pipeline_prerequisites(
     return inputs, paths, state, approval[0]
 
 
+def _comparison_variant_by_id(
+    comparison: ComparisonPipelineConfig,
+    variant_id: str | None,
+) -> ComparisonVariantConfig:
+    if variant_id is None:
+        raise ValueError("--variant is required for a comparison output viewer")
+    parsed = _parse_id(variant_id, "--variant")
+    matches = [
+        variant
+        for variant in comparison.variants
+        if variant.variant_id == parsed
+    ]
+    if not matches:
+        raise ValueError(
+            f"Unknown comparison variant {parsed!r}; expected one of "
+            f"{[variant.variant_id for variant in comparison.variants]}"
+        )
+    return matches[0]
+
+
+def _main_comparison(
+    args: argparse.Namespace,
+    comparison: ComparisonPipelineConfig,
+) -> None:
+    base = comparison.base_config
+    base_paths = _pipeline_paths(base)
+    control_paths = _comparison_control_paths(comparison)
+    if args.command == "run":
+        _run_comparison_pipeline(
+            comparison,
+            dry_run=bool(args.dry_run),
+            variant_id=args.variant,
+        )
+        return
+    if args.command == "status":
+        print(
+            json.dumps(
+                _comparison_status_payload(comparison),
+                indent=2,
+                allow_nan=False,
+            )
+        )
+        return
+
+    if args.command in {"extend-static", "approve-static"}:
+        inputs = load_prestatic_inputs(base)
+        base_state = _prepare_controller(base, inputs, base_paths)
+        if args.command == "extend-static":
+            if _load_static_approval(base, inputs, base_paths) is not None:
+                raise ValueError(
+                    "The shared static checkpoint is already approved and immutable"
+                )
+            target = _parse_int(args.target_epochs, "--target-epochs")
+            current_target = int(base_state["static_target_epochs"])
+            if target <= current_target:
+                raise ValueError(
+                    f"--target-epochs must exceed current target {current_target}"
+                )
+            base_state["static_target_epochs"] = target
+            _set_gate(base_paths, base_state, None)
+            _append_event(
+                base_paths,
+                {
+                    "event": "static_target_extended",
+                    "previous_target_epochs": current_target,
+                    "target_epochs": target,
+                },
+            )
+            _run_static_candidate(
+                base,
+                inputs,
+                base_paths,
+                base_state,
+                dry_run=False,
+            )
+            control_state = _prepare_controller(
+                comparison.shared_config,
+                inputs,
+                control_paths,
+            )
+            _set_gate(
+                control_paths,
+                control_state,
+                {
+                    "name": "static_quality",
+                    "status": "waiting_for_approval",
+                    "base_pipeline_id": base.pipeline_id,
+                    "candidate_work_dir": str(base_paths.static_work_dir),
+                    "target_epochs": target,
+                },
+            )
+            _print_comparison_static_gate(comparison, base_paths)
+            return
+        _approve_static(
+            base,
+            inputs,
+            base_paths,
+            base_state,
+            args.note,
+        )
+        control_state = _prepare_controller(
+            comparison.shared_config,
+            inputs,
+            control_paths,
+        )
+        _set_gate(control_paths, control_state, None)
+        print(
+            "Continue: "
+            f"python -u {REPO_ROOT / 'run_experiment_pipeline.py'} run "
+            f"--config {comparison.config_path}"
+        )
+        return
+
+    if args.command in {"build-graph-candidate", "approve-graph"}:
+        inputs = load_prestatic_inputs(base)
+        static_approval = _load_static_approval(base, inputs, base_paths)
+        if static_approval is None:
+            raise ValueError("Static quality must be approved before graph commands")
+        accepted_checkpoint = static_approval[0]
+        if args.command == "build-graph-candidate" and bool(args.dry_run):
+            if not control_paths.state_path.is_file():
+                raise FileNotFoundError(
+                    "Comparison controller state is absent; run the comparison "
+                    "before this dry-run"
+                )
+            control_state = dict(
+                _require_mapping(
+                    _read_json(control_paths.state_path),
+                    "comparison pipeline state",
+                )
+            )
+        else:
+            control_state = _prepare_controller(
+                comparison.shared_config,
+                inputs,
+                control_paths,
+            )
+        if not control_paths.topology_path.is_file() or not (
+            control_paths.view_configs_dir.is_dir()
+        ):
+            raise ValueError(
+                "Run the comparison through the graph gate before graph commands"
+            )
+        if args.command == "build-graph-candidate":
+            parameters = _candidate_parameters_from_args(
+                comparison.shared_config,
+                args,
+            )
+            _build_graph_candidate(
+                comparison.shared_config,
+                inputs,
+                control_paths,
+                accepted_checkpoint,
+                parameters,
+                dry_run=bool(args.dry_run),
+            )
+            if not args.dry_run:
+                print(
+                    _viewer_command_text(
+                        comparison.shared_config,
+                        control_paths,
+                        "rigid-graph",
+                        parameters.candidate_id,
+                        8890,
+                    )
+                )
+            return
+        candidate_id = _parse_id(args.candidate_id, "--candidate-id")
+        _approve_graph(
+            comparison.shared_config,
+            inputs,
+            control_paths,
+            accepted_checkpoint,
+            candidate_id,
+            args.note,
+        )
+        _set_gate(control_paths, control_state, None)
+        print(
+            "Continue: "
+            f"python -u {REPO_ROOT / 'run_experiment_pipeline.py'} run "
+            f"--config {comparison.config_path}"
+        )
+        return
+
+    if args.command == "viewer-command":
+        if args.port <= 0 or args.port > 65535:
+            raise ValueError("--port must lie in [1,65535]")
+        if args.target in {"direct", "physics"}:
+            variant = _comparison_variant_by_id(comparison, args.variant)
+            config = variant.config
+            paths = _comparison_variant_paths(comparison, variant)
+        elif args.target == "static":
+            if args.variant is not None:
+                raise ValueError("--variant is not used by the shared static viewer")
+            config = base
+            paths = base_paths
+        else:
+            if args.variant is not None:
+                raise ValueError("--variant is not used by the shared graph viewer")
+            if (
+                args.candidate_id is None
+                and not _graph_approval_path(control_paths).is_file()
+                and _graph_approval_path(base_paths).is_file()
+            ):
+                config = replace(
+                    base,
+                    solver=replace(base.solver, method="rigid-components"),
+                )
+                paths = base_paths
+            else:
+                config = comparison.shared_config
+                paths = control_paths
+        print(
+            "cd "
+            + str(REPO_ROOT)
+            + "\n"
+            + _viewer_command_text(
+                config,
+                paths,
+                args.target,
+                args.candidate_id,
+                int(args.port),
+            )
+        )
+        return
+    raise RuntimeError(f"Unhandled comparison command: {args.command}")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    config = load_config(args.config)
+    loaded_config = load_pipeline_configuration(args.config)
+    if isinstance(loaded_config, ComparisonPipelineConfig):
+        _main_comparison(args, loaded_config)
+        return
+    config = loaded_config
     if args.command == "run":
+        if args.variant is not None:
+            raise ValueError("--variant requires a comparison config")
         _run_pipeline(config, dry_run=bool(args.dry_run))
         return
     if args.command == "status":

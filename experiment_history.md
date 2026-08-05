@@ -1060,3 +1060,23 @@ Date: 2026-08-05
 - No soft-elastic cluster artifact has been produced yet. The run must use a
   new pipeline and solver artifact ID so the completed rigid/staged outputs
   remain immutable and directly comparable.
+
+### Shared three-solver comparison controller
+
+- The intended comparison now references the existing curtain version-1
+  pipeline config as its immutable shared base. Therefore the approved static
+  checkpoint, native-resolution flow caches, dense stride-1 topology,
+  frequency selection, modal exports, split observation measurements, and
+  motion-fill graph retain their existing directories under
+  `/home/zs292/data_formal/curtain3_2view_v1` rather than being recomputed for
+  each solver.
+- If the base pipeline already has a compatible approved observed structure
+  graph, the comparison reuses it directly. Otherwise the comparison creates
+  and pauses on one shared graph candidate before both rigid-components and
+  soft-elastic proceed; staged consumes the same observation bank without
+  using the graph constraint.
+- Downstream outputs are namespaced by solver artifact under `modal_fields`,
+  `rendered_modal_designs`, `flow_coordinates`, `physics_coordinates`, and
+  `modal_checkpoints`. No curtain comparison run directory or cluster result
+  has been created yet; `shared_run_id` and all variant artifact IDs must be
+  chosen in the cluster comparison YAML before the first run.

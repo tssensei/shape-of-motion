@@ -303,8 +303,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--resume",
         action="store_true",
         help=(
-            "Reuse completed rigid-component or soft-elastic modes in an "
-            "interrupted output directory. A mode is complete only when its "
+            "Reuse completed shared-observation staged, rigid-component, or "
+            "soft-elastic modes in an interrupted output directory. A mode is "
+            "complete only when its "
             "compact latent and successful diagnostics are both present and "
             "compatible."
         ),
@@ -365,6 +366,24 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
             "pointwise motion fill (default: 8)."
         ),
     )
+    parser.add_argument(
+        "--staged-observation-topology",
+        default=None,
+        help=(
+            "Optional shared Gaussian observation topology for staged solves. "
+            "When supplied, staged solving reuses split observations instead "
+            "of rebuilding pixel-to-Gaussian candidates per mode."
+        ),
+    )
+    parser.add_argument(
+        "--staged-observation-measurement",
+        action="append",
+        default=[],
+        help=(
+            "Lightweight Gaussian observation measurement for one requested "
+            "staged mode. Repeat once per mode with a shared topology."
+        ),
+    )
     add_solve_method_arguments(parser)
     add_soft_elastic_solver_arguments(parser)
     add_staged_solver_arguments(parser)
@@ -379,14 +398,16 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
     soft_graph_path = args.soft_elastic_graph
     soft_topology_path = args.soft_elastic_observation_topology
     soft_measurement_paths = list(args.soft_elastic_observation_measurement)
+    staged_topology_path = args.staged_observation_topology
+    staged_measurement_paths = list(args.staged_observation_measurement)
     if args.solve_method != "staged" and args.base_manifest is not None:
         raise ValueError(
             "--base-manifest is currently supported only with --solve-method=staged."
         )
-    if args.resume and args.solve_method not in {"rigid-components", "soft-elastic"}:
+    if args.resume and args.solve_method == "staged" and staged_topology_path is None:
         raise ValueError(
-            "--resume is supported only with --solve-method=rigid-components "
-            "or --solve-method=soft-elastic."
+            "Staged --resume requires the shared --staged-observation-topology "
+            "and --staged-observation-measurement inputs."
         )
     rcond = float(args.rigid_component_rcond)
     min_valid_views = int(args.rigid_seed_min_valid_views)
@@ -450,6 +471,9 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         or soft_topology_path is not None
         or bool(soft_measurement_paths)
     )
+    staged_paths_supplied = staged_topology_path is not None or bool(
+        staged_measurement_paths
+    )
     soft_values = {
         "--soft-elastic-stretch-relative": (
             float(args.soft_elastic_stretch_relative),
@@ -488,6 +512,16 @@ def _validate_solve_method_arguments(args: argparse.Namespace) -> None:
         raise ValueError(
             "Soft-elastic graph/topology/measurement arguments require "
             "--solve-method=soft-elastic."
+        )
+    if args.solve_method != "staged" and staged_paths_supplied:
+        raise ValueError(
+            "Staged observation topology/measurement arguments require "
+            "--solve-method=staged."
+        )
+    if (staged_topology_path is None) != (not staged_measurement_paths):
+        raise ValueError(
+            "--staged-observation-topology and "
+            "--staged-observation-measurement must be supplied together."
         )
     if args.solve_method != "soft-elastic" and soft_custom:
         raise ValueError(
@@ -699,7 +733,7 @@ def _load_shared_observation_measurements(
 
 
 def _validate_shared_source_observations(
-    loaded_graph: LoadedObservedStructureGraph,
+    loaded_graph: LoadedObservedStructureGraph | None,
     observations: Mapping[str, np.ndarray],
     *,
     source_path: Path,
@@ -903,16 +937,17 @@ def _validate_shared_source_observations(
                 f"{source_path} {key} does not match the current CLI value."
             )
 
-    validate_observed_structure_graph_sources(
-        loaded_graph,
-        points_world=points,
-        gaussian_indices=indices,
-        source_checkpoint=str(args.input_ckpt),
-        view_ids=observation_view_ids,
-        obs_point_index=observations["obs_point_index"],
-        obs_view_index=observations["obs_view_index"],
-        obs_weights=observations["obs_contribution_weight"],
-    )
+    if loaded_graph is not None:
+        validate_observed_structure_graph_sources(
+            loaded_graph,
+            points_world=points,
+            gaussian_indices=indices,
+            source_checkpoint=str(args.input_ckpt),
+            view_ids=observation_view_ids,
+            obs_point_index=observations["obs_point_index"],
+            obs_view_index=observations["obs_view_index"],
+            obs_weights=observations["obs_contribution_weight"],
+        )
     return prepare_observations(observations)
 
 
@@ -1174,6 +1209,145 @@ def _load_resumed_rigid_mode(
 
 def _soft_elastic_resume_summary_path(diagnostics_path: Path) -> Path:
     return diagnostics_path.with_suffix(".json")
+
+
+def _staged_resume_summary_path(diagnostics_path: Path) -> Path:
+    return diagnostics_path.with_suffix(".json")
+
+
+def _write_staged_resume_summary(
+    path: Path,
+    *,
+    args: argparse.Namespace,
+    mode_index: int,
+    reference_freq: float,
+    source_measurement_path: Path,
+    motion_fill_graph_path: Path | None,
+    mode_entry: Mapping[str, Any],
+    motion_fill_diagnostics: Mapping[str, Any] | None,
+) -> Path:
+    return _write_json_atomic(
+        path,
+        {
+            "format": "staged_mode_completion",
+            "version": 1,
+            "mode_index": int(mode_index),
+            "freq_hz": float(reference_freq),
+            "source_checkpoint": str(args.input_ckpt),
+            "source_observation_measurement": str(source_measurement_path),
+            "source_motion_fill_graph": (
+                str(motion_fill_graph_path)
+                if motion_fill_graph_path is not None
+                else None
+            ),
+            "solver_parameters": staged_solver_manifest_parameters(args),
+            "mode_entry": dict(mode_entry),
+            "motion_fill_diagnostics": (
+                dict(motion_fill_diagnostics)
+                if motion_fill_diagnostics is not None
+                else None
+            ),
+        },
+    )
+
+
+def _load_resumed_staged_mode(
+    *,
+    args: argparse.Namespace,
+    prepared: PreparedObservations,
+    reference_freq: float,
+    mode_index: int,
+    source_measurement_path: Path,
+    latent_path: Path,
+    diagnostics_path: Path,
+    motion_fill_graph_path: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    summary_path = _staged_resume_summary_path(diagnostics_path)
+    if not diagnostics_path.is_file() or not summary_path.is_file():
+        raise ValueError(
+            f"Cannot resume {latent_path}: staged diagnostics or completion "
+            "summary are missing."
+        )
+    latent = _load_npz_arrays(latent_path)
+    diagnostics = _load_npz_arrays(diagnostics_path)
+    summary = _read_json(summary_path)
+    if summary.get("format") != "staged_mode_completion" or summary.get(
+        "version"
+    ) != 1:
+        raise ValueError(f"Cannot resume {latent_path}: completion format differs.")
+    expected_summary = {
+        "mode_index": int(mode_index),
+        "source_checkpoint": str(args.input_ckpt),
+        "source_observation_measurement": str(source_measurement_path),
+        "source_motion_fill_graph": (
+            str(motion_fill_graph_path)
+            if motion_fill_graph_path is not None
+            else None
+        ),
+        "solver_parameters": staged_solver_manifest_parameters(args),
+    }
+    mismatches = {
+        key: (summary.get(key), expected)
+        for key, expected in expected_summary.items()
+        if summary.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(
+            f"Cannot resume {latent_path}: completion metadata differs: {mismatches}"
+        )
+    if not np.isclose(
+        float(summary.get("freq_hz", np.nan)),
+        reference_freq,
+        rtol=0.0,
+        atol=float(args.freq_tolerance_hz),
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: frequency differs.")
+    if int(_scalar_value(latent, "mode_index", latent_path)) != mode_index:
+        raise ValueError(f"Cannot resume {latent_path}: mode index differs.")
+    for name in (
+        "final_point_solution_status",
+        "point_residual",
+        "alpha_identifiable_mask",
+    ):
+        if name not in diagnostics:
+            raise ValueError(
+                f"Cannot resume {latent_path}: diagnostics field {name!r} is missing."
+            )
+    if str(_scalar_value(latent, "source_checkpoint", latent_path)) != str(
+        args.input_ckpt
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: checkpoint differs.")
+    expected_indices = np.arange(prepared.points.shape[0], dtype=np.int32)
+    if not np.array_equal(latent.get("gaussian_indices"), expected_indices):
+        raise ValueError(f"Cannot resume {latent_path}: Gaussian indices differ.")
+    if not np.array_equal(
+        np.asarray(latent.get("points_world"), dtype=np.float32),
+        prepared.points.astype(np.float32),
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: Gaussian centers differ.")
+    phi = np.asarray(latent.get("phi"))
+    if (
+        phi.shape != prepared.points.shape
+        or not np.iscomplexobj(phi)
+        or not np.all(np.isfinite(phi.real))
+        or not np.all(np.isfinite(phi.imag))
+    ):
+        raise ValueError(f"Cannot resume {latent_path}: final phi is invalid.")
+    mode_entry = summary.get("mode_entry")
+    if not isinstance(mode_entry, dict):
+        raise ValueError(f"Cannot resume {latent_path}: mode entry is missing.")
+    motion_fill_diagnostics = summary.get("motion_fill_diagnostics")
+    if motion_fill_diagnostics is not None and not isinstance(
+        motion_fill_diagnostics, dict
+    ):
+        raise ValueError(
+            f"Cannot resume {latent_path}: motion-fill diagnostics are malformed."
+        )
+    return dict(mode_entry), (
+        dict(motion_fill_diagnostics)
+        if motion_fill_diagnostics is not None
+        else None
+    )
 
 
 def _write_soft_elastic_resume_summary(
@@ -3121,7 +3295,13 @@ def run(args: argparse.Namespace) -> None:
     )
 
     stage_started = perf_counter()
-    if args.solve_method in {"rigid-components", "soft-elastic"}:
+    staged_shared_observations = (
+        args.solve_method == "staged"
+        and args.staged_observation_topology is not None
+    )
+    if args.solve_method in {"rigid-components", "soft-elastic"} or (
+        staged_shared_observations
+    ):
         fg_means = load_fg_means_from_checkpoint(args.input_ckpt)
         fg_scales = None
         fg_quats = None
@@ -3147,7 +3327,7 @@ def run(args: argparse.Namespace) -> None:
 
     gaussian_tree = None
     stage_started = perf_counter()
-    if args.solve_method == "staged" or (
+    if (args.solve_method == "staged" and not staged_shared_observations) or (
         args.motion_fill and args.motion_fill_graph is None
     ):
         from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
@@ -3216,6 +3396,25 @@ def run(args: argparse.Namespace) -> None:
             "soft-elastic",
         )
         if args.solve_method == "soft-elastic"
+        else {}
+    )
+    staged_observation_topology_path = (
+        Path(args.staged_observation_topology).expanduser().resolve()
+        if staged_shared_observations
+        else None
+    )
+    staged_observation_topology = (
+        load_gaussian_observation_topology(staged_observation_topology_path)
+        if staged_observation_topology_path is not None
+        else None
+    )
+    staged_observation_measurements = (
+        _load_shared_observation_measurements(
+            list(args.staged_observation_measurement),
+            mode_indices,
+            "staged",
+        )
+        if staged_shared_observations
         else {}
     )
     setup_timings["frequency_and_rigid_graph_loading_seconds"] = float(
@@ -3897,36 +4096,85 @@ def run(args: argparse.Namespace) -> None:
             )
             print(f"Solved soft-elastic Gaussian mode {mode_name}", flush=True)
             continue
-        build_gaussian_observation_graph(
-            # Staged mode loaded the static render inputs and Gaussian tree above.
-            points_world=fg_means,
-            view_config_paths=view_configs_paths,
-            modal_npz_paths=modal_npzs_paths,
-            out_path=obs_path,
-            source_checkpoint=args.input_ckpt,
-            mode_index=mode_index,
-            mask_erode_iters=args.mask_erode_iters,
-            freq_tolerance_hz=args.freq_tolerance_hz,  #
-            pixel_sample_stride=args.pixel_sample_stride,
-            pixel_candidate_k=args.pixel_candidate_k,
-            pixel_preselect_k=args.pixel_preselect_k,
-            pixel_render_acc_min=args.pixel_render_acc_min,
-            pixel_min_contribution=args.pixel_min_contribution,
-            gaussian_scales=fg_scales,
-            gaussian_quats=fg_quats,
-            gaussian_opacities=fg_opacities,
-            rendered_depths=rendered_depths,
-            rendered_accs=rendered_accs,
-            gaussian_tree=gaussian_tree,
-        )
-        with np.load(str(obs_path), allow_pickle=False) as loaded:
-            observations = {key: loaded[key] for key in loaded.files}
-        if incremental_base is not None:
-            validate_incremental_observation_topology(
-                incremental_base,
-                observations,
-                obs_path,
+        source_measurement_path: Path | None = None
+        prepared: PreparedObservations | None = None
+        if staged_shared_observations:
+            assert staged_observation_topology is not None
+            source_measurement_path = staged_observation_measurements[mode_index]
+            measurement = load_gaussian_observation_measurement(
+                source_measurement_path
             )
+            observations = compose_gaussian_observations(
+                staged_observation_topology,
+                measurement,
+            )
+            prepared = _validate_shared_source_observations(
+                None,
+                observations,
+                source_path=source_measurement_path,
+                args=args,
+                view_config_paths=view_configs_paths,
+                modal_npz_paths=modal_npzs_paths,
+                freqs_per_view=freqs_per_view,
+                mode_index=mode_index,
+                reference_freq=reference_freq,
+                foreground_points=fg_means,
+            )
+            if args.resume and latent_path.is_file():
+                mode_entry, resumed_motion_fill_diagnostics = (
+                    _load_resumed_staged_mode(
+                        args=args,
+                        prepared=prepared,
+                        reference_freq=reference_freq,
+                        mode_index=mode_index,
+                        source_measurement_path=source_measurement_path,
+                        latent_path=latent_path,
+                        diagnostics_path=diagnostics_path,
+                        motion_fill_graph_path=motion_fill_graph_path,
+                    )
+                )
+                modes.append(mode_entry)
+                if resumed_motion_fill_diagnostics is not None:
+                    motion_fill_mode_diagnostics[mode_name] = (
+                        resumed_motion_fill_diagnostics
+                    )
+                print(f"Resumed completed Gaussian mode {mode_name}", flush=True)
+                continue
+
+            latent_path.unlink(missing_ok=True)
+            diagnostics_path.unlink(missing_ok=True)
+            _staged_resume_summary_path(diagnostics_path).unlink(missing_ok=True)
+        else:
+            build_gaussian_observation_graph(
+                # Staged mode loaded the static render inputs and Gaussian tree above.
+                points_world=fg_means,
+                view_config_paths=view_configs_paths,
+                modal_npz_paths=modal_npzs_paths,
+                out_path=obs_path,
+                source_checkpoint=args.input_ckpt,
+                mode_index=mode_index,
+                mask_erode_iters=args.mask_erode_iters,
+                freq_tolerance_hz=args.freq_tolerance_hz,  #
+                pixel_sample_stride=args.pixel_sample_stride,
+                pixel_candidate_k=args.pixel_candidate_k,
+                pixel_preselect_k=args.pixel_preselect_k,
+                pixel_render_acc_min=args.pixel_render_acc_min,
+                pixel_min_contribution=args.pixel_min_contribution,
+                gaussian_scales=fg_scales,
+                gaussian_quats=fg_quats,
+                gaussian_opacities=fg_opacities,
+                rendered_depths=rendered_depths,
+                rendered_accs=rendered_accs,
+                gaussian_tree=gaussian_tree,
+            )
+            with np.load(str(obs_path), allow_pickle=False) as loaded:
+                observations = {key: loaded[key] for key in loaded.files}
+            if incremental_base is not None:
+                validate_incremental_observation_topology(
+                    incremental_base,
+                    observations,
+                    obs_path,
+                )
         _print_observation_sanity(observations, fg_means.shape[0])
         staged = optimize_multi_view_staged(
             observations=observations,
@@ -3992,19 +4240,43 @@ def run(args: argparse.Namespace) -> None:
         if motion_fill_result is not None:
             mode_stats["motion_fill"] = motion_fill_result.diagnostics
         freqs_by_view = [float(freqs[mode_index]) for freqs in freqs_per_view]
-        mode_entry = {
+        mode_entry: dict[str, Any] = {
             "mode_index": int(mode_index),
             "freq_hz": reference_freq,
             "freqs_hz_by_view": freqs_by_view,
             "label": f"{mode_index}: {reference_freq:.6f} Hz",
-            "observation_path": relative_path(obs_path, out_dir),
             "latent_path": relative_path(latent_path, out_dir),
             "diagnostics_path": relative_path(diagnostics_path, out_dir),
             "vis_dir": relative_path(mode_vis_dir, out_dir),
             "alpha_by_view": alpha_by_view_diagnostics(staged),
             "stats": mode_stats,
         }
+        if source_measurement_path is None:
+            mode_entry["observation_path"] = relative_path(obs_path, out_dir)
+        else:
+            mode_entry["observation_measurement_path"] = relative_path(
+                source_measurement_path,
+                out_dir,
+            )
+            mode_entry["source_observation_measurement_path"] = str(
+                source_measurement_path
+            )
         modes.append(mode_entry)
+        if source_measurement_path is not None:
+            _write_staged_resume_summary(
+                _staged_resume_summary_path(diagnostics_path),
+                args=args,
+                mode_index=mode_index,
+                reference_freq=reference_freq,
+                source_measurement_path=source_measurement_path,
+                motion_fill_graph_path=motion_fill_graph_path,
+                mode_entry=mode_entry,
+                motion_fill_diagnostics=(
+                    motion_fill_result.diagnostics
+                    if motion_fill_result is not None
+                    else None
+                ),
+            )
 
     global_output_started = perf_counter()
     if args.solve_method == "rigid-components":
@@ -4032,6 +4304,17 @@ def run(args: argparse.Namespace) -> None:
                 "rigid_component_graph_count": 1,
                 "rigid_component_graph_policy": "shared_observation_topology",
                 "rigid_component_observation_policy": (
+                    "shared_topology_sample_measurements_v1"
+                ),
+                "observation_storage_policy": (
+                    "shared_topology_sample_measurements_v1"
+                ),
+            }
+        )
+    elif staged_shared_observations:
+        manifest_parameters.update(
+            {
+                "staged_observation_policy": (
                     "shared_topology_sample_measurements_v1"
                 ),
                 "observation_storage_policy": (
@@ -4151,6 +4434,8 @@ def run(args: argparse.Namespace) -> None:
         rigid_observation_topology_path
         if rigid_observation_topology_path is not None
         else soft_observation_topology_path
+        if soft_observation_topology_path is not None
+        else staged_observation_topology_path
     )
     if observation_topology_path is not None:
         manifest["observation_topology_path"] = relative_path(

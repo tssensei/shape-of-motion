@@ -1,0 +1,37 @@
+format: som_modal_solver_comparison_pipeline
+version: 2
+
+# Existing version-1 experiment config that owns all shared preprocessing,
+# including the approved static checkpoint and canonical observation bank.
+base_config: /home/zs292/data_formal/SCENE/shared/inputs/modal_pipeline_k20_v1.yaml
+
+# New immutable controller/graph-approval namespace for this comparison.
+shared_run_id: modal_solver_comparison_k20_v1
+
+variants:
+  - variant_id: staged
+    method: staged
+    solver_artifact_id: staged_k20_v1
+    rendered_design_artifact_id: rendered_stride2_v1
+    flow_coordinates_artifact_id: ridge1e4_v1
+    physics_artifact_id: ridge1e4_zeta0p05_force0p1_v1
+    direct_checkpoint_artifact_id: fixed_staged_ridge1e4_v1
+    physics_checkpoint_artifact_id: fixed_staged_ridge1e4_zeta0p05_force0p1_v1
+
+  - variant_id: rigid
+    method: rigid-components
+    solver_artifact_id: rigid_k20_v1
+    rendered_design_artifact_id: rendered_stride2_v1
+    flow_coordinates_artifact_id: ridge1e4_v1
+    physics_artifact_id: ridge1e4_zeta0p05_force0p1_v1
+    direct_checkpoint_artifact_id: fixed_rigid_ridge1e4_v1
+    physics_checkpoint_artifact_id: fixed_rigid_ridge1e4_zeta0p05_force0p1_v1
+
+  - variant_id: soft
+    method: soft-elastic
+    solver_artifact_id: soft_elastic_k20_v1
+    rendered_design_artifact_id: rendered_stride2_v1
+    flow_coordinates_artifact_id: ridge1e4_v1
+    physics_artifact_id: ridge1e4_zeta0p05_force0p1_v1
+    direct_checkpoint_artifact_id: fixed_soft_ridge1e4_v1
+    physics_checkpoint_artifact_id: fixed_soft_ridge1e4_zeta0p05_force0p1_v1

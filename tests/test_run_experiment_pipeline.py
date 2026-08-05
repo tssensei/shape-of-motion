@@ -13,10 +13,14 @@ from pathlib import Path
 import yaml
 
 from run_experiment_pipeline import (
+    ComparisonPipelineConfig,
     PrestaticInputs,
     REPO_ROOT,
     SourceView,
     _candidate_parameters_from_args,
+    _comparison_control_paths,
+    _comparison_stage_config,
+    _comparison_variant_paths,
     _initial_state,
     _modal_solver_argv,
     _parse_source_view,
@@ -29,11 +33,16 @@ from run_experiment_pipeline import (
     _status_payload,
     _viewer_command_text,
     build_parser,
+    load_comparison_config,
     load_config,
+    load_pipeline_configuration,
 )
 
 
 TEMPLATE_PATH = REPO_ROOT / "preproc" / "experiment_pipeline_template.yaml"
+COMPARISON_TEMPLATE_PATH = (
+    REPO_ROOT / "preproc" / "experiment_comparison_pipeline_template.yaml"
+)
 
 
 def _write_test_config(root: Path) -> tuple[dict[str, object], Path]:
@@ -47,7 +56,160 @@ def _write_test_config(root: Path) -> tuple[dict[str, object], Path]:
     return payload, path
 
 
+def _write_comparison_config(
+    root: Path,
+    base_path: Path,
+) -> tuple[dict[str, object], Path]:
+    payload = yaml.safe_load(
+        COMPARISON_TEMPLATE_PATH.read_text(encoding="utf-8")
+    )
+    payload["base_config"] = str(base_path)
+    payload["shared_run_id"] = "comparison_v1"
+    path = root / "comparison.yaml"
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return payload, path
+
+
 class ExperimentPipelineTest(unittest.TestCase):
+    def test_comparison_config_reuses_shared_paths_and_isolates_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, base_path = _write_test_config(root)
+            _, comparison_path = _write_comparison_config(root, base_path)
+
+            loaded = load_pipeline_configuration(comparison_path)
+
+            self.assertIsInstance(loaded, ComparisonPipelineConfig)
+            assert isinstance(loaded, ComparisonPipelineConfig)
+            self.assertEqual(
+                [variant.config.solver.method for variant in loaded.variants],
+                ["staged", "rigid-components", "soft-elastic"],
+            )
+            base_paths = _pipeline_paths(loaded.base_config)
+            control_paths = _comparison_control_paths(loaded)
+            self.assertEqual(control_paths.topology_path, base_paths.topology_path)
+            self.assertEqual(
+                control_paths.observations_dir,
+                base_paths.observations_dir,
+            )
+            variant_paths = [
+                _comparison_variant_paths(loaded, variant)
+                for variant in loaded.variants
+            ]
+            self.assertEqual(len({path.modal_fields_dir for path in variant_paths}), 3)
+            for variant, paths in zip(loaded.variants, variant_paths):
+                self.assertIn(
+                    variant.config.solver.artifact_id,
+                    paths.rendered_design_dir.parts,
+                )
+                self.assertEqual(paths.topology_path, base_paths.topology_path)
+
+    def test_comparison_stage_identities_do_not_invalidate_modal_solve_for_physics_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, base_path = _write_test_config(root)
+            payload, comparison_path = _write_comparison_config(root, base_path)
+            first = load_comparison_config(comparison_path)
+            first_variant = first.variants[0]
+            first_modal = _comparison_stage_config(
+                first,
+                first_variant,
+                "gaussian_modal_fields",
+            ).config_identity
+            first_physics = _comparison_stage_config(
+                first,
+                first_variant,
+                "modal_physics_coordinates",
+            ).config_identity
+
+            variants = payload["variants"]
+            assert isinstance(variants, list)
+            variants[0]["physics_artifact_id"] = "different_physics_v2"
+            comparison_path.write_text(
+                yaml.safe_dump(payload, sort_keys=False),
+                encoding="utf-8",
+            )
+            second = load_comparison_config(comparison_path)
+            second_variant = second.variants[0]
+
+            self.assertEqual(
+                first_modal,
+                _comparison_stage_config(
+                    second,
+                    second_variant,
+                    "gaussian_modal_fields",
+                ).config_identity,
+            )
+            self.assertNotEqual(
+                first_physics,
+                _comparison_stage_config(
+                    second,
+                    second_variant,
+                    "modal_physics_coordinates",
+                ).config_identity,
+            )
+            rigid_variant = second.variants[1]
+            self.assertNotEqual(
+                _comparison_stage_config(
+                    second,
+                    rigid_variant,
+                    "gaussian_modal_fields",
+                    "graph_sha_1",
+                ).config_identity,
+                _comparison_stage_config(
+                    second,
+                    rigid_variant,
+                    "gaussian_modal_fields",
+                    "graph_sha_2",
+                ).config_identity,
+            )
+
+    def test_staged_modal_command_reuses_shared_observation_bank(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, config_path = _write_test_config(root)
+            config = load_config(config_path)
+            paths = _pipeline_paths(config)
+            view = SourceView(
+                view_id="view1",
+                image_dir=root / "images" / "view1",
+                mask_dir=root / "masks" / "view1",
+                fps_hz=30.0,
+                width=960,
+                height=540,
+                frame_names=("000000.png",),
+                source_identity="source_identity",
+                reference_frame_name="000000.png",
+                reference_frame_stem="000000",
+                reference_local_index=0,
+            )
+            inputs = PrestaticInputs(
+                ready_path=root / "ready.json",
+                static_dataset=root / "static_dataset",
+                source_manifest=root / "source_manifest.json",
+                reference_cameras=root / "reference_cameras.json",
+                reference_selection=root / "reference_selection.json",
+                views=(view,),
+            )
+
+            argv = _modal_solver_argv(
+                config,
+                inputs,
+                paths,
+                root / "last.ckpt",
+                None,
+                resume=True,
+            )
+
+            self.assertIn("--staged-observation-topology", argv)
+            self.assertEqual(
+                argv[argv.index("--staged-observation-topology") + 1],
+                str(paths.topology_path),
+            )
+            self.assertIn("--staged-observation-measurement", argv)
+            self.assertIn("--resume", argv)
+            self.assertNotIn("--rigid-component-observation-topology", argv)
+
     def test_template_loads_and_derives_formal_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -421,3 +583,6 @@ class ExperimentPipelineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    _comparison_control_paths,
+    _comparison_stage_config,
+    _comparison_variant_paths,
