@@ -964,3 +964,27 @@ Date: 2026-07-26
 - Viser inspection considered the K20 motion acceptable for continuing, and
   the modal renderer now offers an optional background-hide control for
   foreground-only inspection without changing the stored checkpoint.
+
+## `curtain3_static_3dgs_no_background_discarded`
+
+Date: 2026-08-05
+
+### Inputs and discarded output
+
+- Pre-static input remains reusable at
+  `/home/zs292/data_formal/curtain3_2view_v1/shared/preprocessing/joint_colmap_frames_v1`.
+- The first static candidate was trained at
+  `/home/zs292/data_formal/curtain3_2view_v1/static_3dgs/sweep_rgbmask_v1`
+  with 40,000 foreground Gaussians and `num_bg=0`.
+- Viser inspection identified the missing explicit background model. This
+  candidate and its matching pipeline-controller state are to be deleted; the
+  completed COLMAP output and canonical RGB/mask sequences remain unchanged.
+
+### Replacement run
+
+- The curtain experiment config will use `num_bg=100000`, matching the
+  repository's established static-training default, while retaining
+  `w_mask=0` and zero depth-loss weights.
+- Because `num_bg` participates in the immutable pipeline config identity,
+  the replacement run starts with a clean controller directory and retrains
+  the static candidate from scratch.

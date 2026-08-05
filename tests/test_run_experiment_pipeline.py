@@ -51,7 +51,7 @@ class ExperimentPipelineTest(unittest.TestCase):
             paths = _pipeline_paths(config)
 
             self.assertEqual(config.scene_id, "scene_v1")
-            self.assertEqual(config.static.num_bg, 0)
+            self.assertEqual(config.static.num_bg, 100000)
             self.assertEqual(config.frequency.mode_counts, (20, 40, 60))
             self.assertEqual(config.frequency.selected_k, 60)
             self.assertEqual(

@@ -11,7 +11,7 @@ static:
   artifact_id: sweep_rgbmask_v1
   initial_epochs: 100
   num_fg: 40000
-  num_bg: 0
+  num_bg: 100000
   batch_size: 8
   num_workers: 4
   use_2dgs: false
