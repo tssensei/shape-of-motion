@@ -1,0 +1,50 @@
+# Copy this file to:
+# /home/zs292/data_formal/<scene_id>/shared/inputs/prestatic_pipeline_v1.yaml
+#
+# image_dir and mask_dir are canonical inputs. The controller only copies PNG
+# bytes; it never decodes video or rotates, crops, or resizes any frame.
+format: som_prestatic_pipeline
+version: 1
+
+scene_id: example_3view_v1
+scene_root: /home/zs292/data_formal/example_3view_v1
+run_id: joint_colmap_frames_v1
+
+sweep:
+  view_id: example_sweep
+  image_dir: /home/zs292/datasets/custom/images/example_sweep
+  mask_dir: /home/zs292/datasets/custom/masks/example_sweep
+  fps_hz: 30
+  camera_group: sweep_camera
+
+static_views:
+  - view_id: view1
+    image_dir: /home/zs292/datasets/custom/images/view1
+    mask_dir: /home/zs292/datasets/custom/masks/view1
+    fps_hz: 30
+    camera_group: fixed_camera
+    reference_policy: middle
+
+  - view_id: view2
+    image_dir: /home/zs292/datasets/custom/images/view2
+    mask_dir: /home/zs292/datasets/custom/masks/view2
+    fps_hz: 30
+    camera_group: fixed_camera
+    reference_policy: middle
+
+  - view_id: view3
+    image_dir: /home/zs292/datasets/custom/images/view3
+    mask_dir: /home/zs292/datasets/custom/masks/view3
+    fps_hz: 30
+    camera_group: fixed_camera
+    reference_policy: middle
+    # Or replace reference_policy with an exact filename:
+    # reference_frame: view3_000900.png
+
+colmap:
+  sweep_sample_fps_hz: 3
+  camera_model: SIMPLE_RADIAL
+  matcher: exhaustive
+  min_sweep_registration_ratio: 0.8
+  # An absolute executable path is allowed when COLMAP is in another conda env.
+  command: colmap
