@@ -1110,3 +1110,21 @@ Date: 2026-08-05
 - The interrupted directory has no accepted completed mode and may be resumed
   with the same command plus `--resume` after pulling the fix. Cluster rerun and
   visual evaluation remain pending.
+
+## Bush internal-poster technical brief
+
+- Added the English source document at
+  `docs/poster_brief/shape_of_motion_poster_brief.tex`, with bibliography in
+  `docs/poster_brief/references.bib` and the pending Bush export checklist in
+  `docs/poster_brief/figures/README.md`.
+- This reporting artifact covers the Bush workflow from sweep/fixed-view
+  capture through COLMAP, static foreground/background 3DGS, masked optical
+  flow and frequency selection, Gaussian observation topology, the
+  color/depth-filtered rigid-component solve, and motion fill to a complete 3D
+  modal field. It intentionally stops before modal-coordinate recovery,
+  physics post-fitting, fixed-checkpoint animation, or original-video
+  reconstruction.
+- Results are presented qualitatively and contain no experimental metric
+  claims. The six requested Bush figures remain explicit placeholders pending
+  reproducible Viewer exports from the cluster artifacts; no new Bush solve or
+  render was run for this documentation update.
