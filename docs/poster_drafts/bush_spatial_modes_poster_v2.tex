@@ -212,11 +212,6 @@ Gaussian to an image-space ellipse. Depth-ordered alpha compositing gives
 \end{tikzpicture}
 \end{center}
 
-\notebox{PosterSlate}{PosterFog}{%
-  \textbf{Why 3DGS is useful here.} The same representation provides sharp
-  rendering, explicit world-space locations, foreground/background separation,
-  rendered depth, and differentiable camera projection Jacobians.}
-
 \postersection{2A.}{Modal analysis: coupled motion, simple modes}{PosterSage}
 
 \postersubsection{A two-degree-of-freedom example}
@@ -226,16 +221,29 @@ approximated by
 \equationbox{PosterSage}{
   M\ddot u(t)+C\dot u(t)+Ku(t)=f(t).
 }
-Its undamped mode shapes satisfy
-\begin{equation*}
-  K\phi_i=\omega_i^2M\phi_i.
-\end{equation*}
-The mode vectors are linearly independent and $M$-orthogonal. Writing
-$\Phi=[\phi_1,\ldots,\phi_N]$ transforms the coupled degrees of freedom into
-independent modal coordinates:
+Define the modal transformation
 \equationbox{PosterSage}{
   u(t)=\Phi q(t)=\sum_{i=1}^{N}\phi_iq_i(t).
 }
+Each column $\phi_i$ of $\Phi$ is a spatial \emph{mode shape}; $q_i(t)$ is its
+time-varying \emph{modal coordinate}. Substitution and projection by
+$\Phi^\top$ give
+\equationbox{PosterSage}{
+  \begin{gathered}
+    \widetilde M\ddot q+\widetilde C\dot q+\widetilde Kq=\widetilde f,\\
+    \widetilde X=\Phi^\top X\Phi\ (X=M,C,K),\qquad
+    \widetilde f=\Phi^\top f,\\
+    \widetilde M,\widetilde K\ \text{diagonal},\qquad
+    C\approx\alpha M+\beta K
+    \Rightarrow
+    \widetilde C\approx\alpha\widetilde M+\beta\widetilde K\ \text{diagonal},\\
+    \widetilde m_i\ddot q_i+\widetilde c_i\dot q_i+
+    \widetilde k_iq_i=\phi_i^\top f.
+  \end{gathered}
+}
+Modal orthogonality diagonalizes mass and stiffness; Rayleigh damping also
+diagonalizes damping. The coupled system therefore separates into independent
+modal oscillators.
 
 \begin{center}
 \begin{tikzpicture}[x=1in,y=1in,>=Latex]
@@ -278,12 +286,6 @@ independent modal coordinates:
   \node[anchor=west,PosterMuted] at (4.35,0.00) {$\phi_2\propto[1,-1]^\top$};
 \end{tikzpicture}
 \end{center}
-
-Instead of tracking every coupled coordinate independently, modal analysis
-keeps a small set of spatial patterns $\phi_i$ and lets scalar coordinates
-$q_i(t)$ describe how strongly each pattern is active. Low-frequency modes
-often dominate visible vibration, so the basis can be much smaller than the
-original number of degrees of freedom.
 
 \postersection{2B.}{Modal analysis from ordinary video}{PosterSage}
 
