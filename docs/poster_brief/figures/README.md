@@ -5,6 +5,24 @@ Replace each placeholder by exporting the requested Bush result to the exact
 filename below. Prefer PNG for plots and UI captures; use PDF for vector
 diagrams if a later replacement is drawn manually.
 
+## Version-2 poster placement
+
+`docs/poster_drafts/bush_spatial_modes_poster_v2.tex` uses the same stable
+filenames but gives more space to background and assumptions. The most
+important final assets are, in order:
+
+1. `bush_flow_and_frequency.png`, which supports the Davis image-space modal
+   analysis explanation;
+2. `bush_capture_and_cameras.png`, which shows the asynchronous capture and
+   shared COLMAP coordinate system;
+3. `bush_rigid_components.png`, which illustrates the local 3D solve; and
+4. `bush_modes_grid.png`, which is the largest qualitative result panel.
+
+`bush_static_3dgs.png` remains a smaller background panel. The motion-fill
+before/after image is optional in this layout because the full pipeline and
+mode grid have higher priority. Use muted annotations that match the poster's
+slate, sage, clay, and warm-gray palette; do not add bright rainbow borders.
+
 Keep screenshots tightly cropped. Avoid terminal chrome and large empty Viewer
 regions. For all modal screenshots, use the same camera, Viewer resolution,
 Gaussian scale, opacity, amplitude normalization, and phase-color convention.
@@ -20,7 +38,7 @@ Gaussian scale, opacity, amplitude normalization, and phase-color convention.
 
 ## Recommended poster crops
 
-- Export at least 1800 pixels on the long side; the eventual 48-by-36-inch
+- Export at least 1800 pixels on the long side; the eventual 30-by-40-inch
   poster will expose low-resolution screenshots.
 - Prefer the static camera angle that makes foreground branches readable in
   silhouette.

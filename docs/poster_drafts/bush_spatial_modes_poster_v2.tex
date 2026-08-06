@@ -1,0 +1,614 @@
+\documentclass[10pt]{article}
+
+\usepackage[paperwidth=30in,paperheight=40in,margin=0.62in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathmorphing}
+\usepackage{ragged2e}
+\usepackage[hidelinks]{hyperref}
+
+\renewcommand{\familydefault}{\sfdefault}
+
+% Muted palette for the review draft.
+\definecolor{PosterInk}{HTML}{23313A}
+\definecolor{PosterSlate}{HTML}{496577}
+\definecolor{PosterSage}{HTML}{657B70}
+\definecolor{PosterClay}{HTML}{956B58}
+\definecolor{PosterFog}{HTML}{EEF1F2}
+\definecolor{PosterSand}{HTML}{F3F0EA}
+\definecolor{PosterLine}{HTML}{CCD4D8}
+\definecolor{PosterMuted}{HTML}{53616A}
+
+\hypersetup{
+  pdftitle={Recovering 3D Vibration Modes from Asynchronous Multi-View Videos},
+  colorlinks=true,
+  linkcolor=PosterSlate,
+  citecolor=PosterSlate,
+  urlcolor=PosterSlate
+}
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.34em}
+\setlength{\columnsep}{0.34in}
+\setlist[itemize]{leftmargin=1.25em,itemsep=0.15em,topsep=0.15em}
+\setlist[enumerate]{leftmargin=1.35em,itemsep=0.18em,topsep=0.18em}
+
+\newcommand{\postersection}[3]{%
+  \vspace{0.18in}
+  \noindent
+  \colorbox{#3}{%
+    \parbox{\dimexpr\linewidth-2\fboxsep\relax}{%
+      \color{white}\bfseries\fontsize{38}{43}\selectfont
+      \strut #1\hspace{0.24em}#2\strut}}
+  \vspace{0.11in}
+}
+
+\newcommand{\postersubsection}[1]{%
+  \vspace{0.10in}
+  {\bfseries\color{PosterInk}\fontsize{29}{34}\selectfont #1\par}
+  \vspace{0.03in}
+}
+
+\newcommand{\smalllabel}[1]{%
+  {\bfseries\color{PosterSlate}\fontsize{18}{21}\selectfont\MakeUppercase{#1}}}
+
+\newcommand{\notebox}[3]{%
+  \vspace{0.08in}
+  \noindent\fcolorbox{#1}{#2}{%
+    \parbox{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{%
+      \vspace{0.05in}\textbf{#3}\vspace{0.05in}}}
+  \vspace{0.08in}
+}
+
+\newcommand{\equationbox}[2]{%
+  \vspace{0.06in}
+  \noindent\fcolorbox{#1}{PosterFog}{%
+    \parbox{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{%
+      \vspace{-0.06in}
+      \begin{equation*}#2\end{equation*}
+      \vspace{-0.09in}}}
+  \vspace{0.06in}
+}
+
+\newcommand{\posterplaceholder}[3]{%
+  \vspace{0.08in}
+  \begin{center}
+    \IfFileExists{#1}{%
+      \includegraphics[width=\linewidth,height=#2,keepaspectratio]{#1}
+    }{%
+      \fcolorbox{PosterLine}{PosterFog}{%
+        \parbox[c][#2][c]{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{%
+          \centering
+          {\bfseries\fontsize{23}{27}\selectfont Figure placeholder}\par
+          \vspace{0.10in}
+          {\fontsize{17}{20}\selectfont\texttt{\detokenize{#1}}}}}}
+    \vspace{0.05in}
+    {\color{PosterMuted}\fontsize{18}{22}\selectfont #3\par}
+  \end{center}
+  \vspace{0.06in}
+}
+
+\newcommand{\pipelinebox}[4]{%
+  \node[draw=#1,fill=#1!7,line width=1.8pt,rounded corners=3pt,
+        align=center,text width=1.58in,minimum height=0.82in,#4] (#2)
+        {\bfseries\fontsize{18}{21}\selectfont #3};}
+
+\begin{document}
+\RaggedRight
+\color{PosterInk}
+\fontsize{23}{29}\selectfont
+
+% -----------------------------------------------------------------------------
+% Header
+% -----------------------------------------------------------------------------
+\begin{center}
+  {\bfseries\fontsize{76}{82}\selectfont
+    Recovering 3D Vibration Modes from\[-0.03in]
+    Asynchronous Multi-View Videos\par}
+  \vspace{0.15in}
+  {\color{PosterSlate}\fontsize{32}{39}\selectfont
+    A Gaussian-splat representation connects independently recorded image-space
+    vibrations to shared spatial 3D mode shapes.\par}
+\end{center}
+
+\vspace{0.16in}
+\noindent\colorbox{PosterSand}{%
+  \parbox{\dimexpr\linewidth-2\fboxsep\relax}{%
+    \centering\fontsize{24}{30}\selectfont
+    \textbf{Goal.} Use one mobile phone to scan a static scene and then record
+    vibration from several fixed viewpoints at different times. Recover a
+    view-consistent, high-detail 3D Gaussian model and a bank of spatial
+    vibration fields without requiring synchronized cameras.}}
+\vspace{0.22in}
+
+% -----------------------------------------------------------------------------
+% Three-column poster body
+% -----------------------------------------------------------------------------
+\noindent
+\begin{minipage}[t]{0.322\textwidth}
+\vspace{0pt}
+
+\postersection{1.}{From 3DGS to dynamic 3D scenes}{PosterSlate}
+
+\postersubsection{3D Gaussian Splatting in one paragraph}
+
+3D Gaussian Splatting (3DGS) represents a scene as explicit, oriented,
+semi-transparent ellipsoids rather than as a dense voxel grid
+\cite{kerbl2023gaussians}. Gaussian $g$ stores
+\begin{equation*}
+  \mathcal G_g=(\mu_g,\Sigma_g,o_g,c_g),
+\end{equation*}
+where $\mu_g\in\mathbb R^3$ is its center, $\Sigma_g$ its 3D covariance,
+$o_g$ opacity, and $c_g$ appearance. A calibrated camera projects each
+Gaussian to an image-space ellipse. Depth-ordered alpha compositing gives
+\begin{equation*}
+  \widehat C(p)=\sum_{i\in\mathcal H(p)}
+  T_{p,i}\,a_{p,i}\,c_i,
+  \qquad
+  T_{p,i}=\prod_{j<i}(1-a_{p,j}).
+\end{equation*}
+
+\begin{center}
+\begin{tikzpicture}[x=1in,y=1in,>=Latex]
+  \draw[line width=2pt,PosterInk] (0,0) -- (0,1.30);
+  \node[rotate=90,anchor=south,PosterMuted] at (-0.10,0.65)
+    {camera image};
+  \draw[dashed,PosterLine,line width=1.4pt] (0,0.38) -- (2.15,1.00);
+  \draw[dashed,PosterLine,line width=1.4pt] (0,0.62) -- (3.15,0.54);
+  \draw[dashed,PosterLine,line width=1.4pt] (0,0.86) -- (4.12,1.08);
+  \draw[fill=PosterSlate!25,draw=PosterSlate,line width=1.8pt,
+        rotate around={18:(2.15,1.00)}] (2.15,1.00) ellipse (0.52 and 0.20);
+  \draw[fill=PosterSage!28,draw=PosterSage,line width=1.8pt,
+        rotate around={-12:(3.15,0.54)}] (3.15,0.54) ellipse (0.66 and 0.22);
+  \draw[fill=PosterClay!24,draw=PosterClay,line width=1.8pt,
+        rotate around={22:(4.12,1.08)}] (4.12,1.08) ellipse (0.56 and 0.19);
+  \fill[PosterInk] (2.15,1.00) circle (2.3pt);
+  \fill[PosterInk] (3.15,0.54) circle (2.3pt);
+  \fill[PosterInk] (4.12,1.08) circle (2.3pt);
+  \draw[->,PosterSlate,line width=2pt] (3.15,0.54) -- ++(0.42,0.46);
+  \node[align=center,PosterMuted] at (2.75,-0.06)
+    {explicit centers support a 3D displacement field};
+\end{tikzpicture}
+\end{center}
+
+\notebox{PosterSlate}{PosterFog}{%
+  \textbf{Why 3DGS is useful here.} The same representation provides sharp
+  rendering, explicit world-space locations, foreground/background separation,
+  rendered depth, and differentiable camera projection Jacobians.}
+
+\postersubsection{How prior work makes 3DGS dynamic}
+
+Dynamic reconstruction remains ill-posed because geometry, camera motion,
+occlusion, and non-rigid object motion are entangled. Representative families
+include:
+
+{\fontsize{19}{24}\selectfont
+\renewcommand{\arraystretch}{1.18}
+\begin{tabularx}{\linewidth}{@{}>{\bfseries}p{0.27\linewidth}X@{}}
+\hline
+Capture/model & Typical strategy \\
+\hline
+Synchronized multi-view or RGB-D
+  & Triangulate changing geometry with simultaneous observations; accurate but
+    hardware-heavy. \\
+Dynamic NeRF
+  & Learn time-dependent radiance or a canonical-to-observation deformation
+    field, as in Nerfies/HyperNeRF \cite{park2021nerfies,park2021hypernerf}. \\
+Dynamic 3DGS
+  & Move or deform explicit Gaussians over time for fast rendering
+    \cite{wu2024fourDgs,yang2024deformable}. \\
+Persistent motion bases
+  & Share a compact set of $SE(3)$ trajectories across Gaussians, as in Shape
+    of Motion \cite{wang2025shape}. \\
+\hline
+\end{tabularx}}
+
+Shape of Motion emphasizes that many monocular methods recover short-range
+scene flow or canonical deformation, while synchronized multi-view systems
+remain much easier to constrain. Our setting takes a different middle ground:
+multiple views are available, but they are recorded asynchronously by one
+phone.
+
+\posterplaceholder{../poster_brief/figures/bush_static_3dgs.png}{2.50in}{%
+  Canonical Bush 3DGS: high-detail appearance and explicit foreground centers.}
+
+\postersection{2.}{Modal analysis: coupled motion, simple modes}{PosterSage}
+
+\postersubsection{A two-degree-of-freedom example}
+
+For small displacements around a rest state, a coupled mechanical system is
+approximated by
+\equationbox{PosterSage}{
+  M\ddot u(t)+C\dot u(t)+Ku(t)=f(t).
+}
+Its undamped mode shapes satisfy
+\begin{equation*}
+  K\phi_i=\omega_i^2M\phi_i.
+\end{equation*}
+The mode vectors are linearly independent and $M$-orthogonal. Writing
+$\Phi=[\phi_1,\ldots,\phi_N]$ transforms the coupled degrees of freedom into
+independent modal coordinates:
+\equationbox{PosterSage}{
+  u(t)=\Phi q(t)=\sum_{i=1}^{N}\phi_iq_i(t).
+}
+
+\begin{center}
+\begin{tikzpicture}[x=1in,y=1in,>=Latex]
+  % Physical two-mass system.
+  \node[PosterMuted] at (2.30,2.16) {two coupled degrees of freedom};
+  \draw[line width=2pt,PosterInk] (0.10,1.34) -- (0.10,1.98);
+  \foreach \yy in {1.40,1.52,1.64,1.76,1.88}
+    \draw[PosterInk,line width=0.8pt] (0.10,\yy) -- (-0.06,\yy-0.08);
+  \draw[decorate,decoration={coil,aspect=0.45,segment length=0.12in,
+        amplitude=0.08in},PosterSlate,line width=1.7pt]
+        (0.10,1.66) -- (1.20,1.66);
+  \draw[fill=PosterFog,draw=PosterInk,line width=1.7pt]
+        (1.20,1.35) rectangle (2.10,1.97);
+  \node at (1.65,1.66) {$m_1$};
+  \draw[decorate,decoration={coil,aspect=0.45,segment length=0.12in,
+        amplitude=0.08in},PosterSlate,line width=1.7pt]
+        (2.10,1.66) -- (3.20,1.66);
+  \draw[fill=PosterFog,draw=PosterInk,line width=1.7pt]
+        (3.20,1.35) rectangle (4.10,1.97);
+  \node at (3.65,1.66) {$m_2$};
+
+  % Mode 1.
+  \node[anchor=west,PosterInk] at (0.10,0.88) {Mode 1: in phase};
+  \draw[fill=PosterSlate!13,draw=PosterSlate,line width=1.4pt]
+        (2.20,0.55) rectangle (2.72,0.97);
+  \draw[fill=PosterSlate!13,draw=PosterSlate,line width=1.4pt]
+        (3.47,0.55) rectangle (3.99,0.97);
+  \draw[->,PosterSlate,line width=2.2pt] (2.46,0.47) -- ++(0.46,0);
+  \draw[->,PosterSlate,line width=2.2pt] (3.73,0.47) -- ++(0.46,0);
+  \node[anchor=west,PosterMuted] at (4.35,0.75) {$\phi_1\propto[1,1]^\top$};
+
+  % Mode 2.
+  \node[anchor=west,PosterInk] at (0.10,0.13) {Mode 2: out of phase};
+  \draw[fill=PosterSage!16,draw=PosterSage,line width=1.4pt]
+        (2.20,-0.20) rectangle (2.72,0.22);
+  \draw[fill=PosterSage!16,draw=PosterSage,line width=1.4pt]
+        (3.47,-0.20) rectangle (3.99,0.22);
+  \draw[->,PosterSage,line width=2.2pt] (2.46,-0.28) -- ++(0.46,0);
+  \draw[->,PosterSage,line width=2.2pt] (3.73,-0.28) -- ++(-0.46,0);
+  \node[anchor=west,PosterMuted] at (4.35,0.00) {$\phi_2\propto[1,-1]^\top$};
+\end{tikzpicture}
+\end{center}
+
+Instead of tracking every coupled coordinate independently, modal analysis
+keeps a small set of spatial patterns $\phi_i$ and lets scalar coordinates
+$q_i(t)$ describe how strongly each pattern is active. Low-frequency modes
+often dominate visible vibration, so the basis can be much smaller than the
+original number of degrees of freedom.
+
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.322\textwidth}
+\vspace{0pt}
+
+\postersection{2.}{Modal analysis from ordinary video}{PosterSage}
+
+\postersubsection{Davis et al.: image-space modal bases}
+
+Davis, Chen, and Durand recover projections of resonant modes from a short
+video without knowing geometry or material parameters
+\cite{davis2015imagespace}. Their key observation is that, near a resonant
+frequency $\omega_i$, the temporal spectrum of visible displacement is
+proportional to the projected mode shape:
+\equationbox{PosterSage}{
+  VU(\omega_i)=A_iH_i(\omega_i)V\phi_i
+  \quad\Longrightarrow\quad
+  VU(\omega_i)\propto V\phi_i.
+}
+Here $V$ selects visible degrees of freedom, $A_i$ is the unknown excitation at
+the mode, and $H_i$ is its frequency response. The pipeline is:
+
+\begin{center}
+\begin{tikzpicture}[node distance=0.24in,>=Latex]
+  \node[draw=PosterSlate,fill=PosterSlate!7,rounded corners=3pt,
+        text width=1.45in,minimum height=0.72in,align=center] (video)
+        {\bfseries fixed-camera video};
+  \node[draw=PosterSage,fill=PosterSage!8,rounded corners=3pt,
+        text width=1.32in,minimum height=0.72in,align=center,right=of video] (flow)
+        {\bfseries small optical flow};
+  \node[draw=PosterClay,fill=PosterClay!8,rounded corners=3pt,
+        text width=1.20in,minimum height=0.72in,align=center,right=of flow] (fft)
+        {\bfseries temporal FFT};
+  \node[draw=PosterSlate,fill=PosterSlate!7,rounded corners=3pt,
+        text width=1.38in,minimum height=0.72in,align=center,right=of fft] (peak)
+        {\bfseries resonant peak};
+  \node[draw=PosterSage,fill=PosterSage!8,rounded corners=3pt,
+        text width=1.45in,minimum height=0.72in,align=center,right=of peak] (mode)
+        {\bfseries complex 2D mode};
+  \draw[->,line width=1.7pt,PosterMuted] (video) -- (flow);
+  \draw[->,line width=1.7pt,PosterMuted] (flow) -- (fft);
+  \draw[->,line width=1.7pt,PosterMuted] (fft) -- (peak);
+  \draw[->,line width=1.7pt,PosterMuted] (peak) -- (mode);
+\end{tikzpicture}
+\end{center}
+
+Each spatial slice of the displacement FFT is a candidate mode. Peaks in the
+global power spectrum identify resonances; magnitude visualizes motion strength
+and complex phase records relative timing. These projected modes need not be
+orthogonal or purely real; Davis retains complex, non-binary phase relationships
+when they better explain the video. The selected modes become a basis for
+synthesizing 2D image deformation:
+\begin{equation*}
+  D(t)=\sum_i\operatorname{Re}\{\phi_i' q_i(t)\}.
+\end{equation*}
+
+\posterplaceholder{../poster_brief/figures/bush_flow_and_frequency.png}{2.72in}{%
+  Bush fixed-view optical flow, power spectrum, and one selected complex 2D mode.}
+
+\postersubsection{What makes the Davis derivation possible?}
+
+{\renewcommand{\arraystretch}{1.16}
+\fontsize{20}{25}\selectfont
+\begin{tabularx}{\linewidth}{@{}>{\bfseries\color{PosterSlate}}p{0.28\linewidth}X@{}}
+Small linear motion
+  & The object vibrates near a fixed rest state, so superposition applies. \\
+Weak perspective
+  & Small 3D displacement projects approximately linearly into the image. \\
+Well-spaced modes
+  & Resonances do not strongly overlap, so one frequency isolates one mode. \\
+Broad-spectrum forcing
+  & The observed excitation is sufficiently rich; unknown force/mass scaling is
+    absorbed into a global modal scale. \\
+\end{tabularx}}
+
+\notebox{PosterSage}{PosterSand}{%
+  \textbf{Important limit.} Davis recovers a useful \emph{projected} modal
+  basis. It does not identify depth motion, 3D geometry, modal mass, stiffness,
+  or a physically normalized eigenvector.}
+
+\postersection{3.}{Why asynchronous multi-view is different}{PosterClay}
+
+Synchronized camera arrays can triangulate the same moving surface at the same
+instant and recover detailed dynamic 3D scenes. Most users, however, own one
+phone. They can revisit several viewpoints, but the recordings start at
+different times and experience different forcing.
+
+\begin{center}
+\begin{tikzpicture}[x=1in,y=1in,>=Latex]
+  % Central object.
+  \draw[fill=PosterSage!18,draw=PosterSage,line width=1.8pt]
+        (3.25,1.30) ellipse (0.62 and 0.38);
+  \node[PosterInk,align=center] at (3.25,1.30) {same\object};
+  % Camera 1.
+  \draw[fill=PosterFog,draw=PosterSlate,line width=1.6pt]
+        (0.22,2.12) rectangle (1.02,2.62);
+  \draw[fill=PosterSlate!16,draw=PosterSlate,line width=1.4pt]
+        (1.02,2.20) -- (1.42,2.37) -- (1.02,2.54) -- cycle;
+  \node[PosterMuted] at (0.62,1.92) {video 1};
+  \node[PosterClay] at (0.62,1.64) {unknown start $\tau_1$};
+  \draw[->,dashed,PosterLine,line width=1.6pt] (1.42,2.37) -- (2.72,1.58);
+  % Camera 2.
+  \draw[fill=PosterFog,draw=PosterSlate,line width=1.6pt]
+        (0.22,0.18) rectangle (1.02,0.68);
+  \draw[fill=PosterSlate!16,draw=PosterSlate,line width=1.4pt]
+        (1.02,0.26) -- (1.42,0.43) -- (1.02,0.60) -- cycle;
+  \node[PosterMuted] at (0.62,-0.02) {video 2};
+  \node[PosterClay] at (0.62,-0.30) {unknown start $\tau_2$};
+  \draw[->,dashed,PosterLine,line width=1.6pt] (1.42,0.43) -- (2.72,1.05);
+  % Camera 3.
+  \draw[fill=PosterFog,draw=PosterSlate,line width=1.6pt]
+        (5.48,1.08) rectangle (6.28,1.58);
+  \draw[fill=PosterSlate!16,draw=PosterSlate,line width=1.4pt]
+        (5.48,1.16) -- (5.08,1.33) -- (5.48,1.50) -- cycle;
+  \node[PosterMuted] at (5.88,0.87) {video 3};
+  \node[PosterClay] at (5.88,0.59) {unknown start $\tau_3$};
+  \draw[->,dashed,PosterLine,line width=1.6pt] (5.08,1.33) -- (3.88,1.33);
+  % Shared frequency label.
+  \node[draw=PosterClay,fill=PosterSand,rounded corners=3pt,
+        text width=2.65in,minimum height=0.58in,align=center]
+        at (3.25,-0.12)
+        {\bfseries same resonant frequency $f_k$\\different complex phase/gain};
+\end{tikzpicture}
+\end{center}
+
+Time-domain optical flow from these recordings is not synchronized and should
+not match frame by frame. Our central modeling assumption is weaker:
+
+\notebox{PosterClay}{PosterSand}{%
+  \textbf{Frequency-domain consistency assumption.} If geometry, boundary
+  conditions, and material properties do not change between recordings, the
+  same natural frequency represents the same underlying 3D spatial mode.
+  Each view may observe it with a different complex phase and amplitude.}
+
+\postersubsection{Additional assumptions introduced by our setting}
+
+\begin{itemize}
+  \item A static sweep defines one canonical rest geometry.
+  \item Fixed reference cameras can be calibrated into that coordinate system.
+  \item Vibrations remain small enough for camera and modal linearization.
+  \item The same modes are excited across takes, although forcing strength and
+        phase may differ.
+  \item Frequencies are stable and sufficiently separated over the capture.
+\end{itemize}
+
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.322\textwidth}
+\vspace{0pt}
+
+\postersection{3.}{Synchronizing phase without synchronized time}{PosterClay}
+
+At frequency $k$, view $v$ observes a complex 2D displacement
+$\widehat d_{v,k,p}$. For a Gaussian point $g$ with complex 3D mode vector
+$\phi_{k,g}$, first-order camera projection gives
+\equationbox{PosterClay}{
+  \widehat d_{v,k,p}\approx
+  \alpha_{v,k}J_{v,g}\phi_{k,g},
+}
+where $J_{v,g}\in\mathbb R^{2\times3}$ is the camera projection Jacobian and
+$\alpha_{v,k}\in\mathbb C$ is the unknown view-specific phase/gain.
+
+Directly optimizing both $\phi$ and every $\alpha$ is bilinear. We instead set
+$\beta_{v,k}=\alpha_{v,k}^{-1}$ and use points observed by multiple cameras.
+For one shared Gaussian, weighted equations can be stacked as
+\equationbox{PosterClay}{
+  A_g\phi_{k,g}=B_g\beta_k.
+}
+The columns of $B_g$ place each view's measured complex flow in the
+corresponding view block. Let $N_g$ span the left null space of the stacked
+Jacobian $A_g$:
+\begin{equation*}
+  N_g^HA_g=0.
+\end{equation*}
+Any set of view offsets that can be explained by one common 3D displacement
+must therefore satisfy
+\equationbox{PosterClay}{
+  N_g^HB_g\beta_k=0.
+}
+
+\begin{center}
+\begin{tikzpicture}[node distance=0.28in,>=Latex]
+  \node[draw=PosterSlate,fill=PosterSlate!7,rounded corners=3pt,
+        text width=1.72in,minimum height=0.86in,align=center] (shared)
+        {shared Gaussian\\multi-view $J$ and $\widehat d$};
+  \node[draw=PosterClay,fill=PosterClay!7,rounded corners=3pt,
+        text width=1.72in,minimum height=0.86in,align=center,right=of shared] (null)
+        {SVD of stacked $A_g$\\left-null $N_g$};
+  \node[draw=PosterSage,fill=PosterSage!7,rounded corners=3pt,
+        text width=1.72in,minimum height=0.86in,align=center,right=of null] (aggregate)
+        {aggregate $N_g^HB_g$\\across points};
+  \node[draw=PosterSlate,fill=PosterSlate!7,rounded corners=3pt,
+        text width=1.72in,minimum height=0.86in,align=center,right=of aggregate] (solve)
+        {fix $\beta_{1,k}=1$\\solve remaining views};
+  \draw[->,PosterMuted,line width=1.8pt] (shared) -- (null);
+  \draw[->,PosterMuted,line width=1.8pt] (null) -- (aggregate);
+  \draw[->,PosterMuted,line width=1.8pt] (aggregate) -- (solve);
+\end{tikzpicture}
+\end{center}
+
+We aggregate these constraints over many shared points, fix one reference-view
+gauge $\beta_{1,k}=1$, and solve a robust least-squares synchronization. The
+default model estimates unit-magnitude phase offsets; a bounded-complex option
+also allows limited gain differences. Rank and information tests exclude views
+whose phase is not identifiable from the available shared geometry.
+
+\notebox{PosterClay}{PosterFog}{%
+  \textbf{Interpretation.} The left-null projection removes the unknown 3D
+  vector from the synchronization step. It asks only whether the differently
+  phased 2D observations could have come from \emph{some} common 3D motion.}
+
+\postersection{4.}{Our end-to-end pipeline}{PosterSlate}
+
+\begin{center}
+\begin{tikzpicture}[x=1in,y=1in,>=Latex]
+  \pipelinebox{PosterSlate}{capture}{1. Sweep + fixed videos}{at={(0,1.18)}}
+  \pipelinebox{PosterSlate}{colmap}{2. Joint COLMAP}{at={(2.02,1.18)}}
+  \pipelinebox{PosterSage}{static}{3. Static 3DGS}{at={(4.04,1.18)}}
+  \pipelinebox{PosterClay}{flow}{4. Flow + Fourier modes}{at={(6.06,1.18)}}
+  \pipelinebox{PosterSage}{topology}{5. Pixel--Gaussian topology}{at={(6.06,0)}}
+  \pipelinebox{PosterClay}{phase}{6. View phase sync}{at={(4.04,0)}}
+  \pipelinebox{PosterSlate}{solve3d}{7. Local 3D solve}{at={(2.02,0)}}
+  \pipelinebox{PosterSage}{fill}{8. Motion fill}{at={(0,0)}}
+  \node[PosterMuted,below=0.16in of fill] (output)
+        {\bfseries completed $\phi_k\in\mathbb C^{G\times3}$};
+  \draw[->,PosterMuted,line width=1.6pt] (capture) -- (colmap);
+  \draw[->,PosterMuted,line width=1.6pt] (colmap) -- (static);
+  \draw[->,PosterMuted,line width=1.6pt] (static) -- (flow);
+  \draw[->,PosterMuted,line width=1.6pt] (flow) -- (topology);
+  \draw[->,PosterMuted,line width=1.6pt] (topology) -- (phase);
+  \draw[->,PosterMuted,line width=1.6pt] (phase) -- (solve3d);
+  \draw[->,PosterMuted,line width=1.6pt] (solve3d) -- (fill);
+  \draw[->,PosterMuted,line width=1.6pt] (fill) -- (output);
+\end{tikzpicture}
+\end{center}
+
+\postersubsection{A. Shared canonical scene}
+
+We sample a sweep video and add one reference image from each fixed view to the
+same COLMAP reconstruction. This provides a common world coordinate system.
+Registered sweep views train a foreground/background 3DGS; fixed cameras are
+exported for modal projection.
+
+\posterplaceholder{../poster_brief/figures/bush_capture_and_cameras.png}{2.15in}{%
+  Sweep frames, fixed references, and registered cameras around the canonical scene.}
+
+\postersubsection{B. 2D frequency evidence and observation topology}
+
+Foreground optical flow is transformed over time:
+\begin{equation*}
+  \widehat d_{v,p}(f)=\sum_t d_{v,p}(t)e^{-i2\pi ft}.
+\end{equation*}
+Greedy frequency selection chooses a compact set that reconstructs the observed
+flow spectra. Rendered foreground depth unprojects each retained pixel to a
+canonical surface point $X_{v,p}$. Nearby Gaussians are ranked by
+\begin{equation*}
+  s_{v,p,g}=o_g\exp\!\left[-\tfrac12
+  (X_{v,p}-\mu_g)^\top\Sigma_g^{-1}(X_{v,p}-\mu_g)\right].
+\end{equation*}
+This creates a mode-independent observation topology connecting complex 2D
+measurements to plausible foreground Gaussian centers.
+
+\postersubsection{C. Spatial structure, local solve, and completion}
+
+Mutual KNN edges are removed across strong Gaussian-color or rendered-depth
+discontinuities. Remaining connected neighborhoods provide local structure.
+For a local first-order rigid component $c$,
+\begin{equation*}
+  \phi_{k,g}=B_{c,g}\xi_{k,c},
+\end{equation*}
+and the complex twist is obtained by matching its projections to all aligned
+2D observations:
+{\fontsize{20}{24}\selectfont
+\begin{equation*}
+  \xi_{k,c}^{\star}=\arg\min_{\xi}
+  \sum_{(v,p,g)\in\mathcal O_c}\bar w_{v,p,g}
+  \left\|\alpha_{v,k}J_{v,g}B_{c,g}\xi-
+  \widehat d_{v,k,p}\right\|_2^2.
+\end{equation*}}
+A separate foreground graph propagates trusted observed motion into compatible
+unobserved Gaussians while preserving the measured solution.
+
+\posterplaceholder{../poster_brief/figures/bush_rigid_components.png}{2.00in}{%
+  Bush Gaussian graph colored by local component or observation support.}
+
+\posterplaceholder{../poster_brief/figures/bush_modes_grid.png}{3.15in}{%
+  Representative completed Bush spatial 3D modes, shown from a common view and scale.}
+
+\notebox{PosterSlate}{PosterSand}{%
+  \textbf{Current interpretation.} The output modes are evidence-driven,
+  spatially coherent complex displacement patterns. They are not yet mass- and
+  stiffness-normalized structural eigenmodes. Accuracy depends on camera
+  calibration, masks, optical flow, static Gaussian quality, and the validity
+  of the shared-frequency assumption.}
+
+{\fontsize{15}{18}\selectfont
+\textbf{Selected references.}
+\begin{thebibliography}{9}
+\setlength{\itemsep}{0.03in}
+\bibitem{kerbl2023gaussians}
+B. Kerbl et al. \emph{3D Gaussian Splatting for Real-Time Radiance Field
+Rendering}. ACM TOG, 2023.
+\bibitem{park2021nerfies}
+K. Park et al. \emph{Nerfies: Deformable Neural Radiance Fields}. ICCV, 2021.
+\bibitem{park2021hypernerf}
+K. Park et al. \emph{HyperNeRF}. SIGGRAPH Asia, 2021.
+\bibitem{wu2024fourDgs}
+G. Wu et al. \emph{4D Gaussian Splatting for Real-Time Dynamic Scene Rendering}.
+CVPR, 2024.
+\bibitem{yang2024deformable}
+Z. Yang et al. \emph{Deformable 3D Gaussians for High-Fidelity Monocular
+Dynamic Scene Reconstruction}. CVPR, 2024.
+\bibitem{wang2025shape}
+Q. Wang et al. \emph{Shape of Motion: 4D Reconstruction from a Single Video}.
+ICCV, 2025.
+\bibitem{davis2015imagespace}
+A. Davis, J. G. Chen, and F. Durand. \emph{Image-Space Modal Bases for Plausible
+Manipulation of Objects in Video}. ACM TOG, 2015.
+\end{thebibliography}}
+
+\end{minipage}
+
+\end{document}
