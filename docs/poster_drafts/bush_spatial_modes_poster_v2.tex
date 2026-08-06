@@ -13,6 +13,7 @@
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning,calc,decorations.pathmorphing}
 \usepackage{ragged2e}
+\usepackage{adjustbox}
 \usepackage[hidelinks]{hyperref}
 
 \renewcommand{\familydefault}{\sfdefault}
@@ -47,14 +48,14 @@
   \noindent
   \colorbox{#3}{%
     \parbox{\dimexpr\linewidth-2\fboxsep\relax}{%
-      \color{white}\bfseries\fontsize{38}{43}\selectfont
+      \color{white}\bfseries\fontsize{34}{39}\selectfont
       \strut #1\hspace{0.24em}#2\strut}}
   \vspace{0.11in}
 }
 
 \newcommand{\postersubsection}[1]{%
   \vspace{0.10in}
-  {\bfseries\color{PosterInk}\fontsize{29}{34}\selectfont #1\par}
+  {\bfseries\color{PosterInk}\fontsize{26}{31}\selectfont #1\par}
   \vspace{0.03in}
 }
 
@@ -88,24 +89,24 @@
       \fcolorbox{PosterLine}{PosterFog}{%
         \parbox[c][#2][c]{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{%
           \centering
-          {\bfseries\fontsize{23}{27}\selectfont Figure placeholder}\par
+          {\bfseries\fontsize{21}{25}\selectfont Figure placeholder}\par
           \vspace{0.10in}
           {\fontsize{17}{20}\selectfont\texttt{\detokenize{#1}}}}}}
     \vspace{0.05in}
-    {\color{PosterMuted}\fontsize{18}{22}\selectfont #3\par}
+    {\color{PosterMuted}\fontsize{17}{20}\selectfont #3\par}
   \end{center}
   \vspace{0.06in}
 }
 
 \newcommand{\pipelinebox}[4]{%
   \node[draw=#1,fill=#1!7,line width=1.8pt,rounded corners=3pt,
-        align=center,text width=1.58in,minimum height=0.82in,#4] (#2)
-        {\bfseries\fontsize{18}{21}\selectfont #3};}
+        align=center,text width=2.78in,minimum height=0.66in,#4] (#2)
+        {\bfseries\fontsize{16}{19}\selectfont #3};}
 
 \begin{document}
 \RaggedRight
 \color{PosterInk}
-\fontsize{23}{29}\selectfont
+\fontsize{21}{26}\selectfont
 
 % -----------------------------------------------------------------------------
 % Header
@@ -128,11 +129,39 @@
     vibration from several fixed viewpoints at different times. Recover a
     view-consistent, high-detail 3D Gaussian model and a bank of spatial
     vibration fields without requiring synchronized cameras.}}
-\vspace{0.22in}
+\vspace{0.12in}
+
+\begin{center}
+{\bfseries\color{PosterSlate}\fontsize{22}{26}\selectfont End-to-end pipeline}\par
+\vspace{0.04in}
+\begin{tikzpicture}[x=1in,y=1in,>=Latex]
+  \pipelinebox{PosterSlate}{capture}{1. Sweep + fixed videos}{at={(1.48,0)}}
+  \pipelinebox{PosterSlate}{colmap}{2. Joint COLMAP}{at={(5.02,0)}}
+  \pipelinebox{PosterSage}{static}{3. Static 3DGS}{at={(8.56,0)}}
+  \pipelinebox{PosterClay}{flow}{4. Flow + Fourier modes}{at={(12.10,0)}}
+  \pipelinebox{PosterSage}{topology}{5. Pixel--Gaussian topology}{at={(15.64,0)}}
+  \pipelinebox{PosterClay}{phase}{6. View phase sync}{at={(19.18,0)}}
+  \pipelinebox{PosterSlate}{solve3d}{7. Local 3D solve}{at={(22.72,0)}}
+  \pipelinebox{PosterSage}{fill}{8. Motion fill}{at={(26.26,0)}}
+  \draw[->,PosterMuted,line width=1.6pt] (capture) -- (colmap);
+  \draw[->,PosterMuted,line width=1.6pt] (colmap) -- (static);
+  \draw[->,PosterMuted,line width=1.6pt] (static) -- (flow);
+  \draw[->,PosterMuted,line width=1.6pt] (flow) -- (topology);
+  \draw[->,PosterMuted,line width=1.6pt] (topology) -- (phase);
+  \draw[->,PosterMuted,line width=1.6pt] (phase) -- (solve3d);
+  \draw[->,PosterMuted,line width=1.6pt] (solve3d) -- (fill);
+\end{tikzpicture}
+\vspace{0.02in}
+{\color{PosterMuted}\fontsize{17}{20}\selectfont
+Output: completed complex spatial fields $\phi_k\in\mathbb C^{G\times3}$.\par}
+\end{center}
+\vspace{0.08in}
 
 % -----------------------------------------------------------------------------
 % Three-column poster body
 % -----------------------------------------------------------------------------
+\begin{adjustbox}{max totalsize={\textwidth}{32.70in},center}
+\begin{minipage}{\textwidth}
 \noindent
 \begin{minipage}[t]{0.322\textwidth}
 \vspace{0pt}
@@ -289,6 +318,18 @@ $q_i(t)$ describe how strongly each pattern is active. Low-frequency modes
 often dominate visible vibration, so the basis can be much smaller than the
 original number of degrees of freedom.
 
+\postersection{4.}{Our reconstruction pipeline}{PosterSlate}
+
+\postersubsection{A. Shared canonical scene}
+
+We sample a sweep video and add one reference image from each fixed view to the
+same COLMAP reconstruction. This provides a common world coordinate system.
+Registered sweep views train a foreground/background 3DGS; fixed cameras are
+exported for modal projection.
+
+\posterplaceholder{../poster_brief/figures/bush_capture_and_cameras.png}{1.82in}{%
+  Sweep frames, fixed references, and registered cameras around the canonical scene.}
+
 \end{minipage}
 \hfill
 \begin{minipage}[t]{0.322\textwidth}
@@ -434,12 +475,28 @@ not match frame by frame. Our central modeling assumption is weaker:
   \item Frequencies are stable and sufficiently separated over the capture.
 \end{itemize}
 
+\postersubsection{B. 2D frequency evidence and observation topology}
+
+Foreground optical flow is transformed over time:
+\begin{equation*}
+  \widehat d_{v,p}(f)=\sum_t d_{v,p}(t)e^{-i2\pi ft}.
+\end{equation*}
+Greedy frequency selection chooses a compact set that reconstructs the observed
+flow spectra. Rendered foreground depth unprojects each retained pixel to a
+canonical surface point $X_{v,p}$. Nearby Gaussians are ranked by
+\begin{equation*}
+  s_{v,p,g}=o_g\exp\!\left[-\tfrac12
+  (X_{v,p}-\mu_g)^\top\Sigma_g^{-1}(X_{v,p}-\mu_g)\right].
+\end{equation*}
+This creates a mode-independent observation topology connecting complex 2D
+measurements to plausible foreground Gaussian centers.
+
 \end{minipage}
 \hfill
 \begin{minipage}[t]{0.322\textwidth}
 \vspace{0pt}
 
-\postersection{3.}{Synchronizing phase without synchronized time}{PosterClay}
+\postersection{3B.}{Synchronizing phase without synchronized time}{PosterClay}
 
 At frequency $k$, view $v$ observes a complex 2D displacement
 $\widehat d_{v,k,p}$. For a Gaussian point $g$ with complex 3D mode vector
@@ -500,57 +557,6 @@ whose phase is not identifiable from the available shared geometry.
   vector from the synchronization step. It asks only whether the differently
   phased 2D observations could have come from \emph{some} common 3D motion.}
 
-\postersection{4.}{Our end-to-end pipeline}{PosterSlate}
-
-\begin{center}
-\begin{tikzpicture}[x=1in,y=1in,>=Latex]
-  \pipelinebox{PosterSlate}{capture}{1. Sweep + fixed videos}{at={(0,1.18)}}
-  \pipelinebox{PosterSlate}{colmap}{2. Joint COLMAP}{at={(2.02,1.18)}}
-  \pipelinebox{PosterSage}{static}{3. Static 3DGS}{at={(4.04,1.18)}}
-  \pipelinebox{PosterClay}{flow}{4. Flow + Fourier modes}{at={(6.06,1.18)}}
-  \pipelinebox{PosterSage}{topology}{5. Pixel--Gaussian topology}{at={(6.06,0)}}
-  \pipelinebox{PosterClay}{phase}{6. View phase sync}{at={(4.04,0)}}
-  \pipelinebox{PosterSlate}{solve3d}{7. Local 3D solve}{at={(2.02,0)}}
-  \pipelinebox{PosterSage}{fill}{8. Motion fill}{at={(0,0)}}
-  \node[PosterMuted,below=0.16in of fill] (output)
-        {\bfseries completed $\phi_k\in\mathbb C^{G\times3}$};
-  \draw[->,PosterMuted,line width=1.6pt] (capture) -- (colmap);
-  \draw[->,PosterMuted,line width=1.6pt] (colmap) -- (static);
-  \draw[->,PosterMuted,line width=1.6pt] (static) -- (flow);
-  \draw[->,PosterMuted,line width=1.6pt] (flow) -- (topology);
-  \draw[->,PosterMuted,line width=1.6pt] (topology) -- (phase);
-  \draw[->,PosterMuted,line width=1.6pt] (phase) -- (solve3d);
-  \draw[->,PosterMuted,line width=1.6pt] (solve3d) -- (fill);
-  \draw[->,PosterMuted,line width=1.6pt] (fill) -- (output);
-\end{tikzpicture}
-\end{center}
-
-\postersubsection{A. Shared canonical scene}
-
-We sample a sweep video and add one reference image from each fixed view to the
-same COLMAP reconstruction. This provides a common world coordinate system.
-Registered sweep views train a foreground/background 3DGS; fixed cameras are
-exported for modal projection.
-
-\posterplaceholder{../poster_brief/figures/bush_capture_and_cameras.png}{2.15in}{%
-  Sweep frames, fixed references, and registered cameras around the canonical scene.}
-
-\postersubsection{B. 2D frequency evidence and observation topology}
-
-Foreground optical flow is transformed over time:
-\begin{equation*}
-  \widehat d_{v,p}(f)=\sum_t d_{v,p}(t)e^{-i2\pi ft}.
-\end{equation*}
-Greedy frequency selection chooses a compact set that reconstructs the observed
-flow spectra. Rendered foreground depth unprojects each retained pixel to a
-canonical surface point $X_{v,p}$. Nearby Gaussians are ranked by
-\begin{equation*}
-  s_{v,p,g}=o_g\exp\!\left[-\tfrac12
-  (X_{v,p}-\mu_g)^\top\Sigma_g^{-1}(X_{v,p}-\mu_g)\right].
-\end{equation*}
-This creates a mode-independent observation topology connecting complex 2D
-measurements to plausible foreground Gaussian centers.
-
 \postersubsection{C. Spatial structure, local solve, and completion}
 
 Mutual KNN edges are removed across strong Gaussian-color or rendered-depth
@@ -571,10 +577,10 @@ and the complex twist is obtained by matching its projections to all aligned
 A separate foreground graph propagates trusted observed motion into compatible
 unobserved Gaussians while preserving the measured solution.
 
-\posterplaceholder{../poster_brief/figures/bush_rigid_components.png}{2.00in}{%
+\posterplaceholder{../poster_brief/figures/bush_rigid_components.png}{1.75in}{%
   Bush Gaussian graph colored by local component or observation support.}
 
-\posterplaceholder{../poster_brief/figures/bush_modes_grid.png}{3.15in}{%
+\posterplaceholder{../poster_brief/figures/bush_modes_grid.png}{2.75in}{%
   Representative completed Bush spatial 3D modes, shown from a common view and scale.}
 
 \notebox{PosterSlate}{PosterSand}{%
@@ -584,7 +590,7 @@ unobserved Gaussians while preserving the measured solution.
   calibration, masks, optical flow, static Gaussian quality, and the validity
   of the shared-frequency assumption.}
 
-{\fontsize{15}{18}\selectfont
+{\fontsize{14}{17}\selectfont
 \textbf{Selected references.}
 \begin{thebibliography}{9}
 \setlength{\itemsep}{0.03in}
@@ -610,5 +616,7 @@ Manipulation of Objects in Video}. ACM TOG, 2015.
 \end{thebibliography}}
 
 \end{minipage}
+\end{minipage}
+\end{adjustbox}
 
 \end{document}
