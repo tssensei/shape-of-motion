@@ -1,6 +1,6 @@
 \documentclass[10pt]{article}
 
-\usepackage[paperwidth=30in,paperheight=40in,margin=0.62in]{geometry}
+\usepackage[paperwidth=30in,paperheight=40in,margin=0.45in]{geometry}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
 \usepackage{microtype}
@@ -48,35 +48,39 @@
   \noindent
   \colorbox{#3}{%
     \parbox{\dimexpr\linewidth-2\fboxsep\relax}{%
-      \color{white}\bfseries\fontsize{34}{39}\selectfont
+      \color{white}\bfseries\fontsize{36}{41}\selectfont
       \strut #1\hspace{0.24em}#2\strut}}
   \vspace{0.11in}
 }
 
 \newcommand{\postersubsection}[1]{%
   \vspace{0.10in}
-  {\bfseries\color{PosterInk}\fontsize{26}{31}\selectfont #1\par}
+  {\bfseries\color{PosterInk}\fontsize{28}{33}\selectfont #1\par}
   \vspace{0.03in}
 }
 
 \newcommand{\smalllabel}[1]{%
-  {\bfseries\color{PosterSlate}\fontsize{18}{21}\selectfont\MakeUppercase{#1}}}
+  {\bfseries\color{PosterSlate}\fontsize{19}{23}\selectfont\MakeUppercase{#1}}}
 
 \newcommand{\notebox}[3]{%
+  \par
   \vspace{0.08in}
   \noindent\fcolorbox{#1}{#2}{%
     \parbox{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{%
-      \vspace{0.05in}\textbf{#3}\vspace{0.05in}}}
+      \RaggedRight\vspace{0.05in}\textbf{#3}\vspace{0.05in}}}
+  \par
   \vspace{0.08in}
 }
 
 \newcommand{\equationbox}[2]{%
+  \par
   \vspace{0.06in}
   \noindent\fcolorbox{#1}{PosterFog}{%
     \parbox{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{%
       \vspace{-0.06in}
-      \begin{equation*}#2\end{equation*}
-      \vspace{-0.09in}}}
+       \begin{equation*}#2\end{equation*}
+       \vspace{-0.09in}}}
+  \par
   \vspace{0.06in}
 }
 
@@ -89,11 +93,11 @@
       \fcolorbox{PosterLine}{PosterFog}{%
         \parbox[c][#2][c]{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{%
           \centering
-          {\bfseries\fontsize{21}{25}\selectfont Figure placeholder}\par
+          {\bfseries\fontsize{22}{27}\selectfont Figure placeholder}\par
           \vspace{0.10in}
           {\fontsize{17}{20}\selectfont\texttt{\detokenize{#1}}}}}}
     \vspace{0.05in}
-    {\color{PosterMuted}\fontsize{17}{20}\selectfont #3\par}
+    {\color{PosterMuted}\fontsize{18}{22}\selectfont #3\par}
   \end{center}
   \vspace{0.06in}
 }
@@ -101,12 +105,12 @@
 \newcommand{\pipelinebox}[4]{%
   \node[draw=#1,fill=#1!7,line width=1.8pt,rounded corners=3pt,
         align=center,text width=2.78in,minimum height=0.66in,#4] (#2)
-        {\bfseries\fontsize{16}{19}\selectfont #3};}
+        {\bfseries\fontsize{17}{20}\selectfont #3};}
 
 \begin{document}
 \RaggedRight
 \color{PosterInk}
-\fontsize{21}{26}\selectfont
+\fontsize{22}{28}\selectfont
 
 % -----------------------------------------------------------------------------
 % Header
@@ -151,6 +155,7 @@
   \draw[->,PosterMuted,line width=1.6pt] (phase) -- (solve3d);
   \draw[->,PosterMuted,line width=1.6pt] (solve3d) -- (fill);
 \end{tikzpicture}
+\par
 \vspace{0.02in}
 {\color{PosterMuted}\fontsize{17}{20}\selectfont
 Output: completed complex spatial fields $\phi_k\in\mathbb C^{G\times3}$.\par}
@@ -165,6 +170,7 @@ Output: completed complex spatial fields $\phi_k\in\mathbb C^{G\times3}$.\par}
 \noindent
 \begin{minipage}[t]{0.492\textwidth}
 \vspace{0pt}
+\RaggedRight
 
 \postersection{1.}{3D Gaussian Splatting}{PosterSlate}
 
@@ -339,8 +345,8 @@ synthesizing 2D image deformation:
 \postersubsection{What makes the Davis derivation possible?}
 
 {\renewcommand{\arraystretch}{1.16}
-\fontsize{20}{25}\selectfont
-\begin{tabularx}{\linewidth}{@{}>{\bfseries\color{PosterSlate}}p{0.28\linewidth}X@{}}
+\fontsize{21}{26}\selectfont
+\begin{tabularx}{\linewidth}{@{}>{\bfseries\color{PosterSlate}}p{0.28\linewidth}>{\RaggedRight\arraybackslash}X@{}}
 Small linear motion
   & The object vibrates near a fixed rest state, so superposition applies. \\
 Weak perspective
@@ -351,6 +357,12 @@ Broad-spectrum forcing
   & The observed excitation is sufficiently rich; unknown force/mass scaling is
     absorbed into a global modal scale. \\
 \end{tabularx}}
+
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.492\textwidth}
+\vspace{0pt}
+\RaggedRight
 
 \postersection{3.}{Why asynchronous multi-view is different}{PosterClay}
 
@@ -416,11 +428,6 @@ not match frame by frame. Our central modeling assumption is weaker:
         phase may differ.
   \item Frequencies are stable and sufficiently separated over the capture.
 \end{itemize}
-
-\end{minipage}
-\hfill
-\begin{minipage}[t]{0.492\textwidth}
-\vspace{0pt}
 
 \postersection{4.}{Solving shared 3D modes}{PosterSlate}
 
