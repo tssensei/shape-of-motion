@@ -144,6 +144,39 @@ Gaussian stores a center, shape, opacity, and color. To render an image, the
 camera projects the ellipsoids into 2D ``splats'' and blends them from front to
 back.
 
+More precisely, Gaussian $g$ is parameterized as
+\begin{equation}
+  \mathcal G_g=(\mu_g,q_g,s_g,o_g,c_g),
+  \qquad
+  \mu_g\in\mathbb R^3,
+  \quad s_g\in\mathbb R_{>0}^3,
+  \quad o_g\in(0,1),
+  \quad c_g\in[0,1]^3.
+\end{equation}
+Here $\mu_g$ is the world-space center, $q_g$ is a unit quaternion, $s_g$ is
+the three-axis scale, $o_g$ is opacity, and $c_g$ is RGB color. The Bush
+experiment uses direct view-independent color rather than spherical harmonics.
+The implementation maintains unconstrained trainable values and applies
+\begin{equation}
+  q_g=\frac{\widetilde q_g}{\lVert\widetilde q_g\rVert_2},
+  \qquad s_g=\exp(\widetilde s_g),
+  \qquad o_g=\operatorname{sigmoid}(\widetilde o_g),
+  \qquad c_g=\operatorname{sigmoid}(\widetilde c_g),
+\end{equation}
+which enforces the domains shown above during optimization.
+The quaternion and scale define a symmetric positive-definite covariance
+\begin{equation}
+  \Sigma_g
+  =R(q_g)\operatorname{diag}(s_g^2)R(q_g)^\top,
+\end{equation}
+so the unnormalized spatial density of the primitive is
+\begin{equation}
+  G_g(x)
+  =\exp\!\left[
+    -\frac{1}{2}(x-\mu_g)^\top\Sigma_g^{-1}(x-\mu_g)
+  \right].
+\end{equation}
+
 \plainidea{Think of the scene as a cloud of tiny, colored, translucent stickers
 floating in 3D. Seen together from a camera, they form a sharp image. Unlike a
 plain video, every sticker has an explicit 3D location, so we can attach a 3D
@@ -172,6 +205,121 @@ displacement vector to it.}
   \caption{A conceptual 3DGS scene. The Gaussian centers provide explicit 3D
   locations on which the recovered motion field can live.}
 \end{figure}
+
+\paragraph{Projection into one camera.}
+Let a calibrated view $v$ have world-to-camera rotation $R_v$, translation
+$t_v$, and pinhole intrinsics $(f_x,f_y,c_x,c_y)$. For
+$x^{\mathrm c}=(x,y,z)^\top=R_vx+t_v$, its pixel projection is
+\begin{equation}
+  \pi_v(x^{\mathrm c})
+  =
+  \begin{bmatrix}
+    f_x x/z+c_x\\
+    f_y y/z+c_y
+  \end{bmatrix}.
+\end{equation}
+The projected Gaussian mean and the world-displacement-to-pixel Jacobian are
+\begin{align}
+  m_{v,g} &= \pi_v(R_v\mu_g+t_v),\\
+  J_{v,g}
+  &=
+  \left.
+  \frac{\partial\pi_v(R_vx+t_v)}{\partial x}
+  \right|_{x=\mu_g}
+  =
+  \begin{bmatrix}
+    f_x/z_g & 0 & -f_x x_g/z_g^2\\
+    0 & f_y/z_g & -f_y y_g/z_g^2
+  \end{bmatrix}R_v,
+\end{align}
+where $(x_g,y_g,z_g)^\top=R_v\mu_g+t_v$. Linearizing the projection maps the
+3D covariance into the image plane:
+\begin{equation}
+  \Sigma^{2D}_{v,g}
+  =J_{v,g}\Sigma_gJ_{v,g}^\top+\epsilon I_2.
+\end{equation}
+The small $\epsilon I_2$ term represents the rasterizer's pixel-space
+low-pass regularization and keeps the footprint numerically well conditioned.
+
+\plainidea{The center tells us where the splat appears. The projected
+covariance tells us the size and orientation of its elliptical footprint. The
+same Jacobian $J_{v,g}$ later converts a recovered 3D vibration vector into a
+2D arrow, so the rendering and motion equations share the same camera model.}
+
+\paragraph{Front-to-back alpha compositing.}
+For pixel position $p\in\mathbb R^2$, the projected opacity contributed by
+Gaussian $g$ is
+\begin{equation}
+  a_{v,p,g}
+  =o_g\exp\!\left[
+    -\frac{1}{2}(p-m_{v,g})^\top
+    (\Sigma^{2D}_{v,g})^{-1}(p-m_{v,g})
+  \right].
+\end{equation}
+Suppose the overlapping Gaussians are ordered from near to far as
+$g_1,\ldots,g_M$. Their transmittance and rendered contribution weight are
+\begin{equation}
+  T_{v,p,i}=\prod_{j<i}(1-a_{v,p,g_j}),
+  \qquad
+  w^{\mathrm{render}}_{v,p,i}=T_{v,p,i}a_{v,p,g_i}.
+\end{equation}
+The final RGB color and accumulated foreground alpha are therefore
+\begin{align}
+  C_v(p)
+  &=\sum_{i=1}^{M}w^{\mathrm{render}}_{v,p,i}c_{g_i}
+    +\left[\prod_{j=1}^{M}(1-a_{v,p,g_j})\right]c_{\mathrm{bg}},\\
+  A_v(p)
+  &=\sum_{i=1}^{M}w^{\mathrm{render}}_{v,p,i}
+   =1-\prod_{j=1}^{M}(1-a_{v,p,g_j}).
+\end{align}
+An expected foreground depth can be written as
+\begin{equation}
+  D_v(p)
+  =\frac{\sum_iw^{\mathrm{render}}_{v,p,i}z_{v,g_i}}
+  {\max(A_v(p),\epsilon)},
+\end{equation}
+which later provides a canonical surface point for pixel--Gaussian matching.
+
+\plainidea{A Gaussian only contributes the light that reaches it. Nearer
+Gaussians consume some transparency, so farther Gaussians are multiplied by
+the remaining transmittance. This is why visibility is more informative than
+simply choosing the closest 3D center.}
+
+\paragraph{Static optimization.}
+All Gaussian parameters are differentiable through projection, rasterization,
+and compositing. For the current static Bush run, the active image objective is
+the implementation's RGB loss
+\begin{equation}
+  \mathcal L_{\mathrm{RGB}}
+  =0.8\,\lVert C_v-I_v\rVert_1
+   +0.2\left[1-\operatorname{SSIM}(C_v,I_v)\right],
+\end{equation}
+evaluated over registered sweep images $I_v$. Gradient-based optimization and
+adaptive Gaussian densification update the primitives so that their rendered
+views reproduce the capture. Auxiliary mask and depth-loss weights are zero in
+this static configuration; masks still define the foreground/background data
+organization used by the pipeline.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Core 3DGS notation reused by the modal pipeline.}
+  \begin{tabularx}{\linewidth}{@{}>{$}l<{$}X@{}}
+    \toprule
+    \text{Symbol} & \text{Meaning} \\
+    \midrule
+    \mu_g,\Sigma_g & World-space mean and covariance of Gaussian $g$. \\
+    q_g,s_g & Quaternion orientation and positive principal-axis scales. \\
+    o_g,c_g & Gaussian opacity and RGB color. \\
+    K_v,R_v,t_v & Camera intrinsics and world-to-camera extrinsics for view $v$. \\
+    m_{v,g},\Sigma^{2D}_{v,g} & Projected 2D mean and elliptical covariance. \\
+    J_{v,g} & Jacobian mapping a small world-space displacement to pixel motion. \\
+    a_{v,p,g} & Gaussian $g$'s opacity footprint at pixel $p$. \\
+    T_{v,p,i} & Transmittance remaining before the $i$th depth-ordered Gaussian. \\
+    w^{\mathrm{render}}_{v,p,i} & Actual rasterization contribution $T_{v,p,i}a_{v,p,g_i}$. \\
+    C_v(p),A_v(p),D_v(p) & Rendered RGB, accumulated alpha, and expected depth. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
 
 We train separate foreground and background Gaussian sets. The vibration
 pipeline only assigns modes to foreground Gaussians. This separation matters:
@@ -270,25 +418,59 @@ selected frequency, and the corresponding complex 2D modal image.}
 
 A measured pixel does not correspond to one obvious 3D point. Several
 foreground Gaussians can overlap along its camera ray, with different opacity
-and visibility. The observation topology records which Gaussians contributed
-to each sampled foreground pixel in each fixed view.
+and visibility. The observation topology records a compact set of plausible
+Gaussian correspondences for each sampled foreground pixel in each fixed view.
 
-For every candidate observation it stores the camera projection Jacobian
-$J_{v,g}$, which converts a small 3D displacement of Gaussian $g$ into a 2D
-image displacement in view $v$. In simplified form,
+The current topology deliberately uses a surface-guided approximation rather
+than storing every rasterizer fragment. A canonical foreground render provides
+$D_v(p)$ and $A_v(p)$. Pixels with inadequate mask support, invalid depth, or
+low accumulated alpha are removed. Every retained pixel is unprojected to a
+world-space surface point
 \begin{equation}
-  \text{predicted 2D motion}\;\approx\;J_{v,g}\,\phi_{k,g},
+  X_{v,p}
+  =R_v^\top\left[
+    D_v(p)K_v^{-1}\widetilde p-t_v
+  \right],
+  \qquad \widetilde p=(p_x,p_y,1)^\top.
 \end{equation}
-where $\phi_{k,g}\in\mathbb C^3$ is the unknown 3D displacement of Gaussian
-$g$ at selected frequency $k$.
+Nearby foreground Gaussians are preselected with a 3D KNN query and scored by
+their opacity-weighted spatial Gaussian density:
+\begin{equation}
+  s_{v,p,g}
+  =o_g\exp\!\left[
+    -\frac12(X_{v,p}-\mu_g)^\top
+    \Sigma_g^{-1}(X_{v,p}-\mu_g)
+  \right].
+\end{equation}
+After keeping the strongest valid candidates, the topology stores
+\begin{equation}
+  \bar w_{v,p,g}
+  =\frac{s_{v,p,g}}{\sum_{h\in C(v,p)}s_{v,p,h}},
+  \qquad
+  \sum_{g\in C(v,p)}\bar w_{v,p,g}=1,
+\end{equation}
+together with Gaussian index $g$, view $v$, pixel $p$, and the already defined
+projection Jacobian $J_{v,g}$. These normalized scores are observation
+confidence weights; they should not be confused with the exact depth-ordered
+rasterization weights $w^{\mathrm{render}}$ from the 3DGS equations above.
 
-\plainidea{The renderer tells us which 3D Gaussians were actually visible at a
-pixel. The camera Jacobian then tells us how a tiny 3D move of each Gaussian
-would appear in that image.}
+For a small complex 3D displacement
+$\phi_{k,g}\in\mathbb C^3$ at selected frequency $k$, the corresponding image
+motion remains
+\begin{equation}
+  \widehat d^{\mathrm{pred}}_{v,k,g}
+  =\alpha_{v,k}J_{v,g}\phi_{k,g},
+\end{equation}
+where $\alpha_{v,k}\in\mathbb C$ aligns the complex gain and phase of view $v$.
+
+\plainidea{The foreground render anchors a pixel to a plausible 3D surface
+point. Nearby Gaussians are then ranked by how strongly their 3D ellipsoids
+support that point. The camera Jacobian tells us how a tiny 3D move of each
+retained candidate would appear in the image.}
 
 This topology is built once and reused across selected frequencies. The
-frequency-specific data only changes the measured complex 2D displacement at
-each sampled pixel.
+frequency-specific data only changes the measured complex 2D displacement
+$\widehat d_{v,k,p}$ at each sampled pixel.
 
 \section{Building local rigid components}
 
@@ -343,16 +525,31 @@ where $x_g$ is its canonical center and $\bar x_c$ is the component center.
 This is a first-order motion model: it captures a small local translation and
 rotation without forcing the entire plant to be one rigid object.
 
-The unknown component motions are solved by projecting them into every
-supporting camera and matching the observed complex 2D Fourier displacement:
+Define the component twist
+$\xi_{k,c}=(t_{k,c}^\top,\omega_{k,c}^\top)^\top\in\mathbb C^6$ and
 \begin{equation}
-  \widehat d_{v,k,p}\;\approx\;
-  \alpha_{v,k}\sum_{g\in C(p)}w_{v,p,g}\,J_{v,g}\phi_{k,g}.
+  B_{c,g}
+  =\begin{bmatrix}I_3&-[x_g-\bar x_c]_\times\end{bmatrix},
+  \qquad
+  \phi_{k,g}=B_{c,g}\xi_{k,c}.
 \end{equation}
-Here $C(p)$ is the visible contributor set, $w_{v,p,g}$ represents its image
-contribution, and $\alpha_{v,k}$ aligns the view-specific complex gain and
-phase. The resulting weighted least-squares system is solved jointly for the
-component's 3D motion.
+The unknown twist is solved by projecting it into every supporting camera and
+matching the observed complex 2D Fourier displacement. For component $c$, the
+implemented weighted complex least-squares problem is
+\begin{equation}
+  \xi_{k,c}^{\star}
+  =\underset{\xi\in\mathbb C^6}{\arg\min}
+  \sum_{(v,p,g)\in\mathcal O_c}
+  \bar w_{v,p,g}
+  \left\|
+    \alpha_{v,k}J_{v,g}B_{c,g}\xi
+    -\widehat d_{v,k,p}
+  \right\|_2^2.
+\end{equation}
+Thus each retained candidate supplies a confidence-weighted constraint that
+its projected local rigid motion should match the pixel measurement. The
+minimum-norm solution is computed by SVD, which also exposes rank and condition
+diagnostics for deciding whether the component is a trustworthy motion seed.
 
 \plainidea{We propose a small 3D movement for a patch, project it into each
 camera, and adjust it until those projected arrows agree with the arrows

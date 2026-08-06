@@ -1128,3 +1128,9 @@ Date: 2026-08-05
   claims. The six requested Bush figures remain explicit placeholders pending
   reproducible Viewer exports from the cluster artifacts; no new Bush solve or
   render was run for this documentation update.
+- The mathematical preliminary was subsequently expanded to document the
+  exact 3D Gaussian parameterization, camera projection, alpha compositing,
+  expected depth, active static RGB objective, rendered-depth-guided
+  observation approximation, and confidence-weighted rigid-component SVD
+  objective. This is a reporting clarification only; no Bush artifact was
+  regenerated and no experimental result changed.
