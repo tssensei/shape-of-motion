@@ -213,40 +213,22 @@ Gaussian to an image-space ellipse. Depth-ordered alpha compositing gives
 \end{tikzpicture}
 \end{center}
 
-\postersection{2A.}{Modal analysis: coupled motion, simple modes}{PosterSage}
+\postersection{2.}{Why Modal Analysis?}{PosterSage}
 
-\postersubsection{A two-degree-of-freedom example}
+\postersubsection{Pixels are too many degrees of freedom}
 
-For small displacements around a rest state, a coupled mechanical system is
-approximated by
+Tracking $P$ pixels independently produces a coupled displacement vector
+$d(t)\in\mathbb R^{2P}$. Modal analysis replaces these dense degrees of freedom
+with a compact basis:
 \equationbox{PosterSage}{
-  M\ddot u(t)+C\dot u(t)+Ku(t)=f(t).
+  d(t)\approx\Phi q(t)=\sum_{k=1}^{K}\phi_kq_k(t),
+  \qquad K\ll 2P.
 }
-Define the modal transformation
-\equationbox{PosterSage}{
-  u(t)=\Phi q(t)=\sum_{i=1}^{N}\phi_iq_i(t).
-}
-Each column $\phi_i$ of $\Phi$ is a spatial \emph{mode shape}; $q_i(t)$ is its
-time-varying \emph{modal coordinate}. Substitution and projection by
-$\Phi^\top$ give
-\equationbox{PosterSage}{
-  \begin{gathered}
-    \widetilde M\ddot q+\widetilde C\dot q+\widetilde Kq=\widetilde f,\\
-    \widetilde X=\Phi^\top X\Phi\ (X=M,C,K),\qquad
-    \widetilde f=\Phi^\top f,\\
-    \widetilde M,\widetilde K\ \text{diagonal},\\
-    C\approx\alpha M+\beta K
-    \quad\text{(Rayleigh damping)},\\
-    \Longrightarrow\quad
-    \widetilde C\approx\alpha\widetilde M+\beta\widetilde K
-    \quad\text{diagonal},\\
-    \widetilde m_i\ddot q_i+\widetilde c_i\dot q_i+
-    \widetilde k_iq_i=\phi_i^\top f.
-  \end{gathered}
-}
-Modal orthogonality diagonalizes mass and stiffness; Rayleigh damping also
-diagonalizes damping. The coupled system therefore separates into independent
-modal oscillators.
+Each $\phi_k$ is a coherent spatial motion pattern and $q_k(t)$ is its temporal
+activation. Under small linear motion, the modal coordinates approximately
+decouple and can be analyzed independently. Only a few modes usually dominate
+the visible response: they are resonantly excited, lightly damped, and clearly
+projected into the camera.
 
 \begin{center}
 \begin{tikzpicture}[x=1in,y=1in,>=Latex]
@@ -290,22 +272,18 @@ modal oscillators.
 \end{tikzpicture}
 \end{center}
 
-\postersection{2B.}{Modal analysis from ordinary video}{PosterSage}
+\postersubsection{Why the frequency domain?}
 
-\postersubsection{Davis et al.: image-space modal bases}
-
-Davis, Chen, and Durand recover projections of resonant modes from a short
-video without knowing geometry or material parameters (Davis et al., 2015).
-Their key observation is that, near a resonant
-frequency $\omega_i$, the temporal spectrum of visible displacement is
-proportional to the projected mode shape:
+Time-domain pixel motion mixes many modes. Because each mode has a natural
+frequency, the temporal Fourier transform separates their responses:
 \equationbox{PosterSage}{
-  VU(\omega_i)=A_iH_i(\omega_i)V\phi_i
-  \quad\Longrightarrow\quad
-  VU(\omega_i)\propto V\phi_i.
+  \widehat d(f)=\sum_t d(t)e^{-i2\pi ft},
+  \qquad
+  \widehat d(f_k)\propto\phi_k^{\mathrm{2D}}.
 }
-Here $V$ selects visible degrees of freedom, $A_i$ is the unknown excitation at
-the mode, and $H_i$ is its frequency response. The pipeline is:
+Near a resonant peak $f_k$, one spatial mode often dominates. Davis, Chen, and
+Durand use this observation to recover projected complex 2D modes from ordinary
+video without knowing geometry or material parameters (Davis et al., 2015):
 
 \begin{center}
 \begin{tikzpicture}[node distance=0.24in,>=Latex]
@@ -331,33 +309,26 @@ the mode, and $H_i$ is its frequency response. The pipeline is:
 \end{tikzpicture}
 \end{center}
 
-Each spatial slice of the displacement FFT is a candidate mode. Peaks in the
-global power spectrum identify resonances; magnitude visualizes motion strength
-and complex phase records relative timing. These projected modes need not be
-orthogonal or purely real; Davis retains complex, non-binary phase relationships
-when they better explain the video. The selected modes become a basis for
-synthesizing 2D image deformation:
-\begin{equation*}
-  D(t)=\sum_i\operatorname{Re}\{\phi_i' q_i(t)\}.
-\end{equation*}
+Each frequency slice is a candidate spatial pattern. Strong resonant peaks
+identify representative modes; their complex values retain both displacement
+magnitude and relative phase.
 
 \posterplaceholder{../poster_brief/figures/bush_flow_and_frequency.png}{2.72in}{%
   Bush fixed-view optical flow, power spectrum, and one selected complex 2D mode.}
 
-\postersubsection{What makes the Davis derivation possible?}
+\postersubsection{Working assumptions}
 
 {\renewcommand{\arraystretch}{1.16}
 \fontsize{21}{26}\selectfont
 \begin{tabularx}{\linewidth}{@{}>{\bfseries\color{PosterSlate}}p{0.28\linewidth}>{\RaggedRight\arraybackslash}X@{}}
 Small linear motion
-  & The object vibrates near a fixed rest state, so superposition applies. \\
+  & Mode superposition and linear projection are valid. \\
 Weak perspective
-  & Small 3D displacement projects approximately linearly into the image. \\
+  & Small 3D displacement projects approximately linearly. \\
 Well-spaced modes
-  & Resonances do not strongly overlap, so one frequency isolates one mode. \\
+  & One mode dominates near each resonant peak. \\
 Broad-spectrum forcing
-  & The observed excitation is sufficiently rich; unknown force/mass scaling is
-    absorbed into a global modal scale. \\
+  & Relevant modes receive measurable excitation. \\
 \end{tabularx}}
 
 \postersection{3.}{Why asynchronous multi-view is different}{PosterClay}
