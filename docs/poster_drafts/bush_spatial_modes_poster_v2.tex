@@ -7,6 +7,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{tabularx}
+\usepackage{multicol}
 \usepackage{array}
 \usepackage{enumitem}
 \usepackage{xcolor}
@@ -39,6 +40,7 @@
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{0.34em}
 \setlength{\columnsep}{0.34in}
+\setlength{\multicolsep}{0pt}
 \setlist[itemize]{leftmargin=1.25em,itemsep=0.15em,topsep=0.15em}
 \setlist[enumerate]{leftmargin=1.35em,itemsep=0.18em,topsep=0.18em}
 
@@ -162,12 +164,9 @@ Output: completed complex spatial fields $\phi_k\in\mathbb C^{G\times3}$.\par}
 \vspace{0.08in}
 
 % -----------------------------------------------------------------------------
-% Poster body: full-width horizontal bands with two-column interiors
+% Two-column poster body
 % -----------------------------------------------------------------------------
-% Band 1: 3DGS and modal-analysis background.
-\noindent
-\begin{minipage}[t]{0.492\textwidth}
-\vspace{0pt}
+\begin{multicols}{2}
 \RaggedRight
 
 \postersection{1.}{3D Gaussian Splatting}{PosterSlate}
@@ -286,12 +285,6 @@ $q_i(t)$ describe how strongly each pattern is active. Low-frequency modes
 often dominate visible vibration, so the basis can be much smaller than the
 original number of degrees of freedom.
 
-\end{minipage}
-\hfill
-\begin{minipage}[t]{0.492\textwidth}
-\vspace{0pt}
-\RaggedRight
-
 \postersection{2B.}{Modal analysis from ordinary video}{PosterSage}
 
 \postersubsection{Davis et al.: image-space modal bases}
@@ -362,16 +355,7 @@ Broad-spectrum forcing
     absorbed into a global modal scale. \\
 \end{tabularx}}
 
-\end{minipage}
-\par
-
-% Band 2: the asynchronous setting spans the full poster width.
 \postersection{3.}{Why asynchronous multi-view is different}{PosterClay}
-
-\noindent
-\begin{minipage}[t]{0.492\textwidth}
-\vspace{0pt}
-\RaggedRight
 
 Synchronized camera arrays can triangulate the same moving surface at the same
 instant and recover detailed dynamic 3D scenes. Most users, however, own one
@@ -416,12 +400,6 @@ different times and experience different forcing.
 \end{tikzpicture}
 \end{center}
 
-\end{minipage}
-\hfill
-\begin{minipage}[t]{0.492\textwidth}
-\vspace{0pt}
-\RaggedRight
-
 Time-domain optical flow from these recordings is not synchronized and should
 not match frame by frame. Our central modeling assumption is weaker:
 
@@ -442,16 +420,7 @@ not match frame by frame. Our central modeling assumption is weaker:
   \item Frequencies are stable and sufficiently separated over the capture.
 \end{itemize}
 
-\end{minipage}
-\par
-
-% Band 3: the shared 3D solve spans the full poster width.
 \postersection{4.}{Solving shared 3D modes}{PosterSlate}
-
-\noindent
-\begin{minipage}[t]{0.492\textwidth}
-\vspace{0pt}
-\RaggedRight
 
 \postersubsection{A. Shared canonical scene}
 
@@ -529,12 +498,6 @@ must therefore satisfy
 \end{tikzpicture}
 \end{center}
 
-\end{minipage}
-\hfill
-\begin{minipage}[t]{0.492\textwidth}
-\vspace{0pt}
-\RaggedRight
-
 We aggregate these constraints over many shared points, fix one reference-view
 gauge $\beta_{1,k}=1$, and solve a robust least-squares synchronization. The
 default model estimates unit-magnitude phase offsets; a bounded-complex option
@@ -579,7 +542,6 @@ unobserved Gaussians while preserving the measured solution.
   calibration, masks, optical flow, static Gaussian quality, and the validity
   of the shared-frequency assumption.}
 
-\end{minipage}
-\par
+\end{multicols}
 
 \end{document}
