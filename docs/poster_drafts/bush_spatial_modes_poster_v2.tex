@@ -166,13 +166,13 @@ Output: completed complex spatial fields $\phi_k\in\mathbb C^{G\times3}$.\par}
 \begin{minipage}[t]{0.322\textwidth}
 \vspace{0pt}
 
-\postersection{1.}{From 3DGS to dynamic 3D scenes}{PosterSlate}
+\postersection{1.}{3D Gaussian Splatting}{PosterSlate}
 
 \postersubsection{3D Gaussian Splatting in one paragraph}
 
 3D Gaussian Splatting (3DGS) represents a scene as explicit, oriented,
 semi-transparent ellipsoids rather than as a dense voxel grid
-\cite{kerbl2023gaussians}. Gaussian $g$ stores
+(Kerbl et al., 2023). Gaussian $g$ stores
 \begin{equation*}
   \mathcal G_g=(\mu_g,\Sigma_g,o_g,c_g),
 \end{equation*}
@@ -214,43 +214,7 @@ Gaussian to an image-space ellipse. Depth-ordered alpha compositing gives
   rendering, explicit world-space locations, foreground/background separation,
   rendered depth, and differentiable camera projection Jacobians.}
 
-\postersubsection{How prior work makes 3DGS dynamic}
-
-Dynamic reconstruction remains ill-posed because geometry, camera motion,
-occlusion, and non-rigid object motion are entangled. Representative families
-include:
-
-{\fontsize{19}{24}\selectfont
-\renewcommand{\arraystretch}{1.18}
-\begin{tabularx}{\linewidth}{@{}>{\bfseries}p{0.27\linewidth}X@{}}
-\hline
-Capture/model & Typical strategy \\
-\hline
-Synchronized multi-view or RGB-D
-  & Triangulate changing geometry with simultaneous observations; accurate but
-    hardware-heavy. \\
-Dynamic NeRF
-  & Learn time-dependent radiance or a canonical-to-observation deformation
-    field, as in Nerfies/HyperNeRF \cite{park2021nerfies,park2021hypernerf}. \\
-Dynamic 3DGS
-  & Move or deform explicit Gaussians over time for fast rendering
-    \cite{wu2024fourDgs,yang2024deformable}. \\
-Persistent motion bases
-  & Share a compact set of $SE(3)$ trajectories across Gaussians, as in Shape
-    of Motion \cite{wang2025shape}. \\
-\hline
-\end{tabularx}}
-
-Shape of Motion emphasizes that many monocular methods recover short-range
-scene flow or canonical deformation, while synchronized multi-view systems
-remain much easier to constrain. Our setting takes a different middle ground:
-multiple views are available, but they are recorded asynchronously by one
-phone.
-
-\posterplaceholder{../poster_brief/figures/bush_static_3dgs.png}{2.50in}{%
-  Canonical Bush 3DGS: high-detail appearance and explicit foreground centers.}
-
-\postersection{2.}{Modal analysis: coupled motion, simple modes}{PosterSage}
+\postersection{2A.}{Modal analysis: coupled motion, simple modes}{PosterSage}
 
 \postersubsection{A two-degree-of-freedom example}
 
@@ -318,30 +282,18 @@ $q_i(t)$ describe how strongly each pattern is active. Low-frequency modes
 often dominate visible vibration, so the basis can be much smaller than the
 original number of degrees of freedom.
 
-\postersection{4.}{Our reconstruction pipeline}{PosterSlate}
-
-\postersubsection{A. Shared canonical scene}
-
-We sample a sweep video and add one reference image from each fixed view to the
-same COLMAP reconstruction. This provides a common world coordinate system.
-Registered sweep views train a foreground/background 3DGS; fixed cameras are
-exported for modal projection.
-
-\posterplaceholder{../poster_brief/figures/bush_capture_and_cameras.png}{1.82in}{%
-  Sweep frames, fixed references, and registered cameras around the canonical scene.}
-
 \end{minipage}
 \hfill
 \begin{minipage}[t]{0.322\textwidth}
 \vspace{0pt}
 
-\postersection{2.}{Modal analysis from ordinary video}{PosterSage}
+\postersection{2B.}{Modal analysis from ordinary video}{PosterSage}
 
 \postersubsection{Davis et al.: image-space modal bases}
 
 Davis, Chen, and Durand recover projections of resonant modes from a short
-video without knowing geometry or material parameters
-\cite{davis2015imagespace}. Their key observation is that, near a resonant
+video without knowing geometry or material parameters (Davis et al., 2015).
+Their key observation is that, near a resonant
 frequency $\omega_i$, the temporal spectrum of visible displacement is
 proportional to the projected mode shape:
 \equationbox{PosterSage}{
@@ -475,7 +427,24 @@ not match frame by frame. Our central modeling assumption is weaker:
   \item Frequencies are stable and sufficiently separated over the capture.
 \end{itemize}
 
-\postersubsection{B. 2D frequency evidence and observation topology}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.322\textwidth}
+\vspace{0pt}
+
+\postersection{4.}{Solving shared 3D modes}{PosterSlate}
+
+\postersubsection{A. Shared canonical scene}
+
+We sample a sweep video and add one reference image from each fixed view to the
+same COLMAP reconstruction. This provides a common world coordinate system.
+Registered sweep views train a foreground/background 3DGS; fixed cameras are
+exported for modal projection.
+
+\posterplaceholder{../poster_brief/figures/bush_capture_and_cameras.png}{1.55in}{%
+  Sweep frames, fixed references, and registered cameras around the canonical scene.}
+
+\postersubsection{B. Frequency evidence and observation topology}
 
 Foreground optical flow is transformed over time:
 \begin{equation*}
@@ -491,12 +460,7 @@ canonical surface point $X_{v,p}$. Nearby Gaussians are ranked by
 This creates a mode-independent observation topology connecting complex 2D
 measurements to plausible foreground Gaussian centers.
 
-\end{minipage}
-\hfill
-\begin{minipage}[t]{0.322\textwidth}
-\vspace{0pt}
-
-\postersection{3B.}{Synchronizing phase without synchronized time}{PosterClay}
+\postersubsection{C. Synchronizing phase without synchronized time}
 
 At frequency $k$, view $v$ observes a complex 2D displacement
 $\widehat d_{v,k,p}$. For a Gaussian point $g$ with complex 3D mode vector
@@ -557,7 +521,7 @@ whose phase is not identifiable from the available shared geometry.
   vector from the synchronization step. It asks only whether the differently
   phased 2D observations could have come from \emph{some} common 3D motion.}
 
-\postersubsection{C. Spatial structure, local solve, and completion}
+\postersubsection{D. Spatial structure, local solve, and completion}
 
 Mutual KNN edges are removed across strong Gaussian-color or rendered-depth
 discontinuities. Remaining connected neighborhoods provide local structure.
@@ -589,31 +553,6 @@ unobserved Gaussians while preserving the measured solution.
   stiffness-normalized structural eigenmodes. Accuracy depends on camera
   calibration, masks, optical flow, static Gaussian quality, and the validity
   of the shared-frequency assumption.}
-
-{\fontsize{14}{17}\selectfont
-\textbf{Selected references.}
-\begin{thebibliography}{9}
-\setlength{\itemsep}{0.03in}
-\bibitem{kerbl2023gaussians}
-B. Kerbl et al. \emph{3D Gaussian Splatting for Real-Time Radiance Field
-Rendering}. ACM TOG, 2023.
-\bibitem{park2021nerfies}
-K. Park et al. \emph{Nerfies: Deformable Neural Radiance Fields}. ICCV, 2021.
-\bibitem{park2021hypernerf}
-K. Park et al. \emph{HyperNeRF}. SIGGRAPH Asia, 2021.
-\bibitem{wu2024fourDgs}
-G. Wu et al. \emph{4D Gaussian Splatting for Real-Time Dynamic Scene Rendering}.
-CVPR, 2024.
-\bibitem{yang2024deformable}
-Z. Yang et al. \emph{Deformable 3D Gaussians for High-Fidelity Monocular
-Dynamic Scene Reconstruction}. CVPR, 2024.
-\bibitem{wang2025shape}
-Q. Wang et al. \emph{Shape of Motion: 4D Reconstruction from a Single Video}.
-ICCV, 2025.
-\bibitem{davis2015imagespace}
-A. Davis, J. G. Chen, and F. Durand. \emph{Image-Space Modal Bases for Plausible
-Manipulation of Objects in Video}. ACM TOG, 2015.
-\end{thebibliography}}
 
 \end{minipage}
 \end{minipage}
