@@ -164,9 +164,9 @@ Output: completed complex spatial fields $\phi_k\in\mathbb C^{G\times3}$.\par}
 \vspace{0.08in}
 
 % -----------------------------------------------------------------------------
-% Two-column poster body
+% Three-column poster body
 % -----------------------------------------------------------------------------
-\begin{multicols}{2}
+\begin{multicols}{3}
 \RaggedRight
 
 \postersection{1.}{3D Gaussian Splatting}{PosterSlate}
@@ -233,10 +233,12 @@ $\Phi^\top$ give
     \widetilde M\ddot q+\widetilde C\dot q+\widetilde Kq=\widetilde f,\\
     \widetilde X=\Phi^\top X\Phi\ (X=M,C,K),\qquad
     \widetilde f=\Phi^\top f,\\
-    \widetilde M,\widetilde K\ \text{diagonal},\qquad
+    \widetilde M,\widetilde K\ \text{diagonal},\\
     C\approx\alpha M+\beta K
-    \Rightarrow
-    \widetilde C\approx\alpha\widetilde M+\beta\widetilde K\ \text{diagonal},\\
+    \quad\text{(Rayleigh damping)},\\
+    \Longrightarrow\quad
+    \widetilde C\approx\alpha\widetilde M+\beta\widetilde K
+    \quad\text{diagonal},\\
     \widetilde m_i\ddot q_i+\widetilde c_i\dot q_i+
     \widetilde k_iq_i=\phi_i^\top f.
   \end{gathered}
@@ -286,6 +288,8 @@ modal oscillators.
   \node[anchor=west,PosterMuted] at (4.35,0.00) {$\phi_2\propto[1,-1]^\top$};
 \end{tikzpicture}
 \end{center}
+
+\columnbreak
 
 \postersection{2B.}{Modal analysis from ordinary video}{PosterSage}
 
@@ -422,6 +426,8 @@ not match frame by frame. Our central modeling assumption is weaker:
   \item Frequencies are stable and sufficiently separated over the capture.
 \end{itemize}
 
+\columnbreak
+
 \postersection{4.}{Solving shared 3D modes}{PosterSlate}
 
 \postersubsection{A. Shared canonical scene}
@@ -523,10 +529,13 @@ and the complex twist is obtained by matching its projections to all aligned
 2D observations:
 {\fontsize{20}{24}\selectfont
 \begin{equation*}
-  \xi_{k,c}^{\star}=\arg\min_{\xi}
-  \sum_{(v,p,g)\in\mathcal O_c}\bar w_{v,p,g}
-  \left\|\alpha_{v,k}J_{v,g}B_{c,g}\xi-
-  \widehat d_{v,k,p}\right\|_2^2.
+  \begin{aligned}
+    \xi_{k,c}^{\star}
+    &=\arg\min_{\xi}
+      \sum_{(v,p,g)\in\mathcal O_c}\bar w_{v,p,g}\\
+    &\qquad\left\|\alpha_{v,k}J_{v,g}B_{c,g}\xi-
+      \widehat d_{v,k,p}\right\|_2^2.
+  \end{aligned}
 \end{equation*}}
 A separate foreground graph propagates trusted observed motion into compatible
 unobserved Gaussians while preserving the measured solution.
