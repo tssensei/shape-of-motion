@@ -1,0 +1,15 @@
+# Paper2Poster per-poster style override for a 30 x 40 inch portrait poster.
+# Place this file beside Paper2Poster's input paper.pdf.
+
+main_text_font_size: 36
+section_title_font_size: 50
+poster_title_font_size: 76
+poster_author_font_size: 30
+
+title_text_color: [33, 37, 43]
+title_fill_color: null
+main_text_color: [42, 53, 68]
+main_text_fill_color: null
+
+section_title_vertical_align: "bottom"
+section_title_symbol: "▶"
