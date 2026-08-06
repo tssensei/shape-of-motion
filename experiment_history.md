@@ -1134,3 +1134,11 @@ Date: 2026-08-05
   observation approximation, and confidence-weighted rigid-component SVD
   objective. This is a reporting clarification only; no Bush artifact was
   regenerated and no experimental result changed.
+- The brief now records that the topology's depth-unprojection, foreground
+  Gaussian search, contribution-based soft selection, and reprojection
+  principle is adapted from Guo et al., *Motion-aware 3D Gaussian Splatting for
+  Efficient Dynamic Scene Reconstruction* (arXiv:2403.11447). It separately
+  identifies the Bush pipeline's canonical complex-frequency observations,
+  shared topology, multi-view rigid-component solve, color/depth structure
+  graph, and motion fill as later adaptations. This attribution update did not
+  regenerate any experiment artifact.

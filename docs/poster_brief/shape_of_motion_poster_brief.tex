@@ -414,7 +414,58 @@ across cameras.}
 asset: a masked optical-flow frame, a representative power spectrum with a
 selected frequency, and the corresponding complex 2D modal image.}
 
-\section{Connecting pixels to visible Gaussians}
+\section{Cross-dimensional pixel--Gaussian motion correspondence}
+
+This stage follows the central correspondence principle introduced by Guo
+et al.\ for motion-aware 3DGS \cite{guo2024motionaware}: instead of treating a
+rendered flow image as if it were identical to measured optical flow, establish
+an explicit bridge between pixel-level motion and a small set of foreground
+Gaussian centers. Guo et al. call this a \emph{cross-dimensional motion
+correspondence}, constructed through foreground Gaussian searching and
+reprojection.
+
+The distinction matters because alpha compositing is designed to render
+appearance, not to define a unique motion label. A static or weakly moving
+Gaussian in front of a moving surface can absorb transmittance and suppress a
+rendered flow feature, even though the measured image pixel belongs to the
+moving content. In addition, the theoretically unbounded support of a Gaussian
+can give distant primitives small but nonzero influence. Directly interpreting
+all rasterized flow contributions as motion correspondence can therefore mix
+visibility, appearance blending, and motion supervision.
+
+\plainidea{Rendering asks, ``Which Gaussians explain this pixel's color?''
+Motion correspondence asks a different question: ``Which nearby foreground
+Gaussians should be constrained by this pixel's measured movement?''}
+
+\begin{figure}[htbp]
+  \centering
+  \resizebox{0.96\linewidth}{!}{%
+  \begin{tikzpicture}[node distance=0.65cm and 0.65cm,>=Latex]
+    \node[draw=CaptureBlue,very thick,rounded corners,fill=CaptureBlue!7,
+      minimum height=1.15cm,text width=2.45cm,align=center] (pixel)
+      {Pixel $p$\\depth $D_v(p)$\\modal flow $\widehat d_{v,k,p}$};
+    \node[draw=GeometryTeal,very thick,rounded corners,fill=GeometryTeal!7,
+      minimum height=1.15cm,text width=2.55cm,align=center,right=of pixel] (unproject)
+      {Unproject to canonical\\surface point $X_{v,p}$};
+    \node[draw=EvidenceOrange,very thick,rounded corners,fill=EvidenceOrange!7,
+      minimum height=1.15cm,text width=2.65cm,align=center,right=of unproject] (search)
+      {Foreground KNN search\\and Gaussian scoring};
+    \node[draw=EvidenceOrange,very thick,rounded corners,fill=EvidenceOrange!7,
+      minimum height=1.15cm,text width=2.55cm,align=center,right=of search] (soft)
+      {Soft selection\\$\{g,\bar w_{v,p,g}\}$};
+    \node[draw=ModePurple,very thick,rounded corners,fill=ModePurple!7,
+      minimum height=1.15cm,text width=2.75cm,align=center,right=of soft] (project)
+      {Reproject candidate motion\\$\alpha_{v,k}J_{v,g}\phi_{k,g}$};
+    \draw[->,thick] (pixel) -- (unproject);
+    \draw[->,thick] (unproject) -- (search);
+    \draw[->,thick] (search) -- (soft);
+    \draw[->,thick] (soft) -- (project);
+  \end{tikzpicture}}
+  \caption{Surface-guided cross-dimensional correspondence. Rendered depth
+  locates the pixel in canonical 3D; local foreground search and soft selection
+  associate it with Gaussian candidates; camera reprojection connects their 3D
+  modal displacement to the measured complex 2D motion.}
+\end{figure}
 
 A measured pixel does not correspond to one obvious 3D point. Several
 foreground Gaussians can overlap along its camera ray, with different opacity
@@ -471,6 +522,47 @@ retained candidate would appear in the image.}
 This topology is built once and reused across selected frequencies. The
 frequency-specific data only changes the measured complex 2D displacement
 $\widehat d_{v,k,p}$ at each sampled pixel.
+
+\paragraph{Adaptation from dynamic flow to modal observations.}
+The correspondence construction is inherited from Motion-aware 3DGS, but its
+role and data contract are adapted to our multi-view frequency-domain problem:
+
+\begin{table}[htbp]
+  \centering
+  \small
+  \caption{From Guo et al.'s motion correspondence to the Bush modal topology.}
+  \begin{tabularx}{\linewidth}{@{}p{0.20\linewidth}XX@{}}
+    \toprule
+    & \textbf{Motion-aware 3DGS} & \textbf{Bush modal pipeline} \\
+    \midrule
+    Motion evidence
+      & Optical flow between adjacent frames.
+      & Complex Fourier displacement at a selected frequency. \\
+    Geometry anchor
+      & Rendered depth from the already modeled previous/coarse scene.
+      & Foreground-only depth from one canonical static 3DGS. \\
+    Candidate assignment
+      & $k$ nearby foreground Gaussians with contribution-based soft selection.
+      & KNN preselection, opacity-weighted 3D Gaussian scoring, top-candidate
+        filtering, and normalized confidence $\bar w_{v,p,g}$. \\
+    Reuse
+      & Correspondence supports temporal dynamic-scene optimization.
+      & One mode-independent topology is reused for all selected frequencies. \\
+    3D unknown
+      & Per-timestamp Gaussian center movement or instantaneous velocity.
+      & One complex local rigid twist per connected component, followed by
+        completion over all foreground Gaussians. \\
+    Additional structure
+      & Flow uncertainty and dynamic-aware training losses.
+      & Multi-view phase/gain alignment, color/depth-filtered structure graph,
+        component trust tests, and graph-based motion fill. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+The color/depth structure graph in the next section is therefore a separate
+spatial regularization layer, not part of the correspondence method adopted
+from Guo et al.
 
 \section{Building local rigid components}
 
